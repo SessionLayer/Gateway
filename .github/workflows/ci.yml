@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: the gate only needs to read the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a hung/old build does not sit in the
+# queue or run to the 6h default.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The required status check is literally `gate`. Do NOT rename this job, add a
+  # matrix, or set a custom `name:` — a mismatch hangs branch-protection
+  # auto-merge. One job, one gate.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Toolchain pinned to match rust-toolchain.toml (1.95.0). dtolnay's action
+      # requires an explicit `toolchain` input (it does not read the toml), so
+      # keep this in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (pinned)
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # protoc: needed by build.rs (tonic-prost-build shells out to protoc).
+      # nextest / cargo-deny / cargo-audit: used by scripts/gate.sh.
+      - name: Install gate tools (protoc, nextest, cargo-deny, cargo-audit)
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
+        with:
+          tool: protoc,cargo-nextest,cargo-deny,cargo-audit
+
+      - name: Run gate
+        run: ./scripts/gate.sh

@@ -1,0 +1,36 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SessionLayer Gateway daemon (Session One scaffold): health/version surface + CP handshake smoke."
+default-run = "gateway"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Propagate the io_uring reactor selection to the core library.
+io-uring = ["gateway-core/io-uring"]
+
+[dependencies]
+gateway-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+# Exercised by the cross-repo E2E smoke (scripts/e2e-smoke.sh), not unit tests.
+[[bin]]
+name = "handshake-smoke"
+path = "src/bin/handshake-smoke.rs"

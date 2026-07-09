@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = ["gateway", "gateway-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "GPL-3.0-only"
+repository = "https://github.com/SessionLayer/Gateway"
+authors = ["SessionLayer"]
+
+# Tier-0 invariant, uniform across every crate (lib and binaries): no first-party
+# `unsafe`. `forbid` cannot be locally overridden. Dependencies are unaffected
+# (that is expected — this governs our code only).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+gateway-core = { path = "gateway-core", version = "0.1.0" }
+
+# Async runtime. Multi-threaded tokio is the process base; the io_uring reactor
+# (behind gateway-core's `io-uring` feature) is a per-connection concern behind
+# the AsyncIo seam, not the runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+# CP <-> Gateway gRPC, generated from the frozen contract (proto/). tonic 0.14
+# split the prost integration into tonic-prost / tonic-prost-build.
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+
+# TLS. Pinned from Session One so the supply chain is audited now; the CP<->GW
+# mTLS channel is built in Session Four (this session is plaintext dev-only).
+rustls = { version = "0.23", default-features = false }
+
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Ser/de, errors, CLI.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+# Tier-0 data plane: keep integer-overflow checks on even in release. A
+# byte-shoveling proxy must not silently wrap a length/offset. Cheap insurance.
+overflow-checks = true

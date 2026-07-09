@@ -1,0 +1,43 @@
+[package]
+name = "gateway-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SessionLayer Gateway core: AsyncIo seam, CP handshake client, version/health surface (Session One scaffold)."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Opt-in io_uring reactor for the byte-copy hot path (Linux only). The epoll
+# reactor stays the portable default and fallback. See src/asyncio.rs.
+io-uring = ["dep:tokio-uring"]
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+rustls = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# tokio-uring is Linux-only; keep it target-gated so the crate still builds on
+# other platforms (the epoll fallback carries them).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { version = "0.5", optional = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+anyhow = { workspace = true }

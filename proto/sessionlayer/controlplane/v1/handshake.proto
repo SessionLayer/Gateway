@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+import "sessionlayer/controlplane/v1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "HandshakeProto";
+
+// Handshake is the version-negotiation service on the Control Plane <-> Gateway
+// gRPC plane. It is the ONLY RPC implemented in Session One and exists to prove
+// the contract-first codegen and cross-repo wiring end to end (CP implements
+// the server; the Gateway generates and calls the client).
+//
+// Per FR-HA-9 / Design D33 / Design §16A, the CP<->Gateway gRPC contract MUST
+// be explicitly versioned and MUST negotiate a common version at connect. This
+// service is that negotiation.
+//
+// SECURITY: transport security for this plane (mTLS channel auth + per-RPC,
+// session-bound authorization) is introduced in Session Four. Session One runs
+// this RPC over PLAINTEXT localhost for the smoke test only. That is
+// insecure-by-design, dev-only, and is replaced in Session Four. The messages
+// here carry no secrets, so negotiating before authentication is acceptable.
+service Handshake {
+  // Negotiate resolves the highest protocol version supported by BOTH peers.
+  //
+  // The resolved version is the maximum version v such that
+  //   v >= max(client.protocol_min, server.protocol_min)  AND
+  //   v <= min(client.protocol_max, server.protocol_max).
+  // If that interval is empty the peers share no common version and the server
+  // MUST fail the RPC with gRPC status FAILED_PRECONDITION, and SHOULD attach a
+  // NoCommonVersion message as an error detail. The resolution is a pure
+  // function of the two ranges (order-independent, deterministic) so any CP
+  // replica answers identically.
+  rpc Negotiate(ClientHello) returns (ServerHello);
+}
+
+// ClientHello is sent by the connecting component (the Gateway in Session One)
+// and advertises who it is and which protocol versions it can speak. Named
+// after the TLS ClientHello it mirrors in spirit.
+message ClientHello {
+  ComponentInfo client = 1;
+}
+
+// ServerHello is the Control Plane's response. It echoes the server's own
+// identity/range and returns the resolved common version.
+message ServerHello {
+  ComponentInfo server = 1;
+
+  // The resolved highest common protocol version. Guaranteed to lie within
+  // both peers' [protocol_min, protocol_max] ranges.
+  ProtocolVersion selected = 2;
+}
+
+// NoCommonVersion is attached as a google.rpc.Status detail when Negotiate
+// fails because the peers' supported ranges do not overlap. Purely diagnostic;
+// it never carries security-sensitive data.
+message NoCommonVersion {
+  ProtocolVersion client_min = 1;
+  ProtocolVersion client_max = 2;
+  ProtocolVersion server_min = 3;
+  ProtocolVersion server_max = 4;
+}

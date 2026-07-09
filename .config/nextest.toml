@@ -1,0 +1,11 @@
+# cargo-nextest configuration. Run the full suite (no fail-fast) so CI reports
+# the complete failure picture, and surface failing-test output inline.
+[profile.default]
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "flaky"
+retries = 0
+
+[profile.ci]
+inherits = "default"
+failure-output = "immediate-final"
