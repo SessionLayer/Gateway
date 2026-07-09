@@ -17,7 +17,9 @@
 //!
 //! There is deliberately no SSH I/O, no network listener, and no plaintext
 //! handling in this session.
-#![forbid(unsafe_code)]
+//!
+//! `unsafe_code` is forbidden workspace-wide via the `[workspace.lints]` table
+//! (see the root `Cargo.toml`); this crate additionally warns on missing docs.
 #![warn(missing_docs)]
 
 pub mod asyncio;

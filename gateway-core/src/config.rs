@@ -8,8 +8,12 @@ use crate::asyncio::IoBackend;
 use serde::{Deserialize, Serialize};
 
 /// Gateway configuration.
+///
+/// `deny_unknown_fields` makes misconfiguration fail closed: a misspelled or
+/// unrecognised key is an error, not a silently-ignored setting that leaves a
+/// (possibly security-relevant) default in place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GatewayConfig {
     /// Which async-I/O reactor to request for the byte-copy hot path. A `uring`
     /// request degrades to epoll when io_uring is unavailable (deny-safe).
@@ -44,5 +48,12 @@ mod tests {
         let cfg: GatewayConfig = serde_json::from_str(r#"{"io_backend":"uring"}"#).unwrap();
         assert_eq!(cfg.io_backend, IoBackend::Uring);
         assert_eq!(cfg.cp_endpoint, "http://127.0.0.1:9090");
+    }
+
+    #[test]
+    fn unknown_key_fails_closed() {
+        // A misspelled key must error, not be silently dropped.
+        let result: Result<GatewayConfig, _> = serde_json::from_str(r#"{"io_back_end":"uring"}"#);
+        assert!(result.is_err(), "unknown config key must be rejected");
     }
 }

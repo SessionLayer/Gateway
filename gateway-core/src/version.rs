@@ -58,12 +58,21 @@ pub fn component_info() -> ComponentInfo {
 /// tuples order lexicographically, which is exactly semantic `major.minor`
 /// ordering. Returns `None` when the ranges do not overlap — the peers share no
 /// version and the caller MUST fail closed.
+///
+/// PRECONDITION: each peer's advertised range lies within a single MAJOR line
+/// (`min.major == max.major`). A MAJOR change is a hard break (`common.proto`),
+/// not an additive step, so a range must never straddle majors. Enforced by
+/// `debug_assert!` — in release the lexicographic resolution would otherwise
+/// treat the space as contiguous across a major boundary.
 pub fn resolve_common_version(
     a_min: (u32, u32),
     a_max: (u32, u32),
     b_min: (u32, u32),
     b_max: (u32, u32),
 ) -> Option<(u32, u32)> {
+    debug_assert_eq!(a_min.0, a_max.0, "peer A range must not span majors");
+    debug_assert_eq!(b_min.0, b_max.0, "peer B range must not span majors");
+
     let lower = a_min.max(b_min);
     let upper = a_max.min(b_max);
     (lower <= upper).then_some(upper)

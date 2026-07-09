@@ -93,6 +93,12 @@ impl AsyncIo for UringIo {
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 impl UringIo {
     /// Run `future` to completion on a thread-local io_uring runtime.
+    ///
+    /// PRECONDITION: must be called on a dedicated OS thread that is NOT already
+    /// inside a tokio runtime — `tokio_uring::start` spins up its own runtime and
+    /// panics ("Cannot start a runtime from within a runtime") if nested. The
+    /// SSH bridge will drive this on its own thread; it is not called from the
+    /// process's multi-threaded tokio runtime.
     pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio_uring::start(future)
     }

@@ -8,12 +8,19 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref so a hung/old build does not sit in the
+# queue or run to the 6h default.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # The required status check is literally `gate`. Do NOT rename this job, add a
   # matrix, or set a custom `name:` — a mismatch hangs branch-protection
   # auto-merge. One job, one gate.
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

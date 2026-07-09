@@ -19,10 +19,13 @@ in `scripts/gate.sh` and the idle hook depends on it):
 
 ```
 # F-<area>-<n>: <title>
-- Severity: critical|high|medium|low|info
-- Status: Open|Verified-Fixed|Accepted-Risk
+- Severity: <critical|high|medium|low|info>
+- Status: <Open|Verified-Fixed|Accepted-Risk>
 - Area: <area>
 ```
+
+(The angle brackets above are placeholders — a real finding uses a bare
+keyword, e.g. `- Severity: medium`.)
 
 ## Closing findings
 

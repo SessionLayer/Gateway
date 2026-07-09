@@ -10,6 +10,12 @@ license = "GPL-3.0-only"
 repository = "https://github.com/SessionLayer/Gateway"
 authors = ["SessionLayer"]
 
+# Tier-0 invariant, uniform across every crate (lib and binaries): no first-party
+# `unsafe`. `forbid` cannot be locally overridden. Dependencies are unaffected
+# (that is expected — this governs our code only).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 gateway-core = { path = "gateway-core", version = "0.1.0" }
 

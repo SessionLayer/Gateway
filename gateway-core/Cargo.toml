@@ -8,6 +8,9 @@ repository.workspace = true
 authors.workspace = true
 description = "SessionLayer Gateway core: AsyncIo seam, CP handshake client, version/health surface (Session One scaffold)."
 
+[lints]
+workspace = true
+
 [features]
 default = []
 # Opt-in io_uring reactor for the byte-copy hot path (Linux only). The epoll

@@ -9,6 +9,9 @@ authors.workspace = true
 description = "SessionLayer Gateway daemon (Session One scaffold): health/version surface + CP handshake smoke."
 default-run = "gateway"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 # Propagate the io_uring reactor selection to the core library.

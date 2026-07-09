@@ -13,6 +13,13 @@
 use crate::pb::handshake_client::HandshakeClient;
 use crate::pb::{ClientHello, ProtocolVersion, ServerHello};
 use crate::version;
+use std::time::Duration;
+
+/// Default bound on establishing the transport to the Control Plane.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default per-RPC deadline for `Negotiate`.
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A failure while negotiating the protocol version with the Control Plane.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +38,16 @@ pub enum HandshakeError {
     /// the peers share no common version (fail-closed per VERSIONING.md §3).
     #[error("Handshake.Negotiate failed: {0}")]
     Rpc(#[from] tonic::Status),
+
+    /// The negotiation did not complete within its deadline — a hostile or
+    /// unresponsive peer must never hang the caller (fail closed).
+    #[error("timed out negotiating with Control Plane at {endpoint} after {after:?}")]
+    Timeout {
+        /// The endpoint that was dialed.
+        endpoint: String,
+        /// The elapsed bound that was exceeded.
+        after: Duration,
+    },
 
     /// The `ServerHello` omitted the selected version (malformed response).
     #[error("Control Plane returned no selected protocol version")]
@@ -72,6 +89,38 @@ impl Negotiated {
 /// `endpoint` is an HTTP(S) URL, e.g. `http://127.0.0.1:9090`. Session One runs
 /// this over plaintext for the dev smoke test; mTLS arrives in Session Four.
 pub async fn negotiate(endpoint: &str) -> Result<Negotiated, HandshakeError> {
+    negotiate_with_timeouts(endpoint, DEFAULT_CONNECT_TIMEOUT, DEFAULT_RPC_TIMEOUT).await
+}
+
+/// As [`negotiate`], with explicit timeouts. An overall wall-clock bound covers
+/// connect + HTTP/2 handshake + RPC so a peer that stalls at ANY phase cannot
+/// hang the caller; the per-connect / per-RPC bounds on the `Endpoint` are
+/// defense-in-depth within it.
+async fn negotiate_with_timeouts(
+    endpoint: &str,
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
+) -> Result<Negotiated, HandshakeError> {
+    let overall = connect_timeout + rpc_timeout;
+    match tokio::time::timeout(
+        overall,
+        negotiate_inner(endpoint, connect_timeout, rpc_timeout),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(HandshakeError::Timeout {
+            endpoint: endpoint.to_string(),
+            after: overall,
+        }),
+    }
+}
+
+async fn negotiate_inner(
+    endpoint: &str,
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
+) -> Result<Negotiated, HandshakeError> {
     let connect_err = |source| HandshakeError::Connect {
         endpoint: endpoint.to_string(),
         source,
@@ -79,6 +128,8 @@ pub async fn negotiate(endpoint: &str) -> Result<Negotiated, HandshakeError> {
 
     let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())
         .map_err(connect_err)?
+        .connect_timeout(connect_timeout)
+        .timeout(rpc_timeout)
         .connect()
         .await
         .map_err(connect_err)?;
@@ -112,9 +163,18 @@ fn interpret(hello: ServerHello) -> Result<Negotiated, HandshakeError> {
     let server = hello.server.unwrap_or_default();
     Ok(Negotiated {
         selected,
-        server_name: server.name,
-        server_semver: server.semver,
+        server_name: sanitize_diagnostic(&server.name),
+        server_semver: sanitize_diagnostic(&server.semver),
     })
+}
+
+/// Sanitize a peer-supplied diagnostic string before it is printed or logged.
+/// All wire input is hostile — even the pre-auth `ComponentInfo` diagnostics,
+/// which arrive over an unauthenticated plaintext channel in Session One — so
+/// drop control characters (terminal-escape / log-injection guard) and cap the
+/// length. Any future `tracing` of wire-sourced fields must front this too.
+fn sanitize_diagnostic(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(128).collect()
 }
 
 #[cfg(test)]
@@ -233,5 +293,65 @@ mod tests {
             interpret(hello),
             Err(HandshakeError::MissingSelectedVersion)
         ));
+    }
+
+    #[test]
+    fn interpret_sanitizes_hostile_diagnostic_strings() {
+        // A hostile CP embeds ANSI/control bytes in its identity strings.
+        let hello = ServerHello {
+            server: Some(ComponentInfo {
+                name: "evil\u{1b}[2Jname\nline".to_string(),
+                semver: "1.0\u{7f}\u{9b}".to_string(),
+                ..Default::default()
+            }),
+            selected: Some(ProtocolVersion { major: 1, minor: 0 }),
+        };
+        let negotiated = interpret(hello).expect("selection is in range");
+        assert!(!negotiated.server_name.chars().any(|c| c.is_control()));
+        assert!(!negotiated.server_semver.chars().any(|c| c.is_control()));
+        assert_eq!(negotiated.server_name, "evil[2Jnameline");
+    }
+
+    #[tokio::test]
+    async fn negotiation_times_out_against_a_silent_peer() {
+        // Peer accepts the TCP connection but never speaks HTTP/2. The call must
+        // return an error within its own bound, not hang.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _conn = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        let endpoint = format!("http://{addr}");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            negotiate_with_timeouts(
+                &endpoint,
+                Duration::from_millis(250),
+                Duration::from_millis(250),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "negotiate must return within its own timeout, not hang"
+        );
+        let err = result
+            .unwrap()
+            .expect_err("silent peer must yield an error");
+        // The bound may surface as our overall Timeout, a connect error, or the
+        // Endpoint's per-RPC deadline (Rpc/Cancelled) — all are bounded
+        // failures, none is a hang.
+        assert!(
+            matches!(
+                err,
+                HandshakeError::Timeout { .. }
+                    | HandshakeError::Connect { .. }
+                    | HandshakeError::Rpc(_)
+            ),
+            "expected a bounded timeout/connect/rpc error, got {err:?}"
+        );
     }
 }
