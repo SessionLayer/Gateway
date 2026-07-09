@@ -1,0 +1,37 @@
+//! SessionLayer Gateway core library (Session One scaffold).
+//!
+//! The Gateway is the platform's Tier-0 data plane: it will terminate the outer
+//! SSH leg, re-originate the inner leg, and see session plaintext (Design §1,
+//! §15). This session builds only the load-bearing seams so later sessions drop
+//! in without rework:
+//!
+//! - [`asyncio`] — the reactor-agnostic byte-I/O seam (`AsyncIo`) with an epoll
+//!   default and an opt-in io_uring backend.
+//! - [`handshake`] / [`pb`] — the CP <-> Gateway version-negotiation client,
+//!   generated from the frozen contract (`proto/`); implements FR-HA-9 / D33.
+//! - [`version`] — protocol/version constants and the pure highest-common
+//!   resolver.
+//! - [`health`] — a minimal health/version surface.
+//! - [`config`] — the Session One configuration subset.
+//! - [`tls`] — a placeholder that pins `rustls` for the Session Four mTLS plane.
+//!
+//! There is deliberately no SSH I/O, no network listener, and no plaintext
+//! handling in this session.
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod asyncio;
+pub mod config;
+pub mod handshake;
+pub mod health;
+pub mod tls;
+pub mod version;
+
+/// Generated protobuf types and gRPC client/server for the frozen CP <-> Gateway
+/// contract (`sessionlayer.controlplane.v1`), produced at build time by
+/// `build.rs` from the vendored `proto/`. This is generated code; its own docs
+/// come from the `.proto` comments.
+pub mod pb {
+    #![allow(missing_docs)]
+    tonic::include_proto!("sessionlayer.controlplane.v1");
+}
