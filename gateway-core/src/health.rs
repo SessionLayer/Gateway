@@ -24,7 +24,7 @@ pub struct Health {
     pub component: String,
     /// Build SemVer.
     pub semver: String,
-    /// Supported CP <-> Gateway protocol range, e.g. `1.0-1.0`.
+    /// Supported CP <-> Gateway protocol range, e.g. `1.0-1.1`.
     pub protocol_range: String,
     /// Liveness/readiness.
     pub status: Status,
@@ -51,13 +51,13 @@ mod tests {
         assert_eq!(health.status, Status::Ok);
         assert_eq!(health.component, "SessionLayer Gateway");
         assert_eq!(health.semver, env!("CARGO_PKG_VERSION"));
-        assert_eq!(health.protocol_range, "1.0-1.0");
+        assert_eq!(health.protocol_range, "1.0-1.1");
     }
 
     #[test]
     fn report_serialises_to_json() {
         let json = serde_json::to_string(&report()).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
-        assert!(json.contains("\"protocol_range\":\"1.0-1.0\""));
+        assert!(json.contains("\"protocol_range\":\"1.0-1.1\""));
     }
 }
