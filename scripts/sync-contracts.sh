@@ -27,8 +27,9 @@ fi
 mkdir -p "$DST"
 # Session Four added identity.proto (GatewayIdentity: EnrollGateway,
 # RenewGatewayIdentity) and signing.proto (SessionSigning:
-# SignSessionCertificate) as additive services on the mTLS plane.
-for f in common.proto handshake.proto identity.proto signing.proto; do
+# SignSessionCertificate) as additive services on the mTLS plane. Session Five
+# added authz.proto (Authorization: Authorize) — the connect-time decision.
+for f in common.proto handshake.proto identity.proto signing.proto authz.proto; do
   cp -v "$SRC/$f" "$DST/$f"
 done
 

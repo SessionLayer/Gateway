@@ -22,9 +22,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the Gateway identity lifecycle (enroll/renew) and the session-bound signer.
     let identity = proto_root.join("sessionlayer/controlplane/v1/identity.proto");
     let signing = proto_root.join("sessionlayer/controlplane/v1/signing.proto");
+    // Session Five addition (frozen upstream): the connect-time decision service
+    // (Authorization: Authorize). Compiled here so the vendored contract stays
+    // consistent; the Gateway does not call it yet (S7/S8/S10 own that flow).
+    let authz = proto_root.join("sessionlayer/controlplane/v1/authz.proto");
 
     // Regenerate only when the vendored contract (or this script) changes.
-    for p in [&common, &handshake, &identity, &signing] {
+    for p in [&common, &handshake, &identity, &signing, &authz] {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-changed=build.rs");
@@ -35,7 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // CP (mTLS + enroll/renew/sign); the Gateway itself is a client of these
         // services.
         .build_server(true)
-        .compile_protos(&[handshake, identity, signing, common], &[proto_root])?;
+        .compile_protos(
+            &[handshake, identity, signing, authz, common],
+            &[proto_root],
+        )?;
 
     Ok(())
 }
