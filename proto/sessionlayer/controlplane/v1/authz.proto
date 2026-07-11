@@ -1,0 +1,173 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+import "sessionlayer/controlplane/v1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "AuthzProto";
+
+// Authorization is the Control Plane's connect-time data-plane RBAC decision
+// service (Design §6.1/§6.3; FR-AUTHZ-1..8, FR-CHAN-1). Added in Session Five.
+//
+// The CP is the sole decision authority. Authorize evaluates the standing
+// data-plane grants for a resolved identity against a fixed target node and a
+// source IP, applies default-deny + deny-overrides + a top-tier un-overridable
+// Lock, and returns a SIGNED, TTL'd decision context the Gateway verifies and
+// caches for its per-channel local checks (S10). On ALLOW it also mints the
+// single-use session-signing token that authorises exactly one
+// SessionSigning.SignSessionCertificate call; on DENY/Lock it mints nothing
+// (fail closed).
+//
+// TIER. This RPC is on the identity/session tier of the mTLS plane: it REQUIRES
+// the caller's Gateway mTLS client certificate (the AuthInterceptor resolves the
+// caller's gateway_identity). The minted token is bound to that authenticated
+// caller — never to a request field — so a Gateway can never obtain a token for
+// a session it does not broker.
+//
+// NON-DISCLOSURE (FR-AUTHZ-5, §7.1). The response carries one generic Decision;
+// the matched rule / lock / no-allow reason is written only to the decision log
+// (audit_event) for the Admin/Auditor. The caller is never told WHY it was
+// denied.
+service Authorization {
+  // Authorize makes the one connect-time decision (fail-closed). ALLOW returns a
+  // signed decision context + the minted session token; DENY returns the generic
+  // decision and no token.
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+}
+
+// The SSH capability enum (FR-AUTHZ-6 / D14). Independently grantable; default
+// shell+exec; agent-forward default-deny. Enforced at the Gateway.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_SHELL = 1;
+  CAPABILITY_EXEC = 2;
+  CAPABILITY_SFTP = 3;
+  CAPABILITY_SCP = 4;
+  CAPABILITY_PORT_FORWARD_LOCAL = 5;
+  CAPABILITY_PORT_FORWARD_REMOTE = 6;
+  CAPABILITY_AGENT_FORWARD = 7;
+  CAPABILITY_X11 = 8;
+}
+
+// The generic connect-time outcome (§7.1). No reason is disclosed to the caller.
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_ALLOW = 1;
+  DECISION_DENY = 2;
+}
+
+// AuthorizeRequest is the resolved connect-time decision input. Identity
+// resolution (OIDC/OTP/pins) is upstream (S6); here the identity is already
+// resolved. Source IP is a DENY-ONLY reducer (FR-AUTH-15) — never positive
+// evidence of identity.
+message AuthorizeRequest {
+  // The resolved subject identity (e.g. an OIDC subject / username). Matched
+  // against dp_rule identity selectors; the user never chooses a raw principal.
+  string identity = 1;
+
+  // The identity's SSO/OIDC groups, for group-based identity selectors. Advisory
+  // input resolved upstream; empty is fine.
+  repeated string identity_groups = 2;
+
+  // The fixed target node id (UUID). The CP resolves its labels from inventory;
+  // the decision is bound to THIS node.
+  string node_id = 3;
+
+  // The Linux login the user is requesting (the SSH username maps to it). The
+  // decision allows it only if it is within the RBAC-resolved allowed logins; it
+  // becomes the inner-leg cert principal (FR-AUTHZ-8).
+  string requested_principal = 4;
+
+  // The client source IP (a single address, not a CIDR). Deny-only reducer: it
+  // can suppress an allow or scope a deny, never grant on its own (FR-AUTH-15).
+  string source_ip = 5;
+
+  // The SessionLayer session id the Gateway allocated for this connect (UUID).
+  // Bound into the decision context and the minted token.
+  string session_id = 6;
+
+  // The calling Gateway's identity/version, for diagnostics. Carries NO secrets;
+  // the AUTHENTICATED caller is the mTLS client cert, not this field.
+  ComponentInfo client = 7;
+}
+
+// AuthorizeResponse carries the generic decision and, on ALLOW, the signed
+// decision context + the minted single-use session token.
+message AuthorizeResponse {
+  // The generic outcome. On DENY (including a matching Lock) nothing below is
+  // populated except this field.
+  Decision decision = 1;
+
+  // The decision context (populated on ALLOW). A convenience DECODE of
+  // signed_context; signed_context is authoritative. A verifier MUST verify the
+  // signature over signed_context and SHOULD confirm this mirror agrees.
+  DecisionContext context = 2;
+
+  // The exact canonical bytes that were signed: the deterministic serialization
+  // of `context`. The signature covers a fixed domain-separation prefix followed
+  // by these bytes (see contracts/VERSIONING.md). Present on ALLOW.
+  bytes signed_context = 3;
+
+  // ECDSA-P256 / SHA-256 signature over {domain-prefix || signed_context},
+  // produced by the CP's decision-context signing key. Present on ALLOW.
+  bytes signature = 4;
+
+  // The decision-context signer's leaf certificate (X.509 DER). It chains to the
+  // internal mTLS CA the Gateway already pins and carries a distinguishing SAN
+  // marking it as the context signer, so the Gateway verifies the signature
+  // without any new trust distribution. Present on ALLOW.
+  bytes signer_certificate = 5;
+
+  // The signer's issuing CA chain (DER; issuing CA first). Present on ALLOW.
+  repeated bytes signer_ca_chain = 6;
+
+  // The minted single-use session-signing token (bearer, shown once). The
+  // Gateway presents it to SessionSigning.SignSessionCertificate. Empty on DENY
+  // (fail closed — no token is minted for a denied or locked decision).
+  string session_token = 7;
+}
+
+// DecisionContext is the signed, TTL'd connect-time decision (FR-CHAN-1). The
+// Gateway verifies it, caches it, and runs per-channel-open local checks against
+// it (S10): capability match, grant_expiry vs clock, local lock-set.
+message DecisionContext {
+  // The fixed target node (the decision is bound to it).
+  string node_id = 1;
+  string node_name = 2;
+
+  // The RBAC-resolved set of allowed Linux logins for this identity on this node.
+  repeated string allowed_logins = 3;
+
+  // The granted capability set for this decision (union of the applicable allow
+  // grants; AND-of-denies). Default shell+exec; agent-forward only if granted.
+  repeated Capability capabilities = 4;
+
+  // The chosen inner-leg cert principal for THIS connect (the requested login,
+  // confirmed within allowed_logins). The minted token is bound to it.
+  string principal = 5;
+
+  // grant_expiry = min(standing/JIT grant TTL, access-cred TTL) as Unix epoch
+  // seconds (UTC). The Gateway expires the grant conservatively (§2B).
+  int64 grant_expiry_epoch_seconds = 6;
+
+  // The policy epoch this decision was taken under (the CP monotonic epoch). Lets
+  // the Gateway detect a stale cached context after a policy change (S10).
+  uint64 policy_epoch = 7;
+
+  // How long the Gateway may serve per-channel checks from this cached context
+  // before it MUST re-authorize (~30-60s). 0 forces re-validate per channel-open.
+  int64 decision_ttl_seconds = 8;
+
+  // Bindings the Gateway checks the cached context against.
+  string gateway_id = 9;
+  string session_id = 10;
+
+  // The pinned source address (the client IP the decision was made for). A
+  // channel-open from a different source is refused locally (S10).
+  string source_address = 11;
+
+  // When the decision was issued (Unix epoch seconds, UTC).
+  int64 issued_at_epoch_seconds = 12;
+}
