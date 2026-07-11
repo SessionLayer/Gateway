@@ -14,6 +14,7 @@ use crate::pb::handshake_client::HandshakeClient;
 use crate::pb::{ClientHello, ProtocolVersion, ServerHello};
 use crate::version;
 use std::time::Duration;
+use tonic::transport::Channel;
 
 /// Default bound on establishing the transport to the Control Plane.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,8 +36,10 @@ pub enum HandshakeError {
     },
 
     /// `Negotiate` returned an error status. Notably `FAILED_PRECONDITION` when
-    /// the peers share no common version (fail-closed per VERSIONING.md §3).
-    #[error("Handshake.Negotiate failed: {0}")]
+    /// the peers share no common version (fail-closed per VERSIONING.md §3). Only
+    /// the gRPC status **code** is rendered — never the CP-supplied message
+    /// (untrusted wire text; log-injection / terminal-escape guard).
+    #[error("Handshake.Negotiate failed (gRPC status {:?})", .0.code())]
     Rpc(#[from] tonic::Status),
 
     /// The negotiation did not complete within its deadline — a hostile or
@@ -134,12 +137,22 @@ async fn negotiate_inner(
         .await
         .map_err(connect_err)?;
 
-    let mut client = HandshakeClient::new(channel);
+    negotiate_over_channel(channel).await
+}
 
+/// Run `Handshake.Negotiate` over an already-established tonic [`Channel`].
+///
+/// Session Four carries version negotiation over the **secured** (mTLS or
+/// bootstrap) channel built by [`crate::mtls`]: the caller connects (verifying
+/// the CP server certificate, TLS 1.3, fail-closed) and hands the channel here.
+/// The channel is expected to carry its own per-RPC deadline (set on the
+/// `Endpoint`), so a hung peer is bounded; a version mismatch still surfaces as
+/// `FAILED_PRECONDITION` and fails closed exactly as before.
+pub async fn negotiate_over_channel(channel: Channel) -> Result<Negotiated, HandshakeError> {
+    let mut client = HandshakeClient::new(channel);
     let request = tonic::Request::new(ClientHello {
         client: Some(version::component_info()),
     });
-
     let hello = client.negotiate(request).await?.into_inner();
     interpret(hello)
 }
@@ -239,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_highest_common_version_against_mock_cp() {
-        // Server speaks [1.0, 1.2]; this build speaks [1.0, 1.0] -> common 1.0.
+        // Server speaks [1.0, 1.2]; this build speaks [1.0, 1.1] -> common 1.1.
         let (endpoint, _srv) = spawn_mock(MockCp {
             server_min: (1, 0),
             server_max: (1, 2),
@@ -247,9 +260,23 @@ mod tests {
         .await;
 
         let negotiated = negotiate(&endpoint).await.expect("negotiation succeeds");
-        assert_eq!(negotiated.version_string(), "1.0");
-        assert_eq!(negotiated.selected, ProtocolVersion { major: 1, minor: 0 });
+        assert_eq!(negotiated.version_string(), "1.1");
+        assert_eq!(negotiated.selected, ProtocolVersion { major: 1, minor: 1 });
         assert_eq!(negotiated.server_name, "SessionLayer Control Plane");
+    }
+
+    #[tokio::test]
+    async fn negotiates_n_minus_one_with_an_older_cp() {
+        // An un-upgraded CP still on [1.0, 1.0] must resolve to 1.0 against this
+        // 1.1 build — the N-1 window (VERSIONING.md §4) is now load-bearing.
+        let (endpoint, _srv) = spawn_mock(MockCp {
+            server_min: (1, 0),
+            server_max: (1, 0),
+        })
+        .await;
+
+        let negotiated = negotiate(&endpoint).await.expect("negotiation succeeds");
+        assert_eq!(negotiated.version_string(), "1.0");
     }
 
     #[tokio::test]
