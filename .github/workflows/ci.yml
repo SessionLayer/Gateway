@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Toolchain pinned to match rust-toolchain.toml (1.95.0). dtolnay's action
       # requires an explicit `toolchain` input (it does not read the toml), so
@@ -35,7 +35,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # protoc: needed by build.rs (tonic-prost-build shells out to protoc).
       # nextest / cargo-deny / cargo-audit: used by scripts/gate.sh.

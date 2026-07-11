@@ -2,10 +2,13 @@
 //! highest-common-version resolver.
 //!
 //! Implements FR-HA-9 / Design D33 / §16A and mirrors the resolution rule in
-//! `ControlPlane-API/contracts/VERSIONING.md` §3. Session One's baseline is the
-//! single version **1.0** (`protocol_min = protocol_max = 1.0`); there is no
-//! prior release yet, so the N-1 window becomes load-bearing from the first
-//! MINOR bump onward.
+//! `ControlPlane-API/contracts/VERSIONING.md` §3. Session One's baseline was the
+//! single version **1.0**; **Session Four bumps to `[1.0, 1.1]`** — the first
+//! MINOR bump (VERSIONING.md §6). 1.1 adds three additive services carried over
+//! the new mTLS transport (`GatewayIdentity` enroll/renew, `SessionSigning`).
+//! Keeping `protocol_min = 1.0` makes the N-1 window (VERSIONING.md §4)
+//! load-bearing now: a 1.1 build still negotiates 1.0 with a peer that has not
+//! upgraded, and vice-versa. No common version still **fails closed**.
 
 use crate::pb::{ComponentInfo, ProtocolVersion};
 
@@ -20,7 +23,9 @@ pub const SEMVER: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_MIN: (u32, u32) = (1, 0);
 
 /// Highest CP <-> Gateway protocol version this build speaks, as `(major, minor)`.
-pub const PROTOCOL_MAX: (u32, u32) = (1, 0);
+/// Session Four: `1.1` (the enroll/renew/sign additions). `PROTOCOL_MIN` stays
+/// `1.0` to hold the N-1 window open.
+pub const PROTOCOL_MAX: (u32, u32) = (1, 1);
 
 /// Build a [`ProtocolVersion`] message from a `(major, minor)` pair.
 pub fn protocol_version((major, minor): (u32, u32)) -> ProtocolVersion {
@@ -83,7 +88,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn our_component_info_advertises_1_0_range() {
+    fn our_component_info_advertises_1_0_to_1_1_range() {
+        // Session Four: max bumped to 1.1, min held at 1.0 for the N-1 window.
         let info = component_info();
         assert_eq!(info.name, "SessionLayer Gateway");
         assert_eq!(
@@ -92,13 +98,13 @@ mod tests {
         );
         assert_eq!(
             info.protocol_max,
-            Some(ProtocolVersion { major: 1, minor: 0 })
+            Some(ProtocolVersion { major: 1, minor: 1 })
         );
     }
 
     #[test]
-    fn protocol_range_renders_1_0_to_1_0() {
-        assert_eq!(protocol_range(), "1.0-1.0");
+    fn protocol_range_renders_1_0_to_1_1() {
+        assert_eq!(protocol_range(), "1.0-1.1");
     }
 
     #[test]

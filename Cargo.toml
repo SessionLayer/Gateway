@@ -21,20 +21,45 @@ gateway-core = { path = "gateway-core", version = "0.1.0" }
 
 # Async runtime. Multi-threaded tokio is the process base; the io_uring reactor
 # (behind gateway-core's `io-uring` feature) is a per-connection concern behind
-# the AsyncIo seam, not the runtime.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+# the AsyncIo seam, not the runtime. `sync` carries the renew-ahead loop's
+# manual-trigger / shutdown channels (Session Four).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # CP <-> Gateway gRPC, generated from the frozen contract (proto/). tonic 0.14
-# split the prost integration into tonic-prost / tonic-prost-build.
-tonic = "0.14"
+# split the prost integration into tonic-prost / tonic-prost-build. `tls-ring`
+# (Session Four) enables the tokio-rustls transport with the *ring* provider —
+# deliberately NOT aws-lc-rs, to avoid a C/asm build toolchain + license churn.
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
 
-# TLS. Pinned from Session One so the supply chain is audited now; the CP<->GW
-# mTLS channel is built in Session Four (this session is plaintext dev-only).
-rustls = { version = "0.23", default-features = false }
+# TLS. Pinned from Session One so the supply chain is audited from day one; the
+# CP<->GW mTLS channel is built in Session Four on the *ring* provider (no
+# aws-lc-rs). `logging`/`std` are the non-provider bits we rely on.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+
+# X.509 identity: local ECDSA P-256 keypair + PKCS#10 CSR generation (the
+# Gateway sends only a CSR; its mTLS private key never leaves — D2/§15). Also the
+# mock-CP internal CA in tests. `ring` backend (NOT aws_lc_rs); `pem` for the
+# tonic client-identity PEM.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+# Inner-leg SSH keypair + OpenSSH wire encoding (the ecdsa-sha2-nistp256 public
+# blob the CP signs) + OpenSSH certificate assembly (mock session CA in tests).
+ssh-key = { version = "0.6", default-features = false, features = ["ecdsa", "p256", "std", "getrandom"] }
+# `OsRng` for inner-keypair generation + renew-ahead jitter (rand_core 0.6, the
+# version ssh-key 0.6 speaks — kept aligned deliberately).
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Single-writer advisory lock on the credential data-dir (§8.2): two Gateway
+# processes must not race the generation counter.
+fd-lock = "4"
+# Scrub private-key / secret buffers (Tier-0 caution).
+zeroize = "1"
+# DER -> PEM for the tonic client Identity (enrollment returns cert DER).
+pem = "3"
 
 # Observability.
 tracing = "0.1"

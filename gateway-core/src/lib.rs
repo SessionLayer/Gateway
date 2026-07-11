@@ -12,11 +12,18 @@
 //! - [`version`] — protocol/version constants and the pure highest-common
 //!   resolver.
 //! - [`health`] — a minimal health/version surface.
-//! - [`config`] — the Session One configuration subset.
-//! - [`tls`] — a placeholder that pins `rustls` for the Session Four mTLS plane.
+//! - [`config`] — the runtime configuration.
+//! - [`tls`] — installs the ring rustls crypto provider for the mTLS plane.
+//! - [`mtls`] — builds the CP <-> Gateway mTLS channels (Session Four, Part A):
+//!   a bootstrap server-auth channel and the fully mutual channel, both TLS 1.3
+//!   with a fail-closed custom certificate verifier.
+//! - [`identity`] — the Gateway's renewable mTLS X.509 identity lifecycle
+//!   (bootstrap → enroll → renew-ahead + generation counter; Part B).
+//! - [`signing`] — the session-bound inner-leg signer client (generate the inner
+//!   keypair locally, send only the public key; Part C).
 //!
-//! There is deliberately no SSH I/O, no network listener, and no plaintext
-//! handling in this session.
+//! The SSH legs (outer/inner), PROXY protocol, recorder, and NodeConnector are
+//! still later sessions; Session Four builds the mTLS/identity/signing seams.
 //!
 //! `unsafe_code` is forbidden workspace-wide via the `[workspace.lints]` table
 //! (see the root `Cargo.toml`); this crate additionally warns on missing docs.
@@ -26,6 +33,10 @@ pub mod asyncio;
 pub mod config;
 pub mod handshake;
 pub mod health;
+pub mod identity;
+pub mod mtls;
+mod secret;
+pub mod signing;
 pub mod tls;
 pub mod version;
 

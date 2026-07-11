@@ -1,0 +1,15 @@
+# cargo-audit configuration for the SessionLayer Gateway.
+#
+# RUSTSEC-2023-0071 (Marvin timing side-channel in `rsa`) is IGNORED here with
+# justification, mirrored by audit/F-dep-1.md (Status: Accepted-Risk):
+#   * The Gateway uses ONLY ECDSA P-256 (inner-leg keys, mTLS identity). `rsa`
+#     is an OPTIONAL dependency of `ssh-key` that we never enable — verified by
+#     `cargo tree -e features -i rsa` (empty) and by `cargo build --all-features`
+#     never compiling `rsa`. `cargo deny` (feature-aware) agrees: "advisories ok".
+#   * `rsa` is only pinned in Cargo.lock's optional-dependency superset, which
+#     cargo-audit scans regardless of what is actually built.
+#   * No fixed `rsa` release exists ("No fixed upgrade is available").
+# The vulnerable code is therefore never in the Gateway binary. Re-evaluate if
+# ssh-key ever makes rsa non-optional or a fix ships.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
