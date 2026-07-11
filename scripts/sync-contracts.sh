@@ -29,7 +29,9 @@ mkdir -p "$DST"
 # RenewGatewayIdentity) and signing.proto (SessionSigning:
 # SignSessionCertificate) as additive services on the mTLS plane. Session Five
 # added authz.proto (Authorization: Authorize) — the connect-time decision.
-for f in common.proto handshake.proto identity.proto signing.proto authz.proto; do
+# Session Seven added auth.proto (OuterLegAuth: ResolveUserCert / ResolvePin /
+# ResolveOtp / Begin+PollDeviceFlow) — the outer-leg authentication RPCs.
+for f in common.proto handshake.proto identity.proto signing.proto authz.proto auth.proto; do
   cp -v "$SRC/$f" "$DST/$f"
 done
 

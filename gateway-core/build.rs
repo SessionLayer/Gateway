@@ -26,9 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (Authorization: Authorize). Compiled here so the vendored contract stays
     // consistent; the Gateway does not call it yet (S7/S8/S10 own that flow).
     let authz = proto_root.join("sessionlayer/controlplane/v1/authz.proto");
+    // Session Seven addition (frozen upstream): the outer-leg authentication
+    // service (OuterLegAuth: ResolveUserCert / ResolvePin / ResolveOtp /
+    // Begin+PollDeviceFlow). The Gateway is a client of these; the server side is
+    // generated for the in-process mock CP used by the integration tests.
+    let auth = proto_root.join("sessionlayer/controlplane/v1/auth.proto");
 
     // Regenerate only when the vendored contract (or this script) changes.
-    for p in [&common, &handshake, &identity, &signing, &authz] {
+    for p in [&common, &handshake, &identity, &signing, &authz, &auth] {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-changed=build.rs");
@@ -40,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // services.
         .build_server(true)
         .compile_protos(
-            &[handshake, identity, signing, authz, common],
+            &[handshake, identity, signing, authz, auth, common],
             &[proto_root],
         )?;
 
