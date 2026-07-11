@@ -127,6 +127,73 @@ message AuthorizeResponse {
   // Gateway presents it to SessionSigning.SignSessionCertificate. Empty on DENY
   // (fail closed — no token is minted for a denied or locked decision).
   string session_token = 7;
+
+  // How the Gateway reaches the fixed target node and how it verifies the node's
+  // host identity (Design §9; FR-CONN-1/2/5). UNSIGNED, unlike the decision
+  // context: it travels over the authenticated, confidential, integrity-
+  // protected mTLS channel from the trusted CP, and forging it requires
+  // compromising the CP itself (which already holds the decision-context signing
+  // key), so a separate signature would add no security. Present only on ALLOW.
+  NodeConnection node_connection = 8;
+}
+
+// ConnectorKind selects how the Gateway reaches a node's sshd (Design §9.2). The
+// model is selectable per node; a fleet may mix both (FR-CONN-3). Session Eight
+// implements AGENTLESS; OUTBOUND_AGENT (dial-back) is Session Thirteen.
+enum ConnectorKind {
+  CONNECTOR_KIND_UNSPECIFIED = 0;
+  CONNECTOR_KIND_AGENTLESS = 1;
+  CONNECTOR_KIND_OUTBOUND_AGENT = 2;
+}
+
+// NodeConnection is the CP's per-node connectivity + host-identity answer for a
+// resolved, authorized target (Design §9; FR-CONN-1/2/5/7). Read from inventory
+// (node / node_host_key). Carried unsigned on the ALLOW path (see the field doc).
+message NodeConnection {
+  // The connector model for this node (agentless dial vs outbound agent).
+  ConnectorKind connector_kind = 1;
+
+  // The dial address of the node's sshd for the agentless model: "host:port"
+  // (e.g. "10.0.0.5:22"). Required and non-empty when connector_kind is
+  // AGENTLESS; empty for the outbound-agent model.
+  string dial_address = 2;
+
+  // Enrollment-anchored material to verify the node host identity BEFORE any
+  // inner-leg auth (Design §9.3, FR-CONN-5). MANDATORY — never TOFU. If this is
+  // absent, or carries neither a host-CA key nor a pinned key, the Gateway
+  // aborts the session (fail closed).
+  HostVerification host_verification = 3;
+}
+
+// HostVerification carries the trust the Gateway checks the node's presented host
+// key/cert against (Design §9.3; FR-CONN-5/7). Host-CA-signed host cert is
+// PRIMARY; explicitly pinned host keys are the FALLBACK. When both are present
+// the host-CA path is authoritative and a pinned-key match is accepted only if
+// the node presents a plain key. Public material only (no secrets).
+message HostVerification {
+  // Trusted host-CA public keys, OpenSSH wire-encoded. A host CERTIFICATE the
+  // node presents must be signed by one of these AND carry a valid principal in
+  // expected_host_principals.
+  repeated bytes host_ca_keys = 1;
+
+  // The host principals the node's host cert must include (its enrollment name /
+  // address). A host cert whose principals do not intersect this set is rejected
+  // (FR-CONN-7). Non-empty whenever host_ca_keys is set.
+  repeated string expected_host_principals = 2;
+
+  // Explicitly pinned node host public keys, OpenSSH wire-encoded — the fallback
+  // when the node presents a plain host key rather than a host cert. A presented
+  // plain host key MUST byte-equal one of these (no TOFU).
+  repeated bytes pinned_host_keys = 3;
+
+  // The node's enrollment host CERTIFICATE(s), OpenSSH cert wire-encoded (the
+  // host-CA path). Sent because the Gateway's inner-leg SSH client negotiates
+  // only plain host keys at KEX (it cannot receive the live cert), so the CP
+  // hands over the enrollment-anchored cert. The Gateway verifies each against
+  // host_ca_keys (trusted-CA signature + validity) and expected_host_principals
+  // (type=host, principal match), then binds the cert's public key to the plain
+  // host key the node presents at KEX. Non-empty whenever host_ca_keys is set.
+  repeated bytes host_certificates = 4;
 }
 
 // DecisionContext is the signed, TTL'd connect-time decision (FR-CHAN-1). The
