@@ -568,3 +568,52 @@ async fn device_flow_timeout_e2e() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn cp_down_during_resolution_e2e() -> anyhow::Result<()> {
+    build_client_image().await?;
+
+    let cp = MockCp::start().await;
+    let pin_key = generate_key();
+    let cert_key = generate_key();
+    let cert_line = cp.sign_user_cert(&cert_key.public_line, "unused", &["x"], 300);
+    cp.register_pin(&pin_key.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", "web-1", "deploy");
+
+    let (port, _shutdown) = start_server(&cp, Arc::new(base_config())).await;
+    let container = client_container(&pin_key, &cert_key, &cert_line).await;
+
+    // Part F (CP-down during resolution): the pin resolve returns UNAVAILABLE; the
+    // publickey attempt degrades to keyboard-interactive, which surfaces the §7.1
+    // "service temporarily unavailable" — NOT a plain auth failure. Fail closed.
+    cp.set_resolve_unavailable(true);
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        ssh_args(
+            port,
+            &[
+                "-i",
+                "/root/pin_key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=publickey,keyboard-interactive",
+            ],
+            "deploy%web-1",
+            "true",
+        ),
+        vec![
+            ("SSH_ASKPASS".to_string(), "/askpass.sh".to_string()),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+            ("SL_OTP".to_string(), String::new()),
+        ],
+    )
+    .await;
+    assert_ne!(code, Some(0), "CP-down must not authenticate");
+    assert!(
+        stderr.contains(SERVICE_UNAVAILABLE),
+        "CP-down during resolution must surface service-unavailable, not a plain auth failure; stderr={stderr:?}"
+    );
+
+    Ok(())
+}

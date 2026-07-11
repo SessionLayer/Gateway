@@ -227,6 +227,9 @@ struct MockState {
     known_nodes: Mutex<HashSet<String>>,
     /// When set, `Authorize` returns UNAVAILABLE (the CP-down fail-closed row).
     authorize_unavailable: Mutex<bool>,
+    /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
+    /// during authentication).
+    resolve_unavailable: Mutex<bool>,
 }
 
 impl MockState {
@@ -583,6 +586,15 @@ impl MockState {
     }
 }
 
+/// Simulate a CP-down during authentication: every resolve RPC returns
+/// UNAVAILABLE when the knob is set.
+fn resolve_down(state: &MockState) -> Result<(), Status> {
+    if *state.resolve_unavailable.lock().unwrap() {
+        return Err(Status::unavailable("control plane temporarily unavailable"));
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl OuterLegAuth for MockSvc {
     async fn resolve_user_cert(
@@ -590,6 +602,7 @@ impl OuterLegAuth for MockSvc {
         request: Request<ResolveUserCertRequest>,
     ) -> Result<Response<ResolveUserCertResponse>, Status> {
         require_gateway(&request, self)?;
+        resolve_down(self)?;
         let r = request.into_inner();
         let identity = self.resolve_cert(&r.certificate_blob, &r.source_ip);
         Ok(Response::new(ResolveUserCertResponse {
@@ -602,6 +615,7 @@ impl OuterLegAuth for MockSvc {
         request: Request<ResolvePinRequest>,
     ) -> Result<Response<ResolvePinResponse>, Status> {
         require_gateway(&request, self)?;
+        resolve_down(self)?;
         let r = request.into_inner();
         let identity = {
             let pins = self.pins.lock().unwrap();
@@ -617,6 +631,7 @@ impl OuterLegAuth for MockSvc {
         request: Request<ResolveOtpRequest>,
     ) -> Result<Response<ResolveOtpResponse>, Status> {
         require_gateway(&request, self)?;
+        resolve_down(self)?;
         let r = request.into_inner();
         // Single-use: consume (atomic mark-used) on a source-matched hit.
         let identity = {
@@ -639,6 +654,7 @@ impl OuterLegAuth for MockSvc {
         request: Request<BeginDeviceFlowRequest>,
     ) -> Result<Response<BeginDeviceFlowResponse>, Status> {
         require_gateway(&request, self)?;
+        resolve_down(self)?;
         let template = self
             .device_flow_template
             .lock()
@@ -669,6 +685,7 @@ impl OuterLegAuth for MockSvc {
         request: Request<PollDeviceFlowRequest>,
     ) -> Result<Response<PollDeviceFlowResponse>, Status> {
         require_gateway(&request, self)?;
+        resolve_down(self)?;
         let r = request.into_inner();
         let mut flows = self.device_flows.lock().unwrap();
         let Some(rec) = flows.get_mut(&r.device_code) else {
@@ -909,6 +926,7 @@ impl MockCpBuilder {
             allow_rules: Mutex::new(Vec::new()),
             known_nodes: Mutex::new(HashSet::new()),
             authorize_unavailable: Mutex::new(false),
+            resolve_unavailable: Mutex::new(false),
         });
 
         let tls = ServerTlsConfig::new()
@@ -1144,6 +1162,12 @@ impl MockCp {
     /// Toggle the CP-unreachable simulation for `Authorize` (returns UNAVAILABLE).
     pub fn set_authorize_unavailable(&self, on: bool) {
         *self.state.authorize_unavailable.lock().unwrap() = on;
+    }
+
+    /// Toggle the CP-unreachable simulation for the OuterLegAuth **resolve** RPCs
+    /// (they return UNAVAILABLE) — CP-down during authentication.
+    pub fn set_resolve_unavailable(&self, on: bool) {
+        *self.state.resolve_unavailable.lock().unwrap() = on;
     }
 
     /// Sign an OpenSSH user certificate with the user-facing CA (for the
