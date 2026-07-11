@@ -46,9 +46,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # tonic client-identity PEM.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
+# Outer SSH leg: the Gateway's SSH server (accept + transport + auth handshake).
+# Session Seven — the outer leg only (inner-leg client is Session Eight). `ring`
+# crypto backend to match the rest of the TLS stack (no aws-lc-rs C/asm
+# toolchain); no default features to keep the surface minimal.
+russh = { version = "0.62", default-features = false, features = ["ring"] }
+
 # Inner-leg SSH keypair + OpenSSH wire encoding (the ecdsa-sha2-nistp256 public
 # blob the CP signs) + OpenSSH certificate assembly (mock session CA in tests).
-ssh-key = { version = "0.6", default-features = false, features = ["ecdsa", "p256", "std", "getrandom"] }
+# `ed25519` powers the outer-leg host key (the standard SSH host-key algorithm).
+ssh-key = { version = "0.6", default-features = false, features = ["ecdsa", "ed25519", "p256", "std", "getrandom"] }
 # `OsRng` for inner-keypair generation + renew-ahead jitter (rand_core 0.6, the
 # version ssh-key 0.6 speaks — kept aligned deliberately).
 rand_core = { version = "0.6", features = ["getrandom"] }

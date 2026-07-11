@@ -71,13 +71,25 @@ change the contract.**
 ## Conventions
 
 - **Component name** `SessionLayer Gateway`; **SemVer** `0.1.0`; **protocol**
-  `1.0` (`min = max = 1.0`).
-- **CP gRPC** at `http://127.0.0.1:9090` (plaintext dev-only). **Ports** (dev,
-  parent Makefile): CP REST `:8080`, CP gRPC `:9090`, Postgres `:5432`, NATS
-  `:4222/:8222`, MinIO `:9000/:9001`, oidc-mock `:8090`, target-sshd `:2222`.
+  `1.1` (`min = 1.0`, `max = 1.1`; the N-1 window is live since S4).
+- **CP gRPC** at `https://127.0.0.1:9443` — **TLS 1.3 mutually authenticated**
+  since Session Four (`cp_mtls_endpoint`). The S1 plaintext `:9090` survives only
+  as the handshake-smoke legacy endpoint. **Ports** (dev, parent Makefile): CP
+  REST `:8080`, CP mTLS gRPC `:9443`, Postgres `:5432`, NATS `:4222/:8222`,
+  MinIO `:9000/:9001`, oidc-mock `:8090`, target-sshd `:2222`.
 - Structured logging via `tracing` (`RUST_LOG`, default `info`). Never log
-  plaintext.
+  plaintext — and never log SSH secrets/keys/OTP/tokens (Session Seven).
 - Edition 2021, toolchain pinned in `rust-toolchain.toml` (`1.95.0`).
+
+## Comment discipline (Session Five onward)
+
+Comment **sparingly — WHY, not WHAT.** No section-divider banners, no comments
+that restate the code or a name, no obvious narration. Prefer self-documenting
+names and small functions. Keep terse doc-comments only on genuinely public
+API / contract surfaces (the `pub` seams, the generated-proto wrappers); a brief
+comment is fine for a security/crypto/spec-tied invariant (e.g. "fail closed",
+"deny wins", a WHY tied to an FR/Design §). This is a **leaner baseline than
+S1–S4** — match it; do not restore the denser earlier style.
 
 ## Gate & CI
 
@@ -114,7 +126,8 @@ cargo deny check
 
 ## Deferred decisions recorded here
 
-- **russh is NOT a dependency yet.** The SSH legs are a later session; adding
-  russh now would be product behavior outside Session One scope and would widen
-  the audit surface for no benefit. Staged for the session that implements the
-  outer/inner SSH legs.
+- **russh is added in Session Seven** for the **outer** SSH leg (the Gateway's
+  SSH server: accept, source-IP gate, auth negotiation). The **inner** leg (SSH
+  client to the node, host verification, byte bridge) is Session Eight; the outer
+  leg stops at a `NodeConnector` seam/stub. Keep russh usage minimal and
+  fail-closed; never log SSH secrets/keys/OTP.

@@ -21,14 +21,26 @@
 
 #![allow(dead_code)] // shared across several test binaries; not all use every item.
 
+use gateway_core::config::SshServerConfig;
+use gateway_core::cpauth::{CpAuthClient, CpChannelFactory};
+use gateway_core::identity;
+use gateway_core::pb::authorization_server::{Authorization, AuthorizationServer};
 use gateway_core::pb::gateway_identity_server::{GatewayIdentity, GatewayIdentityServer};
 use gateway_core::pb::handshake_server::{Handshake, HandshakeServer};
+use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
 use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningServer};
 use gateway_core::pb::{
-    ClientHello, ComponentInfo, EnrollGatewayRequest, EnrollGatewayResponse, ProtocolVersion,
-    RenewGatewayIdentityRequest, RenewGatewayIdentityResponse, ServerHello,
-    SignSessionCertificateRequest, SignSessionCertificateResponse,
+    AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
+    Capability, ClientHello, ComponentInfo, Decision, DecisionContext, DeviceFlowStatus,
+    EnrollGatewayRequest, EnrollGatewayResponse, PollDeviceFlowRequest, PollDeviceFlowResponse,
+    ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse, ResolveOtpRequest,
+    ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest,
+    ResolveUserCertResponse, ResolvedIdentity, ServerHello, SignSessionCertificateRequest,
+    SignSessionCertificateResponse,
 };
+use gateway_core::ssh::connector::PendingInnerLeg;
+use gateway_core::ssh::handler::HandlerDeps;
+use gateway_core::ssh::target::IdentityResolver;
 use gateway_core::{mtls, version};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -137,6 +149,44 @@ struct TokenRecord {
     used: bool,
 }
 
+/// A credential's resolved {identity, principals, groups} for the outer-leg auth
+/// RPCs, with an optional source-IP binding (deny-only reducer).
+#[derive(Clone)]
+struct ResolvedRecord {
+    identity: String,
+    principals: Vec<String>,
+    groups: Vec<String>,
+    source_ip: Option<String>,
+}
+
+/// The pre-configured outcome a device flow will produce (Session Seven tests).
+/// Matching the real CP, an APPROVED device flow carries only the identity —
+/// principals/groups are EMPTY because RBAC decides the device-flow logins.
+#[derive(Clone)]
+struct DeviceFlowTemplate {
+    user_code: String,
+    verification_uri: String,
+    identity: String,
+    /// Polls that report PENDING before the flow flips to APPROVED.
+    approve_after_polls: u32,
+    /// When set, the flow reports DENIED instead of ever approving.
+    deny: bool,
+}
+
+/// A live device flow minted by `BeginDeviceFlow`, tracked by device_code.
+struct DeviceFlowRecord {
+    template: DeviceFlowTemplate,
+    polls: u32,
+    expires_at: SystemTime,
+}
+
+/// A data-plane allow tuple for the mock `Authorize` (a stand-in for a dp_rule).
+struct AllowRule {
+    identity: String,
+    node_id: String,
+    principal: String,
+}
+
 /// Mutable + immutable mock CP state shared by the three service handlers.
 struct MockState {
     ca: TestCa,
@@ -158,6 +208,28 @@ struct MockState {
     /// When set, `SignSessionCertificate` never responds (a hung CP), to prove
     /// the client's fail-closed RPC timeout.
     hang_sign: Mutex<bool>,
+
+    // ---- Session Seven: outer-leg auth (OuterLegAuth) + Authorize ----------
+    /// OpenSSH **user-facing CA** private key (PEM) — signs user certs the
+    /// `ResolveUserCert` path validates (Design §3.1).
+    user_ca_pem: String,
+    /// Registered pins: SHA-256 fingerprint → resolved record.
+    pins: Mutex<HashMap<String, ResolvedRecord>>,
+    /// Registered OTPs: code → resolved record (single-use; consumed on validate).
+    otps: Mutex<HashMap<String, ResolvedRecord>>,
+    /// The device-flow outcome the next `BeginDeviceFlow` will mint.
+    device_flow_template: Mutex<Option<DeviceFlowTemplate>>,
+    /// Live device flows keyed by device_code.
+    device_flows: Mutex<HashMap<String, DeviceFlowRecord>>,
+    /// Data-plane allow tuples for `Authorize`.
+    allow_rules: Mutex<Vec<AllowRule>>,
+    /// Nodes the CP inventory "knows" (an unknown node → §7.1 DENY).
+    known_nodes: Mutex<HashSet<String>>,
+    /// When set, `Authorize` returns UNAVAILABLE (the CP-down fail-closed row).
+    authorize_unavailable: Mutex<bool>,
+    /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
+    /// during authentication).
+    resolve_unavailable: Mutex<bool>,
 }
 
 impl MockState {
@@ -416,6 +488,325 @@ impl SessionSigning for MockSvc {
     }
 }
 
+// ---- Session Seven: outer-leg auth helpers ---------------------------------
+
+fn not_resolved() -> ResolvedIdentity {
+    ResolvedIdentity {
+        resolved: false,
+        identity: String::new(),
+        principals: Vec::new(),
+        groups: Vec::new(),
+    }
+}
+
+fn resolved(rec: &ResolvedRecord) -> ResolvedIdentity {
+    ResolvedIdentity {
+        resolved: true,
+        identity: rec.identity.clone(),
+        principals: rec.principals.clone(),
+        groups: rec.groups.clone(),
+    }
+}
+
+/// Enforce the mTLS tier: every OuterLegAuth/Authorize RPC requires the caller's
+/// Gateway client certificate; resolve it to a known gateway_id.
+fn require_gateway<T>(request: &Request<T>, state: &MockState) -> Result<String, Status> {
+    let peer = request
+        .peer_certs()
+        .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+    let leaf = peer
+        .first()
+        .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+        .as_ref()
+        .to_vec();
+    state.resolve_gateway_id(&leaf)
+}
+
+impl MockState {
+    /// Resolve a pin/OTP record honouring the optional deny-only source binding.
+    fn resolve_map(&self, rec: Option<&ResolvedRecord>, source_ip: &str) -> ResolvedIdentity {
+        match rec {
+            Some(r) if r.source_ip.as_deref().is_none_or(|s| s == source_ip) => resolved(r),
+            _ => not_resolved(),
+        }
+    }
+
+    /// Validate a presented OpenSSH user certificate against the user-facing CA
+    /// (signature + validity window) and resolve identity from its key-id.
+    fn resolve_cert(&self, blob: &[u8], _source_ip: &str) -> ResolvedIdentity {
+        let cert = match ssh_key::Certificate::from_bytes(blob) {
+            Ok(c) => c,
+            Err(_) => return not_resolved(),
+        };
+        let ca = match ssh_key::PrivateKey::from_openssh(&self.user_ca_pem) {
+            Ok(k) => k,
+            Err(_) => return not_resolved(),
+        };
+        let ca_fp = ca.public_key().fingerprint(ssh_key::HashAlg::Sha256);
+        if cert.validate_at(unix_now(), [&ca_fp]).is_err() {
+            return not_resolved();
+        }
+        ResolvedIdentity {
+            resolved: true,
+            identity: cert.key_id().to_string(),
+            principals: cert.valid_principals().to_vec(),
+            groups: Vec::new(),
+        }
+    }
+
+    /// Sign an OpenSSH user certificate with the user-facing CA (for the
+    /// `ResolveUserCert` happy-path test).
+    fn sign_user_cert(
+        &self,
+        pubkey_openssh_line: &str,
+        identity: &str,
+        principals: &[String],
+        valid_secs: u64,
+    ) -> String {
+        let pubkey = ssh_key::PublicKey::from_openssh(pubkey_openssh_line).unwrap();
+        let ca = ssh_key::PrivateKey::from_openssh(&self.user_ca_pem).unwrap();
+        let now = unix_now();
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            now.saturating_sub(60),
+            now + valid_secs,
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::User)
+            .unwrap();
+        builder.key_id(identity).unwrap();
+        for p in principals {
+            builder.valid_principal(p).unwrap();
+        }
+        let cert = builder.sign(&ca).unwrap();
+        cert.to_openssh().unwrap()
+    }
+}
+
+/// Simulate a CP-down during authentication: every resolve RPC returns
+/// UNAVAILABLE when the knob is set.
+fn resolve_down(state: &MockState) -> Result<(), Status> {
+    if *state.resolve_unavailable.lock().unwrap() {
+        return Err(Status::unavailable("control plane temporarily unavailable"));
+    }
+    Ok(())
+}
+
+#[tonic::async_trait]
+impl OuterLegAuth for MockSvc {
+    async fn resolve_user_cert(
+        &self,
+        request: Request<ResolveUserCertRequest>,
+    ) -> Result<Response<ResolveUserCertResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let identity = self.resolve_cert(&r.certificate_blob, &r.source_ip);
+        Ok(Response::new(ResolveUserCertResponse {
+            identity: Some(identity),
+        }))
+    }
+
+    async fn resolve_pin(
+        &self,
+        request: Request<ResolvePinRequest>,
+    ) -> Result<Response<ResolvePinResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let identity = {
+            let pins = self.pins.lock().unwrap();
+            self.resolve_map(pins.get(&r.public_key_fingerprint), &r.source_ip)
+        };
+        Ok(Response::new(ResolvePinResponse {
+            identity: Some(identity),
+        }))
+    }
+
+    async fn resolve_otp(
+        &self,
+        request: Request<ResolveOtpRequest>,
+    ) -> Result<Response<ResolveOtpResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        // Single-use: consume (atomic mark-used) on a source-matched hit.
+        let identity = {
+            let mut otps = self.otps.lock().unwrap();
+            match otps.get(&r.otp) {
+                Some(rec) if rec.source_ip.as_deref().is_none_or(|s| s == r.source_ip) => {
+                    let rec = otps.remove(&r.otp).unwrap();
+                    resolved(&rec)
+                }
+                _ => not_resolved(),
+            }
+        };
+        Ok(Response::new(ResolveOtpResponse {
+            identity: Some(identity),
+        }))
+    }
+
+    async fn begin_device_flow(
+        &self,
+        request: Request<BeginDeviceFlowRequest>,
+    ) -> Result<Response<BeginDeviceFlowResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let template = self
+            .device_flow_template
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("no device flow configured"))?;
+        let device_code = random_token("dev");
+        let resp = BeginDeviceFlowResponse {
+            device_code: device_code.clone(),
+            user_code: template.user_code.clone(),
+            verification_uri: template.verification_uri.clone(),
+            interval_seconds: 1,
+            expires_in_seconds: 120,
+        };
+        self.device_flows.lock().unwrap().insert(
+            device_code,
+            DeviceFlowRecord {
+                template,
+                polls: 0,
+                expires_at: SystemTime::now() + Duration::from_secs(120),
+            },
+        );
+        Ok(Response::new(resp))
+    }
+
+    async fn poll_device_flow(
+        &self,
+        request: Request<PollDeviceFlowRequest>,
+    ) -> Result<Response<PollDeviceFlowResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let mut flows = self.device_flows.lock().unwrap();
+        let Some(rec) = flows.get_mut(&r.device_code) else {
+            // Unknown device_code → EXPIRED (generic, no existence disclosure).
+            return Ok(Response::new(PollDeviceFlowResponse {
+                status: DeviceFlowStatus::Expired as i32,
+                identity: Some(not_resolved()),
+            }));
+        };
+        if SystemTime::now() >= rec.expires_at {
+            return Ok(Response::new(PollDeviceFlowResponse {
+                status: DeviceFlowStatus::Expired as i32,
+                identity: Some(not_resolved()),
+            }));
+        }
+        rec.polls += 1;
+        let (status, identity) = if rec.template.deny {
+            (DeviceFlowStatus::Denied, not_resolved())
+        } else if rec.polls > rec.template.approve_after_polls {
+            (
+                DeviceFlowStatus::Approved,
+                // Real CP: device-flow APPROVED carries identity only; RBAC
+                // decides the logins, so principals/groups are empty.
+                ResolvedIdentity {
+                    resolved: true,
+                    identity: rec.template.identity.clone(),
+                    principals: Vec::new(),
+                    groups: Vec::new(),
+                },
+            )
+        } else {
+            (DeviceFlowStatus::Pending, not_resolved())
+        };
+        Ok(Response::new(PollDeviceFlowResponse {
+            status: status as i32,
+            identity: Some(identity),
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl Authorization for MockSvc {
+    async fn authorize(
+        &self,
+        request: Request<AuthorizeRequest>,
+    ) -> Result<Response<AuthorizeResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        if *self.authorize_unavailable.lock().unwrap() {
+            return Err(Status::unavailable("control plane temporarily unavailable"));
+        }
+        let r = request.into_inner();
+
+        // Unknown node → generic DENY (§7.1, no existence disclosure).
+        if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
+            return Ok(Response::new(deny_response()));
+        }
+        let allowed = self.allow_rules.lock().unwrap().iter().any(|rule| {
+            rule.identity == r.identity
+                && rule.node_id == r.node_id
+                && rule.principal == r.requested_principal
+        });
+        if !allowed {
+            return Ok(Response::new(deny_response()));
+        }
+
+        // ALLOW: mint a single-use session token bound to {gateway, session,
+        // node, principal} (reusing the S4 token machinery) + a decision context.
+        let token = random_token("sess");
+        self.tokens.lock().unwrap().insert(
+            token.clone(),
+            TokenRecord {
+                gateway_id: gid.clone(),
+                session_id: r.session_id.clone(),
+                node_id: r.node_id.clone(),
+                principal: r.requested_principal.clone(),
+                exp: SystemTime::now() + Duration::from_secs(120),
+                used: false,
+            },
+        );
+        let now = unix_now() as i64;
+        let context = DecisionContext {
+            node_id: r.node_id.clone(),
+            node_name: r.node_id.clone(),
+            allowed_logins: vec![r.requested_principal.clone()],
+            capabilities: vec![Capability::Shell as i32, Capability::Exec as i32],
+            principal: r.requested_principal.clone(),
+            grant_expiry_epoch_seconds: now + 3600,
+            policy_epoch: 1,
+            decision_ttl_seconds: 45,
+            gateway_id: gid,
+            session_id: r.session_id.clone(),
+            source_address: r.source_ip.clone(),
+            issued_at_epoch_seconds: now,
+        };
+        // S7 trusts the decision over the authenticated mTLS channel; the
+        // decision-context SIGNATURE fields are populated + verified in S10.
+        Ok(Response::new(AuthorizeResponse {
+            decision: Decision::Allow as i32,
+            context: Some(context),
+            signed_context: Vec::new(),
+            signature: Vec::new(),
+            signer_certificate: Vec::new(),
+            signer_ca_chain: Vec::new(),
+            session_token: token,
+        }))
+    }
+}
+
+/// The generic DENY: no context, no token (fail closed).
+fn deny_response() -> AuthorizeResponse {
+    AuthorizeResponse {
+        decision: Decision::Deny as i32,
+        context: None,
+        signed_context: Vec::new(),
+        signature: Vec::new(),
+        signer_certificate: Vec::new(),
+        signer_ca_chain: Vec::new(),
+        session_token: String::new(),
+    }
+}
+
 impl MockState {
     fn validity_window(&self) -> (i64, i64) {
         let now = unix_now();
@@ -501,6 +892,19 @@ impl MockCpBuilder {
             .unwrap()
             .to_string();
 
+        // User-facing CA (SSH) for signing / validating outer-leg user certs (S7).
+        let user_ca = ssh_key::PrivateKey::random(
+            &mut rng,
+            ssh_key::Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let user_ca_pem = user_ca
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+
         let ca_pem = ca.cert_pem();
         let state = Arc::new(MockState {
             ca,
@@ -514,6 +918,15 @@ impl MockCpBuilder {
             next_id: Mutex::new(0),
             force_bad_renew_generation: Mutex::new(false),
             hang_sign: Mutex::new(false),
+            user_ca_pem,
+            pins: Mutex::new(HashMap::new()),
+            otps: Mutex::new(HashMap::new()),
+            device_flow_template: Mutex::new(None),
+            device_flows: Mutex::new(HashMap::new()),
+            allow_rules: Mutex::new(Vec::new()),
+            known_nodes: Mutex::new(HashSet::new()),
+            authorize_unavailable: Mutex::new(false),
+            resolve_unavailable: Mutex::new(false),
         });
 
         let tls = ServerTlsConfig::new()
@@ -538,6 +951,8 @@ impl MockCpBuilder {
                 .add_service(HandshakeServer::new(MockSvc(svc_state.clone())))
                 .add_service(GatewayIdentityServer::new(MockSvc(svc_state.clone())))
                 .add_service(SessionSigningServer::new(MockSvc(svc_state.clone())))
+                .add_service(OuterLegAuthServer::new(MockSvc(svc_state.clone())))
+                .add_service(AuthorizationServer::new(MockSvc(svc_state.clone())))
                 .serve_with_incoming(incoming)
                 .await;
         });
@@ -665,6 +1080,111 @@ impl MockCp {
         *self.state.hang_sign.lock().unwrap() = true;
     }
 
+    // ---- Session Seven outer-leg knobs -------------------------------------
+
+    /// Register a pin: a public-key fingerprint resolves to `{identity,
+    /// principals}` (no source binding).
+    pub fn register_pin(&self, fingerprint: &str, identity: &str, principals: &[&str]) {
+        self.state.pins.lock().unwrap().insert(
+            fingerprint.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    /// Register a single-use OTP resolving to `{identity, principals}`.
+    pub fn register_otp(&self, otp: &str, identity: &str, principals: &[&str]) {
+        self.state.otps.lock().unwrap().insert(
+            otp.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    /// Configure the outcome the next device flow(s) will produce: PENDING for
+    /// `approve_after_polls` polls, then APPROVED resolving to `identity` (with
+    /// empty principals/groups, as the real CP does — RBAC decides the logins).
+    pub fn set_device_flow(
+        &self,
+        user_code: &str,
+        verification_uri: &str,
+        identity: &str,
+        approve_after_polls: u32,
+    ) {
+        *self.state.device_flow_template.lock().unwrap() = Some(DeviceFlowTemplate {
+            user_code: user_code.to_string(),
+            verification_uri: verification_uri.to_string(),
+            identity: identity.to_string(),
+            approve_after_polls,
+            deny: false,
+        });
+    }
+
+    /// Configure the next device flow to be DENIED.
+    pub fn set_device_flow_denied(&self, user_code: &str, verification_uri: &str) {
+        *self.state.device_flow_template.lock().unwrap() = Some(DeviceFlowTemplate {
+            user_code: user_code.to_string(),
+            verification_uri: verification_uri.to_string(),
+            identity: String::new(),
+            approve_after_polls: u32::MAX,
+            deny: true,
+        });
+    }
+
+    /// Mark a node as existing in inventory (so `Authorize` doesn't §7.1-DENY it
+    /// for non-existence) without granting any access.
+    pub fn register_node(&self, node_id: &str) {
+        self.state
+            .known_nodes
+            .lock()
+            .unwrap()
+            .insert(node_id.to_string());
+    }
+
+    /// Grant `{identity, node, principal}` (also registers the node as existing).
+    pub fn allow(&self, identity: &str, node_id: &str, principal: &str) {
+        self.register_node(node_id);
+        self.state.allow_rules.lock().unwrap().push(AllowRule {
+            identity: identity.to_string(),
+            node_id: node_id.to_string(),
+            principal: principal.to_string(),
+        });
+    }
+
+    /// Toggle the CP-unreachable simulation for `Authorize` (returns UNAVAILABLE).
+    pub fn set_authorize_unavailable(&self, on: bool) {
+        *self.state.authorize_unavailable.lock().unwrap() = on;
+    }
+
+    /// Toggle the CP-unreachable simulation for the OuterLegAuth **resolve** RPCs
+    /// (they return UNAVAILABLE) — CP-down during authentication.
+    pub fn set_resolve_unavailable(&self, on: bool) {
+        *self.state.resolve_unavailable.lock().unwrap() = on;
+    }
+
+    /// Sign an OpenSSH user certificate with the user-facing CA (for the
+    /// `ResolveUserCert` happy path). `pubkey_openssh_line` is an authorized-keys
+    /// line; returns the cert as an authorized-keys line.
+    pub fn sign_user_cert(
+        &self,
+        pubkey_openssh_line: &str,
+        identity: &str,
+        principals: &[&str],
+        valid_secs: u64,
+    ) -> String {
+        let principals: Vec<String> = principals.iter().map(|s| s.to_string()).collect();
+        self.state
+            .sign_user_cert(pubkey_openssh_line, identity, &principals, valid_secs)
+    }
+
     /// The CP-recorded generation for a gateway (test assertions).
     pub fn recorded_generation(&self, gateway_id: &str) -> Option<u64> {
         self.state
@@ -689,6 +1209,42 @@ impl MockCp {
             nb,
             na,
         )
+    }
+}
+
+/// Enroll a Gateway against `cp` and assemble outer-leg [`HandlerDeps`] (a
+/// CP-delegating auth client + the Session-Seven `PendingInnerLeg` connector +
+/// the pass-through target resolver) for the given SSH server `config`. The
+/// enrolled credential is snapshotted into the channel factory, so the temp
+/// data-dir can be dropped immediately.
+pub async fn outer_leg_deps(cp: &MockCp, config: Arc<SshServerConfig>) -> HandlerDeps {
+    let dir = tempfile::tempdir().unwrap();
+    let store = identity::IdentityStore::open(dir.path()).unwrap();
+    let params = cp.channel_params(Duration::from_secs(5), Duration::from_secs(10));
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &cp.mint_enrollment_token(),
+        "gw-s7",
+    )
+    .await
+    .unwrap();
+
+    let factory = Arc::new(CpChannelFactory::fixed(
+        cp.channel_params(Duration::from_secs(5), Duration::from_secs(10)),
+        cred.identity.clone(),
+        cred.ca_chain_der.clone(),
+    ));
+    let cpauth = Arc::new(CpAuthClient::new(
+        factory,
+        Duration::from_secs(config.cp_rpc_timeout_secs),
+    ));
+    HandlerDeps {
+        cpauth,
+        connector: Arc::new(PendingInnerLeg),
+        resolver: Arc::new(IdentityResolver),
+        config,
     }
 }
 

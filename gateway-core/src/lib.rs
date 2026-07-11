@@ -21,9 +21,15 @@
 //!   (bootstrap → enroll → renew-ahead + generation counter; Part B).
 //! - [`signing`] — the session-bound inner-leg signer client (generate the inner
 //!   keypair locally, send only the public key; Part C).
+//! - [`ssh`] — the **outer SSH leg** (Session Seven): the russh SSH server,
+//!   PROXY-v2 + source-IP controls, CP-delegated auth negotiation + device flow,
+//!   the §7.1 error taxonomy, target parsing, and the `NodeConnector` seam/stub.
+//! - [`cpauth`] — the outer-leg CP client (the five `OuterLegAuth` RPCs +
+//!   `Authorize`) over the authenticated mTLS channel, fail-closed.
+//! - [`netmatch`] — dependency-free CIDR containment for the source-IP controls.
 //!
-//! The SSH legs (outer/inner), PROXY protocol, recorder, and NodeConnector are
-//! still later sessions; Session Four builds the mTLS/identity/signing seams.
+//! The **inner** SSH leg (client to the node, host verification, byte bridge) is
+//! Session Eight; the outer leg stops at the `NodeConnector` seam.
 //!
 //! `unsafe_code` is forbidden workspace-wide via the `[workspace.lints]` table
 //! (see the root `Cargo.toml`); this crate additionally warns on missing docs.
@@ -31,12 +37,15 @@
 
 pub mod asyncio;
 pub mod config;
+pub mod cpauth;
 pub mod handshake;
 pub mod health;
 pub mod identity;
 pub mod mtls;
+pub mod netmatch;
 mod secret;
 pub mod signing;
+pub mod ssh;
 pub mod tls;
 pub mod version;
 
