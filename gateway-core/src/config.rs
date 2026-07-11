@@ -36,6 +36,9 @@ pub struct GatewayConfig {
     pub bootstrap: Option<BootstrapConfig>,
     /// mTLS identity lifecycle knobs (renew-ahead + bounded RPC timeouts).
     pub identity: IdentityConfig,
+    /// Outer SSH-leg server (Session Seven). A blank `listen_addr` leaves it
+    /// disabled (scaffold mode); set it to run the SSH front door.
+    pub ssh: SshServerConfig,
 }
 
 impl Default for GatewayConfig {
@@ -47,6 +50,114 @@ impl Default for GatewayConfig {
             data_dir: PathBuf::from("/var/lib/sessionlayer-gateway"),
             bootstrap: None,
             identity: IdentityConfig::default(),
+            ssh: SshServerConfig::default(),
+        }
+    }
+}
+
+/// Outer SSH-leg server configuration (Session Seven).
+///
+/// The Gateway's SSH front door: the listener, host key, source-IP controls
+/// (PROXY v2 + the global CIDR gate), auth/device-flow timing, the target
+/// separator, and the fail-closed CP RPC bounds. All knobs are set here (no
+/// deferrals) with security-relevant defaults; misconfiguration fails closed
+/// (`deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshServerConfig {
+    /// TCP listen address (`host:port`). **Empty disables the SSH server** (the
+    /// scaffold default). Behind an L4 LB, bind `0.0.0.0:22` and set
+    /// [`Self::proxy`]`.lb_cidrs`.
+    pub listen_addr: String,
+    /// Path to the persisted OpenSSH host key (ed25519). When empty, an ephemeral
+    /// host key is generated at startup (fine for tests; a fixed key avoids
+    /// client host-key churn in production).
+    pub host_key_path: PathBuf,
+    /// Generous login grace / inactivity bound (seconds) covering the whole outer
+    /// handshake **including a slow OIDC device flow** (Design §5.2). Maps to
+    /// russh's `inactivity_timeout`. Must exceed [`DeviceFlowConfig::poll_timeout_secs`].
+    pub login_grace_secs: u64,
+    /// Tier-0 bound (seconds) on reading the PROXY v2 header before the SSH
+    /// banner, so a peer that connects and stalls cannot hold an accept slot.
+    pub handshake_timeout_secs: u64,
+    /// Tier-0 bound on concurrently-handshaking connections. A connection over
+    /// the cap is dropped at accept (bounded resource use on the accept path).
+    pub max_connections: usize,
+    /// PROXY protocol v2 / LB trust (FR-AUTH-14).
+    pub proxy: ProxyProtocolConfig,
+    /// Global source-IP allow-list gate (FR-AUTH-13), evaluated at TCP accept
+    /// against the PROXY-derived real client IP, **before any SSH banner**. Empty
+    /// = gate disabled (allow all); a non-empty list drops any source outside it.
+    /// CIDRs, e.g. `["10.0.0.0/8", "2001:db8::/32"]`.
+    pub source_ip_allowlist: Vec<String>,
+    /// The username-encoding target separator (`login%node`, Design §11). `%` by
+    /// default; wildcard-DNS and ProxyJump host-cert modes are Session Sixteen.
+    pub target_separator: char,
+    /// OIDC device-flow presentation + polling knobs (FR-AUTH-4).
+    pub device_flow: DeviceFlowConfig,
+    /// Bound (seconds) on establishing the CP mTLS transport for an auth/authorize
+    /// RPC (fail-closed, §10.3/NFR-2).
+    pub cp_connect_timeout_secs: u64,
+    /// Per-RPC deadline (seconds) on every OuterLegAuth/Authorize call
+    /// (fail-closed): a hung CP never hangs the SSH handshake.
+    pub cp_rpc_timeout_secs: u64,
+}
+
+impl Default for SshServerConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: String::new(),
+            host_key_path: PathBuf::new(),
+            // Generous: covers a human completing an OIDC device flow in a browser.
+            login_grace_secs: 300,
+            handshake_timeout_secs: 10,
+            max_connections: 512,
+            proxy: ProxyProtocolConfig::default(),
+            source_ip_allowlist: Vec::new(),
+            target_separator: '%',
+            device_flow: DeviceFlowConfig::default(),
+            cp_connect_timeout_secs: 5,
+            cp_rpc_timeout_secs: 10,
+        }
+    }
+}
+
+/// PROXY protocol v2 trust (FR-AUTH-14): the real client IP is taken from a
+/// PROXY v2 header, trusted **only** when the immediate TCP peer is inside a
+/// configured LB CIDR. Fail-closed both ways.
+///
+/// - `lb_cidrs` **empty** — PROXY protocol is OFF; the immediate TCP peer IP is
+///   the source (single-instance / dev, FR-HA-1; no LB in front).
+/// - `lb_cidrs` **non-empty** — PROXY protocol is REQUIRED. A connection from an
+///   LB peer must carry a valid PROXY v2 header (missing/malformed → rejected);
+///   a connection from a non-LB peer is rejected (a header from it would be a
+///   spoof, its absence a bypass of the LB). Both directions fail closed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyProtocolConfig {
+    /// Trusted load-balancer CIDRs. See the type docs for the fail-closed matrix.
+    pub lb_cidrs: Vec<String>,
+}
+
+/// OIDC device-flow presentation + polling (FR-AUTH-4, Design §5.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeviceFlowConfig {
+    /// Heartbeat interval (seconds) between `num-prompts=0` keyboard-interactive
+    /// info-requests while polling the CP — below the tightest stock-client idle
+    /// timeout so the connection stays alive (FR-AUTH-4). ~10 s.
+    pub heartbeat_interval_secs: u64,
+    /// Overall device-flow poll deadline (seconds). On expiry the user gets the
+    /// §7.1 "authentication timed out, please reconnect" outcome. Must be less
+    /// than [`SshServerConfig::login_grace_secs`].
+    pub poll_timeout_secs: u64,
+}
+
+impl Default for DeviceFlowConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 10,
+            poll_timeout_secs: 180,
         }
     }
 }
@@ -188,5 +299,27 @@ mod tests {
         let result: Result<GatewayConfig, _> =
             serde_json::from_str(r#"{"identity":{"renew_ahead":0.5}}"#);
         assert!(result.is_err(), "unknown nested key must be rejected");
+    }
+
+    #[test]
+    fn ssh_defaults_are_disabled_with_safe_bounds() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.ssh.listen_addr.is_empty(), "SSH server off by default");
+        assert_eq!(cfg.ssh.target_separator, '%');
+        assert!(cfg.ssh.proxy.lb_cidrs.is_empty(), "PROXY off by default");
+        assert!(
+            cfg.ssh.source_ip_allowlist.is_empty(),
+            "gate off by default"
+        );
+        // The device flow must fit inside the login grace window.
+        assert!(cfg.ssh.device_flow.poll_timeout_secs < cfg.ssh.login_grace_secs);
+        assert_eq!(cfg.ssh.device_flow.heartbeat_interval_secs, 10);
+    }
+
+    #[test]
+    fn ssh_unknown_key_fails_closed() {
+        let result: Result<GatewayConfig, _> =
+            serde_json::from_str(r#"{"ssh":{"listen_port":22}}"#);
+        assert!(result.is_err(), "unknown ssh key must be rejected");
     }
 }

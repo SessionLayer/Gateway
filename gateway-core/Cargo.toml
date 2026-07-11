@@ -24,6 +24,7 @@ prost = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
+russh = { workspace = true }
 ssh-key = { workspace = true }
 rand_core = { workspace = true }
 fd-lock = { workspace = true }
