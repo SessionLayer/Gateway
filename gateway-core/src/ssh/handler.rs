@@ -22,7 +22,8 @@
 
 use std::borrow::Cow;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use russh::keys::{Certificate, HashAlg, PublicKey};
@@ -31,12 +32,35 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty};
 use zeroize::Zeroizing;
 
 use crate::config::SshServerConfig;
-use crate::cpauth::CpAuthClient;
+use crate::cpauth::{CpAuthClient, CpError};
 use crate::pb::{AuthorizeRequest, Decision, DeviceFlowStatus, ResolvedIdentity};
 use crate::ssh::connector::{NodeConnectError, NodeConnector, NodeTarget, SessionGrant};
-use crate::ssh::outcome::{SshOutcome, DEVICE_FLOW_TIMEOUT};
+use crate::ssh::outcome::{SshOutcome, DEVICE_FLOW_TIMEOUT, SERVICE_UNAVAILABLE};
 use crate::ssh::target::{parse_username, TargetResolver};
 use crate::version;
+
+/// Per-connection state shared with the accept loop: whether authentication
+/// completed (arms/disarms the pre-auth deadline), whether the CP was seen down,
+/// and the coarse methods tried (for one consolidated auth-failed record). The
+/// accept loop reads it after the session ends; the handler writes it.
+#[derive(Default)]
+pub struct ConnState {
+    /// Set in `auth_succeeded`; disarms the pre-auth deadline watchdog.
+    pub authenticated: AtomicBool,
+    /// Set when any CP call failed as CP-down (§7.1 fail-closed).
+    pub cp_unavailable: AtomicBool,
+    /// Coarse method labels attempted (no secrets), for the auth-failed record.
+    pub methods_tried: Mutex<Vec<&'static str>>,
+}
+
+impl ConnState {
+    fn record_method(&self, m: &'static str) {
+        let mut v = self.methods_tried.lock().unwrap();
+        if !v.contains(&m) {
+            v.push(m);
+        }
+    }
+}
 
 /// Which method authenticated the connection (for the decision log).
 #[derive(Debug, Clone, Copy)]
@@ -95,11 +119,16 @@ pub struct SshHandler {
     ki: KiState,
     /// Guard so the connect-time authorize + connector hand-off runs exactly once.
     decided: bool,
+    /// Count of credential-resolution attempts (bounds the CP-RPC amplification
+    /// per connection — russh does NOT enforce its own `max_auth_attempts`).
+    auth_attempts: usize,
+    /// Shared with the accept loop (pre-auth deadline + auth-failed record).
+    conn: Arc<ConnState>,
 }
 
 impl SshHandler {
     /// Construct a handler for a freshly-accepted, gate-passed connection.
-    pub fn new(deps: HandlerDeps, source_ip: IpAddr) -> Self {
+    pub fn new(deps: HandlerDeps, source_ip: IpAddr, conn: Arc<ConnState>) -> Self {
         Self {
             deps,
             source_ip,
@@ -108,6 +137,8 @@ impl SshHandler {
             authenticated: None,
             ki: KiState::Start,
             decided: false,
+            auth_attempts: 0,
+            conn,
         }
     }
 
@@ -119,8 +150,32 @@ impl SshHandler {
         self.source_ip.to_string()
     }
 
+    /// Count a credential-resolution attempt and report whether the per-connection
+    /// cap is now exceeded (bounds CP-RPC amplification, F-preauth-grace).
+    fn attempt_cap_exceeded(&mut self) -> bool {
+        self.auth_attempts += 1;
+        self.auth_attempts > self.deps.config.max_auth_attempts
+    }
+
+    /// A hard rejection offering NO further methods, so the client stops (russh
+    /// won't stop on its own). Used when the auth-attempt cap is exceeded.
+    fn hard_reject(&self) -> Auth {
+        Auth::Reject {
+            proceed_with_methods: Some(MethodSet::empty()),
+            partial_success: false,
+        }
+    }
+
+    /// Record a CP-down observation (fail-closed): flag it for the auth-failed
+    /// record and the KI service-unavailable message, and log the outcome.
+    fn note_cp_down(&self, method: &str) {
+        self.conn.cp_unavailable.store(true, Ordering::SeqCst);
+        tracing::warn!(source_ip = %self.source_ip, outcome = "cp_unavailable", method, "CP unreachable during resolution; failing closed");
+    }
+
     fn set_authenticated(&mut self, id: ResolvedIdentity, method: AuthMethod) {
         tracing::info!(
+            outcome = "authenticated",
             method = ?method,
             identity = %sanitize(&id.identity),
             source_ip = %self.source_ip,
@@ -149,6 +204,12 @@ impl SshHandler {
     async fn ki_step(&mut self, response: Option<Response<'_>>) -> Auth {
         match std::mem::replace(&mut self.ki, KiState::Start) {
             KiState::Start => {
+                // If a prior (publickey) resolution already saw the CP down, surface
+                // the §7.1 service-unavailable message here rather than prompting.
+                if self.conn.cp_unavailable.load(Ordering::SeqCst) {
+                    self.ki = KiState::TimedOut;
+                    return partial_message(SERVICE_UNAVAILABLE);
+                }
                 // First info-request: prompt for the OTP (echo off, FR-AUTH-9).
                 self.ki = KiState::AwaitingOtp;
                 Auth::Partial {
@@ -163,6 +224,10 @@ impl SshHandler {
                 // The OTP is a secret: held in a scrub-on-drop buffer, never logged.
                 let otp = first_response(response);
                 if let Some(otp) = otp.as_ref().map(|z| z.as_str()).filter(|s| !s.is_empty()) {
+                    self.conn.record_method("otp");
+                    if self.attempt_cap_exceeded() {
+                        return self.hard_reject();
+                    }
                     match self.deps.cpauth.resolve_otp(otp, &self.source_ip()).await {
                         Ok(id) if id.resolved => {
                             self.set_authenticated(id, AuthMethod::Otp);
@@ -170,6 +235,13 @@ impl SshHandler {
                         }
                         Ok(_) => {
                             tracing::info!(source_ip = %self.source_ip, "OTP did not resolve; falling back to device flow")
+                        }
+                        // CP down during OTP resolution → surface service-unavailable
+                        // (do NOT silently degrade to the device flow).
+                        Err(e) if e.is_cp_down() => {
+                            self.note_cp_down("otp");
+                            self.ki = KiState::TimedOut;
+                            return partial_message(SERVICE_UNAVAILABLE);
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, source_ip = %self.source_ip, "OTP resolution failed; falling back to device flow")
@@ -213,10 +285,14 @@ impl SshHandler {
                     prompts: Cow::Owned(Vec::new()),
                 }
             }
+            // CP unreachable/errored during begin → fail closed. Surface the §7.1
+            // service-unavailable message on the keyboard-interactive path.
+            Err(e) if e.is_cp_down() => {
+                self.note_cp_down("device_flow");
+                self.ki = KiState::TimedOut;
+                partial_message(SERVICE_UNAVAILABLE)
+            }
             Err(e) => {
-                // CP unreachable/errored during begin → cannot proceed; fail closed
-                // (auth fails). The generic §7.1 "service unavailable" surfaces on
-                // the publickey-then-authorize path; here auth simply fails.
                 tracing::warn!(error = %e, source_ip = %self.source_ip, "could not begin device flow; failing auth closed");
                 Auth::reject()
             }
@@ -229,16 +305,20 @@ impl SshHandler {
             self.ki = KiState::TimedOut;
             return timed_out_partial();
         }
-        let heartbeat = || -> Auth {
-            // Pure keepalive: 0 prompts, empty instructions (the URL+code was shown
-            // on the first device-flow info-request). Below the client idle timeout.
-            Auth::Partial {
-                name: Cow::Borrowed(""),
-                instructions: Cow::Borrowed(""),
-                prompts: Cow::Owned(Vec::new()),
-            }
+
+        // Decouple the client-visible heartbeat cadence from CP-poll latency
+        // (FR-AUTH-4): bound the poll by the heartbeat interval, then sleep only
+        // the remainder of that interval, so the next num-prompts=0 info-request
+        // is emitted ~every heartbeat_interval regardless of poll latency.
+        let interval = Duration::from_secs(self.deps.config.device_flow.heartbeat_interval_secs);
+        let started = Instant::now();
+        let poll = self.deps.cpauth.poll_device_flow(&device_code);
+        let polled = match tokio::time::timeout(interval, poll).await {
+            Ok(inner) => inner,
+            Err(_) => Err(CpError::Timeout(interval)),
         };
-        match self.deps.cpauth.poll_device_flow(&device_code).await {
+
+        match polled {
             Ok(resp) => {
                 let status = DeviceFlowStatus::try_from(resp.status)
                     .unwrap_or(DeviceFlowStatus::Unspecified);
@@ -250,50 +330,45 @@ impl SshHandler {
                             return Auth::Accept;
                         }
                         tracing::info!(source_ip = %self.source_ip, "device flow approved without an identity; denying (generic)");
-                        Auth::reject()
+                        return Auth::reject();
                     }
                     DeviceFlowStatus::Denied => {
                         tracing::info!(source_ip = %self.source_ip, "device flow denied");
-                        Auth::reject()
+                        return Auth::reject();
                     }
                     DeviceFlowStatus::Expired => {
                         tracing::info!(source_ip = %self.source_ip, outcome = "device_flow_timeout", "device flow expired");
                         self.ki = KiState::TimedOut;
-                        timed_out_partial()
+                        return timed_out_partial();
                     }
-                    DeviceFlowStatus::Pending | DeviceFlowStatus::Unspecified => {
-                        self.heartbeat_wait(deadline).await;
-                        self.ki = KiState::Device {
-                            device_code,
-                            deadline,
-                        };
-                        heartbeat()
-                    }
+                    DeviceFlowStatus::Pending | DeviceFlowStatus::Unspecified => {}
                 }
             }
             Err(e) => {
-                // Throttled or a transient CP fault: back off and keep the
-                // connection alive with a heartbeat until the deadline (which then
-                // fails closed). Never grants.
+                // Throttled or a transient CP fault: keep the connection alive with
+                // a heartbeat until the deadline (which fails closed). Never grants.
                 if e.code() != Some(tonic::Code::ResourceExhausted) {
                     tracing::warn!(error = %e, source_ip = %self.source_ip, "device flow poll failed transiently; heartbeating");
                 }
-                self.heartbeat_wait(deadline).await;
-                self.ki = KiState::Device {
-                    device_code,
-                    deadline,
-                };
-                heartbeat()
             }
         }
-    }
 
-    /// Sleep one heartbeat interval, but never past the poll deadline, so the next
-    /// `num-prompts=0` info-request is sent below the client idle timeout.
-    async fn heartbeat_wait(&self, deadline: Instant) {
-        let interval = Duration::from_secs(self.deps.config.device_flow.heartbeat_interval_secs);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(interval.min(remaining)).await;
+        // Pending / throttled / transient: sleep the remainder of the interval
+        // (never past the deadline), then send the next keepalive info-request.
+        let elapsed = started.elapsed();
+        let remaining_to_deadline = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(interval.saturating_sub(elapsed).min(remaining_to_deadline)).await;
+        self.ki = KiState::Device {
+            device_code,
+            deadline,
+        };
+        // Pure keepalive: 0 prompts, empty instructions (the URL+code was shown on
+        // the first device-flow info-request), below the client idle timeout.
+        Auth::Partial {
+            name: Cow::Borrowed(""),
+            instructions: Cow::Borrowed(""),
+            prompts: Cow::Owned(Vec::new()),
+        }
     }
 
     /// The one connect-time authorization decision + connector hand-off, run once.
@@ -330,7 +405,7 @@ impl SshHandler {
         let target = match parse_username(username, self.deps.config.target_separator) {
             Ok(t) => t,
             Err(_) => {
-                tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), reason = "malformed_target", "generic denial");
+                tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), outcome = "policy_denied", reason = "malformed_target", "generic denial");
                 return SshOutcome::PolicyDenied;
             }
         };
@@ -338,12 +413,12 @@ impl SshHandler {
         // Credential-principal reducer (deny-only): a login-scoped credential may
         // only be used for a login it is scoped to (FR-AUTH-15 spirit, §5.4/§5.5).
         if !auth.principals.is_empty() && !auth.principals.iter().any(|p| p == &target.login) {
-            tracing::info!(source_ip = %self.source_ip, reason = "credential_principal_scope", "generic denial");
+            tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "credential_principal_scope", "generic denial");
             return SshOutcome::PolicyDenied;
         }
 
         let Some(node_id) = self.deps.resolver.resolve_node_id(&target) else {
-            tracing::info!(source_ip = %self.source_ip, reason = "unknown_node", "generic denial");
+            tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "unknown_node", "generic denial");
             return SshOutcome::PolicyDenied;
         };
 
@@ -362,6 +437,7 @@ impl SshHandler {
                 if resp.decision == Decision::Allow as i32 && !resp.session_token.is_empty() =>
             {
                 tracing::info!(
+                    outcome = "authorized",
                     identity = %sanitize(&auth.identity),
                     method = ?auth.method,
                     node_id = %sanitize(&node_id),
@@ -386,11 +462,12 @@ impl SshHandler {
             Ok(_) => {
                 // DENY, a Lock, no-match, or ALLOW-without-token — one generic
                 // denial to the user; the CP logged the specific reason.
-                tracing::info!(source_ip = %self.source_ip, reason = "authorization_denied", "generic denial");
+                tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "authorization_denied", "generic denial");
                 SshOutcome::PolicyDenied
             }
             Err(e) => {
-                tracing::warn!(error = %e, source_ip = %self.source_ip, "authorization RPC failed; failing closed (service unavailable)");
+                self.note_cp_down("authorize");
+                tracing::warn!(error = %e, source_ip = %self.source_ip, outcome = "cp_unavailable", "authorization RPC failed; failing closed (service unavailable)");
                 SshOutcome::ServiceUnavailable
             }
         }
@@ -416,6 +493,10 @@ impl Handler for SshHandler {
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
         self.remember_user(user);
+        self.conn.record_method("publickey-pin");
+        if self.attempt_cap_exceeded() {
+            return Ok(self.hard_reject());
+        }
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
         match self
             .deps
@@ -431,6 +512,12 @@ impl Handler for SshHandler {
                 tracing::info!(source_ip = %self.source_ip, "offered key is not pinned; degrading");
                 Ok(self.reject_and_degrade())
             }
+            // CP down: flag it (the KI fallback surfaces service-unavailable) and
+            // degrade so the client moves to keyboard-interactive; never fail open.
+            Err(e) if e.is_cp_down() => {
+                self.note_cp_down("publickey-pin");
+                Ok(self.reject_and_degrade())
+            }
             Err(e) => {
                 tracing::warn!(error = %e, source_ip = %self.source_ip, "pin resolution failed; degrading");
                 Ok(self.reject_and_degrade())
@@ -444,6 +531,10 @@ impl Handler for SshHandler {
         certificate: &Certificate,
     ) -> Result<Auth, Self::Error> {
         self.remember_user(user);
+        self.conn.record_method("publickey-cert");
+        if self.attempt_cap_exceeded() {
+            return Ok(self.hard_reject());
+        }
         let blob = match certificate.to_bytes() {
             Ok(b) => b,
             Err(_) => return Ok(self.reject_and_degrade()),
@@ -460,6 +551,10 @@ impl Handler for SshHandler {
             }
             Ok(_) => {
                 tracing::info!(source_ip = %self.source_ip, "user certificate did not resolve; degrading");
+                Ok(self.reject_and_degrade())
+            }
+            Err(e) if e.is_cp_down() => {
+                self.note_cp_down("publickey-cert");
                 Ok(self.reject_and_degrade())
             }
             Err(e) => {
@@ -480,7 +575,9 @@ impl Handler for SshHandler {
     }
 
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
-        tracing::info!(session_id = %self.session_id, source_ip = %self.source_ip, "outer-leg authentication succeeded");
+        // Disarm the pre-auth deadline watchdog.
+        self.conn.authenticated.store(true, Ordering::SeqCst);
+        tracing::info!(outcome = "auth_succeeded", session_id = %self.session_id, source_ip = %self.source_ip, "outer-leg authentication succeeded");
         Ok(())
     }
 
@@ -543,15 +640,20 @@ impl Handler for SshHandler {
     }
 }
 
-/// A `num-prompts=0` info-request whose `instructions` carry the §7.1 device-flow
-/// timeout message; the client's empty response then meets [`KiState::TimedOut`]
-/// and auth is rejected.
-fn timed_out_partial() -> Auth {
+/// A `num-prompts=0` info-request carrying a §7.1 message in `instructions`; the
+/// client's empty response then meets [`KiState::TimedOut`] and auth is rejected.
+/// Used to surface both the device-flow timeout and CP-unavailable outcomes.
+fn partial_message(msg: &'static str) -> Auth {
     Auth::Partial {
         name: Cow::Borrowed(""),
-        instructions: Cow::Borrowed(DEVICE_FLOW_TIMEOUT),
+        instructions: Cow::Borrowed(msg),
         prompts: Cow::Owned(Vec::new()),
     }
+}
+
+/// The device-flow timeout info-request (§7.1 "authentication timed out").
+fn timed_out_partial() -> Auth {
+    partial_message(DEVICE_FLOW_TIMEOUT)
 }
 
 /// Read the user's first keyboard-interactive response as a UTF-8 string, held in
@@ -563,11 +665,33 @@ fn first_response(response: Option<Response<'_>>) -> Option<Zeroizing<String>> {
         .map(|s| Zeroizing::new(s.to_string()))
 }
 
-/// Sanitize a client/CP-supplied string for a log field or a terminal line:
-/// drop control characters and bound the length (log-injection / terminal-escape
-/// guard). Never applied to secrets — those are not rendered at all.
+/// Whether a char is unsafe to render in a log field or on a terminal: a control
+/// character (Cc: C0/C1, incl. ESC/newline) OR a Unicode format/bidi character
+/// (Cf: e.g. RLO U+202E, zero-width joiners, BOM) that could reorder or hide
+/// text. `char::is_control()` covers only Cc, so the format/bidi ranges are
+/// filtered explicitly (no unicode-category dependency).
+fn is_unsafe_display(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200B}'..='\u{200F}' // zero-width space/joiners + LRM/RLM
+            | '\u{202A}'..='\u{202E}' // bidi embeddings/overrides (RLO/LRO/…)
+            | '\u{2060}'..='\u{2064}' // word joiner + invisible math operators
+            | '\u{2066}'..='\u{206F}' // bidi isolates + deprecated format chars
+            | '\u{FEFF}'              // BOM / zero-width no-break space
+            | '\u{061C}'              // Arabic letter mark
+            | '\u{180E}'              // Mongolian vowel separator
+        )
+}
+
+/// Sanitize a client/CP-supplied string for a log field or a terminal line: drop
+/// control + format/bidi characters and bound the length (log-injection /
+/// terminal-escape / bidi-spoofing guard). Never applied to secrets — those are
+/// not rendered at all.
 fn sanitize(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(256).collect()
+    s.chars()
+        .filter(|c| !is_unsafe_display(*c))
+        .take(256)
+        .collect()
 }
 
 /// A random session id for this connect (opaque; not a UUID parser dependency).
@@ -590,6 +714,15 @@ mod tests {
         assert!(!cleaned.contains('\n') && !cleaned.contains('\u{1b}'));
         assert_eq!(cleaned, "abc[2Jd");
         assert_eq!(sanitize(&"x".repeat(500)).len(), 256);
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_and_format_chars() {
+        // A right-to-left override + zero-width joiner + BOM must all be stripped
+        // (bidi-spoofing / invisible-text guard).
+        let cleaned = sanitize("admin\u{202E}txt\u{200D}\u{FEFF}");
+        assert_eq!(cleaned, "admintxt");
+        assert!(!cleaned.contains('\u{202E}'));
     }
 
     #[test]

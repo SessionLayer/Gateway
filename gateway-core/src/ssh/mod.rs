@@ -32,9 +32,11 @@ use russh::keys::PrivateKey;
 use russh::server::Config as RusshConfig;
 use russh::{MethodKind, MethodSet, SshId};
 
+use std::sync::atomic::Ordering;
+
 use crate::config::SshServerConfig;
 use crate::netmatch::{self, Cidr};
-use crate::ssh::handler::{HandlerDeps, SshHandler};
+use crate::ssh::handler::{ConnState, HandlerDeps, SshHandler};
 use crate::ssh::proxy::resolve_source_ip;
 
 pub use crate::cpauth::{CpAuthClient, CpChannelFactory, CredentialSnapshot};
@@ -54,6 +56,10 @@ pub enum SshServerError {
     /// The host key could not be generated / loaded / persisted.
     #[error("outer-leg host key error: {0}")]
     HostKey(String),
+
+    /// The SSH server configuration is internally inconsistent (fail closed).
+    #[error("invalid outer-leg SSH configuration: {0}")]
+    Config(String),
 }
 
 /// Immutable per-server state shared by every accepted connection.
@@ -66,6 +72,9 @@ struct ServerInner {
     gate_cidrs: Vec<Cidr>,
     /// Tier-0 bound on the pre-banner PROXY read.
     handshake_timeout: Duration,
+    /// Absolute pre-auth deadline: a connection that hasn't authenticated within
+    /// this is dropped (not reset by packet activity, unlike inactivity_timeout).
+    login_grace: Duration,
     /// Tier-0 bound on concurrently-handshaking connections.
     connection_slots: Arc<Semaphore>,
 }
@@ -124,6 +133,11 @@ impl BoundServer {
 /// Handle one accepted connection: resolve the real source IP (PROXY), apply the
 /// global gate **before any SSH banner**, then run the SSH handshake.
 async fn handle_connection(inner: Arc<ServerInner>, mut stream: TcpStream, peer: IpAddr) {
+    // Canonicalize the peer first: on a dual-stack listener a v4 client arrives as
+    // `::ffff:a.b.c.d`; `to_canonical` maps it back to v4 so LB-trust and the gate
+    // (and the CP `source_ip`) see the real family (F-dualstack).
+    let peer = peer.to_canonical();
+
     // (1) Real source IP via PROXY v2 (fail-closed both ways), bounded so a
     // connect-then-stall peer cannot hold the slot.
     let real_ip = match tokio::time::timeout(
@@ -132,7 +146,7 @@ async fn handle_connection(inner: Arc<ServerInner>, mut stream: TcpStream, peer:
     )
     .await
     {
-        Ok(Ok(ip)) => ip,
+        Ok(Ok(ip)) => ip.to_canonical(),
         Ok(Err(e)) => {
             tracing::info!(peer = %peer, error = %e, "PROXY/source rejected before banner");
             return;
@@ -150,11 +164,43 @@ async fn handle_connection(inner: Arc<ServerInner>, mut stream: TcpStream, peer:
     }
 
     // (3) SSH transport + auth handshake.
-    let handler = SshHandler::new(inner.deps.clone(), real_ip);
+    let conn = Arc::new(ConnState::default());
+    let handler = SshHandler::new(inner.deps.clone(), real_ip, conn.clone());
     match russh::server::run_stream(inner.russh_config.clone(), stream, handler).await {
         Ok(running) => {
+            // Absolute pre-auth deadline: drop the connection if authentication
+            // hasn't completed within login_grace (russh's inactivity_timeout
+            // resets on every packet, so a slow-loris could camp a slot forever).
+            let handle = running.handle();
+            let grace = inner.login_grace;
+            let wd_conn = conn.clone();
+            let watchdog = tokio::spawn(async move {
+                tokio::time::sleep(grace).await;
+                if !wd_conn.authenticated.load(Ordering::SeqCst) {
+                    let _ = handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "authentication timed out".to_string(),
+                            String::new(),
+                        )
+                        .await;
+                }
+            });
+
             if let Err(e) = running.await {
                 tracing::debug!(error = ?e, source_ip = %real_ip, "SSH session ended");
+            }
+            watchdog.abort();
+
+            // One consolidated record if the connection ended unauthenticated.
+            if !conn.authenticated.load(Ordering::SeqCst) {
+                let methods = conn.methods_tried.lock().unwrap().clone();
+                let outcome = if conn.cp_unavailable.load(Ordering::SeqCst) {
+                    "cp_unavailable"
+                } else {
+                    "auth_failed"
+                };
+                tracing::info!(source_ip = %real_ip, outcome, methods = ?methods, "outer-leg connection ended without authentication");
             }
         }
         Err(e) => {
@@ -169,8 +215,18 @@ pub async fn bind(
     config: Arc<SshServerConfig>,
     deps: HandlerDeps,
 ) -> Result<BoundServer, SshServerError> {
+    validate_config(&config)?;
+
     let lb_cidrs = netmatch::parse_cidrs(&config.proxy.lb_cidrs)?;
     let gate_cidrs = netmatch::parse_cidrs(&config.source_ip_allowlist)?;
+
+    // Operator warnings for permissive-but-valid configurations.
+    if config.source_ip_allowlist.is_empty() {
+        tracing::warn!("outer SSH leg enabled with an EMPTY source-IP gate (allow-all); set ssh.source_ip_allowlist to restrict access (FR-AUTH-13)");
+    }
+    if config.proxy.lb_cidrs.is_empty() {
+        tracing::warn!("PROXY protocol is OFF (ssh.proxy.lb_cidrs empty); behind an L4 LB the LB address would become the source IP for every client — set lb_cidrs (FR-AUTH-14)");
+    }
 
     let host_key = load_or_generate_host_key(&config.host_key_path)?;
     let mut methods = MethodSet::empty();
@@ -199,6 +255,7 @@ pub async fn bind(
         lb_cidrs,
         gate_cidrs,
         handshake_timeout: Duration::from_secs(config.handshake_timeout_secs),
+        login_grace: Duration::from_secs(config.login_grace_secs),
         connection_slots: Arc::new(Semaphore::new(config.max_connections)),
     });
 
@@ -207,6 +264,30 @@ pub async fn bind(
         local_addr,
         inner,
     })
+}
+
+/// Validate the SSH configuration, failing closed on inconsistent timing that
+/// would busy-loop or let the device flow outlast the pre-auth deadline.
+fn validate_config(config: &SshServerConfig) -> Result<(), SshServerError> {
+    let df = &config.device_flow;
+    if df.heartbeat_interval_secs == 0 {
+        return Err(SshServerError::Config(
+            "device_flow.heartbeat_interval_secs must be > 0 (0 would busy-poll)".to_string(),
+        ));
+    }
+    if df.poll_timeout_secs >= config.login_grace_secs {
+        return Err(SshServerError::Config(format!(
+            "device_flow.poll_timeout_secs ({}) must be < login_grace_secs ({})",
+            df.poll_timeout_secs, config.login_grace_secs
+        )));
+    }
+    if df.heartbeat_interval_secs >= config.login_grace_secs {
+        return Err(SshServerError::Config(format!(
+            "device_flow.heartbeat_interval_secs ({}) must be < login_grace_secs ({})",
+            df.heartbeat_interval_secs, config.login_grace_secs
+        )));
+    }
+    Ok(())
 }
 
 /// Load the persisted ed25519 host key, or generate one (persisting it when a
@@ -270,6 +351,33 @@ mod tests {
             a.public_key().to_bytes().unwrap(),
             b.public_key().to_bytes().unwrap()
         );
+    }
+
+    #[test]
+    fn config_validation_fails_closed_on_bad_timing() {
+        use crate::config::{DeviceFlowConfig, SshServerConfig};
+        let ok = SshServerConfig::default();
+        assert!(validate_config(&ok).is_ok());
+
+        let mut zero_hb = SshServerConfig::default();
+        zero_hb.device_flow.heartbeat_interval_secs = 0;
+        assert!(matches!(
+            validate_config(&zero_hb),
+            Err(SshServerError::Config(_))
+        ));
+
+        let bad = SshServerConfig {
+            login_grace_secs: 30,
+            device_flow: DeviceFlowConfig {
+                heartbeat_interval_secs: 10,
+                poll_timeout_secs: 60, // >= login_grace
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_config(&bad),
+            Err(SshServerError::Config(_))
+        ));
     }
 
     #[test]

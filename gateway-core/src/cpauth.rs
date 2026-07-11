@@ -35,6 +35,11 @@ pub enum CpError {
     #[error("Control Plane unreachable")]
     Unreachable(#[source] MtlsError),
 
+    /// A recent connect failed and the circuit breaker is open — the CP is
+    /// treated as down and calls fail fast (no per-call connect storm).
+    #[error("Control Plane unreachable (circuit open)")]
+    CircuitOpen,
+
     /// The RPC did not complete within its deadline — a hung CP must never hang
     /// the SSH handshake.
     #[error("Control Plane RPC timed out after {0:?}")]
@@ -53,6 +58,25 @@ impl CpError {
         match self {
             CpError::Rpc(s) => Some(s.code()),
             _ => None,
+        }
+    }
+
+    /// Whether this error means the CP could not give an answer — a transport /
+    /// timeout / circuit / server-side infrastructure failure — as opposed to a
+    /// clean policy outcome. Used to distinguish "CP down → service unavailable"
+    /// from an ordinary non-resolution (§7.1, fail closed).
+    pub fn is_cp_down(&self) -> bool {
+        match self {
+            CpError::Unreachable(_) | CpError::CircuitOpen | CpError::Timeout(_) => true,
+            CpError::Rpc(s) => matches!(
+                s.code(),
+                tonic::Code::Unavailable
+                    | tonic::Code::Internal
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::Unknown
+                    | tonic::Code::Unauthenticated
+                    | tonic::Code::DataLoss
+            ),
         }
     }
 }
@@ -111,12 +135,19 @@ impl CpChannelFactory {
     }
 }
 
+/// How long a failed connect keeps the circuit breaker open, so a partitioned CP
+/// fails queued calls fast instead of each camping a full connect timeout.
+const BREAKER_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// The CP outer-leg auth/authorize client. Cheap to share (`Arc`); caches one
 /// mTLS channel and multiplexes RPCs over it, rebuilding on a transport fault.
 pub struct CpAuthClient {
     factory: Arc<CpChannelFactory>,
     rpc_timeout: Duration,
     channel: Mutex<Option<Channel>>,
+    /// When the last connect failed. While within [`BREAKER_COOLDOWN`], new
+    /// calls fail fast (circuit open) rather than each attempting a full connect.
+    breaker: Mutex<Option<std::time::Instant>>,
 }
 
 impl CpAuthClient {
@@ -126,17 +157,42 @@ impl CpAuthClient {
             factory,
             rpc_timeout,
             channel: Mutex::new(None),
+            breaker: Mutex::new(None),
         }
     }
 
+    /// Obtain a channel to the CP. The connect is performed **without holding the
+    /// channel lock** (a partitioned CP must not serialize every connection behind
+    /// one full-timeout connect), with a double-check afterwards and a short
+    /// circuit breaker so a known-down CP fails fast.
     async fn channel(&self) -> Result<Channel, CpError> {
-        let mut guard = self.channel.lock().await;
-        if let Some(ch) = guard.as_ref() {
+        // Fast path: a channel is already cached.
+        if let Some(ch) = self.channel.lock().await.as_ref() {
             return Ok(ch.clone());
         }
-        let ch = self.factory.connect().await.map_err(CpError::Unreachable)?;
-        *guard = Some(ch.clone());
-        Ok(ch)
+        // Circuit breaker: a very recent connect failed → fail fast.
+        if let Some(at) = *self.breaker.lock().await {
+            if at.elapsed() < BREAKER_COOLDOWN {
+                return Err(CpError::CircuitOpen);
+            }
+        }
+        // Build the channel WITHOUT holding the channel lock.
+        match self.factory.connect().await {
+            Ok(ch) => {
+                *self.breaker.lock().await = None;
+                let mut guard = self.channel.lock().await;
+                // Double-check: another task may have cached one meanwhile.
+                if let Some(existing) = guard.as_ref() {
+                    return Ok(existing.clone());
+                }
+                *guard = Some(ch.clone());
+                Ok(ch)
+            }
+            Err(e) => {
+                *self.breaker.lock().await = Some(std::time::Instant::now());
+                Err(CpError::Unreachable(e))
+            }
+        }
     }
 
     async fn invalidate(&self) {
@@ -277,5 +333,17 @@ mod tests {
         let t = CpError::Timeout(Duration::from_secs(3));
         assert!(format!("{t}").contains("timed out"));
         assert_eq!(t.code(), None);
+    }
+
+    #[test]
+    fn cp_down_classifies_transport_and_server_errors() {
+        assert!(CpError::CircuitOpen.is_cp_down());
+        assert!(CpError::Timeout(Duration::from_secs(1)).is_cp_down());
+        assert!(CpError::Rpc(tonic::Status::unavailable("x")).is_cp_down());
+        assert!(CpError::Rpc(tonic::Status::internal("x")).is_cp_down());
+        assert!(CpError::Rpc(tonic::Status::unauthenticated("x")).is_cp_down());
+        // A clean policy-shaped status is NOT CP-down (degrade / deny, not unavailable).
+        assert!(!CpError::Rpc(tonic::Status::permission_denied("x")).is_cp_down());
+        assert!(!CpError::Rpc(tonic::Status::resource_exhausted("x")).is_cp_down());
     }
 }

@@ -83,6 +83,11 @@ pub struct SshServerConfig {
     /// Tier-0 bound on concurrently-handshaking connections. A connection over
     /// the cap is dropped at accept (bounded resource use on the accept path).
     pub max_connections: usize,
+    /// Per-connection cap on credential-**resolution** attempts (pin/cert/OTP),
+    /// each of which is one CP RPC. Bounds the CP-RPC amplification a single
+    /// unauthenticated connection can drive (russh does not enforce its own
+    /// `max_auth_attempts`). After the cap the connection is hard-rejected.
+    pub max_auth_attempts: usize,
     /// PROXY protocol v2 / LB trust (FR-AUTH-14).
     pub proxy: ProxyProtocolConfig,
     /// Global source-IP allow-list gate (FR-AUTH-13), evaluated at TCP accept
@@ -112,6 +117,7 @@ impl Default for SshServerConfig {
             login_grace_secs: 300,
             handshake_timeout_secs: 10,
             max_connections: 512,
+            max_auth_attempts: 6,
             proxy: ProxyProtocolConfig::default(),
             source_ip_allowlist: Vec::new(),
             target_separator: '%',
