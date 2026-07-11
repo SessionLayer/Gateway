@@ -1,18 +1,21 @@
-//! SessionLayer Gateway daemon (Session One scaffold).
+//! SessionLayer Gateway daemon.
 //!
-//! Tier-0 caution: this binary becomes the plaintext SSH MITM (Design §15,
-//! NFR-5) — the largest blast radius in the platform. Session One ships only a
-//! skeleton: structured logging, a health/version surface, and async-I/O
-//! backend selection. There is NO SSH I/O, NO network listener, and NO
-//! plaintext handling yet. Product behavior is added in later sessions behind
-//! the seams established here.
+//! Tier-0 caution: this binary is the plaintext SSH MITM (Design §15, NFR-5) —
+//! the largest blast radius in the platform. It establishes the renewable CP
+//! mTLS identity (Session Four) and, when configured, starts the **outer SSH
+//! leg** (Session Seven): the SSH server that gates on source IP and negotiates
+//! auth, delegating every decision to the CP. The **inner** leg (node
+//! connection, host verification, byte bridge) is Session Eight; the outer leg
+//! stops at the `NodeConnector` seam. The SSH server starts only when
+//! `ssh.listen_addr` is set **and** the Gateway holds a CP identity (fail closed).
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gateway_core::{
     asyncio::{self, IoBackend},
     config::GatewayConfig,
-    handshake, health, identity, mtls, tls,
+    cpauth, handshake, health, identity, mtls, ssh, tls,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 /// `--version` output: SemVer plus the supported CP <-> Gateway protocol range.
@@ -81,13 +84,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Run the daemon: a multi-threaded tokio runtime that establishes the Gateway's
-/// mTLS identity (when a bootstrap credential is configured) and then idles until
-/// a shutdown signal. There are still no data-plane listeners (the SSH legs are
-/// later sessions), so beyond the identity lifecycle this is inert.
+/// mTLS identity (when a bootstrap credential is configured), starts the outer
+/// SSH leg (when configured), then idles until a shutdown signal.
 ///
 /// **Fail-closed:** with a bootstrap credential configured, an enrollment /
 /// load failure aborts startup (the process exits non-zero) rather than running
-/// without an authenticated CP identity.
+/// without an authenticated CP identity; the SSH server is not started without
+/// a CP identity to delegate to.
 fn run() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -116,7 +119,11 @@ fn run() -> anyhow::Result<()> {
             );
         }
 
-        tracing::info!("no data-plane listeners yet; awaiting shutdown signal (Ctrl-C)");
+        // Outer SSH leg (Session Seven): started only when configured AND the
+        // Gateway holds a CP mTLS identity to delegate auth to (fail closed).
+        start_outer_leg(&cfg, renew.as_ref()).await?;
+
+        tracing::info!("awaiting shutdown signal (Ctrl-C)");
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutdown signal received; Gateway stopping");
         Ok::<(), anyhow::Error>(())
@@ -252,6 +259,79 @@ async fn bootstrap_identity(cfg: &GatewayConfig) -> anyhow::Result<Option<identi
     });
 
     Ok(Some(handle))
+}
+
+/// Start the outer SSH leg if `ssh.listen_addr` is configured. Requires a CP
+/// mTLS identity to delegate auth to — without one the server is **not** started
+/// (fail closed: never an SSH front door that can't reach the decision authority).
+/// The CP auth client tracks the renewing credential so a rotated identity is
+/// picked up without a restart.
+async fn start_outer_leg(
+    cfg: &GatewayConfig,
+    renew: Option<&identity::RenewHandle>,
+) -> anyhow::Result<()> {
+    if cfg.ssh.listen_addr.is_empty() {
+        return Ok(());
+    }
+    let Some(renew) = renew else {
+        tracing::warn!(
+            "ssh.listen_addr is set but the Gateway has no CP mTLS identity; refusing to start the outer leg (fail closed)"
+        );
+        return Ok(());
+    };
+
+    let server_name = host_from_endpoint(&cfg.cp_mtls_endpoint).ok_or_else(|| {
+        anyhow::anyhow!("cannot derive CP server name from {}", cfg.cp_mtls_endpoint)
+    })?;
+    let params = mtls::ChannelParams {
+        endpoint: cfg.cp_mtls_endpoint.clone(),
+        server_name,
+        connect_timeout: Duration::from_secs(cfg.ssh.cp_connect_timeout_secs),
+        rpc_timeout: Duration::from_secs(cfg.ssh.cp_rpc_timeout_secs),
+    };
+
+    // Republish the renewing credential as channel snapshots so the CP auth
+    // client always dials with the current identity.
+    let (snap_tx, snap_rx) = tokio::sync::watch::channel(snapshot(&renew.current()));
+    let mut cred_rx = renew.subscribe();
+    tokio::spawn(async move {
+        while cred_rx.changed().await.is_ok() {
+            let cred = cred_rx.borrow_and_update().clone();
+            let _ = snap_tx.send(snapshot(&cred));
+        }
+    });
+
+    let factory = Arc::new(cpauth::CpChannelFactory::from_watch(params, snap_rx));
+    let cpauth = Arc::new(cpauth::CpAuthClient::new(
+        factory,
+        Duration::from_secs(cfg.ssh.cp_rpc_timeout_secs),
+    ));
+    let ssh_cfg = Arc::new(cfg.ssh.clone());
+    let deps = ssh::handler::HandlerDeps {
+        cpauth,
+        connector: Arc::new(ssh::connector::PendingInnerLeg),
+        resolver: Arc::new(ssh::target::IdentityResolver),
+        config: ssh_cfg.clone(),
+    };
+
+    let server = ssh::bind(ssh_cfg, deps).await?;
+    tracing::info!(addr = %server.local_addr(), "outer SSH leg started");
+    tokio::spawn(async move {
+        server
+            .run(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+    });
+    Ok(())
+}
+
+/// Snapshot a credential for the CP channel factory (leaf/key + trust anchors).
+fn snapshot(cred: &identity::Credential) -> cpauth::CredentialSnapshot {
+    cpauth::CredentialSnapshot {
+        identity: cred.identity.clone(),
+        ca_chain_der: cred.ca_chain_der.clone(),
+    }
 }
 
 /// Extract the host from a `scheme://host:port` endpoint (no external URL dep),
