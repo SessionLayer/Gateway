@@ -25,7 +25,10 @@ if [[ ! -d "$SRC" ]]; then
 fi
 
 mkdir -p "$DST"
-for f in common.proto handshake.proto; do
+# Session Four added identity.proto (GatewayIdentity: EnrollGateway,
+# RenewGatewayIdentity) and signing.proto (SessionSigning:
+# SignSessionCertificate) as additive services on the mTLS plane.
+for f in common.proto handshake.proto identity.proto signing.proto; do
   cp -v "$SRC/$f" "$DST/$f"
 done
 

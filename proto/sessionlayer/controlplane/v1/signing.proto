@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "SigningProto";
+
+// SessionSigning is the Control Plane service by which a Gateway obtains a signed
+// inner-leg SSH certificate for a session it owns (Design §3.3, §15; FR-CA-3,
+// FR-CA-5, FR-SIGN-1). Added in Session Four.
+//
+// PER-RPC, SESSION-BOUND AUTHORIZATION (Design §15). mTLS authenticates the
+// CHANNEL (which Gateway is calling); this RPC layers per-request authorization
+// on top: the request carries a single-use, CP-minted session token bound to
+// {gateway_id, session_id, node, principal, exp}. The CP resolves the caller's
+// mTLS gateway_identity (active + unlocked), then validates the token
+// (signature/lookup, not expired, NOT already used, and bound to THIS Gateway
+// and its session/node/principal). Any mismatch fails closed with a generic
+// error. A Gateway can never obtain a certificate for a session it does not own;
+// a cross-gateway, cross-session, expired, or replayed token is rejected.
+//
+// KEY CUSTODY (D2/FR-CA-3). The Gateway generates the inner-leg keypair locally
+// and sends ONLY the public key. The CP returns a certificate only and never
+// receives or stores an inner private key.
+service SessionSigning {
+  // SignSessionCertificate mints the short-lived inner-leg certificate for the
+  // principal the session token carries and returns the certificate only. The
+  // token is atomically marked used on success (single-use).
+  rpc SignSessionCertificate(SignSessionCertificateRequest) returns (SignSessionCertificateResponse);
+}
+
+// SignSessionCertificateRequest is the session-bound signing request.
+message SignSessionCertificateRequest {
+  // A single-use, CP-minted session-signing token bound to
+  // {gateway_id, session_id, node, principal, exp}. The sole authority for what
+  // is signed; the mTLS identity authenticates the caller. Consumed atomically
+  // (replay rejected).
+  string session_token = 1;
+
+  // The Gateway-generated inner-leg PUBLIC key, OpenSSH wire-encoded (an
+  // `ecdsa-sha2-nistp256` public-key blob). The Gateway generates the keypair
+  // locally and sends only this public half; the private key never leaves the
+  // Gateway (D2/§15).
+  bytes subject_public_key = 2;
+
+  // Optional, NON-authoritative context for diagnostics and correlation. The
+  // token is the sole authority for {session, node, principal}; if a context
+  // field is set and disagrees with the token, the request fails closed.
+  SignContext context = 3;
+}
+
+// SignContext is advisory correlation data, never a source of authorization.
+message SignContext {
+  string session_id = 1;
+  string node_id = 2;
+  string requested_principal = 3;
+}
+
+// SignSessionCertificateResponse returns the signed certificate — cert only.
+message SignSessionCertificateResponse {
+  // The signed OpenSSH inner-leg certificate as an authorized-keys line
+  // (`ecdsa-sha2-nistp256-cert-v01@openssh.com AAAA... <key-id>`). NEVER a
+  // private key.
+  string certificate_line = 1;
+
+  // The same certificate as the raw OpenSSH wire blob (the base64 body decoded),
+  // for callers presenting the blob directly to the inner-leg client.
+  bytes certificate_blob = 2;
+
+  // The certificate key id (`session_id+identity`) echoed for the node-local
+  // audit correlation the design relies on (§12.2).
+  string key_id = 3;
+
+  // Certificate validity as Unix epoch seconds (UTC). valid_after is backdated
+  // for skew (FR-CA-5); the Gateway expires the grant conservatively (§2B).
+  int64 valid_after_epoch_seconds = 4;
+  int64 valid_before_epoch_seconds = 5;
+}
