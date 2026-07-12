@@ -307,6 +307,11 @@ struct MockState {
     /// test force per-channel re-validate (0) to exercise the break-glass no-replay
     /// re-auth posture on the healthy feed.
     decision_ttl_secs: Mutex<i64>,
+    /// F2 attack simulation: on a STANDING allow, SIGN access_model=BREAKGLASS but ship
+    /// a DOWNGRADED unsigned `context` (access_model=STANDING). A GW that (wrongly) read
+    /// the unsigned copy would drop break-glass enforcement; a correct GW reads the
+    /// signed context.
+    force_signed_breakglass: Mutex<bool>,
     /// When set, `Authorize` returns UNAVAILABLE (the CP-down fail-closed row).
     authorize_unavailable: Mutex<bool>,
     /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
@@ -1058,8 +1063,23 @@ impl MockState {
         r: &AuthorizeRequest,
         access_model: AccessModel,
     ) -> AuthorizeResponse {
-        let context = self.context_for(gid, r, access_model);
-        self.allow_response_with_context(gid, r, context)
+        // F2: optionally SIGN a stronger access_model than the unsigned copy carries.
+        let signed_model = if access_model == AccessModel::Standing
+            && *self.force_signed_breakglass.lock().unwrap()
+        {
+            AccessModel::Breakglass
+        } else {
+            access_model
+        };
+        let signed_context = self.context_for(gid, r, signed_model);
+        let mut resp = self.allow_response_with_context(gid, r, signed_context);
+        // Ship a DOWNGRADED unsigned convenience copy (access_model = the requested,
+        // weaker model). A GW reading the unsigned `context` would be fooled; a correct
+        // GW ignores it and enforces the SIGNED access_model.
+        if signed_model != access_model {
+            resp.context = Some(self.context_for(gid, r, access_model));
+        }
+        resp
     }
 
     /// Whether any active lock matches this context's bindings — deny wins even in
@@ -1476,6 +1496,7 @@ impl MockCpBuilder {
             node_connections: Mutex::new(HashMap::new()),
             node_capabilities: Mutex::new(HashMap::new()),
             decision_ttl_secs: Mutex::new(45),
+            force_signed_breakglass: Mutex::new(false),
             authorize_unavailable: Mutex::new(false),
             resolve_unavailable: Mutex::new(false),
             break_glass_keys: Mutex::new(HashMap::new()),
@@ -1931,6 +1952,13 @@ impl MockCp {
     /// no-replay re-auth posture).
     pub fn set_decision_ttl(&self, secs: i64) {
         *self.state.decision_ttl_secs.lock().unwrap() = secs;
+    }
+
+    /// F2: on a STANDING allow, SIGN access_model=BREAKGLASS while shipping a
+    /// downgraded unsigned `context` (STANDING). Proves the Gateway enforces the
+    /// SIGNED access_model, never the unsigned convenience copy.
+    pub fn set_force_signed_breakglass(&self, on: bool) {
+        *self.state.force_signed_breakglass.lock().unwrap() = on;
     }
 
     /// The number of break-glass tokens minted by a resolve (test assertion for the

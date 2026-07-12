@@ -1010,6 +1010,14 @@ impl SshHandler {
                 // Part A: trust the decision context only because its signature
                 // verifies (chain to the pinned internal mTLS CA + signer marker +
                 // codeSigning EKU + ECDSA-P256/SHA-256). Fail closed on any doubt.
+                // EVERY security field the Gateway acts on — access_model (forced-
+                // strict + per-model expiry), capabilities, allowed_logins,
+                // grant_expiry, source_address, the lock-match bindings — is read from
+                // THIS decoded-from-`signed_context` struct; the response's redundant
+                // UNSIGNED `resp.context` is deliberately NEVER read, so stripping/
+                // downgrading it (e.g. dropping access_model=BREAKGLASS) cannot weaken
+                // enforcement (F2). `verify_decision_context` decodes from the exact
+                // signed bytes, not any convenience copy.
                 let context = match decisionctx::verify_decision_context(
                     &resp.signed_context,
                     &resp.signature,
@@ -1213,12 +1221,24 @@ impl Handler for SshHandler {
             return Ok(self.hard_reject());
         }
         // Break-glass FIDO2 (Design §7, FR-ACC-6): an sk-ecdsa security key is the
-        // PRIMARY break-glass path — try the break-glass resolver first (russh has
-        // already verified the FIDO possession signature). A key that is NOT a
-        // registered break-glass credential FALLS THROUGH to the ordinary pin path
-        // below: a normal sk-ecdsa user rides the pubkey/pin path (SESSION §1.2), and
-        // never a hard reject. Only sk-ecdsa enters here; sk-ed25519 and every other
-        // algorithm go straight to the pin path.
+        // PRIMARY break-glass path — try the break-glass resolver first. Its whole
+        // security rests on FIDO PROOF-OF-POSSESSION, which russh ENFORCES BEFORE this
+        // callback: `server/encrypted.rs` decodes the client's signature and calls
+        // `Verifier::verify(&pubkey, session_id||request, &sig)`, and ONLY on success
+        // invokes `auth_publickey` (a "signature wrong" rejects without calling us). For
+        // an sk key that verify is `ssh_key::public::SkEcdsaSha2NistP256::verify`, which
+        // checks the ECDSA signature over `sha256(application)||flags||counter||
+        // sha256(request)` (`make_sk_signed_data`) — so the FIDO authenticator's private
+        // key MUST have signed, and the assertion flags/counter are signature-covered
+        // (un-forgeable). The registered break-glass key is PUBLIC/listable, so this
+        // possession check is what stops a public-key holder from getting a break-glass
+        // session. (russh does not surface the UP/user-presence bit to the handler, so
+        // touch-required is not independently enforced here — POSSESSION is; test keys
+        // use `no-touch-required` for the virtual authenticator.) A key that is NOT a
+        // registered break-glass credential FALLS THROUGH to the ordinary pin path: a
+        // normal sk-ecdsa user rides the pubkey/pin path (SESSION §1.2), never a hard
+        // reject. Only sk-ecdsa enters here; sk-ed25519 and every other algorithm go
+        // straight to the pin path.
         if self.deps.config.break_glass.enabled && is_break_glass_algorithm(public_key.algorithm())
         {
             self.conn.record_method("publickey-breakglass");

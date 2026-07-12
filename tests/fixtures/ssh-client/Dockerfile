@@ -14,9 +14,13 @@
 # not found" without this. Only `config.h` (./configure) + the openbsd-compat
 # shims are needed to link it — the full openssh build is not.
 ARG OPENSSH_VERSION=10.0p1
+# Pinned tarball digest (reproducible; no floating fetch). Verified against the
+# OpenBSD OpenSSH portable release for OPENSSH_VERSION above.
+ARG OPENSSH_SHA256=021a2e709a0edf4250b1256bd5a9e500411a90dddabea830ed59cef90eb9d85c
 
 FROM debian:13-slim AS skprovider
 ARG OPENSSH_VERSION
+ARG OPENSSH_SHA256
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -25,10 +29,12 @@ RUN apt-get update \
 
 # sk-dummy.so = sk-dummy.c + fatal.c + ed25519.c + hash.c, linked against
 # libcrypto (per regress/misc/sk-dummy/Makefile). Pinned to the same OpenSSH
-# release as the client's openssh-client, so the SK middleware ABI matches.
+# release as the client's openssh-client, so the SK middleware ABI matches. The
+# fetched tarball is checksum-verified before use (reproducible build).
 RUN cd /tmp \
  && curl -fsSL -o openssh.tar.gz \
       "https://cloudflare.cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VERSION}.tar.gz" \
+ && echo "${OPENSSH_SHA256}  openssh.tar.gz" | sha256sum -c - \
  && tar xzf openssh.tar.gz \
  && cd "openssh-${OPENSSH_VERSION}" \
  && ./configure --with-ssl-dir=/usr > /tmp/configure.log 2>&1 \

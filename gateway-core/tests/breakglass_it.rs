@@ -227,6 +227,7 @@ struct KeyMat {
     private_openssh: String,
     public_line: String,
     public_wire: Vec<u8>,
+    fingerprint: String,
 }
 
 fn gen_key(alg: Algorithm) -> KeyMat {
@@ -235,6 +236,10 @@ fn gen_key(alg: Algorithm) -> KeyMat {
         private_openssh: key.to_openssh(LineEnding::LF).unwrap().to_string(),
         public_line: key.public_key().to_openssh().unwrap(),
         public_wire: key.public_key().to_bytes().unwrap(),
+        fingerprint: key
+            .public_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string(),
     }
 }
 
@@ -393,6 +398,48 @@ async fn client_container() -> ContainerAsync<GenericImage> {
         .expect("start ssh-client container")
 }
 
+/// A client container carrying a private key file for a publickey/pin login (F2).
+async fn client_container_with_pin(pin: &KeyMat) -> ContainerAsync<GenericImage> {
+    GenericImage::new(CLIENT_IMAGE, CLIENT_TAG)
+        .with_network("host")
+        .with_startup_timeout(Duration::from_secs(60))
+        .with_copy_to(
+            CopyTargetOptions::new("/root/pin_key").with_mode(0o600),
+            pin.private_openssh.clone().into_bytes(),
+        )
+        .start()
+        .await
+        .expect("start ssh-client container")
+}
+
+/// publickey/pin ssh args (BatchMode; a single pinned key).
+fn pin_ssh(port: u16, target: &str, command: &str) -> Vec<String> {
+    let mut a = vec![
+        "ssh".into(),
+        "-p".into(),
+        port.to_string(),
+        "-i".into(),
+        "/root/pin_key".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "PreferredAuthentications=publickey".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "ConnectTimeout=30".into(),
+        format!("{target}@127.0.0.1"),
+    ];
+    if !command.is_empty() {
+        a.push(command.into());
+    }
+    a
+}
+
 async fn ssh_exec(
     container: &ContainerAsync<GenericImage>,
     args: Vec<String>,
@@ -537,6 +584,54 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
         "a genuine sk-ecdsa-sha2-nistp256@openssh.com key"
     );
     cp.register_break_glass_key(sk_pub.to_bytes()?, "breakglass-admin", &["deploy"]);
+
+    // F1 NEGATIVE: the registered break-glass PUBLIC key is listable, so possession
+    // of the FIDO private key must be REQUIRED. Offer the same key but with a BROKEN
+    // provider so the client cannot produce a FIDO assertion → russh never receives a
+    // valid signature → auth fails → NO break-glass session, NO activation. (Possession
+    // is enforced by russh before auth_publickey; see the handler comment.)
+    let (neg_code, neg_out, _neg_err) = ssh_exec(
+        &client,
+        vec![
+            "ssh".into(),
+            "-p".into(),
+            gw_port.to_string(),
+            "-i".into(),
+            "/root/sk_key".into(),
+            "-o".into(),
+            "SecurityKeyProvider=/nonexistent/no-provider.so".into(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-o".into(),
+            "PreferredAuthentications=publickey".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "ConnectTimeout=30".into(),
+            "deploy%node-bg@127.0.0.1".into(),
+            "echo SHOULD_NOT_RUN".into(),
+        ],
+        vec![],
+    )
+    .await;
+    assert_ne!(
+        neg_code,
+        Some(0),
+        "a break-glass sk key with no valid FIDO assertion must be rejected"
+    );
+    assert!(
+        !neg_out.contains("SHOULD_NOT_RUN"),
+        "no session without possession"
+    );
+    assert_eq!(
+        cp.breakglass_activation_count(),
+        0,
+        "no FIDO assertion → russh rejects → no Authorize → no activation"
+    );
 
     // Log in with the FIDO2 key: the client signs via the authenticator, russh
     // verifies the FIDO signature, and the Gateway resolves it as break-glass.
@@ -787,6 +882,55 @@ async fn break_glass_forces_strict_refused_when_recording_unavailable() -> anyho
     assert!(
         stderr.contains(RECORDING_UNAVAILABLE),
         "the user sees the strict recording-unavailable outcome; stderr={stderr}"
+    );
+
+    drop(client);
+    drop(node);
+    Ok(())
+}
+
+// ── F2: the GW enforces the SIGNED access_model, never the unsigned `context` ──
+
+#[tokio::test]
+async fn gw_enforces_signed_access_model_not_unsigned_context() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    // A STANDING pin auth (the LOCAL break-glass flag is FALSE, isolating the signed-
+    // context path), but the CP SIGNS access_model=BREAKGLASS while shipping a
+    // DOWNGRADED unsigned context (STANDING). NO customer key + recorder strict=false:
+    // reading the SIGNED access_model forces strict → the session is REFUSED; reading
+    // the unsigned copy (STANDING) would run it unrecorded. It MUST be refused.
+    cp.set_force_signed_breakglass(true);
+    let pin = gen_key(Algorithm::Ed25519);
+    cp.register_pin(&pin.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", NODE_ID, "deploy");
+
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    let recorder = RecorderConfig {
+        strict: false,
+        ..RecorderConfig::default()
+    };
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(recorder))).await;
+    let client = client_container_with_pin(&pin).await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        pin_ssh(gw_port, "deploy%node-bg", "echo SHOULD_NOT_RUN"),
+        vec![],
+    )
+    .await;
+    assert_ne!(
+        code,
+        Some(0),
+        "the GW must enforce the SIGNED access_model=BREAKGLASS (forced strict → refused)"
+    );
+    assert!(!stdout.contains("SHOULD_NOT_RUN"));
+    assert!(
+        stderr.contains(RECORDING_UNAVAILABLE),
+        "break-glass from the SIGNED context forces strict; a stripped unsigned context cannot downgrade it; stderr={stderr}"
     );
 
     drop(client);
