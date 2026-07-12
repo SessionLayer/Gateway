@@ -14,27 +14,38 @@
 //! The offered method selects the path; an unresolved credential **degrades to
 //! the next method** (FR-AUTH-1/2). On a resolved identity the Gateway parses the
 //! target (`login%node`, Part G), applies the credential-principal reducer
-//! (deny-only), then calls S5 **`Authorize`**; on ALLOW it obtains the signed
-//! decision context + session token and hands them to the [`NodeConnector`] seam
-//! (the Session-Seven stub closes the session cleanly at "inner leg pending").
-//! Every SSH-surface outcome follows the §7.1 taxonomy ([`SshOutcome`]); no
-//! secret/OTP/token/plaintext is ever logged.
+//! (deny-only), then calls S5 **`Authorize`**. On ALLOW (Session Eight) it dials
+//! the node via the [`NodeConnector`], mints the inner cert, verifies the node
+//! host identity (no TOFU), and **bridges** the two legs per channel (shell / exec
+//! / SFTP) under the granted capability set; a denial or node fault closes the
+//! channel with the §7.1 outcome. Every SSH-surface outcome follows the §7.1
+//! taxonomy ([`SshOutcome`]); no secret/OTP/token/plaintext is ever logged.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use russh::keys::{Certificate, HashAlg, PublicKey};
+use russh::keys::{Certificate, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Response, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty};
 use zeroize::Zeroizing;
 
 use crate::config::SshServerConfig;
 use crate::cpauth::{CpAuthClient, CpError};
-use crate::pb::{AuthorizeRequest, Decision, DeviceFlowStatus, ResolvedIdentity};
-use crate::ssh::connector::{NodeConnectError, NodeConnector, NodeTarget, SessionGrant};
+use crate::pb::{
+    AuthorizeRequest, Capability, Decision, DecisionContext, DeviceFlowStatus, ResolvedIdentity,
+    SignContext,
+};
+use crate::signing::InnerKeyPair;
+use crate::ssh::bridge::{self, RecorderTap, TapDirection};
+use crate::ssh::connector::{NodeConnector, NodeDial, NodeTarget, SessionGrant};
+use crate::ssh::hostverify::{HostTrust, HostVerifier};
+use crate::ssh::innerleg::{
+    ChannelKind, InnerClient, InnerLegConfig, InnerLegError, InnerWriteHalf, PtyParams,
+};
 use crate::ssh::outcome::{SshOutcome, DEVICE_FLOW_TIMEOUT, SERVICE_UNAVAILABLE};
 use crate::ssh::target::{parse_username, TargetResolver};
 use crate::version;
@@ -95,13 +106,20 @@ enum KiState {
 /// Shared, per-server dependencies cloned into each connection handler.
 #[derive(Clone)]
 pub struct HandlerDeps {
-    /// The CP auth/authorize client (Part D).
+    /// The CP auth/authorize client (Part D) + the inner-cert signer (Part B).
     pub cpauth: Arc<CpAuthClient>,
-    /// The inner-leg connector seam (Session-Seven stub).
+    /// The inner-leg connector seam (Session Eight: [`AgentlessDial`]).
+    ///
+    /// [`AgentlessDial`]: crate::ssh::connector::AgentlessDial
     pub connector: Arc<dyn NodeConnector>,
     /// The target `node`-name → node-id resolver (Session-Sixteen seam).
     pub resolver: Arc<dyn TargetResolver>,
-    /// SSH server configuration (target separator, device-flow timing, …).
+    /// The recording tap seam (Session Eight: [`NullRecorder`]; S9 attaches).
+    ///
+    /// [`NullRecorder`]: crate::ssh::bridge::NullRecorder
+    pub recorder: Arc<dyn RecorderTap>,
+    /// SSH server configuration (target separator, device-flow timing, inner-leg
+    /// bounds, …).
     pub config: Arc<SshServerConfig>,
 }
 
@@ -117,13 +135,50 @@ pub struct SshHandler {
     username: Option<String>,
     authenticated: Option<Authenticated>,
     ki: KiState,
-    /// Guard so the connect-time authorize + connector hand-off runs exactly once.
-    decided: bool,
+    /// The connect-time authorization result, decided once on the first channel
+    /// request: either the allow (with the node connection + grant) or a cached
+    /// denial outcome. `None` until the first channel request runs `decide`.
+    authz: Option<Arc<Authorized>>,
+    authz_denied: Option<SshOutcome>,
+    /// The inner-leg client, established lazily once on the first authorized
+    /// channel and shared by every channel on this connection.
+    inner: Option<InnerClient>,
+    /// A cached inner-leg failure outcome (so a second channel after a failed
+    /// establish fails the same way without re-dialing).
+    inner_failed: Option<SshOutcome>,
+    /// PTY parameters stashed per channel (replayed to the node at channel start).
+    pty: HashMap<ChannelId, PtyParams>,
+    /// Retained outer channel objects (kept from `channel_open_session` so their
+    /// write half can drive the backpressured node→client direction). The read
+    /// half is dropped — outer→inner still flows via the `data` callback.
+    pending_channels: HashMap<ChannelId, Channel<russh::server::Msg>>,
+    /// Per-bridged-channel inner write half — the outer `data`/`eof`/window-change
+    /// callbacks forward to it (outer → inner direction).
+    writers: HashMap<ChannelId, InnerWriteHalf>,
+    /// Per-bridged-channel inner→outer pump task, aborted on channel/connection
+    /// close for deterministic teardown (no leak-until-disconnect).
+    pumps: HashMap<ChannelId, tokio::task::JoinHandle<()>>,
+    /// Count of session channels opened on this connection (Tier-0 cap, russh
+    /// enforces none).
+    channels_opened: usize,
     /// Count of credential-resolution attempts (bounds the CP-RPC amplification
     /// per connection — russh does NOT enforce its own `max_auth_attempts`).
     auth_attempts: usize,
     /// Shared with the accept loop (pre-auth deadline + auth-failed record).
     conn: Arc<ConnState>,
+}
+
+/// A successful connect-time authorization: the node connection + host trust to
+/// verify + the single-use grant to mint the inner cert + the granted capability
+/// set. Built once in [`SshHandler::decide`], shared across channels.
+struct Authorized {
+    node: NodeTarget,
+    dial: NodeDial,
+    trust: HostTrust,
+    grant: SessionGrant,
+    /// The granted SSH capabilities (proto `Capability` values); default
+    /// shell+exec if the decision context declares none (Design §6.1).
+    capabilities: Vec<i32>,
 }
 
 impl SshHandler {
@@ -136,7 +191,15 @@ impl SshHandler {
             username: None,
             authenticated: None,
             ki: KiState::Start,
-            decided: false,
+            authz: None,
+            authz_denied: None,
+            inner: None,
+            inner_failed: None,
+            pty: HashMap::new(),
+            pending_channels: HashMap::new(),
+            writers: HashMap::new(),
+            pumps: HashMap::new(),
+            channels_opened: 0,
             auth_attempts: 0,
             conn,
         }
@@ -371,55 +434,129 @@ impl SshHandler {
         }
     }
 
-    /// The one connect-time authorization decision + connector hand-off, run once.
-    async fn authorize_and_close(&mut self, channel: ChannelId, session: &mut Session) {
-        if self.decided {
-            return;
-        }
-        self.decided = true;
-        let outcome = self.decide().await;
-
+    /// Emit a §7.1 refusal on `channel` and close it (a denial or a node fault).
+    /// The authorized happy path never calls this — it bridges the channel.
+    fn close_with(&self, channel: ChannelId, session: &mut Session, outcome: SshOutcome) {
         if let Some(msg) = outcome.user_message() {
             let line = format!("{msg}\r\n").into_bytes();
-            // Refusals go to stderr (extended data code 1); the clean authorized
-            // "inner leg pending" goes to stdout.
-            let _ = if outcome.exit_code() == 0 {
-                session.data(channel, line)
-            } else {
-                session.extended_data(channel, 1, line)
-            };
+            let _ = session.extended_data(channel, 1, line);
         }
         let _ = session.exit_status_request(channel, outcome.exit_code());
         let _ = session.eof(channel);
         let _ = session.close(channel);
     }
 
-    /// Resolve the target, apply the credential reducer, call `Authorize`, and (on
-    /// ALLOW) hand to the connector. Returns the §7.1 outcome. Pre-authorization
-    /// failures are all the same generic denial (no existence disclosure).
-    async fn decide(&self) -> SshOutcome {
+    /// Start a session channel: authorize once, gate the requested capability,
+    /// establish the inner leg once, open + replay the channel to the node, and
+    /// bridge. A denial / node fault closes the channel with the §7.1 outcome; the
+    /// happy path hands the channel to the bridge (no close here).
+    async fn start_channel(
+        &mut self,
+        channel: ChannelId,
+        kind: ChannelKind,
+        session: &mut Session,
+    ) {
+        // (1) Connect-time authorization — decided once per connection, cached.
+        if self.authz.is_none() && self.authz_denied.is_none() {
+            match self.decide().await {
+                Ok(a) => self.authz = Some(Arc::new(a)),
+                Err(o) => self.authz_denied = Some(o),
+            }
+        }
+        if let Some(o) = self.authz_denied {
+            self.close_with(channel, session, o);
+            return;
+        }
+        let authz = self.authz.clone().expect("authorized cached above");
+
+        // (2) Capability gate at channel-open (FR-SESS-2): the channel is admitted
+        // only if one of its acceptable capabilities is granted; UNSPECIFIED (the
+        // "never granted" sentinel for an unknown subsystem) is rejected outright.
+        let accepts = required_capabilities(&kind);
+        let granted = accepts
+            .iter()
+            .any(|c| *c != Capability::Unspecified && authz.capabilities.contains(&(*c as i32)));
+        if !granted {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "capability_withheld", accepts = ?accepts, "channel refused: capability not granted");
+            self.close_with(channel, session, SshOutcome::PolicyDenied);
+            return;
+        }
+
+        // (3) Establish the inner leg once (dial + host-verify + sign + handshake).
+        if self.inner.is_none() {
+            if let Some(o) = self.inner_failed {
+                self.close_with(channel, session, o);
+                return;
+            }
+            match self.establish_inner(&authz).await {
+                Ok(c) => self.inner = Some(c),
+                Err(o) => {
+                    self.inner_failed = Some(o);
+                    self.close_with(channel, session, o);
+                    return;
+                }
+            }
+        }
+        let inner = self.inner.as_ref().expect("inner client established above");
+
+        // (4) Open the matching channel on the node, replaying any PTY.
+        let pty = self.pty.get(&channel);
+        let inner_chan = match inner.open_channel(kind, pty).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "node_unreachable", "inner channel open/replay failed");
+                self.close_with(channel, session, SshOutcome::NodeUnreachable);
+                return;
+            }
+        };
+
+        // (5) Bridge: outer data → inner (via the write half, in `data`); inner →
+        // outer via the pump task. The recorder taps both directions (S9).
+        let (read, write) = crate::ssh::innerleg::split_channel(inner_chan);
+        self.writers.insert(channel, write);
+        // Drive node→client through the outer channel's WRITE half (backpressured);
+        // the read half is dropped (outer→inner flows via the `data` callback).
+        let Some(outer_chan) = self.pending_channels.remove(&channel) else {
+            self.close_with(channel, session, SshOutcome::NodeUnreachable);
+            return;
+        };
+        let (_outer_read, outer_write) = outer_chan.split();
+        let pump = tokio::spawn(bridge::pump_inner_to_outer(
+            read,
+            outer_write,
+            session.handle(),
+            channel,
+            self.deps.recorder.clone(),
+        ));
+        self.pumps.insert(channel, pump);
+        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "bridged", "inner leg bridged; session flowing");
+    }
+
+    /// Resolve the target, apply the credential reducer, call `Authorize`, and on
+    /// ALLOW build the [`Authorized`] hand-off (node connection + host trust +
+    /// grant + capabilities). Pre-authorization failures collapse to the generic
+    /// denial (no existence disclosure); a missing node connection or missing
+    /// host-verification material aborts (never TOFU).
+    async fn decide(&self) -> Result<Authorized, SshOutcome> {
         let Some(auth) = &self.authenticated else {
-            return SshOutcome::AuthFailed;
+            return Err(SshOutcome::AuthFailed);
         };
         let username = self.username.as_deref().unwrap_or_default();
-        let target = match parse_username(username, self.deps.config.target_separator) {
-            Ok(t) => t,
-            Err(_) => {
-                tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), outcome = "policy_denied", reason = "malformed_target", "generic denial");
-                return SshOutcome::PolicyDenied;
-            }
+        let Ok(target) = parse_username(username, self.deps.config.target_separator) else {
+            tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), outcome = "policy_denied", reason = "malformed_target", "generic denial");
+            return Err(SshOutcome::PolicyDenied);
         };
 
         // Credential-principal reducer (deny-only): a login-scoped credential may
         // only be used for a login it is scoped to (FR-AUTH-15 spirit, §5.4/§5.5).
         if !auth.principals.is_empty() && !auth.principals.iter().any(|p| p == &target.login) {
             tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "credential_principal_scope", "generic denial");
-            return SshOutcome::PolicyDenied;
+            return Err(SshOutcome::PolicyDenied);
         }
 
         let Some(node_id) = self.deps.resolver.resolve_node_id(&target) else {
             tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "unknown_node", "generic denial");
-            return SshOutcome::PolicyDenied;
+            return Err(SshOutcome::PolicyDenied);
         };
 
         let req = AuthorizeRequest {
@@ -436,6 +573,19 @@ impl SshHandler {
             Ok(resp)
                 if resp.decision == Decision::Allow as i32 && !resp.session_token.is_empty() =>
             {
+                // The node connection + host-verification material is mandatory.
+                let Some(nc) = resp.node_connection else {
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = "node_unreachable", reason = "no_node_connection", "authorized but the CP returned no node connection; failing closed");
+                    return Err(SshOutcome::NodeUnreachable);
+                };
+                let trust = host_trust_from(nc.host_verification);
+                if trust.is_empty() {
+                    // No enrollment anchor → the node cannot be verified → NEVER
+                    // TOFU. Abort (FR-CONN-5/7).
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = "node_unreachable", reason = "no_host_verification_material", "aborting: node has no host-verification anchor (never TOFU)");
+                    return Err(SshOutcome::NodeUnreachable);
+                }
+                let capabilities = granted_capabilities(resp.context.as_ref());
                 tracing::info!(
                     outcome = "authorized",
                     identity = %sanitize(&auth.identity),
@@ -443,33 +593,139 @@ impl SshHandler {
                     node_id = %sanitize(&node_id),
                     principal = %sanitize(&target.login),
                     session_id = %self.session_id,
-                    "authorized; handing to inner-leg connector"
+                    "authorized; establishing inner leg"
                 );
-                let node = NodeTarget {
-                    node_id,
-                    principal: target.login.clone(),
-                };
-                let grant = SessionGrant {
-                    session_token: resp.session_token,
-                    context: resp.context,
-                };
-                match self.deps.connector.connect(&node, &grant).await {
-                    // Session Seven stops at the seam; Session Eight bridges here.
-                    Ok(_stream) => SshOutcome::InnerLegPending,
-                    Err(NodeConnectError::InnerLegPending) => SshOutcome::InnerLegPending,
-                }
+                Ok(Authorized {
+                    node: NodeTarget {
+                        node_id: node_id.clone(),
+                        principal: target.login.clone(),
+                    },
+                    dial: NodeDial {
+                        node_id,
+                        dial_address: nc.dial_address,
+                    },
+                    trust,
+                    grant: SessionGrant {
+                        session_token: resp.session_token,
+                        context: resp.context,
+                    },
+                    capabilities,
+                })
             }
             Ok(_) => {
                 // DENY, a Lock, no-match, or ALLOW-without-token — one generic
                 // denial to the user; the CP logged the specific reason.
                 tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "authorization_denied", "generic denial");
-                SshOutcome::PolicyDenied
+                Err(SshOutcome::PolicyDenied)
             }
             Err(e) => {
                 self.note_cp_down("authorize");
                 tracing::warn!(error = %e, source_ip = %self.source_ip, outcome = "cp_unavailable", "authorization RPC failed; failing closed (service unavailable)");
-                SshOutcome::ServiceUnavailable
+                Err(SshOutcome::ServiceUnavailable)
             }
+        }
+    }
+
+    /// Establish the inner leg once for this connection: dial the node (Part A),
+    /// mint the ephemeral inner cert (Part B / D2 — key generated locally, cert
+    /// only returned), verify the node host identity during the handshake (Part C,
+    /// no TOFU), and authenticate. Fail-closed with the §7.1 outcome at every step;
+    /// a host-verification abort is generic to the user, specific in the log.
+    async fn establish_inner(&self, authz: &Authorized) -> Result<InnerClient, SshOutcome> {
+        let stream = match self.deps.connector.connect(&authz.dial).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "node_unreachable", "agentless dial failed");
+                return Err(SshOutcome::NodeUnreachable);
+            }
+        };
+
+        let inner_kp = match InnerKeyPair::generate() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(error = %e, session_id = %self.session_id, "inner keypair generation failed");
+                return Err(SshOutcome::NodeUnreachable);
+            }
+        };
+        let sign_ctx = Some(SignContext {
+            session_id: self.session_id.clone(),
+            node_id: authz.node.node_id.clone(),
+            requested_principal: authz.node.principal.clone(),
+        });
+        let signed = match self
+            .deps
+            .cpauth
+            .sign_session_certificate(&authz.grant.session_token, &inner_kp, sign_ctx)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) if e.is_cp_down() => {
+                self.note_cp_down("sign");
+                tracing::warn!(error = %e, session_id = %self.session_id, outcome = "cp_unavailable", "inner-cert signing failed (CP unreachable)");
+                return Err(SshOutcome::ServiceUnavailable);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, session_id = %self.session_id, outcome = "node_unreachable", "inner-cert signing rejected (fail closed)");
+                return Err(SshOutcome::NodeUnreachable);
+            }
+        };
+
+        let cert = match Certificate::from_bytes(&signed.certificate_blob) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, session_id = %self.session_id, "CP returned an unparseable inner certificate");
+                return Err(SshOutcome::NodeUnreachable);
+            }
+        };
+        let key = match inner_kp
+            .private_key_openssh_pem()
+            .map_err(|e| e.to_string())
+            .and_then(|pem| PrivateKey::from_openssh(&pem).map_err(|e| e.to_string()))
+        {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(error = %e, session_id = %self.session_id, "inner private key could not be prepared");
+                return Err(SshOutcome::NodeUnreachable);
+            }
+        };
+        drop(inner_kp); // the local keypair is no longer needed (zeroized on drop)
+
+        let verifier = HostVerifier::new(authz.trust.clone());
+        let cfg = self.inner_leg_config();
+        match InnerClient::establish(stream, verifier, &authz.node.principal, cert, key, &cfg).await
+        {
+            Ok(inner) => {
+                tracing::info!(outcome = "host_verified", source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&authz.node.node_id), host_verified = ?inner.verified(), key_id = %sanitize(&signed.key_id), "inner leg established; node host identity verified (no TOFU)");
+                Ok(inner)
+            }
+            Err(InnerLegError::HostVerification(reason)) => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&authz.node.node_id), reason = %reason, outcome = "host_verification_failed", "ABORT: node host identity not verified (no TOFU)");
+                Err(SshOutcome::NodeUnreachable)
+            }
+            Err(e) => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "node_unreachable", "inner SSH handshake failed");
+                Err(SshOutcome::NodeUnreachable)
+            }
+        }
+    }
+
+    fn inner_leg_config(&self) -> InnerLegConfig {
+        let inner = &self.deps.config.inner;
+        InnerLegConfig {
+            handshake_timeout: Duration::from_secs(inner.handshake_timeout_secs),
+            window_size: inner.window_bytes,
+            max_packet_size: inner.max_packet_bytes,
+            idle_timeout: Duration::from_secs(inner.max_session_idle_secs),
+        }
+    }
+}
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        // Connection end: abort any live pump tasks deterministically (dropping the
+        // inner client also closes the node transport, but this bounds the teardown).
+        for (_, pump) in self.pumps.drain() {
+            pump.abort();
         }
     }
 }
@@ -583,10 +839,20 @@ impl Handler for SshHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<russh::server::Msg>,
+        channel: Channel<russh::server::Msg>,
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Tier-0 per-connection channel cap (bounds pump tasks + node channels +
+        // buffers; russh enforces none). Over the cap → reject (drop the reply).
+        self.channels_opened += 1;
+        if self.channels_opened > self.deps.config.inner.max_channels_per_connection {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection channel cap exceeded; refusing channel open");
+            return Ok(());
+        }
+        // Retain the channel so its write half drives the backpressured node→client
+        // direction (see `pending_channels`).
+        self.pending_channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
     }
@@ -594,15 +860,27 @@ impl Handler for SshHandler {
     async fn pty_request(
         &mut self,
         channel: ChannelId,
-        _term: &str,
-        _col: u32,
-        _row: u32,
-        _pw: u32,
-        _ph: u32,
-        _modes: &[(Pty, u32)],
+        term: &str,
+        col: u32,
+        row: u32,
+        pw: u32,
+        ph: u32,
+        modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Acknowledge PTY setup; the authorize + hand-off runs on shell/exec.
+        // Stash the PTY so it can be replayed to the node when the shell/exec
+        // starts; ack it to the outer client.
+        self.pty.insert(
+            channel,
+            PtyParams {
+                term: term.to_string(),
+                col,
+                row,
+                pix_w: pw,
+                pix_h: ph,
+                modes: modes.to_vec(),
+            },
+        );
         session.channel_success(channel)?;
         Ok(())
     }
@@ -613,30 +891,164 @@ impl Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
-        self.authorize_and_close(channel, session).await;
+        self.start_channel(channel, ChannelKind::Shell, session)
+            .await;
         Ok(())
     }
 
     async fn exec_request(
         &mut self,
         channel: ChannelId,
-        _data: &[u8],
+        data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
-        self.authorize_and_close(channel, session).await;
+        self.start_channel(channel, ChannelKind::Exec(data.to_vec()), session)
+            .await;
         Ok(())
     }
 
     async fn subsystem_request(
         &mut self,
         channel: ChannelId,
-        _name: &str,
+        name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
-        self.authorize_and_close(channel, session).await;
+        self.start_channel(channel, ChannelKind::Subsystem(name.to_string()), session)
+            .await;
         Ok(())
+    }
+
+    /// Outer → inner: forward client bytes to the node's channel write half. The
+    /// recorder taps the input stream (`i`) first; the await naturally backpressures
+    /// the outer read when the node is slow.
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(w) = self.writers.get(&channel) {
+            self.deps
+                .recorder
+                .tap(channel, TapDirection::Input, None, data);
+            let _ = w.data(data).await;
+        }
+        Ok(())
+    }
+
+    /// Client closed its half — relay EOF to the node so the remote command sees
+    /// end-of-input (SFTP/SCP uploads, `cat |` pipelines).
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(w) = self.writers.get(&channel) {
+            let _ = w.eof().await;
+        }
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(w) = self.writers.remove(&channel) {
+            let _ = w.close().await;
+        }
+        // Deterministic teardown: abort the pump rather than wait for the node to
+        // propagate Close (no leak-until-disconnect, F-channelcap-1).
+        if let Some(pump) = self.pumps.remove(&channel) {
+            pump.abort();
+        }
+        self.pending_channels.remove(&channel);
+        self.pty.remove(&channel);
+        Ok(())
+    }
+
+    /// Relay an interactive resize to the node's PTY.
+    async fn window_change_request(
+        &mut self,
+        channel: ChannelId,
+        col: u32,
+        row: u32,
+        pw: u32,
+        ph: u32,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(w) = self.writers.get(&channel) {
+            let _ = w.window_change(col, row, pw, ph).await;
+        }
+        Ok(())
+    }
+
+    /// Agent forwarding is **always refused** (FR-SESS-2): never bridged to the
+    /// node. Returning `false` sends `channel_failure` to the client.
+    async fn agent_request(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "agent_forward_refused", "agent forwarding refused (always)");
+        Ok(false)
+    }
+
+    /// Local port forwarding is refused this session (the capability gate; the
+    /// forwarded-channel bridge is a clean follow-up seam). Dropping the reply
+    /// handle rejects the channel.
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<russh::server::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _reply: russh::server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", "direct-tcpip (local port-forward) refused");
+        Ok(())
+    }
+}
+
+/// The SSH capabilities that admit a channel kind (FR-SESS-2) — the channel is
+/// allowed if ANY is granted. Legacy `scp` is `exec` of the `scp` binary with
+/// attacker-controlled argv (`scp -S <prog>`, shell metacharacters), so it can
+/// never be a safe standalone capability: it requires **EXEC** (F-capgate-scp-1).
+/// Modern scp runs over the SFTP subsystem, so SCP is honored there alongside SFTP
+/// (Design §12.1, both SCP modes). An unknown subsystem has NO acceptable
+/// capability → always refused (fail closed).
+fn required_capabilities(kind: &ChannelKind) -> &'static [Capability] {
+    match kind {
+        ChannelKind::Shell => &[Capability::Shell],
+        ChannelKind::Exec(_) => &[Capability::Exec],
+        ChannelKind::Subsystem(name) if name == "sftp" => &[Capability::Sftp, Capability::Scp],
+        ChannelKind::Subsystem(_) => &[],
+    }
+}
+
+/// The granted capabilities from the decision context; default shell+exec when
+/// the context declares none (Design §6.1 default). Agent-forward is never here.
+fn granted_capabilities(context: Option<&DecisionContext>) -> Vec<i32> {
+    match context {
+        Some(ctx) if !ctx.capabilities.is_empty() => ctx.capabilities.clone(),
+        _ => vec![Capability::Shell as i32, Capability::Exec as i32],
+    }
+}
+
+/// Build the Gateway host-trust from the CP's proto material (public only).
+fn host_trust_from(hv: Option<crate::pb::HostVerification>) -> HostTrust {
+    match hv {
+        Some(h) => HostTrust {
+            host_ca_keys: h.host_ca_keys,
+            expected_principals: h.expected_host_principals,
+            host_certificates: h.host_certificates,
+            pinned_host_keys: h.pinned_host_keys,
+        },
+        None => HostTrust::default(),
     }
 }
 
@@ -732,5 +1144,52 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    /// Capability gate (FR-SESS-2): a legacy `scp` exec is gated by EXEC (never a
+    /// standalone SCP), an unknown subsystem is never granted, and UNSPECIFIED is
+    /// never an acceptable capability (F-capgate-scp-1 / F-capgate-unspec-1).
+    #[test]
+    fn capability_gate_never_admits_scp_exec_or_unknown_subsystem() {
+        // A file-transfer-only grant (scp+sftp, no exec/shell).
+        let scp_only = [Capability::Scp as i32, Capability::Sftp as i32];
+        let admits = |kind: &ChannelKind, granted: &[i32]| {
+            required_capabilities(kind)
+                .iter()
+                .any(|c| *c != Capability::Unspecified && granted.contains(&(*c as i32)))
+        };
+
+        // `scp -S /bin/sh …` and metacharacter smuggling are plain exec → need EXEC,
+        // so an scp-only grant must NOT admit them.
+        for cmd in [
+            "scp -S /bin/sh a b",
+            "scp x y; id",
+            "/usr/bin/scp -o ProxyCommand=id a b",
+        ] {
+            let kind = ChannelKind::Exec(cmd.as_bytes().to_vec());
+            assert_eq!(required_capabilities(&kind), &[Capability::Exec]);
+            assert!(
+                !admits(&kind, &scp_only),
+                "scp-only must not admit exec {cmd:?}"
+            );
+        }
+        // An honest exec is admitted only by EXEC.
+        assert!(admits(
+            &ChannelKind::Exec(b"id".to_vec()),
+            &[Capability::Exec as i32]
+        ));
+
+        // Modern scp uses the sftp subsystem → SFTP or SCP admits it.
+        let sftp = ChannelKind::Subsystem("sftp".into());
+        assert!(admits(&sftp, &scp_only));
+        assert!(admits(&sftp, &[Capability::Sftp as i32]));
+        assert!(!admits(&sftp, &[Capability::Exec as i32]));
+
+        // Unknown subsystem: no acceptable capability → refused even against a set
+        // literally containing UNSPECIFIED (0).
+        let unknown = ChannelKind::Subsystem("netconf".into());
+        assert!(required_capabilities(&unknown).is_empty());
+        assert!(!admits(&unknown, &[Capability::Unspecified as i32]));
+        assert!(!admits(&unknown, &[Capability::Sftp as i32]));
     }
 }

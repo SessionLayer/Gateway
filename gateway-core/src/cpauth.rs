@@ -309,6 +309,35 @@ impl CpAuthClient {
         self.call(move |ch| async move { AuthorizationClient::new(ch).authorize(req).await })
             .await
     }
+
+    /// Mint the inner-leg certificate over the authenticated mTLS channel (Session
+    /// Eight, D2/§15): the Gateway sends only the public key + the single-use
+    /// session token; the CP returns a cert only. A channel failure maps to
+    /// [`SigningError::Unavailable`] (CP-down → fail closed); the cached channel is
+    /// dropped on any failure so the next call rebuilds.
+    pub async fn sign_session_certificate(
+        &self,
+        session_token: &str,
+        inner: &crate::signing::InnerKeyPair,
+        context: Option<crate::pb::SignContext>,
+    ) -> Result<crate::signing::SignedInnerCert, crate::signing::SigningError> {
+        let channel = self
+            .channel()
+            .await
+            .map_err(|_| crate::signing::SigningError::Unavailable)?;
+        let result = crate::signing::sign_session_certificate(
+            channel,
+            session_token,
+            inner,
+            context,
+            self.rpc_timeout,
+        )
+        .await;
+        if result.is_err() {
+            self.invalidate().await;
+        }
+        result
+    }
 }
 
 #[cfg(test)]

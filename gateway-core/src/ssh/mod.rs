@@ -13,8 +13,11 @@
 //! Tier-0: the accept path bounds the PROXY read (handshake timeout), caps
 //! concurrent connections, and never logs SSH secrets/keys/OTP/tokens/plaintext.
 
+pub mod bridge;
 pub mod connector;
 pub mod handler;
+pub mod hostverify;
+pub mod innerleg;
 pub mod outcome;
 pub mod proxy;
 pub mod target;
@@ -237,10 +240,11 @@ pub async fn bind(
         server_id: SshId::Standard("SSH-2.0-SessionLayer_Gateway".into()),
         methods,
         keys: vec![host_key],
-        // Generous grace covering a browser OIDC device flow (FR-AUTH-4). russh's
-        // inactivity_timeout is the connection-idle bound; the device-flow
-        // heartbeat keeps traffic flowing below it.
-        inactivity_timeout: Some(Duration::from_secs(config.login_grace_secs)),
+        // russh's inactivity_timeout is the connection-idle bound. It must cover a
+        // browser OIDC device flow pre-auth (the heartbeat keeps traffic flowing)
+        // AND a live bridged session post-auth, so it is the (larger) inner-leg
+        // idle bound; the pre-auth deadline is enforced separately by the watchdog.
+        inactivity_timeout: Some(Duration::from_secs(config.inner.max_session_idle_secs)),
         // Constant-time auth rejection (russh enforces this floor).
         auth_rejection_time: Duration::from_secs(1),
         ..Default::default()
@@ -286,6 +290,36 @@ fn validate_config(config: &SshServerConfig) -> Result<(), SshServerError> {
             "device_flow.heartbeat_interval_secs ({}) must be < login_grace_secs ({})",
             df.heartbeat_interval_secs, config.login_grace_secs
         )));
+    }
+    // The idle bound must cover the pre-auth window so the pre-auth deadline
+    // watchdog (login_grace) governs the unauthenticated window and the idle
+    // bound governs the authenticated one; otherwise russh's inactivity_timeout
+    // could tear a connection down before the device flow completes.
+    if config.inner.max_session_idle_secs < config.login_grace_secs {
+        return Err(SshServerError::Config(format!(
+            "inner.max_session_idle_secs ({}) must be >= login_grace_secs ({})",
+            config.inner.max_session_idle_secs, config.login_grace_secs
+        )));
+    }
+    // Inner-leg bounds must be fail-closed: non-zero timeouts (0 would make the
+    // node dial/handshake unbounded), a channel window ≥ the packet size, and at
+    // least one channel allowed.
+    let inner = &config.inner;
+    if inner.connect_timeout_secs == 0 || inner.handshake_timeout_secs == 0 {
+        return Err(SshServerError::Config(
+            "inner.connect_timeout_secs and inner.handshake_timeout_secs must be > 0".to_string(),
+        ));
+    }
+    if inner.max_packet_bytes == 0 || inner.window_bytes < inner.max_packet_bytes {
+        return Err(SshServerError::Config(format!(
+            "inner.window_bytes ({}) must be >= inner.max_packet_bytes ({} > 0)",
+            inner.window_bytes, inner.max_packet_bytes
+        )));
+    }
+    if inner.max_channels_per_connection == 0 {
+        return Err(SshServerError::Config(
+            "inner.max_channels_per_connection must be >= 1".to_string(),
+        ));
     }
     Ok(())
 }

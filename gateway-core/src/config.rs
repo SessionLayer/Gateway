@@ -106,6 +106,50 @@ pub struct SshServerConfig {
     /// Per-RPC deadline (seconds) on every OuterLegAuth/Authorize call
     /// (fail-closed): a hung CP never hangs the SSH handshake.
     pub cp_rpc_timeout_secs: u64,
+    /// Inner leg (Session Eight): the agentless dial + SSH-client-to-node bounds.
+    pub inner: InnerLegServerConfig,
+}
+
+/// Inner-leg (node-facing) bounds — the agentless dial, the inner SSH handshake,
+/// flow-control sizing, and the Tier-0 post-auth idle bound (Session Eight,
+/// Design §9). All fail-closed; misconfiguration is rejected (`deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InnerLegServerConfig {
+    /// Bound (seconds) on the agentless TCP dial to `node:22`. An unreachable
+    /// node fails closed as "node offline" (§7.1 post-authz).
+    pub connect_timeout_secs: u64,
+    /// Bound (seconds), applied per step, on the inner SSH transport handshake,
+    /// **userauth** (cert auth), and **channel-open + replay** to the node — each
+    /// node round-trip after the dial. Fail-closed: a node that stalls at any step
+    /// aborts to "node offline" rather than parking on the idle timer.
+    pub handshake_timeout_secs: u64,
+    /// Inner-channel initial window (bytes) — flow control / bridge backpressure.
+    pub window_bytes: u32,
+    /// Inner-channel maximum packet size (bytes).
+    pub max_packet_bytes: u32,
+    /// Tier-0 idle bound (seconds) on a live bridged session (russh
+    /// `inactivity_timeout`, both legs). Must be ≥ [`SshServerConfig::login_grace_secs`]
+    /// so the pre-auth deadline (a separate watchdog) governs the unauthenticated
+    /// window and this governs the authenticated one.
+    pub max_session_idle_secs: u64,
+    /// Tier-0 cap on the number of session channels one connection may open
+    /// (bounds pump tasks + node channels + flow-control buffers). A local
+    /// resource bound, distinct from the S10 concurrent-session policy limit.
+    pub max_channels_per_connection: usize,
+}
+
+impl Default for InnerLegServerConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: 5,
+            handshake_timeout_secs: 10,
+            window_bytes: 2 * 1024 * 1024,
+            max_packet_bytes: 32 * 1024,
+            max_session_idle_secs: 900,
+            max_channels_per_connection: 16,
+        }
+    }
 }
 
 impl Default for SshServerConfig {
@@ -124,6 +168,7 @@ impl Default for SshServerConfig {
             device_flow: DeviceFlowConfig::default(),
             cp_connect_timeout_secs: 5,
             cp_rpc_timeout_secs: 10,
+            inner: InnerLegServerConfig::default(),
         }
     }
 }

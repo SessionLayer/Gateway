@@ -48,6 +48,35 @@ pub enum SigningError {
     /// The CP returned a malformed response (empty certificate).
     #[error("Control Plane returned an empty certificate")]
     EmptyCertificate,
+
+    /// The mTLS channel to the CP could not be established for the signing call
+    /// (CP down) — fail closed as "service temporarily unavailable" (§7.1), not
+    /// as a node fault.
+    #[error("Control Plane unreachable for SignSessionCertificate")]
+    Unavailable,
+}
+
+impl SigningError {
+    /// Whether the failure is a CP-down condition (→ service-unavailable), as
+    /// opposed to a node/token/material fault (→ generic node/policy outcome).
+    /// Mirrors `CpError::is_cp_down` — a transport/timeout/server-side gRPC fault
+    /// is CP-down; a token-rejection code (`UNAUTHENTICATED`/`PERMISSION_DENIED`/
+    /// `INVALID_ARGUMENT`, i.e. a bad/expired/replayed session token) is NOT
+    /// (F-signclass-1).
+    pub fn is_cp_down(&self) -> bool {
+        match self {
+            SigningError::Unavailable | SigningError::Timeout(_) => true,
+            SigningError::Rpc(s) => matches!(
+                s.code(),
+                tonic::Code::Unavailable
+                    | tonic::Code::Internal
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::Unknown
+                    | tonic::Code::DataLoss
+            ),
+            _ => false,
+        }
+    }
 }
 
 /// A locally-generated inner-leg keypair. The private half never leaves the
@@ -244,5 +273,18 @@ mod tests {
             b.public_key_openssh_wire(),
             "each session gets a fresh inner keypair"
         );
+    }
+
+    #[test]
+    fn cp_down_classifies_signing_faults_by_code() {
+        // Server-side CP faults → CP-down (service-unavailable); a token rejection
+        // stays a node/policy fault (NodeUnreachable) — F-signclass-1.
+        assert!(SigningError::Unavailable.is_cp_down());
+        assert!(SigningError::Timeout(Duration::from_secs(1)).is_cp_down());
+        assert!(SigningError::Rpc(tonic::Status::internal("x")).is_cp_down());
+        assert!(SigningError::Rpc(tonic::Status::unavailable("x")).is_cp_down());
+        assert!(!SigningError::Rpc(tonic::Status::permission_denied("token")).is_cp_down());
+        assert!(!SigningError::Rpc(tonic::Status::unauthenticated("token")).is_cp_down());
+        assert!(!SigningError::EmptyCertificate.is_cp_down());
     }
 }

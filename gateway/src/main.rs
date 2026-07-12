@@ -309,8 +309,13 @@ async fn start_outer_leg(
     let ssh_cfg = Arc::new(cfg.ssh.clone());
     let deps = ssh::handler::HandlerDeps {
         cpauth,
-        connector: Arc::new(ssh::connector::PendingInnerLeg),
+        connector: Arc::new(ssh::connector::AgentlessDial::new(Duration::from_secs(
+            ssh_cfg.inner.connect_timeout_secs,
+        ))),
         resolver: Arc::new(ssh::target::IdentityResolver),
+        // Session Eight ships the null recorder; Session Nine attaches the real
+        // asciicast/WORM recorder at this seam.
+        recorder: Arc::new(ssh::bridge::NullRecorder),
         config: ssh_cfg.clone(),
     };
 

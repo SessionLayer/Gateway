@@ -15,7 +15,8 @@
 //! | Authorized-but-denied (RBAC/lock/no-match) | "access denied by policy" | channel |
 //! | Device-flow timeout | "authentication timed out, please reconnect" | keyboard-interactive |
 //! | CP unreachable | "service temporarily unavailable" (fail closed) | channel |
-//! | Authorized (→ inner leg, S8) | "inner leg pending" (clean) | channel |
+//! | Node unreachable / host-verify failed (post-authz) | "the target node is offline or unavailable" | channel |
+//! | Authorized | (no message — the channel is bridged to the node) | — |
 
 /// Generic authorization denial — a Lock, an RBAC deny, a no-match, a malformed
 /// or unknown target, or the credential-principal reducer all collapse to this
@@ -28,12 +29,12 @@ pub const DEVICE_FLOW_TIMEOUT: &str = "authentication timed out, please reconnec
 /// The CP could not be reached / return a decision — fail closed (NFR-2).
 pub const SERVICE_UNAVAILABLE: &str = "service temporarily unavailable";
 
-/// Authenticated + authorized: the outer leg obtained the decision + session
-/// token and handed to the [`NodeConnector`](super::connector::NodeConnector)
-/// seam, whose Session Seven stub reports the inner leg is not built yet.
-pub const INNER_LEG_PENDING: &str =
-    "inner leg pending (Session Eight): authentication and authorization succeeded; \
-     the node connection is not yet implemented";
+/// Post-authorization node-side failure: the node could not be dialed, its host
+/// identity could not be verified (no TOFU), the inner cert could not be minted
+/// for a node reason, or the inner handshake failed. One message for all so a
+/// **host-verification failure is not distinguishable** from an offline node (the
+/// specific reason is in the operator log only — Part C).
+pub const NODE_UNREACHABLE: &str = "the target node is offline or unavailable";
 
 /// A §7.1 outcome. Values that reach an SSH channel carry a user message + exit
 /// code; the pre-banner / native-auth-failure values carry neither.
@@ -49,8 +50,9 @@ pub enum SshOutcome {
     DeviceFlowTimeout,
     /// The CP was unreachable/errored during the connect-time decision.
     ServiceUnavailable,
-    /// Authorized — handed to the inner-leg seam (Session Eight stub).
-    InnerLegPending,
+    /// Post-authorization node-side failure (dial / host-verify / inner
+    /// handshake). Generic to the user; specific in the operator log.
+    NodeUnreachable,
 }
 
 impl SshOutcome {
@@ -62,22 +64,23 @@ impl SshOutcome {
             SshOutcome::PolicyDenied => Some(ACCESS_DENIED),
             SshOutcome::DeviceFlowTimeout => Some(DEVICE_FLOW_TIMEOUT),
             SshOutcome::ServiceUnavailable => Some(SERVICE_UNAVAILABLE),
-            SshOutcome::InnerLegPending => Some(INNER_LEG_PENDING),
+            SshOutcome::NodeUnreachable => Some(NODE_UNREACHABLE),
         }
     }
 
-    /// The channel exit status for a channel-emitted outcome. Only the
-    /// authorized (inner-leg-pending) path is a clean exit; everything else is a
-    /// non-zero refusal.
+    /// The channel exit status for a channel-emitted refusal. Every channel-level
+    /// outcome here is a non-zero refusal (the authorized happy path bridges the
+    /// channel instead of emitting an outcome).
     pub fn exit_code(&self) -> u32 {
-        match self {
-            SshOutcome::InnerLegPending => 0,
-            _ => 1,
-        }
+        1
     }
 
     /// Whether this outcome is a **pre-authorization** result (must stay
-    /// generic). Used by tests to assert non-disclosure.
+    /// generic — no identity/node/rule existence disclosure). [`NodeUnreachable`]
+    /// is post-authorization (the user is already entitled to know the node
+    /// exists, §7.1) but still carries no host-verification detail.
+    ///
+    /// [`NodeUnreachable`]: SshOutcome::NodeUnreachable
     pub fn is_pre_authorization(&self) -> bool {
         matches!(
             self,
@@ -127,7 +130,7 @@ mod tests {
             ACCESS_DENIED,
             DEVICE_FLOW_TIMEOUT,
             SERVICE_UNAVAILABLE,
-            INNER_LEG_PENDING,
+            NODE_UNREACHABLE,
         ] {
             assert!(
                 m.chars().all(|c| !c.is_control()),
@@ -137,12 +140,34 @@ mod tests {
     }
 
     #[test]
-    fn only_inner_leg_pending_exits_clean() {
-        assert_eq!(SshOutcome::InnerLegPending.exit_code(), 0);
+    fn channel_refusals_exit_nonzero_and_node_unreachable_is_post_authz() {
         assert_eq!(SshOutcome::PolicyDenied.exit_code(), 1);
         assert_eq!(SshOutcome::ServiceUnavailable.exit_code(), 1);
-        assert!(!SshOutcome::InnerLegPending.is_pre_authorization());
+        assert_eq!(SshOutcome::NodeUnreachable.exit_code(), 1);
         assert!(SshOutcome::PolicyDenied.is_pre_authorization());
+        // NodeUnreachable is post-authz (the node is known to exist) but leaks no
+        // host-verification detail (one message for offline vs verify-failed).
+        assert!(!SshOutcome::NodeUnreachable.is_pre_authorization());
+    }
+
+    #[test]
+    fn node_unreachable_message_leaks_no_host_verification_detail() {
+        let m = NODE_UNREACHABLE.to_lowercase();
+        for forbidden in [
+            "host key",
+            "certificate",
+            "cert",
+            "tofu",
+            "pin",
+            "verif",
+            "ca ",
+            "principal",
+        ] {
+            assert!(
+                !m.contains(forbidden),
+                "node-unreachable leaked {forbidden:?}"
+            );
+        }
     }
 
     #[test]
