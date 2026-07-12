@@ -115,6 +115,42 @@ pub struct SshServerConfig {
     /// Per-channel re-evaluation, the actively-pushed lock deny-list, and
     /// mid-session identity-expiry policy (Session Ten, Design §6.3/§8.4).
     pub reeval: ReevalConfig,
+    /// Break-glass access model (Session Thirteen, Design §7, FR-ACC-6/8): the
+    /// always-available, IdP-independent override path (FIDO2 `sk-ecdsa` primary,
+    /// offline codes fallback) and its per-model mid-session-expiry behaviour.
+    pub break_glass: BreakGlassConfig,
+}
+
+/// Break-glass access-model policy (Session Thirteen; Design §7, FR-ACC-6/8). The
+/// break-glass auth is resolved by the CP (FIDO2 key / offline code); this block
+/// only governs whether the Gateway offers the path and how a live break-glass
+/// session behaves at grant expiry. Strict recording is ALWAYS forced for a
+/// break-glass session regardless of these knobs. `deny_unknown_fields` fails
+/// misconfiguration closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BreakGlassConfig {
+    /// Whether this Gateway offers the break-glass auth paths at all. Default
+    /// `true` (break-glass is always-available by design, FR-ACC-6); an operator
+    /// can hard-disable it, in which case a break-glass credential simply does not
+    /// resolve and the connection degrades like any other unresolved credential.
+    pub enabled: bool,
+    /// Mid-session identity-expiry behaviour for a break-glass session (FR-ACC-8),
+    /// selected per access model separately from [`ReevalConfig::mid_session_expiry`]
+    /// (which governs standing/JIT). Defaults to `grace_then_kill`: a break-glass
+    /// session is time-boxed and cut a grace window after its grant expires rather
+    /// than running to the idle timeout. A Lock ALWAYS overrides with immediate
+    /// teardown regardless of this.
+    pub mid_session_expiry: MidSessionExpiryMode,
+}
+
+impl Default for BreakGlassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mid_session_expiry: MidSessionExpiryMode::GraceThenKill,
+        }
+    }
 }
 
 /// Per-channel-open re-evaluation, lock-feed health, and mid-session-expiry policy
@@ -309,6 +345,7 @@ impl Default for SshServerConfig {
             inner: InnerLegServerConfig::default(),
             recorder: RecorderConfig::default(),
             reeval: ReevalConfig::default(),
+            break_glass: BreakGlassConfig::default(),
         }
     }
 }
@@ -533,6 +570,23 @@ mod tests {
         let result: Result<GatewayConfig, _> =
             serde_json::from_str(r#"{"ssh":{"recorder":{"strickt":false}}}"#);
         assert!(result.is_err(), "unknown recorder key must be rejected");
+    }
+
+    #[test]
+    fn break_glass_defaults_enabled_grace_then_kill() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.ssh.break_glass.enabled, "break-glass on by default");
+        assert_eq!(
+            cfg.ssh.break_glass.mid_session_expiry,
+            MidSessionExpiryMode::GraceThenKill
+        );
+    }
+
+    #[test]
+    fn break_glass_unknown_key_fails_closed() {
+        let result: Result<GatewayConfig, _> =
+            serde_json::from_str(r#"{"ssh":{"break_glass":{"enable":false}}}"#);
+        assert!(result.is_err(), "unknown break_glass key must be rejected");
     }
 
     #[test]

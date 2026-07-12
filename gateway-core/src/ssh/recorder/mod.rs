@@ -731,7 +731,9 @@ impl RecorderFactory for RecorderFactoryImpl {
 
             Ok(Arc::new(Recorder {
                 cap: Mutex::new(cap),
-                strict: self.config.strict,
+                // A break-glass session forces strict regardless of config (FR-ACC-6);
+                // `force_strict` can only tighten the configured strict mode.
+                strict: self.config.strict || params.force_strict,
                 teardown: params.teardown,
                 torn: AtomicBool::new(false),
                 abort: params.abort,

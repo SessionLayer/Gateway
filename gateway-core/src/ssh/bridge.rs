@@ -131,6 +131,11 @@ pub struct RecordingParams {
     /// so `should_abort()` returns true and the bridge stops forwarding plaintext
     /// at once — the same immediate-stop discipline as a strict-mode failure.
     pub abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Force strict recording for THIS session regardless of the recorder config's
+    /// `strict` (Session Thirteen, FR-ACC-6): a break-glass session dies if its
+    /// recording fails. OR'd into the built recorder's strict flag; it can only
+    /// tighten, never loosen, the configured strict mode.
+    pub force_strict: bool,
 }
 
 /// A fail-closed recorder setup failure. The user only ever sees the generic

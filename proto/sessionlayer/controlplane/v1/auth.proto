@@ -63,6 +63,33 @@ service OuterLegAuth {
   // heartbeat alive, FR-AUTH-4). An unknown device_code reports EXPIRED (generic,
   // no existence disclosure).
   rpc PollDeviceFlow(PollDeviceFlowRequest) returns (PollDeviceFlowResponse);
+
+  // ResolveBreakglassKey resolves a registered break-glass FIDO2 `sk-ecdsa` PUBLIC
+  // key to its break-glass identity + scoped principals, INDEPENDENT of the primary
+  // OIDC IdP (Design §5.2/§7, FR-ACC-6). The key is public and russh has already
+  // verified the FIDO POSSESSION signature before the Gateway calls this (proving the
+  // hardware authenticator, whose private key never leaves it, is present) — the CP
+  // only maps the key to its registered break-glass credential. NOTE: touch
+  // (user-presence) is enforced by the AUTHENTICATOR for a standard touch-required
+  // sk key; it is NOT asserted server-side (this russh does not expose the sk flags),
+  // so break-glass keys MUST be provisioned touch-required (never `-O no-touch-required`).
+  // On success it mints a single-use `breakglass_token` (in BreakglassResolution)
+  // that authorises exactly one break-glass Authorize. A key that is unknown,
+  // revoked, expired, or out-of-source resolves to `resolved = false` with no token
+  // (generic, §7.1). This is the primary break-glass auth path. Added in Session 13.
+  rpc ResolveBreakglassKey(ResolveBreakglassKeyRequest) returns (ResolveBreakglassKeyResponse);
+
+  // ResolveBreakglassCode validates a pre-issued single-use break-glass OFFLINE CODE
+  // (Design §7, FR-ACC-6) — the IdP-independent FALLBACK when no FIDO2 authenticator
+  // is available. The code is looked up by its SHA-256 hash (the raw code is never
+  // stored nor compared in the clear) and consumed by an atomic single-use UPDATE;
+  // it is source-bound and the identity comes from the code record, never client
+  // input. A ≥128-bit code makes the hash-existence timing side-channel useless. The
+  // `code` field is a SECRET (entered over keyboard-interactive with echo off) —
+  // NEVER log it. On success it mints a single-use `breakglass_token`; a replayed,
+  // expired, wrong-source, or unknown code resolves to `resolved = false` with no
+  // token (generic). Added in Session 13.
+  rpc ResolveBreakglassCode(ResolveBreakglassCodeRequest) returns (ResolveBreakglassCodeResponse);
 }
 
 // ResolvedIdentity is the CP's authentication result: the identity a credential
@@ -196,4 +223,65 @@ enum DeviceFlowStatus {
   DEVICE_FLOW_STATUS_DENIED = 3;
   // The flow expired (timed out) or the device_code is unknown. -> §7.1 timeout.
   DEVICE_FLOW_STATUS_EXPIRED = 4;
+}
+
+// BreakglassResolution is the break-glass authentication result (Design §7,
+// FR-ACC-6): the resolved break-glass identity + scoped principals, plus a single-
+// use token the Gateway presents to Authorize to open exactly one break-glass
+// session. AUTHENTICATION ONLY — the alert, the breakglass_activation record, and the
+// forced-strict/Lock-checked authorization all happen at Authorize (on actual use),
+// symmetric with how the other Resolve* RPCs authenticate without granting access.
+message BreakglassResolution {
+  // The resolved identity. resolved = false is the single generic non-resolution
+  // outcome (§7.1); no token is minted on failure (fail closed).
+  ResolvedIdentity identity = 1;
+
+  // A single-use, short-lived break-glass token bound to {gateway (the authenticated
+  // mTLS caller), identity, node, source_ip, exp}. Presented as
+  // AuthorizeRequest.breakglass_token and consumed atomically at Authorize, which then
+  // creates the breakglass_activation, fires the high-priority alert, forces
+  // access_model = BREAKGLASS + strict recording, and evaluates the break-glass allow
+  // SUBJECT TO the top-tier Lock (a Lock still denies — deny wins). Empty when
+  // resolved = false.
+  string breakglass_token = 2;
+}
+
+// ResolveBreakglassKeyRequest carries the offered break-glass FIDO2 sk-ecdsa key.
+message ResolveBreakglassKeyRequest {
+  // The OpenSSH `sk-ecdsa-sha2-nistp256@openssh.com` PUBLIC key the client offered,
+  // as the raw OpenSSH wire blob (the base64 body of the authorized-keys entry).
+  // PUBLIC material — the CP matches it to a registered break-glass credential.
+  bytes sk_public_key_blob = 1;
+
+  // The client source IP (single address). Deny-only reducer (FR-AUTH-15).
+  string source_ip = 2;
+
+  // The fixed target node id (UUID) this break-glass connection is for. Scopes the
+  // credential (a credential may be node-scoped) and binds the minted token. An empty
+  // value is tolerated for a fleet-scoped break-glass credential.
+  string node_id = 3;
+}
+
+message ResolveBreakglassKeyResponse {
+  BreakglassResolution resolution = 1;
+}
+
+// ResolveBreakglassCodeRequest carries the presented break-glass offline code. The
+// `code` field is a SECRET (keyboard-interactive, echo off) — NEVER log it.
+message ResolveBreakglassCodeRequest {
+  // The one-time break-glass code the user typed. Secret; matched by SHA-256 hash
+  // (never compared in the clear) and consumed single-use. Must never appear in a
+  // log or trace.
+  string code = 1;
+
+  // The client source IP. The code is source-bound (deny-only, FR-AUTH-15).
+  string source_ip = 2;
+
+  // The fixed target node id (UUID) this break-glass connection is for (scope + token
+  // binding). Empty tolerated for a fleet-scoped code.
+  string node_id = 3;
+}
+
+message ResolveBreakglassCodeResponse {
+  BreakglassResolution resolution = 1;
 }

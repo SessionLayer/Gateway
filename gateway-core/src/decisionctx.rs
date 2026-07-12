@@ -245,6 +245,7 @@ mod tests {
             identity: "alice".into(),
             identity_groups: vec!["admins".into()],
             node_labels: vec!["env=prod".into()],
+            access_model: crate::pb::AccessModel::Standing as i32,
         }
     }
 

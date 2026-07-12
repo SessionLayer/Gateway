@@ -58,6 +58,19 @@ enum Decision {
   DECISION_DENY = 2;
 }
 
+// AccessModel is which access model produced an ALLOW decision (Design §7, D15). It is
+// SIGNED into the decision context so the Gateway can, against trusted data: select the
+// per-model mid-session-expiry behaviour (FR-ACC-8 / D17) and FORCE strict recording for
+// break-glass (belt-and-suspenders with the Gateway's own local break-glass flag). A
+// standing grant and a JIT-elevated grant both flow through the same evaluator; break-
+// glass is the distinct always-available override path. Added in Session 13.
+enum AccessModel {
+  ACCESS_MODEL_UNSPECIFIED = 0;
+  ACCESS_MODEL_STANDING = 1;
+  ACCESS_MODEL_JIT = 2;
+  ACCESS_MODEL_BREAKGLASS = 3;
+}
+
 // AuthorizeRequest is the resolved connect-time decision input. Identity
 // resolution (OIDC/OTP/pins) is upstream (S6); here the identity is already
 // resolved. Source IP is a DENY-ONLY reducer (FR-AUTH-15) — never positive
@@ -91,6 +104,18 @@ message AuthorizeRequest {
   // The calling Gateway's identity/version, for diagnostics. Carries NO secrets;
   // the AUTHENTICATED caller is the mTLS client cert, not this field.
   ComponentInfo client = 7;
+
+  // Present ONLY when this connect authenticated via the break-glass path (Design §7,
+  // FR-ACC-6): the single-use token minted by OuterLegAuth.ResolveBreakglassKey/Code.
+  // When set, the CP consumes it atomically (replay rejected), creates the
+  // breakglass_activation and fires the high-priority alert (ON USE, before the
+  // allow/deny is decided), forces access_model = BREAKGLASS + strict recording, and
+  // evaluates the break-glass allow (a distinct always-available path that bypasses the
+  // standing dp_rule deny) SUBJECT TO the top-tier Lock — a matching Lock still denies
+  // (deny wins; a locked target refuses break-glass). Empty for a standing/JIT connect.
+  // JIT needs NO request field: the CP resolves an ACTIVE jit_request grant for
+  // {identity, node} server-side. Added in Session 13 (additive; protocol stays 1.1).
+  string breakglass_token = 8;
 }
 
 // AuthorizeResponse carries the generic decision and, on ALLOW, the signed
@@ -260,4 +285,11 @@ message DecisionContext {
   // locks. Signed so the Gateway matches label locks locally without a CP call.
   // Added in Session Ten.
   repeated string node_labels = 15;
+
+  // Which access model produced this decision (standing / JIT / break-glass). SIGNED so
+  // the Gateway, against trusted data, selects the per-model mid-session-expiry
+  // behaviour (FR-ACC-8) and forces strict recording for break-glass. Added in Session
+  // 13 (additive; protocol stays 1.1). Absent/UNSPECIFIED is treated as STANDING by an
+  // older Gateway (N-1), which is the safe default.
+  AccessModel access_model = 16;
 }

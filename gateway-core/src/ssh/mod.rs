@@ -276,6 +276,16 @@ pub async fn bind(
 /// Validate the SSH configuration, failing closed on inconsistent timing that
 /// would busy-loop or let the device flow outlast the pre-auth deadline.
 fn validate_config(config: &SshServerConfig) -> Result<(), SshServerError> {
+    // A break-glass session MUST be time-boxed (G2 / FR-ACC-8, Design §7): under
+    // RunToTtl an already-open break-glass channel would outlive grant_expiry (only
+    // NEW channels are refused after expiry), and break-glass no longer re-authorizes.
+    // Reject it at startup; a Lock remains the backstop, but the grant window must
+    // bound the always-available override.
+    if config.break_glass.mid_session_expiry == crate::config::MidSessionExpiryMode::RunToTtl {
+        return Err(SshServerError::Config(
+            "break_glass.mid_session_expiry must be grace_then_kill or hard_kill (never run_to_ttl): a break-glass session must be time-boxed".to_string(),
+        ));
+    }
     let df = &config.device_flow;
     if df.heartbeat_interval_secs == 0 {
         return Err(SshServerError::Config(
@@ -415,6 +425,37 @@ mod tests {
             validate_config(&bad),
             Err(SshServerError::Config(_))
         ));
+    }
+
+    /// G2: a break-glass session must be time-boxed → RunToTtl is rejected at startup;
+    /// grace_then_kill and hard_kill are accepted.
+    #[test]
+    fn break_glass_run_to_ttl_is_rejected() {
+        use crate::config::{BreakGlassConfig, MidSessionExpiryMode};
+        let run_to_ttl = SshServerConfig {
+            break_glass: BreakGlassConfig {
+                enabled: true,
+                mid_session_expiry: MidSessionExpiryMode::RunToTtl,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_config(&run_to_ttl),
+            Err(SshServerError::Config(_))
+        ));
+        for mode in [
+            MidSessionExpiryMode::GraceThenKill,
+            MidSessionExpiryMode::HardKill,
+        ] {
+            let ok = SshServerConfig {
+                break_glass: BreakGlassConfig {
+                    enabled: true,
+                    mid_session_expiry: mode,
+                },
+                ..Default::default()
+            };
+            assert!(validate_config(&ok).is_ok(), "{mode:?} must be accepted");
+        }
     }
 
     #[test]
