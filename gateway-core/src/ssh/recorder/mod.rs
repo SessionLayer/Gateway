@@ -319,6 +319,8 @@ enum Produced {
 }
 
 /// The per-session recorder handed to the SSH handler and (upcast) to the bridge.
+/// The WORM upload credential is NOT held here — it is fetched at session end via
+/// `RequestUpload` so its TTL covers only the PUT (§12.2; no session-long creds).
 pub struct Recorder {
     cap: Mutex<Capture<ChannelId>>,
     strict: bool,
@@ -326,8 +328,6 @@ pub struct Recorder {
     torn: AtomicBool,
     session_id: String,
     recording_id: String,
-    upload_url: String,
-    upload_headers: BTreeMap<String, String>,
     cpauth: Arc<CpAuthClient>,
     uploader: Arc<HttpUploader>,
 }
@@ -444,14 +444,33 @@ impl SessionRecorder for Recorder {
                 cap.finalize_object()
             };
 
-            // Upload the (possibly partial but hash-chained) ciphertext object, then
+            // Obtain a FRESH short-lived upload credential now (at session end),
+            // then PUT the (possibly partial but hash-chained) ciphertext object and
             // commit the integrity metadata + audit. Bytes never traverse the CP.
+            // Issuing the credential here (not at BeginRecording) keeps its TTL to
+            // the PUT — a session-long begin-time credential would expire before a
+            // long session's end-of-session upload (§12.2; no long-lived creds).
             let upload_ok = match &prepared.object {
-                Ok(bytes) => self
-                    .uploader
-                    .put(&self.upload_url, &self.upload_headers, bytes.clone())
-                    .await
-                    .is_ok(),
+                Ok(bytes) => match self.cpauth.request_upload(&self.recording_id).await {
+                    Ok(resp) => match resp.upload {
+                        Some(cred) => {
+                            let headers: BTreeMap<String, String> =
+                                cred.required_headers.into_iter().collect();
+                            self.uploader
+                                .put(&cred.url, &headers, bytes.clone())
+                                .await
+                                .is_ok()
+                        }
+                        None => {
+                            tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, "RequestUpload returned no credential; recording not uploaded");
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, error = %e, "RequestUpload failed; recording not uploaded");
+                        false
+                    }
+                },
                 Err(_) => false,
             };
             let status = match (prepared.capture_failed, upload_ok) {
@@ -545,7 +564,8 @@ impl RecorderFactory for RecorderFactoryImpl {
             let sealer = RecordingCipher::seal_to_customer(algorithm, &customer_key.public_key)
                 .map_err(|_| RecorderError::Setup)?;
 
-            let upload = resp.upload.ok_or(RecorderError::Setup)?;
+            // The WORM upload credential is NOT issued here — it is fetched at
+            // session end via RequestUpload (short-lived, covers only the PUT).
             let cap = Capture::new(sealer, &self.config).map_err(|_| RecorderError::Setup)?;
 
             Ok(Arc::new(Recorder {
@@ -555,8 +575,6 @@ impl RecorderFactory for RecorderFactoryImpl {
                 torn: AtomicBool::new(false),
                 session_id: params.session_id,
                 recording_id: resp.recording_id,
-                upload_url: upload.url,
-                upload_headers: upload.required_headers.into_iter().collect(),
                 cpauth: self.cpauth.clone(),
                 uploader: self.uploader.clone(),
             }) as Arc<dyn SessionRecorder>)
@@ -882,8 +900,6 @@ mod tests {
             torn: AtomicBool::new(false),
             session_id: "s".into(),
             recording_id: "r".into(),
-            upload_url: String::new(),
-            upload_headers: BTreeMap::new(),
             cpauth: Arc::new(crate::cpauth::CpAuthClient::new(
                 Arc::new(crate::cpauth::CpChannelFactory::fixed(
                     crate::mtls::ChannelParams {

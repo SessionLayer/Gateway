@@ -38,10 +38,11 @@ use gateway_core::pb::{
     CustomerKey, Decision, DecisionContext, DeviceFlowStatus, EnrollGatewayRequest,
     EnrollGatewayResponse, FinalizeRecordingRequest, FinalizeRecordingResponse, HostVerification,
     KeySealAlgorithm, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
-    ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse, ResolveOtpRequest,
-    ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest,
-    ResolveUserCertResponse, ResolvedIdentity, ServerHello, SignSessionCertificateRequest,
-    SignSessionCertificateResponse, UploadCredential, WormMode,
+    ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse,
+    RequestUploadRequest, RequestUploadResponse, ResolveOtpRequest, ResolveOtpResponse,
+    ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse,
+    ResolvedIdentity, ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse,
+    UploadCredential, WormMode,
 };
 use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
 use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
@@ -262,6 +263,13 @@ struct MockState {
     recordings: Mutex<HashMap<String, (String, String)>>,
     /// FinalizeRecording payloads, keyed by recording_id (test assertions).
     finalized: Mutex<HashMap<String, FinalizeRecordingRequest>>,
+    /// TTL (seconds) baked into each RequestUpload presigned PUT. Short values let
+    /// a test prove the credential is issued at UPLOAD time (a long session would
+    /// have expired a begin-time credential).
+    upload_ttl_secs: Mutex<u64>,
+    /// recording_ids RequestUpload was called for (test assertions: the credential
+    /// is fetched at session end, not at BeginRecording).
+    request_uploads: Mutex<Vec<String>>,
 }
 
 impl MockState {
@@ -889,9 +897,36 @@ impl Recording for MockSvc {
             .unwrap()
             .insert(recording_id.clone(), (gid, object_key.clone()));
 
-        // Presign a single-object PUT under COMPLIANCE object-lock, if an S3 target
-        // is configured (the MinIO container). The object-lock headers are SIGNED,
-        // so the uploader cannot strip the WORM lock.
+        // BeginRecording does NOT return an upload credential — that is issued
+        // short-lived at upload time via RequestUpload (§12.2).
+        Ok(Response::new(BeginRecordingResponse {
+            recording_id,
+            object_key,
+            worm_mode: WormMode::Compliance as i32,
+            customer_key,
+        }))
+    }
+
+    async fn request_upload(
+        &self,
+        request: Request<RequestUploadRequest>,
+    ) -> Result<Response<RequestUploadResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        // Ownership check + resolve the object key registered at BeginRecording.
+        let object_key = {
+            let recs = self.recordings.lock().unwrap();
+            match recs.get(&r.recording_id) {
+                Some((owner, key)) if *owner == gid => key.clone(),
+                _ => return Err(Status::permission_denied("access denied by policy")),
+            }
+        };
+        self.request_uploads.lock().unwrap().push(r.recording_id);
+
+        // Presign a FRESH single-object PUT under COMPLIANCE object-lock (the
+        // object-lock headers are SIGNED, so the uploader cannot strip the WORM
+        // lock). The TTL covers only the PUT.
+        let ttl = *self.upload_ttl_secs.lock().unwrap();
         let upload = self.s3.lock().unwrap().as_ref().map(|s3| {
             let retain = sigv4::retain_until_days(1);
             let path = format!("/{}/{}", s3.bucket, object_key);
@@ -904,23 +939,16 @@ impl Recording for MockSvc {
                     ("x-amz-object-lock-mode", "COMPLIANCE"),
                     ("x-amz-object-lock-retain-until-date", &retain),
                 ],
-                900,
+                ttl,
             );
             UploadCredential {
                 url,
                 method: "PUT".to_string(),
                 required_headers: headers.into_iter().collect(),
-                expires_at_epoch_seconds: (unix_now() + 900) as i64,
+                expires_at_epoch_seconds: (unix_now() + ttl) as i64,
             }
         });
-
-        Ok(Response::new(BeginRecordingResponse {
-            recording_id,
-            object_key,
-            worm_mode: WormMode::Compliance as i32,
-            customer_key,
-            upload,
-        }))
+        Ok(Response::new(RequestUploadResponse { upload }))
     }
 
     async fn finalize_recording(
@@ -1104,6 +1132,8 @@ impl MockCpBuilder {
             s3: Mutex::new(None),
             recordings: Mutex::new(HashMap::new()),
             finalized: Mutex::new(HashMap::new()),
+            upload_ttl_secs: Mutex::new(900),
+            request_uploads: Mutex::new(Vec::new()),
         });
 
         let tls = ServerTlsConfig::new()
@@ -1474,6 +1504,19 @@ impl MockCp {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Set the TTL (seconds) baked into each RequestUpload presigned PUT. A short
+    /// value proves the credential is issued at upload time (a long session would
+    /// have expired a begin-time credential).
+    pub fn set_upload_ttl_secs(&self, ttl: u64) {
+        *self.state.upload_ttl_secs.lock().unwrap() = ttl;
+    }
+
+    /// How many times RequestUpload has been called (the credential is fetched at
+    /// session end, not at BeginRecording).
+    pub fn request_upload_count(&self) -> usize {
+        self.state.request_uploads.lock().unwrap().len()
     }
 
     /// Sign an OpenSSH user certificate with the user-facing CA (for the

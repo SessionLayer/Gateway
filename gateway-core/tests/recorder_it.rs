@@ -358,7 +358,8 @@ async fn terminal_session_is_recorded_encrypted_and_worm_locked() -> anyhow::Res
     assert_eq!(code, Some(0), "session must run; stderr={stderr}");
     assert!(stdout.contains("IT_WORKS_RECORDED"));
 
-    // The recording finalizes off the connection teardown (upload → FinalizeRecording).
+    // The recording finalizes off the connection teardown (RequestUpload → PUT →
+    // FinalizeRecording).
     let fin = await_finalized(&cp).await;
     assert_eq!(fin.status, RecordingStatus::Finalized as i32);
     assert!(
@@ -366,6 +367,12 @@ async fn terminal_session_is_recorded_encrypted_and_worm_locked() -> anyhow::Res
         "hash-chain head committed"
     );
     assert!(fin.byte_len > 0);
+    // The upload credential was fetched at SESSION END via RequestUpload (not at
+    // BeginRecording) — the short-lived-credential model.
+    assert!(
+        cp.request_upload_count() >= 1,
+        "the WORM credential is issued at upload time via RequestUpload"
+    );
 
     // The encrypted object landed in the WORM bucket.
     let object_keys = cp.recorded_object_keys();
@@ -591,6 +598,63 @@ async fn strict_mode_refuses_when_spool_is_unwritable() -> anyhow::Result<()> {
         stderr.contains("recording unavailable"),
         "strict recording failure → refused; stderr={stderr}"
     );
+
+    drop(node);
+    drop(minio);
+    Ok(())
+}
+
+// ── The WORM credential is issued at UPLOAD time: a session longer than the
+//    credential TTL still uploads (a begin-time credential would have expired) ──
+
+#[tokio::test]
+async fn long_session_uploads_with_upload_time_credential() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let (minio, s3) = start_minio().await?;
+    cp.set_s3_target(s3.clone());
+    let (cust_pub_der, _s) = customer_keypair();
+    cp.set_customer_key(
+        "ck",
+        cust_pub_der,
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+    // A SHORT upload-credential TTL, shorter than the session below. A begin-time
+    // credential would expire before the end-of-session PUT; an upload-time one
+    // (RequestUpload at session end) does not.
+    cp.set_upload_ttl_secs(5);
+
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    grant(&cp, &pin);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
+    let client = client_container(&pin).await;
+
+    // A session that lasts well past the 5s credential TTL.
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(gw_port, &[], "deploy%node-e2e", "sleep 12; echo LONG_DONE"),
+    )
+    .await;
+    assert_eq!(code, Some(0), "long session must run; stderr={stderr}");
+    assert!(stdout.contains("LONG_DONE"));
+
+    // The recording still uploaded + finalized: the credential was minted fresh at
+    // session end (RequestUpload), ~12s AFTER BeginRecording — a begin-time 5s
+    // credential would have been expired for the PUT.
+    let fin = await_finalized(&cp).await;
+    assert_eq!(
+        fin.status,
+        RecordingStatus::Finalized as i32,
+        "a session longer than the credential TTL still uploads (upload-time cred)"
+    );
+    assert!(cp.request_upload_count() >= 1);
+    let keys = cp.recorded_object_keys();
+    let (status, _obj) = get_object(&s3, &keys[0]).await?;
+    assert_eq!(status, 200, "the object landed in the WORM bucket");
 
     drop(node);
     drop(minio);

@@ -22,14 +22,27 @@ option java_outer_classname = "RecordingProto";
 // exp}) — the sole per-request authority, so a Gateway can never register a
 // recording for a session it does not broker. FinalizeRecording is authorized by
 // the mTLS caller owning the recording_id it created.
+// Lifecycle: BeginRecording (at session start — the Gateway needs the customer
+// key to encrypt from the first byte) → RequestUpload (at session end, just
+// before the PUT — so the single-object upload credential is issued SHORT-LIVED
+// at upload time, never a session-long credential) → the Gateway PUTs the
+// ciphertext directly to the WORM store → FinalizeRecording.
 service Recording {
   // BeginRecording registers the recording for a session (fail-closed): it mints
-  // the recording_ref, chooses the WORM mode + retention, returns the customer
-  // public key to seal the data key to, and issues a short-lived, single-object
-  // upload credential. The recording_token is atomically consumed (replay
-  // rejected). If the operator configured no customer key (keystroke capture is
-  // always on, so encryption is mandatory, FR-AUD-2) this fails closed.
+  // the recording_ref, chooses the WORM mode + retention, and returns the object
+  // key + the customer public key to seal the data key to. The recording_token is
+  // atomically consumed (replay rejected). If the operator configured no customer
+  // key (keystroke capture is always on, so encryption is mandatory, FR-AUD-2)
+  // this fails closed. It does NOT return an upload credential — that is issued
+  // later by RequestUpload so the credential's lifetime is not the session's.
   rpc BeginRecording(BeginRecordingRequest) returns (BeginRecordingResponse);
+
+  // RequestUpload issues the short-lived, single-object WORM upload credential for
+  // a registered recording, at the moment the Gateway is ready to PUT (session
+  // end). Authorized by the mTLS caller owning the recording. Called once per
+  // recording just before the direct upload, so the credential's TTL need only
+  // cover the PUT — not the whole session (§12.2; no long-lived upload creds).
+  rpc RequestUpload(RequestUploadRequest) returns (RequestUploadResponse);
 
   // FinalizeRecording commits the recording's tamper-evidence + integrity
   // metadata (hash-chain head, content digest, byte length, status) and the
@@ -105,9 +118,22 @@ message BeginRecordingResponse {
   // return a session that would store keystrokes in the clear.
   CustomerKey customer_key = 4;
 
+  // Field 5 was the begin-time upload credential; it moved to RequestUpload so the
+  // credential is short-lived (issued at upload time, not session-long).
+  reserved 5;
+  reserved "upload";
+}
+
+message RequestUploadRequest {
+  // The recording id returned by BeginRecording (ownership-checked against the
+  // mTLS caller).
+  string recording_id = 1;
+}
+
+message RequestUploadResponse {
   // Short-lived, single-object upload authority (a signed PUT URL). The Gateway
   // PUTs the ciphertext straight to the WORM store; bytes never traverse the CP.
-  UploadCredential upload = 5;
+  UploadCredential upload = 1;
 }
 
 // CustomerKey is the operator-configured customer public key material. Public

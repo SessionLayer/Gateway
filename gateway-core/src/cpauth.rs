@@ -25,8 +25,9 @@ use crate::pb::recording_client::RecordingClient;
 use crate::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
     BeginRecordingRequest, BeginRecordingResponse, FinalizeRecordingRequest,
-    FinalizeRecordingResponse, PollDeviceFlowRequest, PollDeviceFlowResponse, ResolveOtpRequest,
-    ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity,
+    FinalizeRecordingResponse, PollDeviceFlowRequest, PollDeviceFlowResponse, RequestUploadRequest,
+    RequestUploadResponse, ResolveOtpRequest, ResolvePinRequest, ResolveUserCertRequest,
+    ResolvedIdentity,
 };
 
 /// A failure calling the CP. Fail-closed at every variant.
@@ -323,6 +324,22 @@ impl CpAuthClient {
     ) -> Result<BeginRecordingResponse, CpError> {
         self.call(move |ch| async move { RecordingClient::new(ch).begin_recording(req).await })
             .await
+    }
+
+    /// Obtain the short-lived, single-object WORM upload credential for
+    /// `recording_id` at UPLOAD time (Session Nine, §12.2): issued just before the
+    /// direct PUT so its TTL need only cover the PUT, never the whole session (no
+    /// long-lived upload creds). Fail-closed; the cached channel is dropped on error.
+    pub async fn request_upload(
+        &self,
+        recording_id: &str,
+    ) -> Result<RequestUploadResponse, CpError> {
+        let recording_id = recording_id.to_string();
+        self.call(move |ch| {
+            let req = RequestUploadRequest { recording_id };
+            async move { RecordingClient::new(ch).request_upload(req).await }
+        })
+        .await
     }
 
     /// Commit a recording's tamper-evidence + integrity metadata (hash-chain head,
