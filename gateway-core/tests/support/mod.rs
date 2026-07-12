@@ -29,30 +29,41 @@ use gateway_core::identity;
 use gateway_core::pb::authorization_server::{Authorization, AuthorizationServer};
 use gateway_core::pb::gateway_identity_server::{GatewayIdentity, GatewayIdentityServer};
 use gateway_core::pb::handshake_server::{Handshake, HandshakeServer};
+use gateway_core::pb::lock_feed_server::{LockFeed, LockFeedServer};
 use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
 use gateway_core::pb::recording_server::{Recording, RecordingServer};
 use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningServer};
 use gateway_core::pb::{
-    AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
-    BeginRecordingRequest, BeginRecordingResponse, Capability, ClientHello, ComponentInfo,
-    CustomerKey, Decision, DecisionContext, DeviceFlowStatus, EnrollGatewayRequest,
-    EnrollGatewayResponse, FinalizeRecordingRequest, FinalizeRecordingResponse, HostVerification,
-    KeySealAlgorithm, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
+    lock_event, AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest,
+    BeginDeviceFlowResponse, BeginRecordingRequest, BeginRecordingResponse, Capability,
+    ClientHello, ComponentInfo, CustomerKey, Decision, DecisionContext, DeviceFlowStatus,
+    EnrollGatewayRequest, EnrollGatewayResponse, FinalizeRecordingRequest,
+    FinalizeRecordingResponse, Heartbeat, HostVerification, KeySealAlgorithm, Lock, LockEvent,
+    LockRemoval, LockSnapshot, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
     ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse,
     RequestUploadRequest, RequestUploadResponse, ResolveOtpRequest, ResolveOtpResponse,
     ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse,
     ResolvedIdentity, ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse,
-    UploadCredential, WormMode,
+    StreamLocksRequest, UploadCredential, WormMode,
 };
 use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
 use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
 use gateway_core::ssh::handler::HandlerDeps;
+use gateway_core::ssh::lockfeed::LockFeedClientTask;
+use gateway_core::ssh::locks::{LiveSessionRegistry, LockSet};
 use gateway_core::ssh::target::IdentityResolver;
-use gateway_core::{mtls, version};
+use gateway_core::{decisionctx, mtls, version};
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::SigningKey;
+use p256::pkcs8::DecodePrivateKey;
 use sigv4::S3Target;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
@@ -119,6 +130,32 @@ impl TestCa {
         params.not_before = nb;
         params.not_after = na;
         params.extended_key_usages = ekus;
+        let cert = params.signed_by(&key, &self.issuer()).unwrap();
+        IssuedLeaf {
+            cert_der: cert.der().to_vec(),
+            key_pem: key.serialize_pem(),
+            key_pkcs8_der: key.serialize_der(),
+        }
+    }
+
+    /// Issue a CONTEXT_SIGNER leaf (URI SAN marker + codeSigning EKU) that the S10
+    /// decision-context verifier accepts. Mirrors the CP `DecisionContextSigner`.
+    pub fn issue_context_signer(
+        &self,
+        nb: time::OffsetDateTime,
+        na: time::OffsetDateTime,
+    ) -> IssuedLeaf {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.not_before = nb;
+        params.not_after = na;
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "decision-context-signer");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::CodeSigning];
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(decisionctx::SIGNER_URI).unwrap(),
+        )];
         let cert = params.signed_by(&key, &self.issuer()).unwrap();
         IssuedLeaf {
             cert_der: cert.der().to_vec(),
@@ -270,6 +307,24 @@ struct MockState {
     /// recording_ids RequestUpload was called for (test assertions: the credential
     /// is fetched at session end, not at BeginRecording).
     request_uploads: Mutex<Vec<String>>,
+
+    // ---- Session Ten: decision-context signing + the lock push feed ----------
+    /// The CONTEXT_SIGNER leaf (DER) chained to `ca` — returned as
+    /// `signer_certificate` so the Gateway verifier accepts the signed context.
+    context_signer_der: Vec<u8>,
+    /// The ECDSA-P256 signing key for the decision context (matches the leaf).
+    context_signer_key: SigningKey,
+    /// Per-node inventory labels ("key=value"), signed into the decision context
+    /// so node-label locks can be exercised.
+    node_labels: Mutex<HashMap<String, Vec<String>>>,
+    /// The current lock set (pushed to every `StreamLocks` subscriber as the
+    /// snapshot). Tests mutate it via [`MockCp::add_lock`]/[`MockCp::remove_lock`].
+    locks: Mutex<Vec<Lock>>,
+    /// Broadcast of incremental lock add/remove events to live `StreamLocks`
+    /// subscribers (the fan-out hub).
+    lock_events: tokio::sync::broadcast::Sender<LockEvent>,
+    /// The lock-feed epoch (monotonic per mock CP).
+    feed_epoch: AtomicU64,
 }
 
 impl MockState {
@@ -321,6 +376,23 @@ impl MockState {
             valid_after_epoch_seconds: valid_after as i64,
             valid_before_epoch_seconds: valid_before as i64,
         })
+    }
+
+    /// Sign a decision context exactly as the CP does: the ECDSA-P256/SHA-256
+    /// signature over `DOMAIN_PREFIX || canonical(context)`, returning
+    /// `(signed_context, signature, signer_cert_der, signer_ca_chain)`.
+    fn sign_context(&self, context: &DecisionContext) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<u8>>) {
+        let signed = decisionctx::canonical_bytes(context);
+        let mut msg = decisionctx::DOMAIN_PREFIX.to_vec();
+        msg.extend_from_slice(&signed);
+        let sig: p256::ecdsa::Signature = self.context_signer_key.sign(&msg);
+        let sig_der = sig.to_der().as_bytes().to_vec();
+        (
+            signed,
+            sig_der,
+            self.context_signer_der.clone(),
+            vec![self.ca.cert_der().to_vec()],
+        )
     }
 }
 
@@ -826,6 +898,13 @@ impl Authorization for MockSvc {
             .get(&r.node_id)
             .cloned()
             .unwrap_or_else(|| vec![Capability::Shell as i32, Capability::Exec as i32]);
+        let node_labels = self
+            .node_labels
+            .lock()
+            .unwrap()
+            .get(&r.node_id)
+            .cloned()
+            .unwrap_or_default();
         let context = DecisionContext {
             node_id: r.node_id.clone(),
             node_name: r.node_id.clone(),
@@ -839,6 +918,9 @@ impl Authorization for MockSvc {
             session_id: r.session_id.clone(),
             source_address: r.source_ip.clone(),
             issued_at_epoch_seconds: now,
+            identity: r.identity.clone(),
+            identity_groups: r.identity_groups.clone(),
+            node_labels,
         };
         // Part E: the per-node connection material (dial + host trust), if the
         // test registered it. Absent → the Gateway fails closed (no connection /
@@ -849,19 +931,70 @@ impl Authorization for MockSvc {
             .unwrap()
             .get(&r.node_id)
             .cloned();
-        // S7 trusts the decision over the authenticated mTLS channel; the
-        // decision-context SIGNATURE fields are populated + verified in S10.
+        // Session Ten: the decision context is SIGNED (the Gateway verifies it
+        // before caching + running per-channel local checks against it).
+        let (signed_context, signature, signer_certificate, signer_ca_chain) =
+            self.sign_context(&context);
         Ok(Response::new(AuthorizeResponse {
             decision: Decision::Allow as i32,
             context: Some(context),
-            signed_context: Vec::new(),
-            signature: Vec::new(),
-            signer_certificate: Vec::new(),
-            signer_ca_chain: Vec::new(),
+            signed_context,
+            signature,
+            signer_certificate,
+            signer_ca_chain,
             session_token: token,
             node_connection,
             recording_token,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl LockFeed for MockSvc {
+    type StreamLocksStream = Pin<Box<dyn Stream<Item = Result<LockEvent, Status>> + Send>>;
+
+    async fn stream_locks(
+        &self,
+        request: Request<StreamLocksRequest>,
+    ) -> Result<Response<Self::StreamLocksStream>, Status> {
+        require_gateway(&request, self)?;
+        // Subscribe to live events BEFORE snapshotting, so an add/remove that races
+        // the snapshot is never lost (a duplicate is harmless — the Gateway dedups).
+        let mut events = self.lock_events.subscribe();
+        let snapshot = self.locks.lock().unwrap().clone();
+        let feed_epoch = self.feed_epoch.load(Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<LockEvent, Status>>(64);
+        tokio::spawn(async move {
+            let snap = LockEvent {
+                event: Some(lock_event::Event::Snapshot(LockSnapshot {
+                    locks: snapshot,
+                    feed_epoch,
+                })),
+            };
+            if tx.send(Ok(snap)).await.is_err() {
+                return;
+            }
+            let mut hb = tokio::time::interval(Duration::from_secs(1));
+            hb.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    ev = events.recv() => match ev {
+                        Ok(e) => { if tx.send(Ok(e)).await.is_err() { return; } }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => return,
+                    },
+                    _ = hb.tick() => {
+                        let beat = LockEvent {
+                            event: Some(lock_event::Event::Heartbeat(Heartbeat {
+                                sent_at_epoch_seconds: unix_now() as i64,
+                            })),
+                        };
+                        if tx.send(Ok(beat)).await.is_err() { return; }
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
@@ -1059,6 +1192,16 @@ impl MockCpBuilder {
         let server_cert_pem = mtls::cert_der_to_pem(&server_leaf.cert_der);
         let server_key_pem = server_leaf.key_pem;
 
+        // Session Ten: the CONTEXT_SIGNER leaf (chained to `ca`) + its P-256 key,
+        // used to sign decision contexts the Gateway verifier accepts.
+        let context_signer_leaf = ca.issue_context_signer(
+            rcgen::date_time_ymd(2020, 1, 1),
+            rcgen::date_time_ymd(2100, 1, 1),
+        );
+        let context_signer_der = context_signer_leaf.cert_der.clone();
+        let context_signer_key =
+            SigningKey::from_pkcs8_der(&context_signer_leaf.key_pkcs8_der).unwrap();
+
         // Session CA (SSH) for signing inner-leg certs.
         let mut rng = rand_core::OsRng;
         let session_ca = ssh_key::PrivateKey::random(
@@ -1134,6 +1277,12 @@ impl MockCpBuilder {
             finalized: Mutex::new(HashMap::new()),
             upload_ttl_secs: Mutex::new(900),
             request_uploads: Mutex::new(Vec::new()),
+            context_signer_der,
+            context_signer_key,
+            node_labels: Mutex::new(HashMap::new()),
+            locks: Mutex::new(Vec::new()),
+            lock_events: tokio::sync::broadcast::channel(64).0,
+            feed_epoch: AtomicU64::new(1),
         });
 
         let tls = ServerTlsConfig::new()
@@ -1161,6 +1310,7 @@ impl MockCpBuilder {
                 .add_service(OuterLegAuthServer::new(MockSvc(svc_state.clone())))
                 .add_service(AuthorizationServer::new(MockSvc(svc_state.clone())))
                 .add_service(RecordingServer::new(MockSvc(svc_state.clone())))
+                .add_service(LockFeedServer::new(MockSvc(svc_state.clone())))
                 .serve_with_incoming(incoming)
                 .await;
         });
@@ -1389,6 +1539,73 @@ impl MockCp {
         );
     }
 
+    /// Set a node's inventory labels ("key=value"), signed into the decision
+    /// context (so node-label locks can be exercised).
+    pub fn set_node_labels(&self, node_id: &str, labels: &[&str]) {
+        self.state.node_labels.lock().unwrap().insert(
+            node_id.to_string(),
+            labels.iter().map(|l| l.to_string()).collect(),
+        );
+    }
+
+    /// Push a lock onto the deny-list feed (create): it lands in the snapshot AND
+    /// is broadcast to live `StreamLocks` subscribers (which tear down matches).
+    pub fn add_lock(&self, lock: Lock) {
+        {
+            let mut locks = self.state.locks.lock().unwrap();
+            locks.retain(|l| l.lock_id != lock.lock_id);
+            locks.push(lock.clone());
+        }
+        self.state.feed_epoch.fetch_add(1, Ordering::SeqCst);
+        let _ = self.state.lock_events.send(LockEvent {
+            event: Some(lock_event::Event::Added(lock)),
+        });
+    }
+
+    /// For the teardown E2E: push `lock` onto the feed as soon as a recording has
+    /// begun (i.e. the session is live), from a background task. Lets the test call
+    /// a blocking `ssh_exec` and still deliver the lock mid-session.
+    pub fn push_lock_after_recording_begins(&self, lock: Lock) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                if !state.recordings.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            {
+                let mut locks = state.locks.lock().unwrap();
+                locks.retain(|l| l.lock_id != lock.lock_id);
+                locks.push(lock.clone());
+            }
+            state.feed_epoch.fetch_add(1, Ordering::SeqCst);
+            let _ = state.lock_events.send(LockEvent {
+                event: Some(lock_event::Event::Added(lock)),
+            });
+        });
+    }
+
+    /// The number of recordings that have begun (test synchronization).
+    pub fn began_recording_count(&self) -> usize {
+        self.state.recordings.lock().unwrap().len()
+    }
+
+    /// Release a lock (delete): drop it from the snapshot + broadcast a removal.
+    pub fn remove_lock(&self, lock_id: &str) {
+        self.state
+            .locks
+            .lock()
+            .unwrap()
+            .retain(|l| l.lock_id != lock_id);
+        self.state.feed_epoch.fetch_add(1, Ordering::SeqCst);
+        let _ = self.state.lock_events.send(LockEvent {
+            event: Some(lock_event::Event::Removed(LockRemoval {
+                lock_id: lock_id.to_string(),
+            })),
+        });
+    }
+
     /// The host CA public key (OpenSSH wire): a node host cert signed by this CA
     /// verifies against it.
     pub fn host_ca_public_wire(&self) -> Vec<u8> {
@@ -1610,7 +1827,7 @@ pub async fn outer_leg_deps_with(
         cred.ca_chain_der.clone(),
     ));
     let cpauth = Arc::new(CpAuthClient::new(
-        factory,
+        factory.clone(),
         Duration::from_secs(config.cp_rpc_timeout_secs),
     ));
     let recorder_factory: Arc<dyn RecorderFactory> = match recorder {
@@ -1623,12 +1840,42 @@ pub async fn outer_leg_deps_with(
             .expect("build recorder factory"),
         ),
     };
+
+    // Session Ten: the lock deny-set + live-session registry, plus the background
+    // lock-feed client streaming from the mock CP's LockFeed. The feed keeps the
+    // set healthy (so per-channel checks serve cached allows within decision_ttl)
+    // and pushes locks that tear down matching live sessions.
+    let lock_set = Arc::new(LockSet::new(
+        config.reeval.lock_feed_unhealthy_after_secs,
+        config.reeval.lock_expiry_skew_secs,
+    ));
+    let live_sessions = Arc::new(LiveSessionRegistry::default());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    std::mem::forget(shutdown_tx); // test-only: keep the feed alive for the test.
+    LockFeedClientTask::new(
+        factory,
+        lock_set.clone(),
+        live_sessions.clone(),
+        Duration::from_secs(config.reeval.lock_feed_connect_timeout_secs),
+    )
+    .spawn(shutdown_rx);
+    // Wait for the first snapshot so the feed is healthy before the test drives
+    // SSH — deterministic (no spurious first-channel re-authorize).
+    for _ in 0..200 {
+        if lock_set.healthy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     HandlerDeps {
         cpauth,
         connector,
         resolver: Arc::new(IdentityResolver),
         recorder_factory,
         finalize_tracker: gateway_core::ssh::recorder::FinalizeTracker::default(),
+        lock_set,
+        live_sessions,
         config,
     }
 }

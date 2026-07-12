@@ -728,3 +728,141 @@ async fn spilled_recording_streams_from_temp_file() -> anyhow::Result<()> {
     drop(minio);
     Ok(())
 }
+
+// ── Part D headline: a lock tears down a LIVE recorded session, and the
+// recording is still finalized in WORM (Session Ten, FR-LOCK-1). ──────────────
+
+#[tokio::test]
+async fn a_lock_tears_down_a_live_recorded_session_and_finalizes_the_recording(
+) -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let (minio, s3) = start_minio().await?;
+    cp.set_s3_target(s3.clone());
+    let (cust_pub_der, _cust_secret) = customer_keypair();
+    cp.set_customer_key(
+        "customer-key-1",
+        cust_pub_der,
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    grant(&cp, &pin);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
+    let client = client_container(&pin).await;
+
+    // Once the session is live (recording begun), push a lock matching the node.
+    // The Gateway MUST tear the live session down AND finalize its recording.
+    cp.push_lock_after_recording_begins(gateway_core::pb::Lock {
+        lock_id: "lock-incident-1".into(),
+        target: Some(gateway_core::pb::LockTarget {
+            node_ids: vec![NODE_ID.to_string()],
+            ..Default::default()
+        }),
+        expires_at_epoch_seconds: 0,
+        created_at_epoch_seconds: 0,
+        reason: "incident response".into(),
+    });
+
+    // A long-lived command: without a teardown this blocks ~60s; the lock cuts it
+    // short (ssh returns non-zero because the connection is dropped mid-command).
+    let (code, _stdout, _stderr) = ssh_exec(
+        &client,
+        ssh_cmd(
+            gw_port,
+            &[],
+            "deploy%node-e2e",
+            "sh -c 'echo TEARDOWN_READY; sleep 60'",
+        ),
+    )
+    .await;
+    assert_ne!(
+        code,
+        Some(0),
+        "a locked session must be torn down, not exit cleanly"
+    );
+
+    // The headline: the torn-down session's recording is still FINALIZED in WORM
+    // (flush -> seal -> RequestUpload -> PUT -> FinalizeRecording, the S9 path).
+    let fin = await_finalized(&cp).await;
+    assert_eq!(
+        fin.status,
+        RecordingStatus::Finalized as i32,
+        "the recording is finalized despite the lock teardown (not orphaned)"
+    );
+    assert!(fin.hash_chain_head.starts_with("sha256:"));
+    assert!(fin.byte_len > 0);
+    let object_keys = cp.recorded_object_keys();
+    assert_eq!(
+        object_keys.len(),
+        1,
+        "the recording landed as one WORM object"
+    );
+    let (status, _object) = get_object(&s3, &object_keys[0]).await?;
+    assert_eq!(
+        status, 200,
+        "the finalized recording is present in MinIO WORM"
+    );
+
+    drop(client);
+    drop(node);
+    drop(minio);
+    Ok(())
+}
+
+// ── A pushed lock refuses a NEW session (generic denial), before any node dial. ─
+
+#[tokio::test]
+async fn a_pushed_lock_denies_a_new_session() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let (minio, s3) = start_minio().await?;
+    cp.set_s3_target(s3.clone());
+    let (cust_pub_der, _c) = customer_keypair();
+    cp.set_customer_key(
+        "k",
+        cust_pub_der,
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    grant(&cp, &pin);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    // The lock is in effect BEFORE the Gateway's feed connects, so it is in the
+    // initial snapshot — a new session on the locked node must be refused.
+    cp.add_lock(gateway_core::pb::Lock {
+        lock_id: "pre-lock".into(),
+        target: Some(gateway_core::pb::LockTarget {
+            node_ids: vec![NODE_ID.to_string()],
+            ..Default::default()
+        }),
+        expires_at_epoch_seconds: 0,
+        created_at_epoch_seconds: 0,
+        reason: "quarantined".into(),
+    });
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
+    let client = client_container(&pin).await;
+
+    let (code, stdout, _stderr) = ssh_exec(
+        &client,
+        ssh_cmd(gw_port, &[], "deploy%node-e2e", "echo SHOULD_NOT_RUN"),
+    )
+    .await;
+    assert_ne!(code, Some(0), "a locked target must be refused");
+    assert!(
+        !stdout.contains("SHOULD_NOT_RUN"),
+        "the command must never run on a locked target"
+    );
+
+    drop(client);
+    drop(node);
+    drop(minio);
+    Ok(())
+}
