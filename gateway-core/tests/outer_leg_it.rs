@@ -181,7 +181,7 @@ async fn client_container(
         .expect("start ssh-client container")
 }
 
-const INNER_LEG_PENDING: &str = "inner leg pending";
+const NODE_OFFLINE: &str = "offline or unavailable";
 const ACCESS_DENIED: &str = "access denied by policy";
 const SERVICE_UNAVAILABLE: &str = "service temporarily unavailable";
 
@@ -206,7 +206,7 @@ async fn publickey_paths_and_error_taxonomy_e2e() -> anyhow::Result<()> {
     let container = client_container(&pin_key, &cert_key, &cert_line).await;
 
     // Part A + C(pin) + D + G: reach auth, resolve the pin, authorize, close at
-    // the inner-leg seam ("inner leg pending"), clean exit.
+    // the inner-leg dial. With no real node registered → §7.1 "node offline".
     let (code, stdout, stderr) = ssh_exec(
         &container,
         ssh_args(
@@ -227,18 +227,18 @@ async fn publickey_paths_and_error_taxonomy_e2e() -> anyhow::Result<()> {
         vec![],
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         code,
         Some(0),
-        "pin happy-path must exit clean\nstdout={stdout}\nstderr={stderr}"
+        "pin happy-path: authz ok, node offline\nstdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stdout.contains(INNER_LEG_PENDING),
-        "pin happy-path must reach the inner-leg seam; stdout={stdout:?} stderr={stderr:?}"
+        stderr.contains(NODE_OFFLINE),
+        "pin: auth+authz succeeded, inner leg reached; stdout={stdout:?} stderr={stderr:?}"
     );
 
     // Part C(user cert) + D: resolve a user cert signed by the mock user CA.
-    let (code, stdout, stderr) = ssh_exec(
+    let (code, _stdout, stderr) = ssh_exec(
         &container,
         ssh_args(
             port,
@@ -260,14 +260,14 @@ async fn publickey_paths_and_error_taxonomy_e2e() -> anyhow::Result<()> {
         vec![],
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         code,
         Some(0),
-        "user-cert happy-path must exit clean\nstderr={stderr}"
+        "user-cert happy-path: authz ok, node offline\nstderr={stderr}"
     );
     assert!(
-        stdout.contains(INNER_LEG_PENDING),
-        "user-cert happy-path must reach the inner-leg seam; stdout={stdout:?}"
+        stderr.contains(NODE_OFFLINE),
+        "user-cert: auth+authz succeeded, inner leg reached; stderr={stderr:?}"
     );
 
     // Part F: authorized-but-denied (node exists, no grant) → generic denial.
@@ -419,7 +419,7 @@ async fn keyboard_interactive_otp_device_flow_and_degradation_e2e() -> anyhow::R
     };
 
     // Part C(OTP): keyboard-interactive, answer the OTP prompt via askpass.
-    let (code, stdout, stderr) = ssh_exec(
+    let (code, _stdout, stderr) = ssh_exec(
         &container,
         ssh_args(
             port,
@@ -435,19 +435,19 @@ async fn keyboard_interactive_otp_device_flow_and_degradation_e2e() -> anyhow::R
         askpass("otp-secret-123"),
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         code,
         Some(0),
-        "OTP happy-path must exit clean\nstderr={stderr}"
+        "OTP happy-path: authz ok, node offline\nstderr={stderr}"
     );
     assert!(
-        stdout.contains(INNER_LEG_PENDING),
-        "OTP → inner-leg seam; stdout={stdout:?}"
+        stderr.contains(NODE_OFFLINE),
+        "OTP: auth+authz succeeded, inner leg reached; stderr={stderr:?}"
     );
 
     // Part E(device flow): empty OTP falls back to the device flow; the client
     // stays alive across num-prompts=0 heartbeats and completes on APPROVED.
-    let (code, stdout, stderr) = ssh_exec(
+    let (code, _stdout, stderr) = ssh_exec(
         &container,
         ssh_args(
             port,
@@ -463,14 +463,14 @@ async fn keyboard_interactive_otp_device_flow_and_degradation_e2e() -> anyhow::R
         askpass(""), // empty OTP → device flow
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         code,
         Some(0),
-        "device-flow login must complete on approval\nstderr={stderr}"
+        "device-flow login: authz ok, node offline\nstderr={stderr}"
     );
     assert!(
-        stdout.contains(INNER_LEG_PENDING),
-        "device flow → inner-leg seam; stdout={stdout:?}"
+        stderr.contains(NODE_OFFLINE),
+        "device flow: auth+authz succeeded, inner leg reached; stderr={stderr:?}"
     );
     // The verification URL + user code were presented in the KI instruction.
     assert!(
@@ -481,7 +481,7 @@ async fn keyboard_interactive_otp_device_flow_and_degradation_e2e() -> anyhow::R
     // Part C degradation: an UNPINNED publickey fails, then keyboard-interactive
     // OTP succeeds (the offered method degrades to the next).
     cp.register_otp("otp-degrade-9", "carol", &["ops"]);
-    let (code, stdout, stderr) = ssh_exec(
+    let (code, _stdout, stderr) = ssh_exec(
         &container,
         ssh_args(
             port,
@@ -499,14 +499,14 @@ async fn keyboard_interactive_otp_device_flow_and_degradation_e2e() -> anyhow::R
         askpass("otp-degrade-9"),
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         code,
         Some(0),
-        "degradation publickey→OTP must succeed\nstderr={stderr}"
+        "degradation publickey→OTP: authz ok, node offline\nstderr={stderr}"
     );
     assert!(
-        stdout.contains(INNER_LEG_PENDING),
-        "degradation → inner-leg seam; stdout={stdout:?}"
+        stderr.contains(NODE_OFFLINE),
+        "degradation: auth+authz succeeded, inner leg reached; stderr={stderr:?}"
     );
 
     Ok(())

@@ -32,13 +32,14 @@ use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningSer
 use gateway_core::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
     Capability, ClientHello, ComponentInfo, Decision, DecisionContext, DeviceFlowStatus,
-    EnrollGatewayRequest, EnrollGatewayResponse, PollDeviceFlowRequest, PollDeviceFlowResponse,
-    ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse, ResolveOtpRequest,
-    ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest,
-    ResolveUserCertResponse, ResolvedIdentity, ServerHello, SignSessionCertificateRequest,
-    SignSessionCertificateResponse,
+    EnrollGatewayRequest, EnrollGatewayResponse, HostVerification, NodeConnection,
+    PollDeviceFlowRequest, PollDeviceFlowResponse, ProtocolVersion, RenewGatewayIdentityRequest,
+    RenewGatewayIdentityResponse, ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest,
+    ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity,
+    ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse,
 };
-use gateway_core::ssh::connector::PendingInnerLeg;
+use gateway_core::ssh::bridge::NullRecorder;
+use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
 use gateway_core::ssh::handler::HandlerDeps;
 use gateway_core::ssh::target::IdentityResolver;
 use gateway_core::{mtls, version};
@@ -225,6 +226,17 @@ struct MockState {
     allow_rules: Mutex<Vec<AllowRule>>,
     /// Nodes the CP inventory "knows" (an unknown node → §7.1 DENY).
     known_nodes: Mutex<HashSet<String>>,
+    /// OpenSSH **host CA** private key (PEM) — signs node host certs (§9.3, S8).
+    host_ca_pem: String,
+    /// The host CA public key, OpenSSH wire-encoded (for `host_ca_keys`).
+    host_ca_public_wire: Vec<u8>,
+    /// Per-node connection material returned in the `Authorize` ALLOW response
+    /// (Part E): dial address + host-verification anchors. Absent → the Gateway
+    /// aborts (no connection / never TOFU).
+    node_connections: Mutex<HashMap<String, NodeConnection>>,
+    /// Per-node granted capability override (default shell+exec); drives the
+    /// SFTP-granted-vs-withheld tests (FR-SESS-1/2).
+    node_capabilities: Mutex<HashMap<String, Vec<i32>>>,
     /// When set, `Authorize` returns UNAVAILABLE (the CP-down fail-closed row).
     authorize_unavailable: Mutex<bool>,
     /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
@@ -766,11 +778,18 @@ impl Authorization for MockSvc {
             },
         );
         let now = unix_now() as i64;
+        let capabilities = self
+            .node_capabilities
+            .lock()
+            .unwrap()
+            .get(&r.node_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Capability::Shell as i32, Capability::Exec as i32]);
         let context = DecisionContext {
             node_id: r.node_id.clone(),
             node_name: r.node_id.clone(),
             allowed_logins: vec![r.requested_principal.clone()],
-            capabilities: vec![Capability::Shell as i32, Capability::Exec as i32],
+            capabilities,
             principal: r.requested_principal.clone(),
             grant_expiry_epoch_seconds: now + 3600,
             policy_epoch: 1,
@@ -780,6 +799,15 @@ impl Authorization for MockSvc {
             source_address: r.source_ip.clone(),
             issued_at_epoch_seconds: now,
         };
+        // Part E: the per-node connection material (dial + host trust), if the
+        // test registered it. Absent → the Gateway fails closed (no connection /
+        // never TOFU).
+        let node_connection = self
+            .node_connections
+            .lock()
+            .unwrap()
+            .get(&r.node_id)
+            .cloned();
         // S7 trusts the decision over the authenticated mTLS channel; the
         // decision-context SIGNATURE fields are populated + verified in S10.
         Ok(Response::new(AuthorizeResponse {
@@ -790,11 +818,12 @@ impl Authorization for MockSvc {
             signer_certificate: Vec::new(),
             signer_ca_chain: Vec::new(),
             session_token: token,
+            node_connection,
         }))
     }
 }
 
-/// The generic DENY: no context, no token (fail closed).
+/// The generic DENY: no context, no token, no connection (fail closed).
 fn deny_response() -> AuthorizeResponse {
     AuthorizeResponse {
         decision: Decision::Deny as i32,
@@ -804,6 +833,7 @@ fn deny_response() -> AuthorizeResponse {
         signer_certificate: Vec::new(),
         signer_ca_chain: Vec::new(),
         session_token: String::new(),
+        node_connection: None,
     }
 }
 
@@ -905,6 +935,20 @@ impl MockCpBuilder {
             .unwrap()
             .to_string();
 
+        // Host CA (SSH) for signing node host certs (Design §9.3, Session Eight).
+        let host_ca = ssh_key::PrivateKey::random(
+            &mut rng,
+            ssh_key::Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let host_ca_pem = host_ca
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let host_ca_public_wire = host_ca.public_key().to_bytes().unwrap();
+
         let ca_pem = ca.cert_pem();
         let state = Arc::new(MockState {
             ca,
@@ -925,6 +969,10 @@ impl MockCpBuilder {
             device_flows: Mutex::new(HashMap::new()),
             allow_rules: Mutex::new(Vec::new()),
             known_nodes: Mutex::new(HashSet::new()),
+            host_ca_pem,
+            host_ca_public_wire,
+            node_connections: Mutex::new(HashMap::new()),
+            node_capabilities: Mutex::new(HashMap::new()),
             authorize_unavailable: Mutex::new(false),
             resolve_unavailable: Mutex::new(false),
         });
@@ -1159,6 +1207,89 @@ impl MockCp {
         });
     }
 
+    /// Register the agentless node connection (dial address + host trust) the
+    /// `Authorize` ALLOW returns for `node_id` (Part E). Without this, an
+    /// authorized node has no connection → the Gateway fails closed.
+    pub fn set_node_connection(&self, node_id: &str, dial_address: &str, host: HostVerification) {
+        self.state.node_connections.lock().unwrap().insert(
+            node_id.to_string(),
+            NodeConnection {
+                connector_kind: gateway_core::pb::ConnectorKind::Agentless as i32,
+                dial_address: dial_address.to_string(),
+                host_verification: Some(host),
+            },
+        );
+    }
+
+    /// Override the granted capabilities for `node_id` (default shell+exec).
+    pub fn set_capabilities(&self, node_id: &str, caps: &[Capability]) {
+        self.state.node_capabilities.lock().unwrap().insert(
+            node_id.to_string(),
+            caps.iter().map(|c| *c as i32).collect(),
+        );
+    }
+
+    /// The host CA public key (OpenSSH wire): a node host cert signed by this CA
+    /// verifies against it.
+    pub fn host_ca_public_wire(&self) -> Vec<u8> {
+        self.state.host_ca_public_wire.clone()
+    }
+
+    /// Sign a node **host** certificate over `host_pubkey_wire` with the host CA
+    /// (Design §9.3), carrying `principals`. Returns `(cert_line, cert_wire)`.
+    pub fn sign_host_cert(
+        &self,
+        host_pubkey_wire: &[u8],
+        principals: &[&str],
+        valid_secs: u64,
+    ) -> (String, Vec<u8>) {
+        let pubkey = ssh_key::PublicKey::from_bytes(host_pubkey_wire).unwrap();
+        let ca = ssh_key::PrivateKey::from_openssh(&self.state.host_ca_pem).unwrap();
+        let now = unix_now();
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            now.saturating_sub(60),
+            now + valid_secs,
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .unwrap();
+        for p in principals {
+            builder.valid_principal(*p).unwrap();
+        }
+        builder.key_id("sessionlayer-host-cert").unwrap();
+        let cert = builder.sign(&ca).unwrap();
+        (cert.to_openssh().unwrap(), cert.to_bytes().unwrap())
+    }
+
+    /// A host-CA `HostVerification`: the node's host cert + the trusted host CA +
+    /// the expected principal(s).
+    pub fn host_ca_verification(
+        &self,
+        host_cert_wire: Vec<u8>,
+        principals: &[&str],
+    ) -> HostVerification {
+        HostVerification {
+            host_ca_keys: vec![self.host_ca_public_wire()],
+            expected_host_principals: principals.iter().map(|s| s.to_string()).collect(),
+            pinned_host_keys: Vec::new(),
+            host_certificates: vec![host_cert_wire],
+        }
+    }
+
+    /// A pinned-key `HostVerification` (the fallback path).
+    pub fn pinned_verification(&self, host_pubkey_wire: Vec<u8>) -> HostVerification {
+        HostVerification {
+            host_ca_keys: Vec::new(),
+            expected_host_principals: Vec::new(),
+            pinned_host_keys: vec![host_pubkey_wire],
+            host_certificates: Vec::new(),
+        }
+    }
+
     /// Toggle the CP-unreachable simulation for `Authorize` (returns UNAVAILABLE).
     pub fn set_authorize_unavailable(&self, on: bool) {
         *self.state.authorize_unavailable.lock().unwrap() = on;
@@ -1218,6 +1349,20 @@ impl MockCp {
 /// enrolled credential is snapshotted into the channel factory, so the temp
 /// data-dir can be dropped immediately.
 pub async fn outer_leg_deps(cp: &MockCp, config: Arc<SshServerConfig>) -> HandlerDeps {
+    let connector = Arc::new(AgentlessDial::new(Duration::from_secs(
+        config.inner.connect_timeout_secs,
+    )));
+    outer_leg_deps_with(cp, config, connector, Arc::new(NullRecorder)).await
+}
+
+/// Like [`outer_leg_deps`] but with an explicit connector + recorder tap, for the
+/// inner-leg E2E (a real agentless dial to the Docker node) and the tap test.
+pub async fn outer_leg_deps_with(
+    cp: &MockCp,
+    config: Arc<SshServerConfig>,
+    connector: Arc<dyn NodeConnector>,
+    recorder: Arc<dyn gateway_core::ssh::bridge::RecorderTap>,
+) -> HandlerDeps {
     let dir = tempfile::tempdir().unwrap();
     let store = identity::IdentityStore::open(dir.path()).unwrap();
     let params = cp.channel_params(Duration::from_secs(5), Duration::from_secs(10));
@@ -1226,7 +1371,7 @@ pub async fn outer_leg_deps(cp: &MockCp, config: Arc<SshServerConfig>) -> Handle
         &params,
         &cp.bootstrap_anchors(),
         &cp.mint_enrollment_token(),
-        "gw-s7",
+        "gw-s8",
     )
     .await
     .unwrap();
@@ -1242,8 +1387,9 @@ pub async fn outer_leg_deps(cp: &MockCp, config: Arc<SshServerConfig>) -> Handle
     ));
     HandlerDeps {
         cpauth,
-        connector: Arc::new(PendingInnerLeg),
+        connector,
         resolver: Arc::new(IdentityResolver),
+        recorder,
         config,
     }
 }

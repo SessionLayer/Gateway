@@ -48,6 +48,20 @@ pub enum SigningError {
     /// The CP returned a malformed response (empty certificate).
     #[error("Control Plane returned an empty certificate")]
     EmptyCertificate,
+
+    /// The mTLS channel to the CP could not be established for the signing call
+    /// (CP down) — fail closed as "service temporarily unavailable" (§7.1), not
+    /// as a node fault.
+    #[error("Control Plane unreachable for SignSessionCertificate")]
+    Unavailable,
+}
+
+impl SigningError {
+    /// Whether the failure is a CP-down condition (→ service-unavailable), as
+    /// opposed to a node/token/material fault (→ generic node/policy outcome).
+    pub fn is_cp_down(&self) -> bool {
+        matches!(self, SigningError::Unavailable | SigningError::Timeout(_))
+    }
 }
 
 /// A locally-generated inner-leg keypair. The private half never leaves the
