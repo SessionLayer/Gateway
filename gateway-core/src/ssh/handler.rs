@@ -338,8 +338,10 @@ impl SshHandler {
 
     /// Try an offered sk-ecdsa security key as a break-glass credential (Design §7,
     /// FR-ACC-6, the PRIMARY break-glass path). russh has already verified the FIDO
-    /// possession signature; the CP maps the PUBLIC key to a registered break-glass
-    /// credential and mints a single-use token. Returns `Some(Auth::Accept)` on a
+    /// POSSESSION signature (possession only — the UP/touch bit is authenticator-
+    /// enforced, not server-asserted; F-gw-breakglass-userpresence-1). The CP maps the
+    /// PUBLIC key to a registered break-glass credential and mints a single-use token.
+    /// Returns `Some(Auth::Accept)` on a
     /// resolved credential; `None` when the key is NOT a registered break-glass
     /// credential (or the CP could not answer) so the caller falls through to the
     /// ordinary pin path — a normal sk-ecdsa user is not break-glass and rides the
@@ -379,6 +381,10 @@ impl SshHandler {
     /// `None` to fall through to the device flow. The `code` is a SECRET — NEVER
     /// logged.
     async fn try_break_glass_code(&mut self, code: &str) -> Option<Auth> {
+        // Record the attempt so a failed break-glass-code login is represented in the
+        // auth-failed record (not just "otp"), at parity with the sk path (G5). The
+        // code itself is a secret and is NEVER recorded — only the coarse method label.
+        self.conn.record_method("breakglass-code");
         let node_id = self.break_glass_node_id();
         match self
             .deps
@@ -722,7 +728,7 @@ impl SshHandler {
             match self.deps.recorder_factory.begin(params).await {
                 Ok(r) => self.recorder = Some(r),
                 Err(e) if strict => {
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "recording_unavailable", "strict-mode recording setup failed; refusing the session");
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, break_glass = force_strict, outcome = "recording_unavailable", "strict-mode recording setup failed; refusing the session");
                     self.recorder_failed = Some(SshOutcome::RecordingUnavailable);
                     self.close_with(channel, session, SshOutcome::RecordingUnavailable);
                     return;
@@ -871,10 +877,21 @@ impl SshHandler {
 
         // (b) grant_expiry vs the Gateway clock (conservative/early): once a grant
         // has expired, NO new privileged channel-open is admitted in any
-        // mid-session-expiry mode (Part F).
+        // mid-session-expiry mode (Part F). For a BREAK-GLASS session a missing
+        // grant_expiry (==0) is FAIL-CLOSED (G1): an always-available override MUST be
+        // time-boxed (bounded by grant_expiry or a Lock, and it no longer re-authorizes),
+        // so a context signed without an expiry refuses the channel rather than running
+        // unbounded. A standing/JIT session with ge==0 is bounded by decision_ttl
+        // re-auth + the pushed lock-set, so 0 remains "no fixed expiry" there.
         let now = now_epoch_secs();
         let ge = authz.context.grant_expiry_epoch_seconds;
-        if ge != 0 && now + grant_expiry_skew_secs >= ge {
+        if ge == 0 {
+            if self.session_is_break_glass() {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, break_glass = true, outcome = "policy_denied", reason = "breakglass_no_grant_expiry", "break-glass ALLOW without a grant_expiry; refusing (must be time-boxed)");
+                self.close_with(channel, session, SshOutcome::PolicyDenied);
+                return Err(());
+            }
+        } else if now + grant_expiry_skew_secs >= ge {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "grant_expired", "grant expired; refusing new channel");
             self.close_with(channel, session, SshOutcome::PolicyDenied);
             return Err(());
@@ -927,6 +944,19 @@ impl SshHandler {
     fn arm_expiry(&mut self, grant_expiry: i64) {
         if let Some(task) = self.expiry_task.take() {
             task.abort();
+        }
+        // Defense in depth (G1): a break-glass session MUST be time-boxed. A missing
+        // grant_expiry is a contract violation — tear it down immediately rather than
+        // run unbounded. (In practice local_recheck (b) already refuses the channel, so
+        // ensure_registered/arm_expiry are not reached with ge==0 for break-glass; this
+        // is the belt-and-suspenders backstop. RunToTtl is rejected for break-glass at
+        // config validation, so a break-glass session never reaches the no-teardown mode.)
+        if grant_expiry == 0 && self.session_is_break_glass() {
+            if let Some(control) = self.session_control.clone() {
+                tracing::warn!(session_id = %self.session_id, break_glass = true, outcome = "grant_expired", "break-glass session without a grant_expiry; tearing down (must be time-boxed)");
+                control.terminate();
+            }
+            return;
         }
         let mode = self.mid_session_expiry_mode();
         if mode == MidSessionExpiryMode::RunToTtl || grant_expiry == 0 {
@@ -1036,6 +1066,13 @@ impl SshHandler {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "context_session_mismatch", "decision context bound to a different session (fail closed)");
                     return Err(SshOutcome::PolicyDenied);
                 }
+                // Observability (G7): a break-glass auth should always come back
+                // access_model=BREAKGLASS. A mismatch is a token mis-binding / contract
+                // drift signal (the local flag still forces strict, so it is not a
+                // downgrade — just worth flagging). Not user-facing.
+                if self.break_glass && context.access_model != AccessModel::Breakglass as i32 {
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, break_glass = true, access_model = context.access_model, "break-glass auth resolved to a non-BREAKGLASS access model (token mis-binding / contract drift?)");
+                }
                 let capabilities = granted_capabilities(Some(&context));
                 let bindings = LockBindings::from_context(&context);
                 tracing::info!(
@@ -1071,7 +1108,7 @@ impl SshHandler {
             Ok(_) => {
                 // DENY, a Lock, no-match, or ALLOW-without-token — one generic
                 // denial to the user; the CP logged the specific reason.
-                tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "authorization_denied", "generic denial");
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, break_glass = self.break_glass, outcome = "policy_denied", reason = "authorization_denied", "generic denial");
                 Err(SshOutcome::PolicyDenied)
             }
             Err(e) => {
@@ -1232,13 +1269,13 @@ impl Handler for SshHandler {
         // key MUST have signed, and the assertion flags/counter are signature-covered
         // (un-forgeable). The registered break-glass key is PUBLIC/listable, so this
         // possession check is what stops a public-key holder from getting a break-glass
-        // session. (russh does not surface the UP/user-presence bit to the handler, so
-        // touch-required is not independently enforced here — POSSESSION is; test keys
-        // use `no-touch-required` for the virtual authenticator.) A key that is NOT a
-        // registered break-glass credential FALLS THROUGH to the ordinary pin path: a
-        // normal sk-ecdsa user rides the pubkey/pin path (SESSION §1.2), never a hard
-        // reject. Only sk-ecdsa enters here; sk-ed25519 and every other algorithm go
-        // straight to the pin path.
+        // session. russh verifies POSSESSION ONLY; it does NOT surface the sk assertion
+        // flags to any server seam, so the UP/user-presence (touch) bit is enforced by
+        // the AUTHENTICATOR, not asserted server-side (F-gw-breakglass-userpresence-1,
+        // Accepted-Risk) — break-glass keys MUST be provisioned touch-required. A key
+        // that is NOT a registered break-glass credential FALLS THROUGH to the ordinary
+        // pin path: a normal sk-ecdsa user rides the pubkey/pin path (SESSION §1.2),
+        // never a hard reject. Only sk-ecdsa enters here.
         if self.deps.config.break_glass.enabled && is_break_glass_algorithm(public_key.algorithm())
         {
             self.conn.record_method("publickey-breakglass");
@@ -1246,6 +1283,12 @@ impl Handler for SshHandler {
                 return Ok(auth);
             }
             // Not a break-glass credential (or the CP could not answer) → fall through.
+        } else if is_security_key_algorithm(public_key.algorithm()) {
+            // A non-sk-ecdsa security key (e.g. sk-ed25519): break-glass supports ONLY
+            // sk-ecdsa (SESSION Part D), so route it to the ordinary pin path — but log
+            // it operator-side (§7.1-safe: the user still sees a normal auth outcome) so
+            // a mis-provisioned emergency key does not fail silently (G4).
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, algorithm = %public_key.algorithm().as_str(), "non-sk-ecdsa security key offered; break-glass supports only sk-ecdsa — routing to the pin path");
         }
         self.conn.record_method("publickey-pin");
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
@@ -1590,6 +1633,14 @@ fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind
 /// break-glass credential falls through to the pin path (never a hard reject).
 fn is_break_glass_algorithm(alg: Algorithm) -> bool {
     matches!(alg, Algorithm::SkEcdsaSha2NistP256)
+}
+
+/// Whether `alg` is ANY FIDO2/U2F security-key algorithm. Used to log (G4) when a
+/// non-sk-ecdsa security key (e.g. sk-ed25519) is offered — break-glass supports only
+/// sk-ecdsa, so it routes to the pin path, but the emergency-path operator should see
+/// that a mis-provisioned security key was tried.
+fn is_security_key_algorithm(alg: Algorithm) -> bool {
+    matches!(alg, Algorithm::SkEcdsaSha2NistP256 | Algorithm::SkEd25519)
 }
 
 /// Whether a break-glass resolution actually succeeded: the identity resolved AND a
