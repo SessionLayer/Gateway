@@ -18,6 +18,8 @@ pub mod connector;
 pub mod handler;
 pub mod hostverify;
 pub mod innerleg;
+pub mod lockfeed;
+pub mod locks;
 pub mod outcome;
 pub mod proxy;
 pub mod recorder;

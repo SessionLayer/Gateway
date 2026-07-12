@@ -112,6 +112,74 @@ pub struct SshServerConfig {
     /// WORM upload. Strict by default (recording is mandatory; a failure fails the
     /// session closed).
     pub recorder: RecorderConfig,
+    /// Per-channel re-evaluation, the actively-pushed lock deny-list, and
+    /// mid-session identity-expiry policy (Session Ten, Design §6.3/§8.4).
+    pub reeval: ReevalConfig,
+}
+
+/// Per-channel-open re-evaluation, lock-feed health, and mid-session-expiry policy
+/// (Session Ten; Design §6.3/§8.3/§8.4; FR-CHAN-2/3/4, FR-ACC-8, FR-LOCK-1/2). All
+/// fail-closed; misconfiguration is rejected (`deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReevalConfig {
+    /// Hard ceiling (seconds) on the CP-supplied `decision_ttl` a cached allow may
+    /// be served for before a forced re-authorize — defense against a CP that
+    /// hands out an over-long TTL. The effective TTL is `min(context.decision_ttl,
+    /// this)`, and `0` when the lock feed is unhealthy (forces per-channel
+    /// re-validate, FR-CHAN-4).
+    pub max_decision_ttl_secs: i64,
+    /// Conservative clock-skew margin (seconds) applied to `grant_expiry`: a grant
+    /// expires EARLY (`now + skew >= grant_expiry` refuses new privileged channels),
+    /// per FR-BOOT-4.
+    pub grant_expiry_skew_secs: i64,
+    /// Conservative clock-skew margin (seconds) applied to a LOCK's expiry: a deny
+    /// expires LATE (the lock keeps denying until clearly past its TTL) — the
+    /// opposite direction, because deny must fail closed (§8.4).
+    pub lock_expiry_skew_secs: i64,
+    /// The lock feed is marked unhealthy if idle (no event or heartbeat) longer
+    /// than this. Unhealthy → per-channel re-validate is forced (`decision_ttl` is
+    /// treated as 0). Should be a small multiple of the CP heartbeat interval.
+    pub lock_feed_unhealthy_after_secs: u64,
+    /// Bound (seconds) on establishing the lock-feed mTLS stream (fail-closed dial).
+    pub lock_feed_connect_timeout_secs: u64,
+    /// What happens to a LIVE session when its `grant_expiry` passes. A Lock ALWAYS
+    /// overrides this with immediate teardown (FR-ACC-8).
+    pub mid_session_expiry: MidSessionExpiryMode,
+    /// Grace window (seconds) for [`MidSessionExpiryMode::GraceThenKill`] between
+    /// `grant_expiry` and teardown.
+    pub mid_session_grace_secs: u64,
+}
+
+/// Mid-session identity-expiry behaviour per access model (FR-ACC-8). In all modes
+/// a NEW privileged channel-open is refused once `grant_expiry` passes; the modes
+/// differ only in what happens to already-open channels. A Lock always overrides
+/// with immediate teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MidSessionExpiryMode {
+    /// Let in-flight channels run to their natural close; only refuse new channels
+    /// after expiry. The least-disruptive default for a stable STANDING identity.
+    RunToTtl,
+    /// At `grant_expiry`, wait [`ReevalConfig::mid_session_grace_secs`], then tear
+    /// the session down.
+    GraceThenKill,
+    /// Tear the session down immediately at `grant_expiry`.
+    HardKill,
+}
+
+impl Default for ReevalConfig {
+    fn default() -> Self {
+        Self {
+            max_decision_ttl_secs: 60,
+            grant_expiry_skew_secs: 30,
+            lock_expiry_skew_secs: 30,
+            lock_feed_unhealthy_after_secs: 30,
+            lock_feed_connect_timeout_secs: 5,
+            mid_session_expiry: MidSessionExpiryMode::RunToTtl,
+            mid_session_grace_secs: 30,
+        }
+    }
 }
 
 /// Session-recorder configuration (Session Nine, Design §12/§12A/§15).
@@ -240,6 +308,7 @@ impl Default for SshServerConfig {
             cp_rpc_timeout_secs: 10,
             inner: InnerLegServerConfig::default(),
             recorder: RecorderConfig::default(),
+            reeval: ReevalConfig::default(),
         }
     }
 }
