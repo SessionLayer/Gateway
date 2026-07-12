@@ -35,6 +35,9 @@ mkdir -p "$DST"
 # FinalizeRecording) and an additive recording_token field on authz.proto.
 # Session Ten added lock.proto (LockFeed: StreamLocks — the actively-pushed lock
 # deny-list) and additive identity/groups/node_labels on authz DecisionContext.
+# Session Thirteen added break-glass auth resolution to auth.proto
+# (OuterLegAuth: ResolveBreakglassKey / ResolveBreakglassCode) + additive
+# breakglass_token (AuthorizeRequest) and access_model (DecisionContext) on authz.
 for f in common.proto handshake.proto identity.proto signing.proto authz.proto auth.proto recording.proto lock.proto; do
   cp -v "$SRC/$f" "$DST/$f"
 done
