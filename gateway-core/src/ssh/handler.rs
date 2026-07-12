@@ -336,16 +336,16 @@ impl SshHandler {
             .unwrap_or_default()
     }
 
-    /// Resolve an offered FIDO2 security-key (`sk-ecdsa`/`sk-ed25519`) publickey to
-    /// its break-glass identity (Design §7, FR-ACC-6). russh has already verified
-    /// the FIDO possession signature before this runs; the CP maps the PUBLIC key to
-    /// a registered break-glass credential and mints a single-use token. A key that
-    /// does not resolve degrades to the next method (generic, §7.1); CP-down fails
-    /// closed (surfaced on the keyboard-interactive fallback).
-    async fn resolve_break_glass_publickey(&mut self, public_key: &PublicKey) -> Auth {
-        let Ok(blob) = public_key.to_bytes() else {
-            return self.reject_and_degrade();
-        };
+    /// Try an offered sk-ecdsa security key as a break-glass credential (Design §7,
+    /// FR-ACC-6, the PRIMARY break-glass path). russh has already verified the FIDO
+    /// possession signature; the CP maps the PUBLIC key to a registered break-glass
+    /// credential and mints a single-use token. Returns `Some(Auth::Accept)` on a
+    /// resolved credential; `None` when the key is NOT a registered break-glass
+    /// credential (or the CP could not answer) so the caller falls through to the
+    /// ordinary pin path — a normal sk-ecdsa user is not break-glass and rides the
+    /// pin path. CP-down is noted (the pin fall-through surfaces §7.1 fail-closed).
+    async fn try_break_glass_publickey(&mut self, public_key: &PublicKey) -> Option<Auth> {
+        let blob = public_key.to_bytes().ok()?;
         let node_id = self.break_glass_node_id();
         match self
             .deps
@@ -356,19 +356,19 @@ impl SshHandler {
             Ok(res) if break_glass_resolved(&res) => {
                 let id = res.identity.expect("resolved implies identity present");
                 self.set_break_glass_authenticated(id, res.breakglass_token);
-                Auth::Accept
+                Some(Auth::Accept)
             }
             Ok(_) => {
-                tracing::info!(source_ip = %self.source_ip, "offered security key is not a registered break-glass credential; degrading");
-                self.reject_and_degrade()
+                tracing::info!(source_ip = %self.source_ip, "offered security key is not a registered break-glass credential; trying the pin path");
+                None
             }
             Err(e) if e.is_cp_down() => {
                 self.note_cp_down("publickey-breakglass");
-                self.reject_and_degrade()
+                None
             }
             Err(e) => {
-                tracing::warn!(error = %e, source_ip = %self.source_ip, "break-glass key resolution failed; degrading");
-                self.reject_and_degrade()
+                tracing::warn!(error = %e, source_ip = %self.source_ip, "break-glass key resolution failed; trying the pin path");
+                None
             }
         }
     }
@@ -810,42 +810,61 @@ impl SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<Arc<Authorized>, ()> {
-        // (a) decision_ttl re-validate. An unhealthy lock feed forces re-validate
-        // (effective TTL 0) so a possibly-missed lock cannot be served stale-open.
-        let max_decision_ttl_secs = self.deps.config.reeval.max_decision_ttl_secs;
         let grant_expiry_skew_secs = self.deps.config.reeval.grant_expiry_skew_secs;
-        let healthy = self.deps.lock_set.healthy();
-        let effective_ttl = if healthy {
-            authz
-                .context
-                .decision_ttl_seconds
-                .min(max_decision_ttl_secs)
-                .max(0)
+
+        // (a) Re-validate. A BREAK-GLASS session is authorized ONCE by its single-use
+        // token and does NOT re-authorize — a re-auth would replay the consumed token
+        // (fail-closed replay-DENY) and needlessly refuse new channels. Its deny-side
+        // safety does not depend on the periodic re-auth: it comes from the actively-
+        // pushed LockFeed (§8.4) + conservative grant_expiry, both enforced in (b)/(d).
+        // So on the HEALTHY path it serves new channels from the cached context; when
+        // the feed is UNHEALTHY it cannot confirm the absence of a lock, so it refuses
+        // NEW privileged channel-opens (fail closed) — existing channels run to
+        // grant_expiry (S10 degrade-safe contract, without the token-replay artifact).
+        if self.session_is_break_glass() {
+            if !self.deps.lock_set.healthy() {
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "breakglass_lock_feed_unhealthy", "break-glass: lock feed unhealthy; refusing new channel (fail closed)");
+                self.close_with(channel, session, SshOutcome::PolicyDenied);
+                return Err(());
+            }
         } else {
-            0
-        };
-        if authz.verified_at.elapsed().as_secs() as i64 >= effective_ttl {
-            match self.decide().await {
-                Ok(fresh) => {
-                    let fresh = Arc::new(fresh);
-                    self.authz = Some(fresh.clone());
-                    // Refresh the registered teardown bindings (the re-authorized
-                    // context may carry drifted node_labels / allowed_logins, so a
-                    // lock on the NEW facet still tears this live session down) and
-                    // rearm the expiry timer against the refreshed grant_expiry.
-                    if let Some(control) = self.session_control.clone() {
-                        control.update_bindings(fresh.bindings.clone());
-                        self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
+            // Standing/JIT re-validate: re-authorize when decision_ttl has elapsed, or
+            // immediately when the lock feed is unhealthy (effective TTL 0) so a
+            // possibly-missed lock cannot be served stale-open.
+            let max_decision_ttl_secs = self.deps.config.reeval.max_decision_ttl_secs;
+            let healthy = self.deps.lock_set.healthy();
+            let effective_ttl = if healthy {
+                authz
+                    .context
+                    .decision_ttl_seconds
+                    .min(max_decision_ttl_secs)
+                    .max(0)
+            } else {
+                0
+            };
+            if authz.verified_at.elapsed().as_secs() as i64 >= effective_ttl {
+                match self.decide().await {
+                    Ok(fresh) => {
+                        let fresh = Arc::new(fresh);
+                        self.authz = Some(fresh.clone());
+                        // Refresh the registered teardown bindings (the re-authorized
+                        // context may carry drifted node_labels / allowed_logins, so a
+                        // lock on the NEW facet still tears this live session down) and
+                        // rearm the expiry timer against the refreshed grant_expiry.
+                        if let Some(control) = self.session_control.clone() {
+                            control.update_bindings(fresh.bindings.clone());
+                            self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
+                        }
+                        authz = fresh;
                     }
-                    authz = fresh;
-                }
-                Err(o) => {
-                    // Re-authorize failed (CP down / now denied). Refuse this NEW
-                    // channel-open; existing channels keep flowing (allow fails open
-                    // for the live session, deny/new fails closed — §2, NFR-2).
-                    tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "revalidate_failed", "per-channel re-authorize failed; refusing new channel");
-                    self.close_with(channel, session, o);
-                    return Err(());
+                    Err(o) => {
+                        // Re-authorize failed (CP down / now denied). Refuse this NEW
+                        // channel-open; existing channels keep flowing (allow fails open
+                        // for the live session, deny/new fails closed — §2, NFR-2).
+                        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "revalidate_failed", "per-channel re-authorize failed; refusing new channel");
+                        self.close_with(channel, session, o);
+                        return Err(());
+                    }
                 }
             }
         }
@@ -1193,13 +1212,20 @@ impl Handler for SshHandler {
         if self.attempt_cap_exceeded() {
             return Ok(self.hard_reject());
         }
-        // Break-glass FIDO2 (Design §7, FR-ACC-6): a security-key publickey
-        // (`sk-ecdsa`/`sk-ed25519`) is the PRIMARY break-glass path. russh has
-        // already verified the FIDO possession signature; resolve the key to its
-        // break-glass identity BEFORE the ordinary pin path.
-        if self.deps.config.break_glass.enabled && is_security_key(public_key.algorithm()) {
+        // Break-glass FIDO2 (Design §7, FR-ACC-6): an sk-ecdsa security key is the
+        // PRIMARY break-glass path — try the break-glass resolver first (russh has
+        // already verified the FIDO possession signature). A key that is NOT a
+        // registered break-glass credential FALLS THROUGH to the ordinary pin path
+        // below: a normal sk-ecdsa user rides the pubkey/pin path (SESSION §1.2), and
+        // never a hard reject. Only sk-ecdsa enters here; sk-ed25519 and every other
+        // algorithm go straight to the pin path.
+        if self.deps.config.break_glass.enabled && is_break_glass_algorithm(public_key.algorithm())
+        {
             self.conn.record_method("publickey-breakglass");
-            return Ok(self.resolve_break_glass_publickey(public_key).await);
+            if let Some(auth) = self.try_break_glass_publickey(public_key).await {
+                return Ok(auth);
+            }
+            // Not a break-glass credential (or the CP could not answer) → fall through.
         }
         self.conn.record_method("publickey-pin");
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
@@ -1536,11 +1562,14 @@ fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind
     }
 }
 
-/// Whether `alg` is a FIDO2/U2F security-key algorithm — the break-glass publickey
-/// path (Design §7, FR-ACC-6). `sk-ecdsa-sha2-nistp256@openssh.com` is the primary
-/// break-glass authenticator; `sk-ssh-ed25519@openssh.com` is honoured too.
-fn is_security_key(alg: Algorithm) -> bool {
-    matches!(alg, Algorithm::SkEcdsaSha2NistP256 | Algorithm::SkEd25519)
+/// Whether `alg` is a break-glass candidate algorithm — the FIDO2 publickey path
+/// (Design §7, FR-ACC-6). ONLY `sk-ecdsa-sha2-nistp256@openssh.com`: P-256 is the
+/// platform default and the CP registers break-glass credentials as sk-ecdsa. A
+/// non-break-glass sk-ecdsa key (and every other algorithm, incl. sk-ed25519) rides
+/// the ordinary pubkey/pin path — an sk-ecdsa key that does not resolve as a
+/// break-glass credential falls through to the pin path (never a hard reject).
+fn is_break_glass_algorithm(alg: Algorithm) -> bool {
+    matches!(alg, Algorithm::SkEcdsaSha2NistP256)
 }
 
 /// Whether a break-glass resolution actually succeeded: the identity resolved AND a
@@ -1666,13 +1695,16 @@ mod tests {
         assert!(!cleaned.contains('\u{202E}'));
     }
 
-    /// The break-glass FIDO2 publickey path (Design §7, FR-ACC-6): a security-key
-    /// algorithm routes to break-glass; an ordinary key takes the pin path.
+    /// The break-glass FIDO2 publickey path (Design §7, FR-ACC-6, divergence D6):
+    /// ONLY sk-ecdsa is a break-glass candidate (P-256 is the platform default and
+    /// the CP registers break-glass credentials as sk-ecdsa). sk-ed25519 and every
+    /// other algorithm ride the ordinary pin path; a non-break-glass sk-ecdsa key
+    /// also falls through to the pin path (never a hard reject).
     #[test]
-    fn security_key_algorithms_route_to_break_glass() {
-        assert!(is_security_key(Algorithm::SkEcdsaSha2NistP256));
-        assert!(is_security_key(Algorithm::SkEd25519));
-        assert!(!is_security_key(Algorithm::Ed25519));
+    fn only_sk_ecdsa_routes_to_break_glass() {
+        assert!(is_break_glass_algorithm(Algorithm::SkEcdsaSha2NistP256));
+        assert!(!is_break_glass_algorithm(Algorithm::SkEd25519));
+        assert!(!is_break_glass_algorithm(Algorithm::Ed25519));
     }
 
     /// Break-glass resolution is fail-closed: it succeeds ONLY when the identity

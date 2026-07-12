@@ -135,6 +135,42 @@ async fn sk_ecdsa_publickey_resolves_to_break_glass() {
     );
 }
 
+/// Divergence D6: a normal sk-ecdsa USER key (registered as a PIN, not a break-glass
+/// credential) must FALL THROUGH the break-glass resolver to the ordinary pin path
+/// and authenticate — never a hard reject. sk-ed25519 and every other algorithm skip
+/// the break-glass branch entirely and go straight to the pin path.
+#[tokio::test]
+async fn sk_ecdsa_non_breakglass_key_falls_through_to_pin() {
+    let cp = MockCp::start().await;
+    let config = Arc::new(SshServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        login_grace_secs: 30,
+        ..Default::default()
+    });
+    let deps = support::outer_leg_deps(&cp, config).await;
+
+    // A normal sk-ecdsa user key: a PIN, NOT a registered break-glass credential.
+    let sk = make_sk_ecdsa_pubkey();
+    let fp = sk.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+    cp.register_pin(&fp, "alice", &["deploy"]);
+
+    let conn = Arc::new(ConnState::default());
+    let mut handler = SshHandler::new(deps, "10.9.9.10".parse().unwrap(), conn);
+    let auth = handler
+        .auth_publickey("deploy%node-bg", &sk)
+        .await
+        .expect("auth_publickey");
+    assert!(
+        matches!(auth, Auth::Accept),
+        "a normal sk-ecdsa pin user must authenticate via the pin path (break-glass falls through)"
+    );
+    assert_eq!(
+        cp.breakglass_token_count(),
+        0,
+        "a non-break-glass sk key mints NO break-glass token"
+    );
+}
+
 // ── Docker E2E scaffolding (mirrors recorder_it.rs) ──────────────────────────
 
 fn ensure_docker_host() {
@@ -647,6 +683,62 @@ async fn offline_code_break_glass_runs_forces_strict_single_use_idp_down() -> an
         cp.breakglass_activation_count(),
         1,
         "a replayed code mints no token and drives no activation"
+    );
+
+    drop(client);
+    drop(node);
+    drop(minio);
+    Ok(())
+}
+
+// ── E2E 1b: a break-glass session serves new channels without re-authorizing
+//    (decision_ttl=0, healthy feed) — no single-use-token replay-DENY ───────────
+
+#[tokio::test]
+async fn break_glass_serves_channels_when_decision_ttl_zero() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let (minio, s3) = start_minio().await?;
+    cp.set_s3_target(s3);
+    cp.set_customer_key(
+        "ck",
+        customer_keypair(),
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+    // Force per-channel re-validate. A break-glass session is authorized once by its
+    // single-use token and must NOT re-authorize on the healthy feed: without that
+    // posture the FIRST channel would re-authorize (elapsed >= 0), replay the consumed
+    // token, and be refused. With it, the healthy LockFeed serves the channel from the
+    // cached context (grant_expiry + pushed lock-set still enforced).
+    cp.set_decision_ttl(0);
+    cp.register_offline_code("bg-ttl0", "breakglass-admin", &["deploy"]);
+    cp.register_node(NODE_ID);
+
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
+    let client = client_container().await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ki_ssh(gw_port, "deploy%node-bg", "echo BG_TTL0_OK"),
+        code_env("bg-ttl0"),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "break-glass with decision_ttl=0 must serve the channel (no token replay); stderr={stderr}"
+    );
+    assert!(stdout.contains("BG_TTL0_OK"));
+    // Exactly one activation: the channel was served from the cached context, NOT
+    // re-authorized (a re-auth would have replayed the token).
+    assert_eq!(
+        cp.breakglass_activation_count(),
+        1,
+        "the break-glass session did not re-authorize → one activation"
     );
 
     drop(client);

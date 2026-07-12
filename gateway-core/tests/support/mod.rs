@@ -303,6 +303,10 @@ struct MockState {
     /// Per-node granted capability override (default shell+exec); drives the
     /// SFTP-granted-vs-withheld tests (FR-SESS-1/2).
     node_capabilities: Mutex<HashMap<String, Vec<i32>>>,
+    /// The `decision_ttl_seconds` baked into every signed decision context. Lets a
+    /// test force per-channel re-validate (0) to exercise the break-glass no-replay
+    /// re-auth posture on the healthy feed.
+    decision_ttl_secs: Mutex<i64>,
     /// When set, `Authorize` returns UNAVAILABLE (the CP-down fail-closed row).
     authorize_unavailable: Mutex<bool>,
     /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
@@ -982,7 +986,7 @@ impl MockState {
             principal: r.requested_principal.clone(),
             grant_expiry_epoch_seconds: now + 3600,
             policy_epoch: 1,
-            decision_ttl_seconds: 45,
+            decision_ttl_seconds: *self.decision_ttl_secs.lock().unwrap(),
             gateway_id: gid.to_string(),
             session_id: r.session_id.clone(),
             source_address: r.source_ip.clone(),
@@ -1471,6 +1475,7 @@ impl MockCpBuilder {
             host_ca_public_wire,
             node_connections: Mutex::new(HashMap::new()),
             node_capabilities: Mutex::new(HashMap::new()),
+            decision_ttl_secs: Mutex::new(45),
             authorize_unavailable: Mutex::new(false),
             resolve_unavailable: Mutex::new(false),
             break_glass_keys: Mutex::new(HashMap::new()),
@@ -1919,6 +1924,13 @@ impl MockCp {
                 source_ip: None,
             },
         );
+    }
+
+    /// Set the `decision_ttl_seconds` baked into signed contexts. `0` forces the
+    /// Gateway to re-validate every channel-open (exercises the break-glass
+    /// no-replay re-auth posture).
+    pub fn set_decision_ttl(&self, secs: i64) {
+        *self.state.decision_ttl_secs.lock().unwrap() = secs;
     }
 
     /// The number of break-glass tokens minted by a resolve (test assertion for the
