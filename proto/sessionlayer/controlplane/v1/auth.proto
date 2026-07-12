@@ -67,8 +67,12 @@ service OuterLegAuth {
   // ResolveBreakglassKey resolves a registered break-glass FIDO2 `sk-ecdsa` PUBLIC
   // key to its break-glass identity + scoped principals, INDEPENDENT of the primary
   // OIDC IdP (Design §5.2/§7, FR-ACC-6). The key is public and russh has already
-  // verified the FIDO possession signature (sk flags/counter) before the Gateway
-  // calls this — the CP only maps the key to its registered break-glass credential.
+  // verified the FIDO POSSESSION signature before the Gateway calls this (proving the
+  // hardware authenticator, whose private key never leaves it, is present) — the CP
+  // only maps the key to its registered break-glass credential. NOTE: touch
+  // (user-presence) is enforced by the AUTHENTICATOR for a standard touch-required
+  // sk key; it is NOT asserted server-side (this russh does not expose the sk flags),
+  // so break-glass keys MUST be provisioned touch-required (never `-O no-touch-required`).
   // On success it mints a single-use `breakglass_token` (in BreakglassResolution)
   // that authorises exactly one break-glass Authorize. A key that is unknown,
   // revoked, expired, or out-of-source resolves to `resolved = false` with no token
@@ -77,12 +81,14 @@ service OuterLegAuth {
 
   // ResolveBreakglassCode validates a pre-issued single-use break-glass OFFLINE CODE
   // (Design §7, FR-ACC-6) — the IdP-independent FALLBACK when no FIDO2 authenticator
-  // is available. Constant-time compare + single-use (atomic mark-used), source-
-  // bound; the identity comes from the code record, never client input. The `code`
-  // field is a SECRET (entered over keyboard-interactive with echo off) — NEVER log
-  // it. On success it mints a single-use `breakglass_token`; a replayed, expired,
-  // wrong-source, or unknown code resolves to `resolved = false` with no token
-  // (generic). Added in Session 13.
+  // is available. The code is looked up by its SHA-256 hash (the raw code is never
+  // stored nor compared in the clear) and consumed by an atomic single-use UPDATE;
+  // it is source-bound and the identity comes from the code record, never client
+  // input. A ≥128-bit code makes the hash-existence timing side-channel useless. The
+  // `code` field is a SECRET (entered over keyboard-interactive with echo off) —
+  // NEVER log it. On success it mints a single-use `breakglass_token`; a replayed,
+  // expired, wrong-source, or unknown code resolves to `resolved = false` with no
+  // token (generic). Added in Session 13.
   rpc ResolveBreakglassCode(ResolveBreakglassCodeRequest) returns (ResolveBreakglassCodeResponse);
 }
 
@@ -263,8 +269,9 @@ message ResolveBreakglassKeyResponse {
 // ResolveBreakglassCodeRequest carries the presented break-glass offline code. The
 // `code` field is a SECRET (keyboard-interactive, echo off) — NEVER log it.
 message ResolveBreakglassCodeRequest {
-  // The one-time break-glass code the user typed. Secret; validated constant-time and
-  // single-use, then consumed. Must never appear in a log or trace.
+  // The one-time break-glass code the user typed. Secret; matched by SHA-256 hash
+  // (never compared in the clear) and consumed single-use. Must never appear in a
+  // log or trace.
   string code = 1;
 
   // The client source IP. The code is source-bound (deny-only, FR-AUTH-15).
