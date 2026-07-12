@@ -127,6 +127,10 @@ pub struct RecordingParams {
     /// real handler always supplies it; `None` is only for a recorder driven
     /// directly by a unit test.
     pub teardown: Option<Handle>,
+    /// Shared session-abort flag (Session Ten). A lock-triggered teardown flips it
+    /// so `should_abort()` returns true and the bridge stops forwarding plaintext
+    /// at once — the same immediate-stop discipline as a strict-mode failure.
+    pub abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A fail-closed recorder setup failure. The user only ever sees the generic

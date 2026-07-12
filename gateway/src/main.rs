@@ -347,10 +347,26 @@ async fn start_outer_leg(
 
     let factory = Arc::new(cpauth::CpChannelFactory::from_watch(params, snap_rx));
     let cpauth = Arc::new(cpauth::CpAuthClient::new(
-        factory,
+        factory.clone(),
         Duration::from_secs(cfg.ssh.cp_rpc_timeout_secs),
     ));
     let ssh_cfg = Arc::new(cfg.ssh.clone());
+
+    // Session Ten: the actively-pushed lock deny-set + live-session registry, and
+    // the background lock-feed stream client (resync on reconnect; the set is never
+    // cleared on disconnect, so a pushed lock keeps denying under datastore loss).
+    let lock_set = Arc::new(ssh::locks::LockSet::new(
+        ssh_cfg.reeval.lock_feed_unhealthy_after_secs,
+        ssh_cfg.reeval.lock_expiry_skew_secs,
+    ));
+    let live_sessions = Arc::new(ssh::locks::LiveSessionRegistry::default());
+    ssh::lockfeed::LockFeedClientTask::new(
+        factory,
+        lock_set.clone(),
+        live_sessions.clone(),
+        Duration::from_secs(ssh_cfg.reeval.lock_feed_connect_timeout_secs),
+    )
+    .spawn(shutdown.clone());
     // Session Nine: the real session recorder (asciicast v2 + SFTP/SCP decode +
     // customer-key encryption + hash-chained WORM upload). Reuses the one CP
     // client; reads the optional upload-CA up front (fail closed on misconfig).
@@ -367,6 +383,8 @@ async fn start_outer_leg(
         resolver: Arc::new(ssh::target::IdentityResolver),
         recorder_factory,
         finalize_tracker: finalize_tracker.clone(),
+        lock_set,
+        live_sessions,
         config: ssh_cfg.clone(),
     };
 
