@@ -36,10 +36,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // upload credentials and holds recording metadata. The Gateway is a client;
     // the server side is generated for the in-process mock CP.
     let recording = proto_root.join("sessionlayer/controlplane/v1/recording.proto");
+    // Session Ten addition (frozen upstream): the actively-pushed lock deny-list
+    // (LockFeed: StreamLocks — server-streaming). The Gateway is a client; the
+    // server side is generated for the in-process mock CP.
+    let lock = proto_root.join("sessionlayer/controlplane/v1/lock.proto");
 
     // Regenerate only when the vendored contract (or this script) changes.
     for p in [
-        &common, &handshake, &identity, &signing, &authz, &auth, &recording,
+        &common, &handshake, &identity, &signing, &authz, &auth, &recording, &lock,
     ] {
         println!("cargo:rerun-if-changed={}", p.display());
     }
@@ -52,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // services.
         .build_server(true)
         .compile_protos(
-            &[handshake, identity, signing, authz, auth, recording, common],
+            &[handshake, identity, signing, authz, auth, recording, lock, common],
             &[proto_root],
         )?;
 

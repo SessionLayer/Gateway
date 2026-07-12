@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+import "sessionlayer/controlplane/v1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "LockProto";
+
+// LockFeed is the CP -> Gateway actively-pushed lock deny-list (Design §6.3,
+// §8.3, §8.4; FR-CHAN-3, FR-LOCK-1/2). Added in Session Ten (additive; protocol
+// stays 1.1).
+//
+// It realises the asymmetric-degradation invariant (the safety spine): a lock
+// lives on this INDEPENDENT push feed — never a poll that can go stale-open — so
+// every Gateway honours it even under total datastore loss and in break-glass
+// mode. Allow-state may fail open; deny-state (a lock) MUST fail closed and win.
+//
+// TIER. mTLS-required (gateway-identity): the calling Gateway is authenticated
+// from its client certificate (the AuthInterceptor resolves gateway_identity).
+// The WHOLE fleet-wide lock set is delivered to every Gateway; matching a lock
+// against a live session is a purely LOCAL Gateway decision against the signed
+// decision context — the CP does no per-Gateway filtering.
+service LockFeed {
+  // StreamLocks opens the server-streaming deny-list feed for the calling
+  // Gateway: an initial authoritative SNAPSHOT, then incremental add/remove
+  // events, interleaved with periodic heartbeats (the Gateway's stream-health
+  // signal). On reconnect the Gateway receives a fresh snapshot (a full RESYNC),
+  // so a missed event during a disconnect self-heals. The Gateway holds the set
+  // independent of the datastore; a previously-pushed lock keeps denying even
+  // after the CP/datastore is lost.
+  rpc StreamLocks(StreamLocksRequest) returns (stream LockEvent);
+}
+
+// StreamLocksRequest carries no authority: the AUTHENTICATED caller is the mTLS
+// client certificate, not any request field.
+message StreamLocksRequest {
+  // The calling Gateway's identity/version, for diagnostics only. Carries NO
+  // secrets and is NOT trusted for authorization.
+  ComponentInfo client = 1;
+}
+
+// One event on the feed. Exactly one of snapshot/added/removed/heartbeat is set.
+message LockEvent {
+  oneof event {
+    // The authoritative full lock set (initial connect + every resync). The
+    // Gateway REPLACES its local set wholesale with this.
+    LockSnapshot snapshot = 1;
+
+    // A lock created (or updated) — the Gateway adds it and immediately tears
+    // down any matching live session (FR-LOCK-1).
+    Lock added = 2;
+
+    // A lock removed (deleted or expired) — the Gateway drops it by id. Removal
+    // NEVER tears anything down (a cleared lock only stops denying).
+    LockRemoval removed = 3;
+
+    // A liveness beat. Its absence past the Gateway's threshold marks the stream
+    // unhealthy, which forces per-channel re-validate (decision_ttl -> 0).
+    Heartbeat heartbeat = 4;
+  }
+}
+
+// LockSnapshot is the authoritative current lock set. The Gateway replaces its
+// whole local set with these locks (the resync primitive).
+message LockSnapshot {
+  repeated Lock locks = 1;
+
+  // The CP feed epoch at snapshot time (monotonic within a CP process). Advisory:
+  // lets the Gateway notice a feed/CP restart. This is NOT the policy_epoch.
+  uint64 feed_epoch = 2;
+}
+
+// LockRemoval identifies a lock that no longer applies (deleted or expired).
+message LockRemoval {
+  string lock_id = 1;
+}
+
+// Heartbeat is an empty liveness beat carrying only the CP send time.
+message Heartbeat {
+  int64 sent_at_epoch_seconds = 1;
+}
+
+// A Lock is an incident-response deny (Design §8.3; FR-LOCK-1): it blocks new
+// issuance / session start AND tears down existing matching sessions, INDEPENDENT
+// of TTL and CA rotation. The Gateway matches `target` against a live session's
+// SIGNED decision context locally (S5 LockMatching, ported to Rust).
+message Lock {
+  // The lock's stable id (UUID). The Gateway keys its local set on this.
+  string lock_id = 1;
+
+  // What the lock matches. Facets are OR-matched (S5 LockMatching semantics).
+  LockTarget target = 2;
+
+  // Absolute expiry (Unix epoch seconds, UTC); 0 = no TTL. A DENY expires
+  // CONSERVATIVELY — the Gateway keeps the lock active until clearly past this
+  // (the opposite of a grant, which expires early). An expired lock only stops
+  // denying; it never fails open early.
+  int64 expires_at_epoch_seconds = 3;
+
+  // When the lock was created (Unix epoch seconds, UTC). Diagnostics/ordering.
+  int64 created_at_epoch_seconds = 4;
+
+  // The operator/audit reason. NEVER disclosed to the SSH user (§7.1 — a lock
+  // produces the SAME generic denial as any authorization failure); it may
+  // appear only in the Gateway's OPERATOR-facing log.
+  string reason = 5;
+}
+
+// LockTarget mirrors the runtime.access_lock target_selector facets (S5
+// LockMatching). Facets are OR-matched. Ingest validation (CP-side) rejects a
+// target with no recognised facet UNLESS `all` is explicitly true — a global
+// lock must be intentional, never the result of a typo (the S5 recommendation).
+message LockTarget {
+  // Resolved subject identities the lock denies.
+  repeated string identities = 1;
+
+  // SSO/OIDC groups the lock denies (membership match).
+  repeated string groups = 2;
+
+  // Target node ids (UUID) the lock denies.
+  repeated string node_ids = 3;
+
+  // Linux logins (principals) the lock denies. Matches the requested principal or
+  // any allowed login of the session.
+  repeated string principals = 4;
+
+  // Node labels ("key=value") the lock denies (matched against node inventory
+  // labels on the decision context).
+  repeated string node_labels = 5;
+
+  // An explicit fleet-wide lock (deny everything). Required to be true for a
+  // target that carries no other facet — a global lock is never implicit.
+  bool all = 6;
+}

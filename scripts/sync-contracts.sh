@@ -33,7 +33,9 @@ mkdir -p "$DST"
 # ResolveOtp / Begin+PollDeviceFlow) — the outer-leg authentication RPCs.
 # Session Nine added recording.proto (Recording: BeginRecording /
 # FinalizeRecording) and an additive recording_token field on authz.proto.
-for f in common.proto handshake.proto identity.proto signing.proto authz.proto auth.proto recording.proto; do
+# Session Ten added lock.proto (LockFeed: StreamLocks — the actively-pushed lock
+# deny-list) and additive identity/groups/node_labels on authz DecisionContext.
+for f in common.proto handshake.proto identity.proto signing.proto authz.proto auth.proto recording.proto lock.proto; do
   cp -v "$SRC/$f" "$DST/$f"
 done
 
