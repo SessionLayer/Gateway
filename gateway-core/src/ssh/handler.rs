@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use russh::keys::{Certificate, HashAlg, PrivateKey, PublicKey};
+use russh::keys::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Response, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty};
 use zeroize::Zeroizing;
@@ -38,8 +38,8 @@ use crate::config::SshServerConfig;
 use crate::cpauth::{CpAuthClient, CpError};
 use crate::decisionctx;
 use crate::pb::{
-    AuthorizeRequest, Capability, Decision, DecisionContext, DeviceFlowStatus, ResolvedIdentity,
-    SignContext,
+    AccessModel, AuthorizeRequest, Capability, Decision, DecisionContext, DeviceFlowStatus,
+    ResolvedIdentity, SignContext,
 };
 use crate::signing::InnerKeyPair;
 use crate::ssh::bridge::{
@@ -86,6 +86,9 @@ enum AuthMethod {
     Pin,
     Otp,
     DeviceFlow,
+    /// Break-glass (Design §7, FR-ACC-6): a FIDO2 `sk-ecdsa` key or a single-use
+    /// offline code, resolved by the CP independent of the primary OIDC IdP.
+    BreakGlass,
 }
 
 /// The CP-resolved authenticated identity (authentication only; authorization is
@@ -149,6 +152,13 @@ pub struct SshHandler {
     /// as a principal, sanitized before logging).
     username: Option<String>,
     authenticated: Option<Authenticated>,
+    /// True once a break-glass credential (FIDO2 key / offline code) authenticated
+    /// this connection (Session Thirteen). Drives the break-glass Authorize + forced
+    /// strict recording + the break-glass mid-session-expiry policy.
+    break_glass: bool,
+    /// The single-use break-glass token minted by the CP resolution, presented once
+    /// as `AuthorizeRequest.breakglass_token`. Not a long-lived secret; never logged.
+    breakglass_token: Option<String>,
     ki: KiState,
     /// The connect-time authorization result, decided once on the first channel
     /// request: either the allow (with the node connection + grant) or a cached
@@ -233,6 +243,8 @@ impl SshHandler {
             session_id: new_session_id(),
             username: None,
             authenticated: None,
+            break_glass: false,
+            breakglass_token: None,
             ki: KiState::Start,
             authz: None,
             authz_denied: None,
@@ -302,6 +314,121 @@ impl SshHandler {
         });
     }
 
+    /// Mark the connection break-glass authenticated: store the single-use token,
+    /// flip the break-glass flag (forces strict recording + the break-glass Authorize
+    /// + the break-glass mid-session-expiry policy), then record the identity.
+    fn set_break_glass_authenticated(&mut self, id: ResolvedIdentity, token: String) {
+        self.break_glass = true;
+        self.breakglass_token = Some(token);
+        self.set_authenticated(id, AuthMethod::BreakGlass);
+    }
+
+    /// Best-effort target node id for a break-glass credential's scope + token
+    /// binding, derived from the SSH username (`login%node`) at auth time. The
+    /// AUTHORITATIVE node binding is enforced at Authorize (where the token is
+    /// consumed against the real node); an unparseable/unknown target yields an
+    /// empty node id (tolerated by the CP for a fleet-scoped break-glass credential).
+    fn break_glass_node_id(&self) -> String {
+        let username = self.username.as_deref().unwrap_or_default();
+        parse_username(username, self.deps.config.target_separator)
+            .ok()
+            .and_then(|t| self.deps.resolver.resolve_node_id(&t))
+            .unwrap_or_default()
+    }
+
+    /// Resolve an offered FIDO2 security-key (`sk-ecdsa`/`sk-ed25519`) publickey to
+    /// its break-glass identity (Design §7, FR-ACC-6). russh has already verified
+    /// the FIDO possession signature before this runs; the CP maps the PUBLIC key to
+    /// a registered break-glass credential and mints a single-use token. A key that
+    /// does not resolve degrades to the next method (generic, §7.1); CP-down fails
+    /// closed (surfaced on the keyboard-interactive fallback).
+    async fn resolve_break_glass_publickey(&mut self, public_key: &PublicKey) -> Auth {
+        let Ok(blob) = public_key.to_bytes() else {
+            return self.reject_and_degrade();
+        };
+        let node_id = self.break_glass_node_id();
+        match self
+            .deps
+            .cpauth
+            .resolve_break_glass_key(blob, &self.source_ip(), &node_id)
+            .await
+        {
+            Ok(res) if break_glass_resolved(&res) => {
+                let id = res.identity.expect("resolved implies identity present");
+                self.set_break_glass_authenticated(id, res.breakglass_token);
+                Auth::Accept
+            }
+            Ok(_) => {
+                tracing::info!(source_ip = %self.source_ip, "offered security key is not a registered break-glass credential; degrading");
+                self.reject_and_degrade()
+            }
+            Err(e) if e.is_cp_down() => {
+                self.note_cp_down("publickey-breakglass");
+                self.reject_and_degrade()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, source_ip = %self.source_ip, "break-glass key resolution failed; degrading");
+                self.reject_and_degrade()
+            }
+        }
+    }
+
+    /// Try the typed keyboard-interactive secret as a single-use break-glass OFFLINE
+    /// CODE (Design §7, FR-ACC-6 — the IdP-independent fallback). Returns `Some(Auth)`
+    /// on a terminal outcome (resolved → Accept; CP-down → service-unavailable) and
+    /// `None` to fall through to the device flow. The `code` is a SECRET — NEVER
+    /// logged.
+    async fn try_break_glass_code(&mut self, code: &str) -> Option<Auth> {
+        let node_id = self.break_glass_node_id();
+        match self
+            .deps
+            .cpauth
+            .resolve_break_glass_code(code, &self.source_ip(), &node_id)
+            .await
+        {
+            Ok(res) if break_glass_resolved(&res) => {
+                let id = res.identity.expect("resolved implies identity present");
+                self.set_break_glass_authenticated(id, res.breakglass_token);
+                Some(Auth::Accept)
+            }
+            Ok(_) => None,
+            Err(e) if e.is_cp_down() => {
+                self.note_cp_down("breakglass-code");
+                self.ki = KiState::TimedOut;
+                Some(partial_message(SERVICE_UNAVAILABLE))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, source_ip = %self.source_ip, "break-glass code resolution failed; falling back to device flow");
+                None
+            }
+        }
+    }
+
+    /// The mid-session identity-expiry mode for THIS session, selected per access
+    /// model (FR-ACC-8): a break-glass session uses the break-glass policy; standing
+    /// and JIT use the default reeval policy. Uses BOTH the Gateway's local
+    /// break-glass flag and the SIGNED `access_model` (belt-and-suspenders). A Lock
+    /// always overrides with immediate teardown regardless of this.
+    fn mid_session_expiry_mode(&self) -> MidSessionExpiryMode {
+        if self.session_is_break_glass() {
+            self.deps.config.break_glass.mid_session_expiry
+        } else {
+            self.deps.config.reeval.mid_session_expiry
+        }
+    }
+
+    /// Whether this session is break-glass, from the local auth flag OR the SIGNED
+    /// decision-context `access_model` (the CP forces BREAKGLASS on a break-glass
+    /// token) — either signal forces the break-glass treatment (strict recording,
+    /// expiry policy).
+    fn session_is_break_glass(&self) -> bool {
+        self.break_glass
+            || self
+                .authz
+                .as_ref()
+                .is_some_and(|a| a.context.access_model == AccessModel::Breakglass as i32)
+    }
+
     /// A rejection that keeps `publickey` + `keyboard-interactive` on the table so
     /// the client degrades to its next key/method (FR-AUTH-2).
     fn reject_and_degrade(&self) -> Auth {
@@ -346,6 +473,15 @@ impl SshHandler {
                             return Auth::Accept;
                         }
                         Ok(_) => {
+                            // Not an OTP: before the device flow, try the same typed
+                            // secret as a single-use break-glass OFFLINE CODE (IdP-
+                            // independent, FR-ACC-6) so break-glass works even when the
+                            // primary IdP / device flow is unavailable.
+                            if self.deps.config.break_glass.enabled {
+                                if let Some(auth) = self.try_break_glass_code(otp).await {
+                                    return auth;
+                                }
+                            }
                             tracing::info!(source_ip = %self.source_ip, "OTP did not resolve; falling back to device flow")
                         }
                         // CP down during OTP resolution → surface service-unavailable
@@ -565,6 +701,11 @@ impl SshHandler {
                 self.close_with(channel, session, o);
                 return;
             }
+            // Break-glass ALWAYS forces strict recording (FR-ACC-6): the session dies
+            // if recording fails. Gated on BOTH the local break-glass flag and the
+            // SIGNED access_model (belt-and-suspenders). `force_strict` can only
+            // tighten the configured strict mode, never loosen it.
+            let force_strict = self.session_is_break_glass();
             let params = RecordingParams {
                 recording_token: authz.recording_token.clone(),
                 session_id: self.session_id.clone(),
@@ -575,8 +716,9 @@ impl SshHandler {
                     .session_abort
                     .clone()
                     .expect("session registered before the recorder begins"),
+                force_strict,
             };
-            let strict = self.deps.config.recorder.strict;
+            let strict = self.deps.config.recorder.strict || force_strict;
             match self.deps.recorder_factory.begin(params).await {
                 Ok(r) => self.recorder = Some(r),
                 Err(e) if strict => {
@@ -767,7 +909,7 @@ impl SshHandler {
         if let Some(task) = self.expiry_task.take() {
             task.abort();
         }
-        let mode = self.deps.config.reeval.mid_session_expiry;
+        let mode = self.mid_session_expiry_mode();
         if mode == MidSessionExpiryMode::RunToTtl || grant_expiry == 0 {
             return;
         }
@@ -823,6 +965,11 @@ impl SshHandler {
             source_ip: self.source_ip(),
             session_id: self.session_id.clone(),
             client: Some(version::component_info()),
+            // Present ONLY on a break-glass connect: the CP consumes it (single-use),
+            // creates the activation + fires the alert, forces access_model =
+            // BREAKGLASS + strict, and evaluates the break-glass allow SUBJECT TO the
+            // top-tier Lock (a Lock still denies — deny wins). Empty for standing/JIT.
+            breakglass_token: self.breakglass_token.clone().unwrap_or_default(),
         };
 
         match self.deps.cpauth.authorize(req).await {
@@ -1043,10 +1190,18 @@ impl Handler for SshHandler {
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
         self.remember_user(user);
-        self.conn.record_method("publickey-pin");
         if self.attempt_cap_exceeded() {
             return Ok(self.hard_reject());
         }
+        // Break-glass FIDO2 (Design §7, FR-ACC-6): a security-key publickey
+        // (`sk-ecdsa`/`sk-ed25519`) is the PRIMARY break-glass path. russh has
+        // already verified the FIDO possession signature; resolve the key to its
+        // break-glass identity BEFORE the ordinary pin path.
+        if self.deps.config.break_glass.enabled && is_security_key(public_key.algorithm()) {
+            self.conn.record_method("publickey-breakglass");
+            return Ok(self.resolve_break_glass_publickey(public_key).await);
+        }
+        self.conn.record_method("publickey-pin");
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
         match self
             .deps
@@ -1381,6 +1536,20 @@ fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind
     }
 }
 
+/// Whether `alg` is a FIDO2/U2F security-key algorithm — the break-glass publickey
+/// path (Design §7, FR-ACC-6). `sk-ecdsa-sha2-nistp256@openssh.com` is the primary
+/// break-glass authenticator; `sk-ssh-ed25519@openssh.com` is honoured too.
+fn is_security_key(alg: Algorithm) -> bool {
+    matches!(alg, Algorithm::SkEcdsaSha2NistP256 | Algorithm::SkEd25519)
+}
+
+/// Whether a break-glass resolution actually succeeded: the identity resolved AND a
+/// single-use token was minted. A resolved identity with no token is fail-closed
+/// (no break-glass Authorize can proceed without the token, §7.1).
+fn break_glass_resolved(res: &crate::pb::BreakglassResolution) -> bool {
+    res.identity.as_ref().is_some_and(|i| i.resolved) && !res.breakglass_token.is_empty()
+}
+
 /// The granted capabilities from the decision context; default shell+exec when
 /// the context declares none (Design §6.1 default). Agent-forward is never here.
 fn granted_capabilities(context: Option<&DecisionContext>) -> Vec<i32> {
@@ -1495,6 +1664,47 @@ mod tests {
         let cleaned = sanitize("admin\u{202E}txt\u{200D}\u{FEFF}");
         assert_eq!(cleaned, "admintxt");
         assert!(!cleaned.contains('\u{202E}'));
+    }
+
+    /// The break-glass FIDO2 publickey path (Design §7, FR-ACC-6): a security-key
+    /// algorithm routes to break-glass; an ordinary key takes the pin path.
+    #[test]
+    fn security_key_algorithms_route_to_break_glass() {
+        assert!(is_security_key(Algorithm::SkEcdsaSha2NistP256));
+        assert!(is_security_key(Algorithm::SkEd25519));
+        assert!(!is_security_key(Algorithm::Ed25519));
+    }
+
+    /// Break-glass resolution is fail-closed: it succeeds ONLY when the identity
+    /// resolved AND a single-use token was minted.
+    #[test]
+    fn break_glass_resolution_requires_identity_and_token() {
+        let resolved_id = ResolvedIdentity {
+            resolved: true,
+            identity: "bg-admin".into(),
+            principals: vec!["root".into()],
+            groups: Vec::new(),
+        };
+        let ok = crate::pb::BreakglassResolution {
+            identity: Some(resolved_id.clone()),
+            breakglass_token: "tok".into(),
+        };
+        assert!(break_glass_resolved(&ok));
+        // Resolved identity but NO token → fail closed (no break-glass Authorize).
+        assert!(!break_glass_resolved(&crate::pb::BreakglassResolution {
+            identity: Some(resolved_id),
+            breakglass_token: String::new(),
+        }));
+        // Unresolved identity (even with a token) → false.
+        assert!(!break_glass_resolved(&crate::pb::BreakglassResolution {
+            identity: Some(ResolvedIdentity::default()),
+            breakglass_token: "tok".into(),
+        }));
+        // Missing identity → false.
+        assert!(!break_glass_resolved(&crate::pb::BreakglassResolution {
+            identity: None,
+            breakglass_token: "tok".into(),
+        }));
     }
 
     #[test]

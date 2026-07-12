@@ -24,10 +24,10 @@ use crate::pb::outer_leg_auth_client::OuterLegAuthClient;
 use crate::pb::recording_client::RecordingClient;
 use crate::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
-    BeginRecordingRequest, BeginRecordingResponse, FinalizeRecordingRequest,
+    BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution, FinalizeRecordingRequest,
     FinalizeRecordingResponse, PollDeviceFlowRequest, PollDeviceFlowResponse, RequestUploadRequest,
-    RequestUploadResponse, ResolveOtpRequest, ResolvePinRequest, ResolveUserCertRequest,
-    ResolvedIdentity,
+    RequestUploadResponse, ResolveBreakglassCodeRequest, ResolveBreakglassKeyRequest,
+    ResolveOtpRequest, ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity,
 };
 
 /// A failure calling the CP. Fail-closed at every variant.
@@ -291,6 +291,67 @@ impl CpAuthClient {
             })
             .await?;
         Ok(resp.identity.unwrap_or_default())
+    }
+
+    /// Resolve a registered break-glass FIDO2 `sk-ecdsa` PUBLIC key (OpenSSH wire
+    /// blob) → the break-glass identity + a single-use `breakglass_token` (Design
+    /// §7, FR-ACC-6). russh has already verified the FIDO possession signature
+    /// before this call; the CP only maps the public key to its registered
+    /// break-glass credential (IdP-independent). Non-resolution is generic (§7.1).
+    pub async fn resolve_break_glass_key(
+        &self,
+        sk_public_key_blob: Vec<u8>,
+        source_ip: &str,
+        node_id: &str,
+    ) -> Result<BreakglassResolution, CpError> {
+        let source_ip = source_ip.to_string();
+        let node_id = node_id.to_string();
+        let resp = self
+            .call(move |ch| {
+                let req = ResolveBreakglassKeyRequest {
+                    sk_public_key_blob,
+                    source_ip,
+                    node_id,
+                };
+                async move {
+                    OuterLegAuthClient::new(ch)
+                        .resolve_breakglass_key(req)
+                        .await
+                }
+            })
+            .await?;
+        Ok(resp.resolution.unwrap_or_default())
+    }
+
+    /// Resolve a pre-issued single-use break-glass OFFLINE CODE → the break-glass
+    /// identity + a single-use `breakglass_token` (Design §7, FR-ACC-6, the IdP-
+    /// independent fallback). `code` is a SECRET (keyboard-interactive, echo off) —
+    /// NEVER logged. Non-resolution is generic (§7.1); the code is consumed
+    /// single-use at the CP.
+    pub async fn resolve_break_glass_code(
+        &self,
+        code: &str,
+        source_ip: &str,
+        node_id: &str,
+    ) -> Result<BreakglassResolution, CpError> {
+        let code = code.to_string();
+        let source_ip = source_ip.to_string();
+        let node_id = node_id.to_string();
+        let resp = self
+            .call(move |ch| {
+                let req = ResolveBreakglassCodeRequest {
+                    code,
+                    source_ip,
+                    node_id,
+                };
+                async move {
+                    OuterLegAuthClient::new(ch)
+                        .resolve_breakglass_code(req)
+                        .await
+                }
+            })
+            .await?;
+        Ok(resp.resolution.unwrap_or_default())
     }
 
     /// Begin the fallback OIDC device flow bound to `source_ip`.

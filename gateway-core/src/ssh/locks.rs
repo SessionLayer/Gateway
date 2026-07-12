@@ -391,6 +391,7 @@ mod tests {
             identity: identity.into(),
             identity_groups: groups.iter().map(|s| s.to_string()).collect(),
             node_labels: labels.iter().map(|s| s.to_string()).collect(),
+            access_model: crate::pb::AccessModel::Standing as i32,
         }
     }
 
