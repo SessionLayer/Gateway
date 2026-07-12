@@ -40,7 +40,10 @@ use crate::pb::{
     SignContext,
 };
 use crate::signing::InnerKeyPair;
-use crate::ssh::bridge::{self, RecorderTap, TapDirection};
+use crate::ssh::bridge::{
+    self, RecChannelKind, RecorderFactory, RecorderTap, RecordingParams, SessionRecorder,
+    TapDirection,
+};
 use crate::ssh::connector::{NodeConnector, NodeDial, NodeTarget, SessionGrant};
 use crate::ssh::hostverify::{HostTrust, HostVerifier};
 use crate::ssh::innerleg::{
@@ -114,12 +117,15 @@ pub struct HandlerDeps {
     pub connector: Arc<dyn NodeConnector>,
     /// The target `node`-name → node-id resolver (Session-Sixteen seam).
     pub resolver: Arc<dyn TargetResolver>,
-    /// The recording tap seam (Session Eight: [`NullRecorder`]; S9 attaches).
-    ///
-    /// [`NullRecorder`]: crate::ssh::bridge::NullRecorder
-    pub recorder: Arc<dyn RecorderTap>,
+    /// The per-session recorder factory (Session Nine): builds ONE recorder per
+    /// authorized session (holding its data key, asciicast stream, SFTP decoder,
+    /// hash-chain, ciphertext spool, uploader).
+    pub recorder_factory: Arc<dyn RecorderFactory>,
+    /// Tracks in-flight recording finalizes so a graceful shutdown can await them
+    /// (Session Nine, #3). Cheap to clone (an `Arc`).
+    pub finalize_tracker: crate::ssh::recorder::FinalizeTracker,
     /// SSH server configuration (target separator, device-flow timing, inner-leg
-    /// bounds, …).
+    /// bounds, recorder policy, …).
     pub config: Arc<SshServerConfig>,
 }
 
@@ -146,6 +152,13 @@ pub struct SshHandler {
     /// A cached inner-leg failure outcome (so a second channel after a failed
     /// establish fails the same way without re-dialing).
     inner_failed: Option<SshOutcome>,
+    /// The per-session recorder (Session Nine), created once when the session is
+    /// authorized and shared by every channel. `None` until the first authorized
+    /// channel runs; captures + encrypts + uploads the session recording.
+    recorder: Option<Arc<dyn SessionRecorder>>,
+    /// A cached strict-mode recording-setup failure (so a second channel fails the
+    /// same way without re-attempting BeginRecording).
+    recorder_failed: Option<SshOutcome>,
     /// PTY parameters stashed per channel (replayed to the node at channel start).
     pty: HashMap<ChannelId, PtyParams>,
     /// Retained outer channel objects (kept from `channel_open_session` so their
@@ -179,6 +192,9 @@ struct Authorized {
     /// The granted SSH capabilities (proto `Capability` values); default
     /// shell+exec if the decision context declares none (Design §6.1).
     capabilities: Vec<i32>,
+    /// The single-use Recording.BeginRecording token minted alongside the session
+    /// token (Session Nine, §12/§15). Empty when the CP predates S9.
+    recording_token: String,
 }
 
 impl SshHandler {
@@ -195,6 +211,8 @@ impl SshHandler {
             authz_denied: None,
             inner: None,
             inner_failed: None,
+            recorder: None,
+            recorder_failed: None,
             pty: HashMap::new(),
             pending_channels: HashMap::new(),
             writers: HashMap::new(),
@@ -482,6 +500,38 @@ impl SshHandler {
             return;
         }
 
+        // (2.5) Begin the session recording ONCE, before any bytes flow. Recording
+        // is mandatory (§12/FR-AUD-1): in strict mode a setup failure (incl. no
+        // customer key) refuses the session here; non-strict proceeds unrecorded
+        // (logged loudly, never silent).
+        if self.recorder.is_none() {
+            if let Some(o) = self.recorder_failed {
+                self.close_with(channel, session, o);
+                return;
+            }
+            let params = RecordingParams {
+                recording_token: authz.recording_token.clone(),
+                session_id: self.session_id.clone(),
+                node_id: authz.node.node_id.clone(),
+                principal: authz.node.principal.clone(),
+                teardown: Some(session.handle()),
+            };
+            let strict = self.deps.config.recorder.strict;
+            match self.deps.recorder_factory.begin(params).await {
+                Ok(r) => self.recorder = Some(r),
+                Err(e) if strict => {
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "recording_unavailable", "strict-mode recording setup failed; refusing the session");
+                    self.recorder_failed = Some(SshOutcome::RecordingUnavailable);
+                    self.close_with(channel, session, SshOutcome::RecordingUnavailable);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, "STRICT MODE OFF: recording setup failed; proceeding UNRECORDED (degraded)");
+                    self.recorder = Some(bridge::disabled_recorder());
+                }
+            }
+        }
+
         // (3) Establish the inner leg once (dial + host-verify + sign + handshake).
         if self.inner.is_none() {
             if let Some(o) = self.inner_failed {
@@ -499,7 +549,15 @@ impl SshHandler {
         }
         let inner = self.inner.as_ref().expect("inner client established above");
 
-        // (4) Open the matching channel on the node, replaying any PTY.
+        // (4) Open the matching channel on the node, replaying any PTY. Classify
+        // the channel for the recorder BEFORE `kind` is moved into the node open,
+        // carrying the PTY size so the asciicast header reflects it (#10).
+        let (pty_cols, pty_rows) = self
+            .pty
+            .get(&channel)
+            .map(|p| (p.col as u16, p.row as u16))
+            .unwrap_or((0, 0));
+        let rec_kind = classify_rec_kind(&kind, pty_cols, pty_rows);
         let pty = self.pty.get(&channel);
         let inner_chan = match inner.open_channel(kind, pty).await {
             Ok(c) => c,
@@ -511,7 +569,7 @@ impl SshHandler {
         };
 
         // (5) Bridge: outer data → inner (via the write half, in `data`); inner →
-        // outer via the pump task. The recorder taps both directions (S9).
+        // outer via the pump task. The per-session recorder taps both directions.
         let (read, write) = crate::ssh::innerleg::split_channel(inner_chan);
         self.writers.insert(channel, write);
         // Drive node→client through the outer channel's WRITE half (backpressured);
@@ -521,12 +579,19 @@ impl SshHandler {
             return;
         };
         let (_outer_read, outer_write) = outer_chan.split();
+
+        // Register the channel with the recorder (the asciicast header already
+        // carries the PTY size via `rec_kind`), then hand it to the pump as a tap.
+        let recorder = self.recorder.clone().expect("recorder set above");
+        recorder.open_channel(channel, rec_kind);
+        let tap: Arc<dyn RecorderTap> = recorder;
+
         let pump = tokio::spawn(bridge::pump_inner_to_outer(
             read,
             outer_write,
             session.handle(),
             channel,
-            self.deps.recorder.clone(),
+            tap,
         ));
         self.pumps.insert(channel, pump);
         tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "bridged", "inner leg bridged; session flowing");
@@ -610,6 +675,7 @@ impl SshHandler {
                         context: resp.context,
                     },
                     capabilities,
+                    recording_token: resp.recording_token,
                 })
             }
             Ok(_) => {
@@ -726,6 +792,13 @@ impl Drop for SshHandler {
         // inner client also closes the node transport, but this bounds the teardown).
         for (_, pump) in self.pumps.drain() {
             pump.abort();
+        }
+        // Finalize the recording off the Drop path (flush → seal-final → upload →
+        // FinalizeRecording). Spawned via the tracker so teardown never blocks but a
+        // graceful shutdown can still await it (#3); the recorder holds its own CP
+        // client + uploader.
+        if let Some(rec) = self.recorder.take() {
+            self.deps.finalize_tracker.spawn(rec.finalize());
         }
     }
 }
@@ -929,10 +1002,16 @@ impl Handler for SshHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // A strict-mode recording failure tears the session down; do not forward
+        // further (un-recorded) bytes to the node while the disconnect is in flight.
+        if let Some(rec) = &self.recorder {
+            if rec.is_torn_down() {
+                return Ok(());
+            }
+            // Tap the input stream (`i`) BEFORE forwarding.
+            rec.tap(channel, TapDirection::Input, None, data);
+        }
         if let Some(w) = self.writers.get(&channel) {
-            self.deps
-                .recorder
-                .tap(channel, TapDirection::Input, None, data);
             let _ = w.data(data).await;
         }
         Ok(())
@@ -959,6 +1038,10 @@ impl Handler for SshHandler {
         if let Some(w) = self.writers.remove(&channel) {
             let _ = w.close().await;
         }
+        // Flush the channel's recorder state (final events / file-transfer audit).
+        if let Some(rec) = &self.recorder {
+            rec.close_channel(channel);
+        }
         // Deterministic teardown: abort the pump rather than wait for the node to
         // propagate Close (no leak-until-disconnect, F-channelcap-1).
         if let Some(pump) = self.pumps.remove(&channel) {
@@ -969,7 +1052,8 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    /// Relay an interactive resize to the node's PTY.
+    /// Relay an interactive resize to the node's PTY, recording it as an asciicast
+    /// `r` event.
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
@@ -979,6 +1063,9 @@ impl Handler for SshHandler {
         ph: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(rec) = &self.recorder {
+            rec.resize(channel, col as u16, row as u16);
+        }
         if let Some(w) = self.writers.get(&channel) {
             let _ = w.window_change(col, row, pw, ph).await;
         }
@@ -1027,6 +1114,38 @@ fn required_capabilities(kind: &ChannelKind) -> &'static [Capability] {
         ChannelKind::Exec(_) => &[Capability::Exec],
         ChannelKind::Subsystem(name) if name == "sftp" => &[Capability::Sftp, Capability::Scp],
         ChannelKind::Subsystem(_) => &[],
+    }
+}
+
+/// Classify a bridged channel for the recorder (Design §12.1, red-team #1): a
+/// shell / exec is ALWAYS a terminal (asciicast v2) — a legacy scp-over-exec
+/// additionally runs the SCP decoder for file-transfer audit, but NEVER instead of
+/// asciicast, so the exec command string can never suppress content capture. Only
+/// the sftp SUBSYSTEM (the node runs sftp-server, no shell) is decode-only.
+fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind {
+    match kind {
+        ChannelKind::Shell => RecChannelKind::Terminal {
+            command: None,
+            scp: None,
+            cols,
+            rows,
+        },
+        ChannelKind::Exec(cmd) => RecChannelKind::Terminal {
+            command: Some(cmd.clone()),
+            scp: crate::ssh::recorder::scp::parse_scp_command(cmd)
+                .map(|(upload, target)| crate::ssh::bridge::ScpMode { upload, target }),
+            cols,
+            rows,
+        },
+        ChannelKind::Subsystem(name) if name == "sftp" => RecChannelKind::Sftp,
+        // Only the sftp subsystem is ever bridged (the capability gate refuses the
+        // rest); default to an opaque terminal for safety.
+        ChannelKind::Subsystem(_) => RecChannelKind::Terminal {
+            command: None,
+            scp: None,
+            cols,
+            rows,
+        },
     }
 }
 

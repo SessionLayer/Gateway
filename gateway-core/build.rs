@@ -31,9 +31,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Begin+PollDeviceFlow). The Gateway is a client of these; the server side is
     // generated for the in-process mock CP used by the integration tests.
     let auth = proto_root.join("sessionlayer/controlplane/v1/auth.proto");
+    // Session Nine addition (frozen upstream): the recorder register/finalize
+    // service (Recording: BeginRecording / FinalizeRecording) that issues WORM
+    // upload credentials and holds recording metadata. The Gateway is a client;
+    // the server side is generated for the in-process mock CP.
+    let recording = proto_root.join("sessionlayer/controlplane/v1/recording.proto");
 
     // Regenerate only when the vendored contract (or this script) changes.
-    for p in [&common, &handshake, &identity, &signing, &authz, &auth] {
+    for p in [
+        &common, &handshake, &identity, &signing, &authz, &auth, &recording,
+    ] {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-changed=build.rs");
@@ -45,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // services.
         .build_server(true)
         .compile_protos(
-            &[handshake, identity, signing, authz, auth, common],
+            &[handshake, identity, signing, authz, auth, recording, common],
             &[proto_root],
         )?;
 

@@ -135,6 +135,14 @@ message AuthorizeResponse {
   // compromising the CP itself (which already holds the decision-context signing
   // key), so a separate signature would add no security. Present only on ALLOW.
   NodeConnection node_connection = 8;
+
+  // A second single-use token (bearer, shown once), bound to the SAME
+  // {gateway_id, session_id, node, principal, exp} as session_token, that
+  // authorises exactly one Recording.BeginRecording call for this session
+  // (Design §12, §15; FR-AUD-1). Empty on DENY (fail closed — a denied session is
+  // never recorded because it never runs). Added in Session Nine (additive;
+  // protocol stays 1.1).
+  string recording_token = 9;
 }
 
 // ConnectorKind selects how the Gateway reaches a node's sshd (Design §9.2). The

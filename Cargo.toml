@@ -23,7 +23,7 @@ gateway-core = { path = "gateway-core", version = "0.1.0" }
 # (behind gateway-core's `io-uring` feature) is a per-connection concern behind
 # the AsyncIo seam, not the runtime. `sync` carries the renew-ahead loop's
 # manual-trigger / shutdown channels (Session Four).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # CP <-> Gateway gRPC, generated from the frozen contract (proto/). tonic 0.14
@@ -67,6 +67,28 @@ fd-lock = "4"
 zeroize = "1"
 # DER -> PEM for the tonic client Identity (enrollment returns cert DER).
 pem = "3"
+
+# Session Nine recorder crypto (§12/§15). All RustCrypto (MIT/Apache), already in
+# the dependency graph; `rsa` is deliberately NOT enabled (audit-ignored precisely
+# because it is never compiled). ECIES-P256 seals the per-recording AES-256-GCM
+# data key to the customer-held public key so no platform key can unwrap it.
+#   * p256 (ecdh + pkcs8): ephemeral-static ECDH + DER-SPKI customer key parsing.
+#   * hkdf + sha2: HKDF-SHA256 key derivation + the hash-chain / streaming digest.
+#   * aes-gcm: the AES-256-GCM data + key-wrap cipher (zeroizing key schedule).
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "pkcs8", "std"] }
+hkdf = "0.13"
+sha2 = "0.11"
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+
+# Session Nine WORM upload: a dumb HTTP PUT of the ciphertext object to the
+# CP-issued presigned URL. hyper (+util) are already transitive via tonic; no
+# reqwest / webpki-roots (MPL-2.0). https uses the existing rustls (ring) stack.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 # Observability.
 tracing = "0.1"

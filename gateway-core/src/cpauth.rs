@@ -21,10 +21,13 @@ use tonic::transport::Channel;
 use crate::mtls::{self, ChannelParams, ClientIdentity, MtlsError};
 use crate::pb::authorization_client::AuthorizationClient;
 use crate::pb::outer_leg_auth_client::OuterLegAuthClient;
+use crate::pb::recording_client::RecordingClient;
 use crate::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
-    PollDeviceFlowRequest, PollDeviceFlowResponse, ResolveOtpRequest, ResolvePinRequest,
-    ResolveUserCertRequest, ResolvedIdentity,
+    BeginRecordingRequest, BeginRecordingResponse, FinalizeRecordingRequest,
+    FinalizeRecordingResponse, PollDeviceFlowRequest, PollDeviceFlowResponse, RequestUploadRequest,
+    RequestUploadResponse, ResolveOtpRequest, ResolvePinRequest, ResolveUserCertRequest,
+    ResolvedIdentity,
 };
 
 /// A failure calling the CP. Fail-closed at every variant.
@@ -307,6 +310,46 @@ impl CpAuthClient {
     /// against the target node.
     pub async fn authorize(&self, req: AuthorizeRequest) -> Result<AuthorizeResponse, CpError> {
         self.call(move |ch| async move { AuthorizationClient::new(ch).authorize(req).await })
+            .await
+    }
+
+    /// Register a session recording (Session Nine, §12/§15): consume the single-use
+    /// `recording_token` minted by Authorize ALLOW; receive the WORM object key +
+    /// mode, the customer public key to seal the data key to, and a short-lived
+    /// single-object upload credential. Fail-closed (a failure → the strict-mode
+    /// session refusal); the cached channel is dropped on any error.
+    pub async fn begin_recording(
+        &self,
+        req: BeginRecordingRequest,
+    ) -> Result<BeginRecordingResponse, CpError> {
+        self.call(move |ch| async move { RecordingClient::new(ch).begin_recording(req).await })
+            .await
+    }
+
+    /// Obtain the short-lived, single-object WORM upload credential for
+    /// `recording_id` at UPLOAD time (Session Nine, §12.2): issued just before the
+    /// direct PUT so its TTL need only cover the PUT, never the whole session (no
+    /// long-lived upload creds). Fail-closed; the cached channel is dropped on error.
+    pub async fn request_upload(
+        &self,
+        recording_id: &str,
+    ) -> Result<RequestUploadResponse, CpError> {
+        let recording_id = recording_id.to_string();
+        self.call(move |ch| {
+            let req = RequestUploadRequest { recording_id };
+            async move { RecordingClient::new(ch).request_upload(req).await }
+        })
+        .await
+    }
+
+    /// Commit a recording's tamper-evidence + integrity metadata (hash-chain head,
+    /// content digest, byte length, status) and the per-operation SFTP/SCP audit
+    /// into the correlated audit stream (Session Nine). Fail-closed.
+    pub async fn finalize_recording(
+        &self,
+        req: FinalizeRecordingRequest,
+    ) -> Result<FinalizeRecordingResponse, CpError> {
+        self.call(move |ch| async move { RecordingClient::new(ch).finalize_recording(req).await })
             .await
     }
 

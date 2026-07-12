@@ -108,6 +108,76 @@ pub struct SshServerConfig {
     pub cp_rpc_timeout_secs: u64,
     /// Inner leg (Session Eight): the agentless dial + SSH-client-to-node bounds.
     pub inner: InnerLegServerConfig,
+    /// Session recorder (Session Nine): capture + customer-key encryption + the
+    /// WORM upload. Strict by default (recording is mandatory; a failure fails the
+    /// session closed).
+    pub recorder: RecorderConfig,
+}
+
+/// Session-recorder configuration (Session Nine, Design §12/§12A/§15).
+///
+/// Every session is captured (keystrokes + output), encrypted under a
+/// customer-held key, hash-chained, and uploaded to a WORM store. Recording is
+/// **mandatory** (FR-AUD-1/2): in [`Self::strict`] mode (the default) a
+/// recording setup/continuation/upload failure refuses or tears down the session
+/// (fail closed). `deny_unknown_fields` makes misconfiguration fail closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecorderConfig {
+    /// Strict mode (default `true`): a recording setup/continuation failure
+    /// refuses the session ([`SshOutcome::RecordingUnavailable`]) rather than
+    /// running it unrecorded. Non-strict proceeds in a documented degraded mode
+    /// (logs loudly; never silently drops). Break-glass forcing strict is S11.
+    ///
+    /// [`SshOutcome::RecordingUnavailable`]: crate::ssh::outcome::SshOutcome::RecordingUnavailable
+    pub strict: bool,
+    /// Directory for the **ciphertext** spool file (used once a recording exceeds
+    /// [`Self::spool_memory_threshold_bytes`]). `None` uses the system temp dir.
+    /// Plaintext is NEVER written here — only sealed frames (§3/§15).
+    pub spool_dir: Option<PathBuf>,
+    /// Ciphertext bytes held in memory before spilling to a temp file. Enforced
+    /// ALWAYS (a large recording spills even with no `spool_dir`), bounding Gateway
+    /// RAM per session.
+    pub spool_memory_threshold_bytes: usize,
+    /// Hard cap on a single recording's ciphertext object. Exceeding it fails
+    /// closed (strict: tear the session down; non-strict: stop recording loudly) —
+    /// an unbounded session can never OOM the Gateway.
+    pub max_object_bytes: u64,
+    /// Plaintext bytes buffered before a frame is sealed + flushed. Larger frames
+    /// mean less per-frame AEAD overhead; smaller frames bound the plaintext held
+    /// in memory on the hot path.
+    pub frame_plaintext_bytes: usize,
+    /// Bound (seconds) on the whole ciphertext PUT to the presigned WORM URL
+    /// (fail-closed): a hung object store never hangs finalize forever.
+    pub upload_timeout_secs: u64,
+    /// Max attempts (incl. the first) for the end-of-session RequestUpload + PUT.
+    /// A transient store fault is retried with exponential backoff; the recording
+    /// is marked failed only after these are exhausted (fail-closed, never silent).
+    pub upload_max_attempts: u32,
+    /// Require the WORM store URL to be **https** in production. Set `false` only
+    /// for the plain-http MinIO E2E; a plain-http upload is otherwise refused.
+    pub require_https: bool,
+    /// Optional PEM trust anchor for an **https** WORM store (prod). When the
+    /// presigned URL is https and this is empty, the upload fails closed (no
+    /// implicit web-PKI roots — supply-chain policy). Plain-http upload (the E2E
+    /// MinIO) ignores it.
+    pub upload_ca_pem_path: Option<PathBuf>,
+}
+
+impl Default for RecorderConfig {
+    fn default() -> Self {
+        Self {
+            strict: true,
+            spool_dir: None,
+            spool_memory_threshold_bytes: 8 * 1024 * 1024,
+            max_object_bytes: 4 * 1024 * 1024 * 1024,
+            frame_plaintext_bytes: 16 * 1024,
+            upload_timeout_secs: 30,
+            upload_max_attempts: 4,
+            require_https: true,
+            upload_ca_pem_path: None,
+        }
+    }
 }
 
 /// Inner-leg (node-facing) bounds — the agentless dial, the inner SSH handshake,
@@ -169,6 +239,7 @@ impl Default for SshServerConfig {
             cp_connect_timeout_secs: 5,
             cp_rpc_timeout_secs: 10,
             inner: InnerLegServerConfig::default(),
+            recorder: RecorderConfig::default(),
         }
     }
 }
@@ -372,5 +443,35 @@ mod tests {
         let result: Result<GatewayConfig, _> =
             serde_json::from_str(r#"{"ssh":{"listen_port":22}}"#);
         assert!(result.is_err(), "unknown ssh key must be rejected");
+    }
+
+    #[test]
+    fn recorder_defaults_are_strict() {
+        // Recording is mandatory: the recorder defaults to strict (fail closed) and
+        // to an in-memory ciphertext spool (no plaintext ever touches disk).
+        let cfg = GatewayConfig::default();
+        assert!(cfg.ssh.recorder.strict, "recording must default to strict");
+        assert!(cfg.ssh.recorder.spool_dir.is_none());
+        assert!(cfg.ssh.recorder.upload_ca_pem_path.is_none());
+        assert!(cfg.ssh.recorder.frame_plaintext_bytes > 0);
+        assert!(cfg.ssh.recorder.upload_timeout_secs > 0);
+    }
+
+    #[test]
+    fn recorder_unknown_key_fails_closed() {
+        // A misspelled recorder key must error (fail closed), not leave the default
+        // (possibly security-relevant, e.g. `strict`) silently in place.
+        let result: Result<GatewayConfig, _> =
+            serde_json::from_str(r#"{"ssh":{"recorder":{"strickt":false}}}"#);
+        assert!(result.is_err(), "unknown recorder key must be rejected");
+    }
+
+    #[test]
+    fn recorder_strict_can_be_disabled_explicitly() {
+        let cfg: GatewayConfig =
+            serde_json::from_str(r#"{"ssh":{"recorder":{"strict":false}}}"#).unwrap();
+        assert!(!cfg.ssh.recorder.strict);
+        // The rest of the recorder block keeps its (strict-adjacent) defaults.
+        assert!(cfg.ssh.recorder.spool_dir.is_none());
     }
 }
