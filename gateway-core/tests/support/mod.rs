@@ -21,6 +21,8 @@
 
 #![allow(dead_code)] // shared across several test binaries; not all use every item.
 
+pub mod sigv4;
+
 use gateway_core::config::SshServerConfig;
 use gateway_core::cpauth::{CpAuthClient, CpChannelFactory};
 use gateway_core::identity;
@@ -28,21 +30,25 @@ use gateway_core::pb::authorization_server::{Authorization, AuthorizationServer}
 use gateway_core::pb::gateway_identity_server::{GatewayIdentity, GatewayIdentityServer};
 use gateway_core::pb::handshake_server::{Handshake, HandshakeServer};
 use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
+use gateway_core::pb::recording_server::{Recording, RecordingServer};
 use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningServer};
 use gateway_core::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
-    Capability, ClientHello, ComponentInfo, Decision, DecisionContext, DeviceFlowStatus,
-    EnrollGatewayRequest, EnrollGatewayResponse, HostVerification, NodeConnection,
-    PollDeviceFlowRequest, PollDeviceFlowResponse, ProtocolVersion, RenewGatewayIdentityRequest,
-    RenewGatewayIdentityResponse, ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest,
-    ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity,
-    ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse,
+    BeginRecordingRequest, BeginRecordingResponse, Capability, ClientHello, ComponentInfo,
+    CustomerKey, Decision, DecisionContext, DeviceFlowStatus, EnrollGatewayRequest,
+    EnrollGatewayResponse, FinalizeRecordingRequest, FinalizeRecordingResponse, HostVerification,
+    KeySealAlgorithm, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
+    ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse, ResolveOtpRequest,
+    ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest,
+    ResolveUserCertResponse, ResolvedIdentity, ServerHello, SignSessionCertificateRequest,
+    SignSessionCertificateResponse, UploadCredential, WormMode,
 };
-use gateway_core::ssh::bridge::NullRecorder;
+use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
 use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
 use gateway_core::ssh::handler::HandlerDeps;
 use gateway_core::ssh::target::IdentityResolver;
 use gateway_core::{mtls, version};
+use sigv4::S3Target;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -242,6 +248,20 @@ struct MockState {
     /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
     /// during authentication).
     resolve_unavailable: Mutex<bool>,
+
+    // ---- Session Nine: recorder (Recording service + WORM presign) ----------
+    /// Recording tokens minted on Authorize ALLOW (single-use, gateway/session-
+    /// bound), consumed by BeginRecording.
+    recording_tokens: Mutex<HashMap<String, TokenRecord>>,
+    /// The operator-configured customer PUBLIC key seal params. `None` models an
+    /// operator with NO customer key (BeginRecording returns none → strict refuse).
+    customer_key: Mutex<Option<CustomerKey>>,
+    /// The WORM object store the CP presigns PUTs to (the MinIO container).
+    s3: Mutex<Option<S3Target>>,
+    /// Registered recordings: recording_id → (gateway_id, object_key).
+    recordings: Mutex<HashMap<String, (String, String)>>,
+    /// FinalizeRecording payloads, keyed by recording_id (test assertions).
+    finalized: Mutex<HashMap<String, FinalizeRecordingRequest>>,
 }
 
 impl MockState {
@@ -777,6 +797,19 @@ impl Authorization for MockSvc {
                 used: false,
             },
         );
+        // Session Nine: a SECOND single-use token, same binding, for BeginRecording.
+        let recording_token = random_token("rec");
+        self.recording_tokens.lock().unwrap().insert(
+            recording_token.clone(),
+            TokenRecord {
+                gateway_id: gid.clone(),
+                session_id: r.session_id.clone(),
+                node_id: r.node_id.clone(),
+                principal: r.requested_principal.clone(),
+                exp: SystemTime::now() + Duration::from_secs(120),
+                used: false,
+            },
+        );
         let now = unix_now() as i64;
         let capabilities = self
             .node_capabilities
@@ -819,7 +852,97 @@ impl Authorization for MockSvc {
             signer_ca_chain: Vec::new(),
             session_token: token,
             node_connection,
+            recording_token,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl Recording for MockSvc {
+    async fn begin_recording(
+        &self,
+        request: Request<BeginRecordingRequest>,
+    ) -> Result<Response<BeginRecordingResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+
+        // Consume the single-use recording token (bound to this gateway; unexpired).
+        {
+            let mut toks = self.recording_tokens.lock().unwrap();
+            let rec = toks
+                .get_mut(&r.recording_token)
+                .ok_or_else(|| Status::permission_denied("access denied by policy"))?;
+            if rec.used || rec.exp <= SystemTime::now() || rec.gateway_id != gid {
+                return Err(Status::permission_denied("access denied by policy"));
+            }
+            rec.used = true;
+        }
+
+        // The customer key is mandatory: if the operator configured none, return a
+        // response WITHOUT a customer key so the Gateway refuses (strict).
+        let customer_key = self.customer_key.lock().unwrap().clone();
+
+        let recording_id = random_token("recid");
+        let object_key = format!("recordings/{recording_id}");
+        self.recordings
+            .lock()
+            .unwrap()
+            .insert(recording_id.clone(), (gid, object_key.clone()));
+
+        // Presign a single-object PUT under COMPLIANCE object-lock, if an S3 target
+        // is configured (the MinIO container). The object-lock headers are SIGNED,
+        // so the uploader cannot strip the WORM lock.
+        let upload = self.s3.lock().unwrap().as_ref().map(|s3| {
+            let retain = sigv4::retain_until_days(1);
+            let path = format!("/{}/{}", s3.bucket, object_key);
+            let (url, headers) = sigv4::presign(
+                s3,
+                "PUT",
+                &path,
+                &[],
+                &[
+                    ("x-amz-object-lock-mode", "COMPLIANCE"),
+                    ("x-amz-object-lock-retain-until-date", &retain),
+                ],
+                900,
+            );
+            UploadCredential {
+                url,
+                method: "PUT".to_string(),
+                required_headers: headers.into_iter().collect(),
+                expires_at_epoch_seconds: (unix_now() + 900) as i64,
+            }
+        });
+
+        Ok(Response::new(BeginRecordingResponse {
+            recording_id,
+            object_key,
+            worm_mode: WormMode::Compliance as i32,
+            customer_key,
+            upload,
+        }))
+    }
+
+    async fn finalize_recording(
+        &self,
+        request: Request<FinalizeRecordingRequest>,
+    ) -> Result<Response<FinalizeRecordingResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        // Ownership check: the recording must have been created by this caller.
+        {
+            let recs = self.recordings.lock().unwrap();
+            match recs.get(&r.recording_id) {
+                Some((owner, _)) if *owner == gid => {}
+                _ => return Err(Status::permission_denied("access denied by policy")),
+            }
+        }
+        let status = r.status;
+        self.finalized
+            .lock()
+            .unwrap()
+            .insert(r.recording_id.clone(), r);
+        Ok(Response::new(FinalizeRecordingResponse { status }))
     }
 }
 
@@ -834,6 +957,7 @@ fn deny_response() -> AuthorizeResponse {
         signer_ca_chain: Vec::new(),
         session_token: String::new(),
         node_connection: None,
+        recording_token: String::new(),
     }
 }
 
@@ -975,6 +1099,11 @@ impl MockCpBuilder {
             node_capabilities: Mutex::new(HashMap::new()),
             authorize_unavailable: Mutex::new(false),
             resolve_unavailable: Mutex::new(false),
+            recording_tokens: Mutex::new(HashMap::new()),
+            customer_key: Mutex::new(None),
+            s3: Mutex::new(None),
+            recordings: Mutex::new(HashMap::new()),
+            finalized: Mutex::new(HashMap::new()),
         });
 
         let tls = ServerTlsConfig::new()
@@ -1001,6 +1130,7 @@ impl MockCpBuilder {
                 .add_service(SessionSigningServer::new(MockSvc(svc_state.clone())))
                 .add_service(OuterLegAuthServer::new(MockSvc(svc_state.clone())))
                 .add_service(AuthorizationServer::new(MockSvc(svc_state.clone())))
+                .add_service(RecordingServer::new(MockSvc(svc_state.clone())))
                 .serve_with_incoming(incoming)
                 .await;
         });
@@ -1301,6 +1431,51 @@ impl MockCp {
         *self.state.resolve_unavailable.lock().unwrap() = on;
     }
 
+    // ---- Session Nine recorder knobs ----------------------------------------
+
+    /// Configure the operator's customer PUBLIC key (DER SPKI) the Gateway seals
+    /// the recording data key to. Without this, BeginRecording returns no customer
+    /// key and the Gateway refuses the session (strict).
+    pub fn set_customer_key(
+        &self,
+        key_ref: &str,
+        public_key_der: Vec<u8>,
+        algorithm: KeySealAlgorithm,
+    ) {
+        *self.state.customer_key.lock().unwrap() = Some(CustomerKey {
+            key_ref: key_ref.to_string(),
+            public_key: public_key_der,
+            algorithm: algorithm as i32,
+        });
+    }
+
+    /// Point the WORM upload credential at a MinIO/S3 target (the container).
+    pub fn set_s3_target(&self, target: S3Target) {
+        *self.state.s3.lock().unwrap() = Some(target);
+    }
+
+    /// The object keys of recordings BeginRecording has registered.
+    pub fn recorded_object_keys(&self) -> Vec<String> {
+        self.state
+            .recordings
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(_, k)| k.clone())
+            .collect()
+    }
+
+    /// The FinalizeRecording payloads the Gateway has committed (test assertions).
+    pub fn finalized_recordings(&self) -> Vec<FinalizeRecordingRequest> {
+        self.state
+            .finalized
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Sign an OpenSSH user certificate with the user-facing CA (for the
     /// `ResolveUserCert` happy path). `pubkey_openssh_line` is an authorized-keys
     /// line; returns the cert as an authorized-keys line.
@@ -1348,20 +1523,30 @@ impl MockCp {
 /// the pass-through target resolver) for the given SSH server `config`. The
 /// enrolled credential is snapshotted into the channel factory, so the temp
 /// data-dir can be dropped immediately.
+/// Which recorder a set of [`HandlerDeps`] wires in.
+pub enum RecorderChoice {
+    /// No recording (the S8 E2E cases; no MinIO needed).
+    Null,
+    /// The real recorder (asciicast + customer-key seal + WORM upload), built over
+    /// the same enrolled CP client and `config.recorder`.
+    Real,
+}
+
 pub async fn outer_leg_deps(cp: &MockCp, config: Arc<SshServerConfig>) -> HandlerDeps {
     let connector = Arc::new(AgentlessDial::new(Duration::from_secs(
         config.inner.connect_timeout_secs,
     )));
-    outer_leg_deps_with(cp, config, connector, Arc::new(NullRecorder)).await
+    outer_leg_deps_with(cp, config, connector, RecorderChoice::Null).await
 }
 
-/// Like [`outer_leg_deps`] but with an explicit connector + recorder tap, for the
-/// inner-leg E2E (a real agentless dial to the Docker node) and the tap test.
+/// Like [`outer_leg_deps`] but with an explicit connector + recorder choice, for
+/// the inner-leg E2E (a real agentless dial to the Docker node) and the recorder
+/// E2E (asciicast/WORM).
 pub async fn outer_leg_deps_with(
     cp: &MockCp,
     config: Arc<SshServerConfig>,
     connector: Arc<dyn NodeConnector>,
-    recorder: Arc<dyn gateway_core::ssh::bridge::RecorderTap>,
+    recorder: RecorderChoice,
 ) -> HandlerDeps {
     let dir = tempfile::tempdir().unwrap();
     let store = identity::IdentityStore::open(dir.path()).unwrap();
@@ -1385,11 +1570,21 @@ pub async fn outer_leg_deps_with(
         factory,
         Duration::from_secs(config.cp_rpc_timeout_secs),
     ));
+    let recorder_factory: Arc<dyn RecorderFactory> = match recorder {
+        RecorderChoice::Null => Arc::new(NullRecorderFactory),
+        RecorderChoice::Real => Arc::new(
+            gateway_core::ssh::recorder::RecorderFactoryImpl::new(
+                cpauth.clone(),
+                config.recorder.clone(),
+            )
+            .expect("build recorder factory"),
+        ),
+    };
     HandlerDeps {
         cpauth,
         connector,
         resolver: Arc::new(IdentityResolver),
-        recorder,
+        recorder_factory,
         config,
     }
 }
