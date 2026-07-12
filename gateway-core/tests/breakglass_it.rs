@@ -543,8 +543,10 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
     let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(recorder))).await;
     let client = client_container().await;
 
-    // Enroll a REAL FIDO2 ecdsa-sk key with the virtual authenticator (no hardware,
-    // no touch) — exactly how an operator enrolls a break-glass security key.
+    // Enroll a REAL FIDO2 ecdsa-sk key with the virtual authenticator. It is
+    // TOUCH-REQUIRED (no `-O no-touch-required`) — the correct break-glass deployment
+    // (BG-1: UP is authenticator-enforced, so prod keys must require touch). sk-dummy
+    // auto-asserts user-presence, so the touch key still drives non-interactively.
     let (code, _out, stderr) = ssh_exec(
         &client,
         vec![
@@ -553,8 +555,6 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
             "ecdsa-sk".into(),
             "-w".into(),
             SK_PROVIDER.into(),
-            "-O".into(),
-            "no-touch-required".into(),
             "-N".into(),
             String::new(),
             "-f".into(),
@@ -566,7 +566,7 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
     assert_eq!(
         code,
         Some(0),
-        "the software SK provider must enroll an ecdsa-sk key; stderr={stderr}"
+        "the software SK provider must enroll a touch-required ecdsa-sk key; stderr={stderr}"
     );
 
     // Register the enrolled PUBLIC key as the break-glass credential at the CP.
@@ -931,6 +931,99 @@ async fn gw_enforces_signed_access_model_not_unsigned_context() -> anyhow::Resul
     assert!(
         stderr.contains(RECORDING_UNAVAILABLE),
         "break-glass from the SIGNED context forces strict; a stripped unsigned context cannot downgrade it; stderr={stderr}"
+    );
+
+    drop(client);
+    drop(node);
+    Ok(())
+}
+
+// ── G1: a break-glass ALLOW with grant_expiry==0 is refused (must be time-boxed) ─
+
+#[tokio::test]
+async fn break_glass_without_grant_expiry_is_refused() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    cp.set_customer_key(
+        "ck",
+        customer_keypair(),
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+    // The CP signs a break-glass ALLOW with grant_expiry==0 (a contract violation).
+    // The GW must fail closed — an always-available override MUST be time-boxed. A REAL
+    // node is wired so that WITHOUT the fix the session would run (echo SHOULD_NOT_RUN).
+    cp.set_grant_expiry(0);
+    cp.register_offline_code("bg-noexp", "breakglass-admin", &["deploy"]);
+
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
+    let client = client_container().await;
+
+    let (code, stdout, _stderr) = ssh_exec(
+        &client,
+        ki_ssh(gw_port, "deploy%node-bg", "echo SHOULD_NOT_RUN"),
+        code_env("bg-noexp"),
+    )
+    .await;
+    assert_ne!(
+        code,
+        Some(0),
+        "a break-glass ALLOW without a grant_expiry must be refused (time-boxed)"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_RUN"),
+        "the un-time-boxed break-glass session must not run"
+    );
+    // The CP consumed the token + recorded the activation at Authorize; the GW then
+    // refused locally on the missing grant_expiry.
+    assert_eq!(cp.breakglass_activation_count(), 1);
+
+    drop(client);
+    drop(node);
+    Ok(())
+}
+
+// ── G6: a break-glass session is refused when the lock feed is unhealthy ──────
+
+#[tokio::test]
+async fn break_glass_refused_when_lock_feed_unhealthy() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    cp.set_customer_key(
+        "ck",
+        customer_keypair(),
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+    // The lock feed is DOWN so the Gateway's deny-set is never healthy: a break-glass
+    // session cannot confirm the absence of a Lock, so it must refuse NEW privileged
+    // channels (fail closed, §8.4). A REAL node → without the fix the session would run.
+    cp.set_lock_feed_down(true);
+    cp.register_offline_code("bg-feeddown", "breakglass-admin", &["deploy"]);
+
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
+    let client = client_container().await;
+
+    let (code, stdout, _stderr) = ssh_exec(
+        &client,
+        ki_ssh(gw_port, "deploy%node-bg", "echo SHOULD_NOT_RUN"),
+        code_env("bg-feeddown"),
+    )
+    .await;
+    assert_ne!(
+        code,
+        Some(0),
+        "a break-glass session must be refused under an unhealthy lock feed (fail closed)"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_RUN"),
+        "no break-glass channel while the deny-feed is unhealthy"
     );
 
     drop(client);

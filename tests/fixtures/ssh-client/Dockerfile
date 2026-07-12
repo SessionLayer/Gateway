@@ -17,8 +17,14 @@ ARG OPENSSH_VERSION=10.0p1
 # Pinned tarball digest (reproducible; no floating fetch). Verified against the
 # OpenBSD OpenSSH portable release for OPENSSH_VERSION above.
 ARG OPENSSH_SHA256=021a2e709a0edf4250b1256bd5a9e500411a90dddabea830ed59cef90eb9d85c
+# Digest-pinned base (reproducible; not a floating tag). Debian trixie slim.
+ARG DEBIAN_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+# Expected OpenSSH major line of the packaged client, asserted so a future Debian
+# bump past 10.x (which could shift the sk-api ABI vs. the built sk-dummy.so) fails
+# the build loudly instead of silently mismatching.
+ARG OPENSSH_CLIENT_MAJOR=OpenSSH_10.
 
-FROM debian:13-slim AS skprovider
+FROM ${DEBIAN_BASE} AS skprovider
 ARG OPENSSH_VERSION
 ARG OPENSSH_SHA256
 
@@ -48,16 +54,21 @@ RUN cd /tmp \
       -lcrypto \
  && test -s /sk-dummy.so
 
-FROM debian:13-slim
+FROM ${DEBIAN_BASE}
+ARG OPENSSH_CLIENT_MAJOR
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       openssh-client \
       ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ # Assert the packaged client's OpenSSH major line matches the sk-dummy source, so
+ # the SK middleware ABI cannot silently drift (reproducible, verified).
+ && ssh -V 2>&1 | grep -q "${OPENSSH_CLIENT_MAJOR}" \
+      || (echo "openssh-client is not ${OPENSSH_CLIENT_MAJOR}x — update OPENSSH_VERSION/DEBIAN_BASE"; ssh -V; exit 1)
 
 # The virtual FIDO2 authenticator, used as:
-#   ssh-keygen -t ecdsa-sk -w /usr/local/lib/sk-dummy.so -O no-touch-required ...
+#   ssh-keygen -t ecdsa-sk -w /usr/local/lib/sk-dummy.so ...   (touch-required in prod)
 #   ssh -o SecurityKeyProvider=/usr/local/lib/sk-dummy.so ...
 COPY --from=skprovider /sk-dummy.so /usr/local/lib/sk-dummy.so
 

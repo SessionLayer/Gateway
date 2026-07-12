@@ -312,6 +312,12 @@ struct MockState {
     /// the unsigned copy would drop break-glass enforcement; a correct GW reads the
     /// signed context.
     force_signed_breakglass: Mutex<bool>,
+    /// G1: when `Some`, `grant_expiry_epoch_seconds` in the signed context is set to this
+    /// exact value (0 exercises the break-glass "must be time-boxed" fail-closed path).
+    grant_expiry_override: Mutex<Option<i64>>,
+    /// G6: when set, `StreamLocks` returns UNAVAILABLE so the Gateway's lock feed never
+    /// becomes healthy (exercises the break-glass unhealthy-feed fail-closed refusal).
+    lock_feed_down: Mutex<bool>,
     /// When set, `Authorize` returns UNAVAILABLE (the CP-down fail-closed row).
     authorize_unavailable: Mutex<bool>,
     /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
@@ -989,7 +995,11 @@ impl MockState {
             allowed_logins: vec![r.requested_principal.clone()],
             capabilities,
             principal: r.requested_principal.clone(),
-            grant_expiry_epoch_seconds: now + 3600,
+            grant_expiry_epoch_seconds: self
+                .grant_expiry_override
+                .lock()
+                .unwrap()
+                .unwrap_or(now + 3600),
             policy_epoch: 1,
             decision_ttl_seconds: *self.decision_ttl_secs.lock().unwrap(),
             gateway_id: gid.to_string(),
@@ -1185,6 +1195,11 @@ impl LockFeed for MockSvc {
         request: Request<StreamLocksRequest>,
     ) -> Result<Response<Self::StreamLocksStream>, Status> {
         require_gateway(&request, self)?;
+        // G6: simulate an unhealthy lock feed — refuse the stream so the Gateway's feed
+        // never delivers a snapshot and stays !healthy (no connection).
+        if *self.lock_feed_down.lock().unwrap() {
+            return Err(Status::unavailable("lock feed unavailable"));
+        }
         // Subscribe to live events BEFORE snapshotting, so an add/remove that races
         // the snapshot is never lost (a duplicate is harmless — the Gateway dedups).
         let mut events = self.lock_events.subscribe();
@@ -1497,6 +1512,8 @@ impl MockCpBuilder {
             node_capabilities: Mutex::new(HashMap::new()),
             decision_ttl_secs: Mutex::new(45),
             force_signed_breakglass: Mutex::new(false),
+            grant_expiry_override: Mutex::new(None),
+            lock_feed_down: Mutex::new(false),
             authorize_unavailable: Mutex::new(false),
             resolve_unavailable: Mutex::new(false),
             break_glass_keys: Mutex::new(HashMap::new()),
@@ -1959,6 +1976,17 @@ impl MockCp {
     /// SIGNED access_model, never the unsigned convenience copy.
     pub fn set_force_signed_breakglass(&self, on: bool) {
         *self.state.force_signed_breakglass.lock().unwrap() = on;
+    }
+
+    /// G1: force the exact `grant_expiry_epoch_seconds` signed into contexts (0 makes a
+    /// break-glass ALLOW un-time-boxed → the GW must fail closed).
+    pub fn set_grant_expiry(&self, epoch_seconds: i64) {
+        *self.state.grant_expiry_override.lock().unwrap() = Some(epoch_seconds);
+    }
+
+    /// G6: make the lock feed unavailable so the Gateway's feed never becomes healthy.
+    pub fn set_lock_feed_down(&self, on: bool) {
+        *self.state.lock_feed_down.lock().unwrap() = on;
     }
 
     /// The number of break-glass tokens minted by a resolve (test assertion for the
