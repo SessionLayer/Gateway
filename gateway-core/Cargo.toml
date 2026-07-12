@@ -35,6 +35,19 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+# Session Nine recorder: customer-held encryption (ECIES-P256 + AES-256-GCM) and
+# the direct WORM PUT of the ciphertext object. See the workspace manifest for the
+# supply-chain rationale (all RustCrypto / hyper, no rsa, no webpki-roots).
+p256 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio-rustls = { workspace = true }
+bytes = "1"
+
 # tokio-uring is Linux-only; keep it target-gated so the crate still builds on
 # other platforms (the epoll fallback carries them).
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -65,3 +78,11 @@ time = "0.3"
 # OpenSSH node (Part D). testcontainers drives Docker; never host ssh.
 tempfile = "3"
 testcontainers = "0.27"
+# Session Nine: the in-process mock CP mints a REAL SigV4 presigned PUT to the
+# MinIO container (no aws-sdk in Rust) — a small test-only presigner over
+# hmac + sha2 (both already deps). NEVER used by the production build.
+hmac = "0.13"
+sha2 = { workspace = true }
+# The recorder E2E generates a customer P-256 keypair (seal to the public half,
+# decrypt with the private half to prove the platform cannot read the recording).
+p256 = { workspace = true }

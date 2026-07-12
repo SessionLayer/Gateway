@@ -20,6 +20,7 @@ pub mod hostverify;
 pub mod innerleg;
 pub mod outcome;
 pub mod proxy;
+pub mod recorder;
 pub mod target;
 
 use std::net::{IpAddr, SocketAddr};

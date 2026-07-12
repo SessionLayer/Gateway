@@ -307,15 +307,20 @@ async fn start_outer_leg(
         Duration::from_secs(cfg.ssh.cp_rpc_timeout_secs),
     ));
     let ssh_cfg = Arc::new(cfg.ssh.clone());
+    // Session Nine: the real session recorder (asciicast v2 + SFTP/SCP decode +
+    // customer-key encryption + hash-chained WORM upload). Reuses the one CP
+    // client; reads the optional upload-CA up front (fail closed on misconfig).
+    let recorder_factory = Arc::new(ssh::recorder::RecorderFactoryImpl::new(
+        cpauth.clone(),
+        cfg.ssh.recorder.clone(),
+    )?);
     let deps = ssh::handler::HandlerDeps {
         cpauth,
         connector: Arc::new(ssh::connector::AgentlessDial::new(Duration::from_secs(
             ssh_cfg.inner.connect_timeout_secs,
         ))),
         resolver: Arc::new(ssh::target::IdentityResolver),
-        // Session Eight ships the null recorder; Session Nine attaches the real
-        // asciicast/WORM recorder at this seam.
-        recorder: Arc::new(ssh::bridge::NullRecorder),
+        recorder_factory,
         config: ssh_cfg.clone(),
     };
 
