@@ -136,6 +136,19 @@ impl CpChannelFactory {
         let snap = self.rx.borrow().clone();
         mtls::connect_mtls(&self.params, &snap.ca_chain_der, &snap.identity).await
     }
+
+    /// Build a fresh authenticated mTLS channel (for a long-lived server stream
+    /// such as the lock feed, which must not share the unary channel's caching /
+    /// circuit-breaker lifecycle).
+    pub async fn open_channel(&self) -> Result<Channel, MtlsError> {
+        self.connect().await
+    }
+
+    /// The pinned internal mTLS CA chain (DER) — the trust root the Gateway already
+    /// uses for the CP channel, reused to verify the decision-context signer leaf.
+    pub fn current_ca_chain(&self) -> Vec<Vec<u8>> {
+        self.rx.borrow().ca_chain_der.clone()
+    }
 }
 
 /// How long a failed connect keeps the circuit breaker open, so a partitioned CP
@@ -311,6 +324,13 @@ impl CpAuthClient {
     pub async fn authorize(&self, req: AuthorizeRequest) -> Result<AuthorizeResponse, CpError> {
         self.call(move |ch| async move { AuthorizationClient::new(ch).authorize(req).await })
             .await
+    }
+
+    /// The pinned internal mTLS CA chain (DER), used to verify the decision-context
+    /// signer leaf (Session Ten). Delegates to the channel factory so a rotated CA
+    /// is picked up.
+    pub fn current_ca_chain(&self) -> Vec<Vec<u8>> {
+        self.factory.current_ca_chain()
     }
 
     /// Register a session recording (Session Nine, §12/§15): consume the single-use

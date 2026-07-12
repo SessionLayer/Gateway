@@ -26,15 +26,17 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use russh::keys::{Certificate, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Response, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty};
 use zeroize::Zeroizing;
 
+use crate::config::MidSessionExpiryMode;
 use crate::config::SshServerConfig;
 use crate::cpauth::{CpAuthClient, CpError};
+use crate::decisionctx;
 use crate::pb::{
     AuthorizeRequest, Capability, Decision, DecisionContext, DeviceFlowStatus, ResolvedIdentity,
     SignContext,
@@ -49,6 +51,7 @@ use crate::ssh::hostverify::{HostTrust, HostVerifier};
 use crate::ssh::innerleg::{
     ChannelKind, InnerClient, InnerLegConfig, InnerLegError, InnerWriteHalf, PtyParams,
 };
+use crate::ssh::locks::{LiveSessionRegistry, LockBindings, LockSet, SessionControl, SessionGuard};
 use crate::ssh::outcome::{SshOutcome, DEVICE_FLOW_TIMEOUT, SERVICE_UNAVAILABLE};
 use crate::ssh::target::{parse_username, TargetResolver};
 use crate::version;
@@ -124,6 +127,12 @@ pub struct HandlerDeps {
     /// Tracks in-flight recording finalizes so a graceful shutdown can await them
     /// (Session Nine, #3). Cheap to clone (an `Arc`).
     pub finalize_tracker: crate::ssh::recorder::FinalizeTracker,
+    /// The actively-pushed lock deny-set (Session Ten): consulted per channel-open
+    /// (deny wins, datastore-independent) and carrying the feed-health signal.
+    pub lock_set: Arc<LockSet>,
+    /// Registry of live sessions so a pushed lock tears down matching ones
+    /// (Session Ten, FR-LOCK-1).
+    pub live_sessions: Arc<LiveSessionRegistry>,
     /// SSH server configuration (target separator, device-flow timing, inner-leg
     /// bounds, recorder policy, …).
     pub config: Arc<SshServerConfig>,
@@ -177,6 +186,16 @@ pub struct SshHandler {
     /// Count of credential-resolution attempts (bounds the CP-RPC amplification
     /// per connection — russh does NOT enforce its own `max_auth_attempts`).
     auth_attempts: usize,
+    /// The shared session-abort flag (Session Ten): flipped by a lock/expiry
+    /// teardown so the bridge + recorder stop plaintext at once. Shared into the
+    /// recorder and the [`SessionControl`].
+    session_abort: Option<Arc<AtomicBool>>,
+    /// Deregisters this session from the live registry on connection end.
+    live_guard: Option<SessionGuard>,
+    /// This session's out-of-band teardown control (registered once).
+    session_control: Option<SessionControl>,
+    /// The mid-session identity-expiry timer (Part F), rearmed on re-authorize.
+    expiry_task: Option<tokio::task::JoinHandle<()>>,
     /// Shared with the accept loop (pre-auth deadline + auth-failed record).
     conn: Arc<ConnState>,
 }
@@ -195,6 +214,14 @@ struct Authorized {
     /// The single-use Recording.BeginRecording token minted alongside the session
     /// token (Session Nine, §12/§15). Empty when the CP predates S9.
     recording_token: String,
+    /// The **signature-verified** decision context (Session Ten, Part A). The
+    /// per-channel local checks run against this — never an unverified copy.
+    context: DecisionContext,
+    /// When the context was verified (Gateway clock). Bounds how long a cached
+    /// allow is served before a forced re-authorize (`decision_ttl`).
+    verified_at: Instant,
+    /// The lock-matchable facts derived from `context` (Session Ten).
+    bindings: LockBindings,
 }
 
 impl SshHandler {
@@ -219,6 +246,10 @@ impl SshHandler {
             pumps: HashMap::new(),
             channels_opened: 0,
             auth_attempts: 0,
+            session_abort: None,
+            live_guard: None,
+            session_control: None,
+            expiry_task: None,
             conn,
         }
     }
@@ -487,6 +518,31 @@ impl SshHandler {
         }
         let authz = self.authz.clone().expect("authorized cached above");
 
+        // (1.5) Per-channel-open LOCAL re-evaluation (FR-CHAN-2, Design §6.3):
+        // decision_ttl re-validate (forced when the lock feed is unhealthy),
+        // grant_expiry vs the Gateway clock (conservative/early), source pin, and
+        // the local lock-set (deny wins, datastore-independent). No CP call except
+        // the forced re-authorize. A failure closes THIS channel with the generic
+        // §7.1 denial; live channels keep flowing.
+        let authz = match self.local_recheck(authz, channel, session).await {
+            Ok(a) => a,
+            Err(()) => return,
+        };
+
+        // (1.6) Register the live session for lock-triggered teardown and arm the
+        // mid-session identity-expiry timer (Parts D/F), once per connection.
+        self.ensure_registered(&authz, session);
+
+        // (1.7) Re-check the lock-set AFTER registering — closes the teardown TOCTOU
+        // with the feed's add-before-scan: a lock pushed concurrently with this
+        // channel-open is now either seen here (deny) or finds this session in the
+        // registry (torn down), so a matching lock can never leave a live channel.
+        if let Some(lock) = self.deps.lock_set.matching(&authz.bindings) {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %sanitize(&lock.lock_id), outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock (post-register recheck)");
+            self.close_with(channel, session, SshOutcome::PolicyDenied);
+            return;
+        }
+
         // (2) Capability gate at channel-open (FR-SESS-2): the channel is admitted
         // only if one of its acceptable capabilities is granted; UNSPECIFIED (the
         // "never granted" sentinel for an unknown subsystem) is rejected outright.
@@ -515,6 +571,10 @@ impl SshHandler {
                 node_id: authz.node.node_id.clone(),
                 principal: authz.node.principal.clone(),
                 teardown: Some(session.handle()),
+                abort: self
+                    .session_abort
+                    .clone()
+                    .expect("session registered before the recorder begins"),
             };
             let strict = self.deps.config.recorder.strict;
             match self.deps.recorder_factory.begin(params).await {
@@ -597,6 +657,137 @@ impl SshHandler {
         tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "bridged", "inner leg bridged; session flowing");
     }
 
+    /// The per-channel-open local checks (FR-CHAN-2). Runs entirely against the
+    /// cached, signature-verified context + the pushed lock-set — no CP call except
+    /// a forced re-authorize when `decision_ttl` has elapsed (or the lock feed is
+    /// unhealthy → `decision_ttl` treated as 0, FR-CHAN-4). On any denial it closes
+    /// the channel with the generic §7.1 outcome and returns `Err(())`.
+    async fn local_recheck(
+        &mut self,
+        mut authz: Arc<Authorized>,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<Arc<Authorized>, ()> {
+        // (a) decision_ttl re-validate. An unhealthy lock feed forces re-validate
+        // (effective TTL 0) so a possibly-missed lock cannot be served stale-open.
+        let max_decision_ttl_secs = self.deps.config.reeval.max_decision_ttl_secs;
+        let grant_expiry_skew_secs = self.deps.config.reeval.grant_expiry_skew_secs;
+        let healthy = self.deps.lock_set.healthy();
+        let effective_ttl = if healthy {
+            authz
+                .context
+                .decision_ttl_seconds
+                .min(max_decision_ttl_secs)
+                .max(0)
+        } else {
+            0
+        };
+        if authz.verified_at.elapsed().as_secs() as i64 >= effective_ttl {
+            match self.decide().await {
+                Ok(fresh) => {
+                    let fresh = Arc::new(fresh);
+                    self.authz = Some(fresh.clone());
+                    // Refresh the registered teardown bindings (the re-authorized
+                    // context may carry drifted node_labels / allowed_logins, so a
+                    // lock on the NEW facet still tears this live session down) and
+                    // rearm the expiry timer against the refreshed grant_expiry.
+                    if let Some(control) = self.session_control.clone() {
+                        control.update_bindings(fresh.bindings.clone());
+                        self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
+                    }
+                    authz = fresh;
+                }
+                Err(o) => {
+                    // Re-authorize failed (CP down / now denied). Refuse this NEW
+                    // channel-open; existing channels keep flowing (allow fails open
+                    // for the live session, deny/new fails closed — §2, NFR-2).
+                    tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "revalidate_failed", "per-channel re-authorize failed; refusing new channel");
+                    self.close_with(channel, session, o);
+                    return Err(());
+                }
+            }
+        }
+
+        // (b) grant_expiry vs the Gateway clock (conservative/early): once a grant
+        // has expired, NO new privileged channel-open is admitted in any
+        // mid-session-expiry mode (Part F).
+        let now = now_epoch_secs();
+        let ge = authz.context.grant_expiry_epoch_seconds;
+        if ge != 0 && now + grant_expiry_skew_secs >= ge {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "grant_expired", "grant expired; refusing new channel");
+            self.close_with(channel, session, SshOutcome::PolicyDenied);
+            return Err(());
+        }
+
+        // (c) Source pin: a channel-open whose source differs from the decision's is
+        // refused (multiplexed channels share one connection, so this normally holds
+        // — a mismatch means a mis-bound context).
+        if !authz.context.source_address.is_empty()
+            && authz.context.source_address != self.source_ip()
+        {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "source_pin_mismatch", "channel source does not match the decision context");
+            self.close_with(channel, session, SshOutcome::PolicyDenied);
+            return Err(());
+        }
+
+        // (d) Local lock-set (deny wins, independent of the datastore). A live match
+        // is also being torn down by the feed; refusing here closes the race window.
+        if let Some(lock) = self.deps.lock_set.matching(&authz.bindings) {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %sanitize(&lock.lock_id), outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock");
+            self.close_with(channel, session, SshOutcome::PolicyDenied);
+            return Err(());
+        }
+
+        Ok(authz)
+    }
+
+    /// Register this session in the live registry (so a pushed lock can tear it
+    /// down) and arm the mid-session-expiry timer — once per connection.
+    fn ensure_registered(&mut self, authz: &Arc<Authorized>, session: &Session) {
+        if self.live_guard.is_some() {
+            return;
+        }
+        let abort = Arc::new(AtomicBool::new(false));
+        let control = SessionControl::new(authz.bindings.clone(), session.handle(), abort.clone());
+        self.session_abort = Some(abort);
+        self.live_guard = Some(
+            self.deps
+                .live_sessions
+                .register(self.session_id.clone(), control.clone()),
+        );
+        self.session_control = Some(control);
+        self.arm_expiry(authz.context.grant_expiry_epoch_seconds);
+    }
+
+    /// (Re)arm the mid-session identity-expiry timer for `grant_expiry` (Part F).
+    /// In `run_to_ttl` mode there is no active teardown (new channels are already
+    /// refused after expiry by [`Self::local_recheck`]); the other modes tear the
+    /// live session down at (or a grace after) `grant_expiry`. A Lock overrides all.
+    fn arm_expiry(&mut self, grant_expiry: i64) {
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
+        }
+        let mode = self.deps.config.reeval.mid_session_expiry;
+        if mode == MidSessionExpiryMode::RunToTtl || grant_expiry == 0 {
+            return;
+        }
+        let Some(control) = self.session_control.clone() else {
+            return;
+        };
+        let grace = if mode == MidSessionExpiryMode::GraceThenKill {
+            self.deps.config.reeval.mid_session_grace_secs
+        } else {
+            0
+        };
+        let wait = (grant_expiry - now_epoch_secs()).max(0) as u64 + grace;
+        let session_id = self.session_id.clone();
+        self.expiry_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            tracing::info!(session_id = %session_id, outcome = "grant_expired", "mid-session grant expiry: tearing session down");
+            control.terminate();
+        }));
+    }
+
     /// Resolve the target, apply the credential reducer, call `Authorize`, and on
     /// ALLOW build the [`Authorized`] hand-off (node connection + host trust +
     /// grant + capabilities). Pre-authorization failures collapse to the generic
@@ -650,7 +841,29 @@ impl SshHandler {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = "node_unreachable", reason = "no_host_verification_material", "aborting: node has no host-verification anchor (never TOFU)");
                     return Err(SshOutcome::NodeUnreachable);
                 }
-                let capabilities = granted_capabilities(resp.context.as_ref());
+                // Part A: trust the decision context only because its signature
+                // verifies (chain to the pinned internal mTLS CA + signer marker +
+                // codeSigning EKU + ECDSA-P256/SHA-256). Fail closed on any doubt.
+                let context = match decisionctx::verify_decision_context(
+                    &resp.signed_context,
+                    &resp.signature,
+                    &resp.signer_certificate,
+                    &self.deps.cpauth.current_ca_chain(),
+                ) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "policy_denied", reason = "decision_context_unverified", "rejecting unverified decision context (fail closed)");
+                        return Err(SshOutcome::PolicyDenied);
+                    }
+                };
+                // The signed context binds the session/gateway this decision was
+                // made for — a mismatch means a mis-routed or replayed context.
+                if context.session_id != self.session_id {
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "context_session_mismatch", "decision context bound to a different session (fail closed)");
+                    return Err(SshOutcome::PolicyDenied);
+                }
+                let capabilities = granted_capabilities(Some(&context));
+                let bindings = LockBindings::from_context(&context);
                 tracing::info!(
                     outcome = "authorized",
                     identity = %sanitize(&auth.identity),
@@ -672,10 +885,13 @@ impl SshHandler {
                     trust,
                     grant: SessionGrant {
                         session_token: resp.session_token,
-                        context: resp.context,
+                        context: Some(context.clone()),
                     },
                     capabilities,
                     recording_token: resp.recording_token,
+                    context,
+                    verified_at: Instant::now(),
+                    bindings,
                 })
             }
             Ok(_) => {
@@ -792,6 +1008,11 @@ impl Drop for SshHandler {
         // inner client also closes the node transport, but this bounds the teardown).
         for (_, pump) in self.pumps.drain() {
             pump.abort();
+        }
+        // Stop the mid-session-expiry timer (the connection is already ending). The
+        // live_guard drops here too, deregistering the session from the lock registry.
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
         }
         // Finalize the recording off the Drop path (flush → seal-final → upload →
         // FinalizeRecording). Spawned via the tracker so teardown never blocks but a
@@ -1002,10 +1223,21 @@ impl Handler for SshHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // A strict-mode recording failure tears the session down; do not forward
-        // further (un-recorded) bytes to the node while the disconnect is in flight.
+        // A lock or strict-mode teardown flips the shared abort flag; stop
+        // forwarding client bytes to the node AT ONCE — before the async
+        // disconnect lands — so no keystroke/command reaches the node after a lock
+        // (the client->node half of the teardown, matching the node->client pump's
+        // should_abort() gate). Covers both the strict recorder (torn) and the
+        // non-strict/disabled recorder (which shares only the session_abort flag).
+        if self
+            .session_abort
+            .as_ref()
+            .is_some_and(|a| a.load(Ordering::SeqCst))
+        {
+            return Ok(());
+        }
         if let Some(rec) = &self.recorder {
-            if rec.is_torn_down() {
+            if rec.should_abort() {
                 return Ok(());
             }
             // Tap the input stream (`i`) BEFORE forwarding.
@@ -1217,8 +1449,9 @@ fn is_unsafe_display(c: char) -> bool {
 /// Sanitize a client/CP-supplied string for a log field or a terminal line: drop
 /// control + format/bidi characters and bound the length (log-injection /
 /// terminal-escape / bidi-spoofing guard). Never applied to secrets — those are
-/// not rendered at all.
-fn sanitize(s: &str) -> String {
+/// not rendered at all. `pub(crate)` so the lock feed sanitizes CP-supplied
+/// lock ids the same way (a breached CP must not inject control chars into logs).
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| !is_unsafe_display(*c))
         .take(256)
@@ -1231,6 +1464,14 @@ fn new_session_id() -> String {
     let mut bytes = [0u8; 16];
     rand_core::OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The Gateway wall clock as Unix epoch seconds (for grant/lock expiry checks).
+fn now_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

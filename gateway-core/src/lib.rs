@@ -38,6 +38,7 @@
 pub mod asyncio;
 pub mod config;
 pub mod cpauth;
+pub mod decisionctx;
 pub mod handshake;
 pub mod health;
 pub mod identity;

@@ -245,4 +245,19 @@ message DecisionContext {
 
   // When the decision was issued (Unix epoch seconds, UTC).
   int64 issued_at_epoch_seconds = 12;
+
+  // The resolved subject identity this decision was made for. SIGNED into the
+  // context so the Gateway matches identity-targeted locks against TRUSTED data
+  // (it can never be told an identity it did not authorize under). Added in
+  // Session Ten (additive; protocol stays 1.1).
+  string identity = 13;
+
+  // The identity's SSO/OIDC groups, for group-targeted locks (membership match).
+  // Signed alongside identity. Added in Session Ten.
+  repeated string identity_groups = 14;
+
+  // The fixed node's inventory labels ("key=value"), for node-label-targeted
+  // locks. Signed so the Gateway matches label locks locally without a CP call.
+  // Added in Session Ten.
+  repeated string node_labels = 15;
 }

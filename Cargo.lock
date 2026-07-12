@@ -1316,6 +1316,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "x509-parser",
  "zeroize",
 ]
 

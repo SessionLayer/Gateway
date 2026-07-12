@@ -75,10 +75,19 @@ pem = "3"
 #   * p256 (ecdh + pkcs8): ephemeral-static ECDH + DER-SPKI customer key parsing.
 #   * hkdf + sha2: HKDF-SHA256 key derivation + the hash-chain / streaming digest.
 #   * aes-gcm: the AES-256-GCM data + key-wrap cipher (zeroizing key schedule).
-p256 = { version = "0.13", default-features = false, features = ["ecdh", "pkcs8", "std"] }
+# Session Ten adds the `ecdsa` feature (already-present transitive crates) to
+# VERIFY the CP's ECDSA-P256/SHA-256 decision-context signature (decisionctx.rs).
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 hkdf = "0.13"
 sha2 = "0.11"
 aes-gcm = { version = "0.11", features = ["zeroize"] }
+
+# Session Ten: parse + PKIX-validate the CONTEXT_SIGNER X.509 leaf (SAN URI marker,
+# codeSigning EKU, validity, chain to the pinned internal mTLS CA) when verifying a
+# signed decision context. Pure-Rust (MIT/Apache), already vetted in the graph as a
+# dev dep; `verify` enables ring-backed chain-signature checks (ring is already the
+# rustls provider). See decisionctx.rs; mirrors the S5 Java DecisionContextVerifier.
+x509-parser = { version = "0.18", features = ["verify"] }
 
 # Session Nine WORM upload: a dumb HTTP PUT of the ciphertext object to the
 # CP-issued presigned URL. hyper (+util) are already transitive via tonic; no

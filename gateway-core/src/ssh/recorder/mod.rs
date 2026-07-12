@@ -444,6 +444,10 @@ pub struct Recorder {
     strict: bool,
     teardown: Option<Handle>,
     torn: AtomicBool,
+    /// Shared session-abort (Session Ten): a lock teardown flips it so the bridge
+    /// stops forwarding at once, independent of this recorder's own strict-mode
+    /// `torn` flag.
+    abort: Arc<AtomicBool>,
     session_id: String,
     recording_id: String,
     cpauth: Arc<CpAuthClient>,
@@ -536,7 +540,7 @@ impl RecorderTap for Recorder {
     }
 
     fn should_abort(&self) -> bool {
-        self.torn.load(Ordering::SeqCst)
+        self.torn.load(Ordering::SeqCst) || self.abort.load(Ordering::SeqCst)
     }
 
     fn resize(&self, channel: ChannelId, cols: u16, rows: u16) {
@@ -730,6 +734,7 @@ impl RecorderFactory for RecorderFactoryImpl {
                 strict: self.config.strict,
                 teardown: params.teardown,
                 torn: AtomicBool::new(false),
+                abort: params.abort,
                 session_id: params.session_id,
                 recording_id: resp.recording_id,
                 cpauth: self.cpauth.clone(),
@@ -1240,6 +1245,7 @@ mod tests {
             strict,
             teardown: None,
             torn: AtomicBool::new(false),
+            abort: Arc::new(AtomicBool::new(false)),
             session_id: "s".into(),
             recording_id: "r".into(),
             cpauth: Arc::new(crate::cpauth::CpAuthClient::new(
