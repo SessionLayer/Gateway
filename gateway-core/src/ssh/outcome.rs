@@ -36,6 +36,13 @@ pub const SERVICE_UNAVAILABLE: &str = "service temporarily unavailable";
 /// specific reason is in the operator log only — Part C).
 pub const NODE_UNREACHABLE: &str = "the target node is offline or unavailable";
 
+/// Strict-mode recording failure (§12, FR-AUD-1/2): the session cannot be
+/// recorded (setup/continuation/encryption/upload failed, or no customer key is
+/// configured while keystroke capture is on), so — recording being mandatory — the
+/// session is refused / torn down rather than run unrecorded (fail closed). The
+/// specific reason is in the operator log only.
+pub const RECORDING_UNAVAILABLE: &str = "session cannot start: recording unavailable";
+
 /// A §7.1 outcome. Values that reach an SSH channel carry a user message + exit
 /// code; the pre-banner / native-auth-failure values carry neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +60,9 @@ pub enum SshOutcome {
     /// Post-authorization node-side failure (dial / host-verify / inner
     /// handshake). Generic to the user; specific in the operator log.
     NodeUnreachable,
+    /// Strict-mode recording failure: recording is mandatory (§12/FR-AUD-1), so a
+    /// setup/continuation failure refuses or tears down the session (fail closed).
+    RecordingUnavailable,
 }
 
 impl SshOutcome {
@@ -65,6 +75,7 @@ impl SshOutcome {
             SshOutcome::DeviceFlowTimeout => Some(DEVICE_FLOW_TIMEOUT),
             SshOutcome::ServiceUnavailable => Some(SERVICE_UNAVAILABLE),
             SshOutcome::NodeUnreachable => Some(NODE_UNREACHABLE),
+            SshOutcome::RecordingUnavailable => Some(RECORDING_UNAVAILABLE),
         }
     }
 

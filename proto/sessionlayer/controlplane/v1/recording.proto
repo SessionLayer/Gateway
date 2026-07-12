@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "RecordingProto";
+
+// Recording registers and finalizes a session recording and hands the Gateway
+// short-lived, single-object upload authority to a WORM object store (Design §12,
+// §12A; FR-AUD-1/2/3/9, FR-DATA-2). Added in Session Nine.
+//
+// The Gateway captures AND ENCRYPTS the recording under a customer-held key and
+// uploads the ciphertext DIRECTLY to the WORM store with the credential this
+// service issues — bytes NEVER proxy through the Control Plane (§12.2). The CP
+// owns metadata, policy (WORM mode + retention), the customer-key reference, and
+// the correlated audit trail; it never sees recording plaintext nor the data key.
+//
+// PER-RPC, SESSION-BOUND AUTHORIZATION (§15). mTLS authenticates the calling
+// Gateway. BeginRecording additionally consumes the single-use recording_token
+// minted by Authorize ALLOW (bound to {gateway_id, session_id, node, principal,
+// exp}) — the sole per-request authority, so a Gateway can never register a
+// recording for a session it does not broker. FinalizeRecording is authorized by
+// the mTLS caller owning the recording_id it created.
+service Recording {
+  // BeginRecording registers the recording for a session (fail-closed): it mints
+  // the recording_ref, chooses the WORM mode + retention, returns the customer
+  // public key to seal the data key to, and issues a short-lived, single-object
+  // upload credential. The recording_token is atomically consumed (replay
+  // rejected). If the operator configured no customer key (keystroke capture is
+  // always on, so encryption is mandatory, FR-AUD-2) this fails closed.
+  rpc BeginRecording(BeginRecordingRequest) returns (BeginRecordingResponse);
+
+  // FinalizeRecording commits the recording's tamper-evidence + integrity
+  // metadata (hash-chain head, content digest, byte length, status) and the
+  // per-operation SFTP/SCP file-transfer audit into the correlated audit stream.
+  rpc FinalizeRecording(FinalizeRecordingRequest) returns (FinalizeRecordingResponse);
+}
+
+// WORM object-lock mode for the recording object (Design §12.2, D9; FR-AUD-3).
+enum WormMode {
+  WORM_MODE_UNSPECIFIED = 0;
+  // Truly un-deletable / un-overwritable object-lock (maximum tamper-evidence).
+  WORM_MODE_COMPLIANCE = 1;
+  // Deletable only by a specifically-privileged, audited role (the GDPR erasure
+  // escape hatch; the delete path itself is Session Fifteen).
+  WORM_MODE_GOVERNANCE = 2;
+}
+
+// How the per-recording AES-256-GCM data key is sealed to the customer-held
+// public key so no platform-held key can unwrap it (FR-AUD-2, §15). ECIES over
+// P-256 is the default (portable, no RSA on the Gateway's hot path).
+enum KeySealAlgorithm {
+  KEY_SEAL_ALGORITHM_UNSPECIFIED = 0;
+  KEY_SEAL_ALGORITHM_ECIES_P256_HKDF_SHA256_AES256GCM = 1;
+  KEY_SEAL_ALGORITHM_RSA_OAEP_SHA256 = 2;
+}
+
+// The terminal state a Gateway reports for a recording.
+enum RecordingStatus {
+  RECORDING_STATUS_UNSPECIFIED = 0;
+  // Complete: fully captured, uploaded, hash-chain committed.
+  RECORDING_STATUS_FINALIZED = 1;
+  // Session ended abnormally; a partial (but valid, hash-chained) object was
+  // uploaded.
+  RECORDING_STATUS_TRUNCATED = 2;
+  // Capture or upload failed; there is no usable object (the session's failure is
+  // recorded loudly in the audit stream — never silently dropped).
+  RECORDING_STATUS_FAILED = 3;
+}
+
+message BeginRecordingRequest {
+  // Single-use recording token minted by Authorize ALLOW; the sole per-request
+  // authority (mTLS authenticates the caller). Consumed atomically; a replayed,
+  // cross-gateway, cross-session, or expired token is rejected (fail closed).
+  string recording_token = 1;
+
+  // Advisory correlation only; the token is authoritative for
+  // {session, node, principal}. If a field is set and disagrees with the token,
+  // the request fails closed.
+  RecordingContext context = 2;
+}
+
+message RecordingContext {
+  string session_id = 1;
+  string node_id = 2;
+  string principal = 3;
+}
+
+message BeginRecordingResponse {
+  // The registered recording id (UUID) — echoed to FinalizeRecording.
+  string recording_id = 1;
+
+  // The WORM object-store key the ENCRYPTED recording MUST be written to. The
+  // upload credential is scoped to exactly this key.
+  string object_key = 2;
+
+  // The WORM mode this object lands under (operator policy). The upload
+  // credential pre-binds the matching object-lock retention.
+  WormMode worm_mode = 3;
+
+  // The customer-held PUBLIC key the Gateway seals the per-recording data key to.
+  // MANDATORY: keystroke capture is always on, so encryption is always required
+  // (FR-AUD-2); if the operator configured none this RPC fails closed rather than
+  // return a session that would store keystrokes in the clear.
+  CustomerKey customer_key = 4;
+
+  // Short-lived, single-object upload authority (a signed PUT URL). The Gateway
+  // PUTs the ciphertext straight to the WORM store; bytes never traverse the CP.
+  UploadCredential upload = 5;
+}
+
+// CustomerKey is the operator-configured customer public key material. Public
+// material only — the CP never holds the private half, so a platform operator
+// cannot decrypt the recording (FR-AUD-2, §15 crown-jewels invariant).
+message CustomerKey {
+  // Operator's reference to the key (persisted in recording_ref.encryption_key_ref;
+  // never key material). Lets replay (S15) locate the customer unwrap path.
+  string key_ref = 1;
+
+  // The customer PUBLIC key, DER SubjectPublicKeyInfo (an EC P-256 point for
+  // ECIES; an RSA public key for RSA-OAEP). Public material only.
+  bytes public_key = 2;
+
+  KeySealAlgorithm algorithm = 3;
+}
+
+// UploadCredential is short-lived authority to write exactly one WORM object.
+message UploadCredential {
+  // The presigned URL (a PUT). Scoped to the single object_key; short-lived.
+  string url = 1;
+
+  // The HTTP method (always "PUT" in Session Nine).
+  string method = 2;
+
+  // Headers the Gateway MUST send verbatim — they are part of the signature
+  // (e.g. the object-lock mode + retain-until-date that make the object WORM, and
+  // any content headers). Sending a different value breaks the signature, so the
+  // WORM lock cannot be stripped by the uploader (fail closed).
+  map<string, string> required_headers = 3;
+
+  // Credential expiry as Unix epoch seconds (UTC).
+  int64 expires_at_epoch_seconds = 4;
+}
+
+message FinalizeRecordingRequest {
+  // The recording id returned by BeginRecording (ownership-checked against the
+  // mTLS caller).
+  string recording_id = 1;
+
+  RecordingStatus status = 2;
+
+  // The recording's hash-chain head, "sha256:<64-hex>", committing to its content
+  // (FR-AUD-3). Written write-once to recording_ref.hash_chain_head.
+  string hash_chain_head = 3;
+
+  // Streaming SHA-256 over the CIPHERTEXT object actually uploaded, "sha256:<hex>"
+  // (NFR-6). Written write-once to recording_ref.content_digest.
+  string content_digest = 4;
+
+  // Byte length of the uploaded ciphertext object (reconciled against the store).
+  int64 byte_len = 5;
+
+  // Per-operation SFTP/SCP file-transfer audit — path, direction, size, streaming
+  // SHA-256 of the transferred content (FR-AUD-1). METADATA ONLY; file content is
+  // never captured. Correlated into the audit_event stream (FR-AUD-9).
+  repeated FileTransferAudit sftp_audit = 6;
+}
+
+// One decoded SFTP/SCP file-transfer operation (metadata only).
+message FileTransferAudit {
+  // The operation: open|read|write|close|rename|remove|mkdir|setstat|realpath|...
+  // For SCP: put|get with the negotiated mode.
+  string operation = 1;
+  string path = 2;
+  // "upload" (client→node) or "download" (node→client).
+  string direction = 3;
+  // Transferred size in bytes (best-effort; the true size is the streamed count).
+  int64 size = 4;
+  // Streaming SHA-256 of the transferred content, "sha256:<64-hex>" (never the
+  // content itself).
+  string sha256 = 5;
+}
+
+message FinalizeRecordingResponse {
+  // The stored terminal status (echoed for the Gateway's structured log).
+  RecordingStatus status = 1;
+}
