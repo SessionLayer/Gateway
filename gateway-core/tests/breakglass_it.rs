@@ -4,9 +4,10 @@
 //! Break-glass is the always-available, IdP-independent override path. This file
 //! proves, against the real russh outer leg + a real node + the in-process mock CP:
 //!
-//! - the FIDO2 `sk-ecdsa` publickey RESOLUTION path routes to the CP break-glass
-//!   resolver and authenticates (deterministic, no authenticator needed — see the
-//!   fixture note below on the software SK provider);
+//! - a **real FIDO2 `sk-ecdsa` login** end-to-end: the client image bakes OpenSSH's
+//!   `sk-dummy.so` (a virtual authenticator), so stock `ssh` produces a genuine FIDO
+//!   possession signature that russh verifies before the Gateway resolves the key as
+//!   a break-glass credential — the PRIMARY break-glass auth path;
 //! - a single-use **offline code** (keyboard-interactive) authenticates a live
 //!   break-glass session on a node, fires the activation + alert, and is rejected
 //!   on replay;
@@ -55,16 +56,14 @@ const BUCKET: &str = "recordings";
 
 const RECORDING_UNAVAILABLE: &str = "recording unavailable";
 
-// ── The deterministic sk-ecdsa RESOLUTION proof (no Docker, no authenticator) ──
+// ── The deterministic sk-ecdsa RESOLUTION unit-proof (no Docker) ──────────────
 //
-// russh (via ssh-key) fully verifies a real FIDO2 `sk-ecdsa` signature server-side
-// before `auth_publickey` runs, so the FULL FIDO E2E needs a software SK provider
-// (`sk-dummy.so`) in the client to produce that signature. Independent of whether
-// that provider is present, this test proves OUR routing deterministically: a real
-// `sk-ecdsa` public key offered to the handler's `auth_publickey` is detected as a
-// security key, serialized to its OpenSSH wire blob, and resolved via the CP
-// break-glass resolver (which mints the single-use token). An UNREGISTERED sk key
-// degrades to the next method.
+// The full FIDO2 login is proven in `sk_ecdsa_fido2_break_glass_session_e2e` below
+// (real authenticator, real signature). This is its fast complement: it pins the
+// handler's ROUTING without any container — a real `sk-ecdsa` public key offered to
+// `auth_publickey` is detected as a security key, serialized to its OpenSSH wire
+// blob, and resolved via the CP break-glass resolver (which mints the single-use
+// token); an UNREGISTERED sk key degrades to the next method (fail closed).
 
 /// Assemble a well-formed OpenSSH `sk-ecdsa-sha2-nistp256@openssh.com` public key
 /// from a fresh P-256 point (the private half is irrelevant here — this test drives
@@ -422,6 +421,146 @@ async fn await_finalized(cp: &MockCp) -> gateway_core::pb::FinalizeRecordingRequ
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("the recording was never finalized");
+}
+
+// ── E2E 0: the REAL FIDO2 sk-ecdsa break-glass login (software SK provider) ───
+//
+// The client image bakes OpenSSH's `sk-dummy.so` — a virtual FIDO2 authenticator
+// — so a genuine `ecdsa-sk` key is enrolled and the stock `ssh` client produces a
+// REAL FIDO possession signature. russh verifies that signature server-side before
+// `auth_publickey`, which then resolves the key as a break-glass credential. This
+// is the primary break-glass auth path (Design §7, FR-ACC-6) end-to-end.
+
+/// The software SK provider (virtual FIDO2 authenticator) baked into the client image.
+const SK_PROVIDER: &str = "/usr/local/lib/sk-dummy.so";
+
+#[tokio::test]
+async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let (minio, s3) = start_minio().await?;
+    cp.set_s3_target(s3);
+    cp.set_customer_key(
+        "ck",
+        customer_keypair(),
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+    // NO standing dp_rule grant: break-glass is the always-available override path.
+    cp.register_node(NODE_ID);
+
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    // recorder.strict = FALSE; break-glass must force strict on top of it.
+    let recorder = RecorderConfig {
+        strict: false,
+        ..RecorderConfig::default()
+    };
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(recorder))).await;
+    let client = client_container().await;
+
+    // Enroll a REAL FIDO2 ecdsa-sk key with the virtual authenticator (no hardware,
+    // no touch) — exactly how an operator enrolls a break-glass security key.
+    let (code, _out, stderr) = ssh_exec(
+        &client,
+        vec![
+            "ssh-keygen".into(),
+            "-t".into(),
+            "ecdsa-sk".into(),
+            "-w".into(),
+            SK_PROVIDER.into(),
+            "-O".into(),
+            "no-touch-required".into(),
+            "-N".into(),
+            String::new(),
+            "-f".into(),
+            "/root/sk_key".into(),
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the software SK provider must enroll an ecdsa-sk key; stderr={stderr}"
+    );
+
+    // Register the enrolled PUBLIC key as the break-glass credential at the CP.
+    let (code, pub_line, _e) = ssh_exec(
+        &client,
+        vec!["cat".into(), "/root/sk_key.pub".into()],
+        vec![],
+    )
+    .await;
+    assert_eq!(code, Some(0), "read the enrolled sk public key");
+    let sk_pub = ssh_key::PublicKey::from_openssh(pub_line.trim())?;
+    assert_eq!(
+        sk_pub.algorithm(),
+        Algorithm::SkEcdsaSha2NistP256,
+        "a genuine sk-ecdsa-sha2-nistp256@openssh.com key"
+    );
+    cp.register_break_glass_key(sk_pub.to_bytes()?, "breakglass-admin", &["deploy"]);
+
+    // Log in with the FIDO2 key: the client signs via the authenticator, russh
+    // verifies the FIDO signature, and the Gateway resolves it as break-glass.
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        vec![
+            "ssh".into(),
+            "-p".into(),
+            gw_port.to_string(),
+            "-i".into(),
+            "/root/sk_key".into(),
+            "-o".into(),
+            format!("SecurityKeyProvider={SK_PROVIDER}"),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-o".into(),
+            "PreferredAuthentications=publickey".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "ConnectTimeout=30".into(),
+            "deploy%node-bg@127.0.0.1".into(),
+            "echo FIDO2_BREAK_GLASS_OK".into(),
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the FIDO2 sk-ecdsa break-glass session must run; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("FIDO2_BREAK_GLASS_OK"),
+        "the break-glass session runs on the node; stdout={stdout}"
+    );
+
+    // The activation + high-priority alert fired ON USE at Authorize.
+    assert_eq!(
+        cp.breakglass_activations(),
+        vec![("breakglass-admin".to_string(), NODE_ID.to_string())],
+        "the FIDO2 break-glass use is recorded as an activation"
+    );
+    // Break-glass FORCED strict recording despite config strict=false.
+    let fin = await_finalized(&cp).await;
+    assert_eq!(
+        fin.status,
+        RecordingStatus::Finalized as i32,
+        "break-glass forces strict → the FIDO2 session is recorded"
+    );
+    assert!(fin.byte_len > 0);
+
+    drop(client);
+    drop(node);
+    drop(minio);
+    Ok(())
 }
 
 // ── E2E 1: offline-code break-glass runs, forces strict, is single-use, and
