@@ -42,6 +42,7 @@ p256 = { workspace = true }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
+x509-parser = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body = { workspace = true }

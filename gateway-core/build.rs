@@ -56,7 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // services.
         .build_server(true)
         .compile_protos(
-            &[handshake, identity, signing, authz, auth, recording, lock, common],
+            &[
+                handshake, identity, signing, authz, auth, recording, lock, common,
+            ],
             &[proto_root],
         )?;
 
