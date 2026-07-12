@@ -68,7 +68,7 @@ impl LockFeedClientTask {
             }
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {}
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
+                res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { return; } }
             }
             backoff = (backoff * 2).min(BACKOFF_MAX);
         }
@@ -111,8 +111,8 @@ impl LockFeedClientTask {
                         Err(s) => return Err(format!("stream error: {:?}", s.code())),
                     }
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return Ok(()); }
+                res = shutdown.changed() => {
+                    if res.is_err() || *shutdown.borrow() { return Ok(()); }
                 }
             }
         }
@@ -139,14 +139,19 @@ impl LockFeedClientTask {
                 );
             }
             Event::Added(lock) => {
-                let id = lock.lock_id.clone();
+                let id = crate::ssh::handler::sanitize(&lock.lock_id);
+                // Add to the deny-set FIRST, then scan the registry: this closes the
+                // teardown TOCTOU — a session that registers concurrently is caught
+                // by the scan, and a session whose per-channel lock-check races the
+                // add sees it in the set (pairs with the handler's post-register
+                // re-check).
+                self.lock_set.add(lock.clone());
                 let torn = self.registry.apply_added_lock(&lock);
-                self.lock_set.add(lock);
                 tracing::info!(lock_id = %id, torn_down = torn, outcome = "lock_added", "lock pushed; matching live sessions torn down");
             }
             Event::Removed(rm) => {
                 self.lock_set.remove(&rm.lock_id);
-                tracing::info!(lock_id = %rm.lock_id, outcome = "lock_removed", "lock cleared");
+                tracing::info!(lock_id = %crate::ssh::handler::sanitize(&rm.lock_id), outcome = "lock_removed", "lock cleared");
             }
             Event::Heartbeat(_) => self.lock_set.touch(),
         }

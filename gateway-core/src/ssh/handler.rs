@@ -533,6 +533,16 @@ impl SshHandler {
         // mid-session identity-expiry timer (Parts D/F), once per connection.
         self.ensure_registered(&authz, session);
 
+        // (1.7) Re-check the lock-set AFTER registering — closes the teardown TOCTOU
+        // with the feed's add-before-scan: a lock pushed concurrently with this
+        // channel-open is now either seen here (deny) or finds this session in the
+        // registry (torn down), so a matching lock can never leave a live channel.
+        if let Some(lock) = self.deps.lock_set.matching(&authz.bindings) {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %sanitize(&lock.lock_id), outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock (post-register recheck)");
+            self.close_with(channel, session, SshOutcome::PolicyDenied);
+            return;
+        }
+
         // (2) Capability gate at channel-open (FR-SESS-2): the channel is admitted
         // only if one of its acceptable capabilities is granted; UNSPECIFIED (the
         // "never granted" sentinel for an unknown subsystem) is rejected outright.
@@ -677,8 +687,12 @@ impl SshHandler {
                 Ok(fresh) => {
                     let fresh = Arc::new(fresh);
                     self.authz = Some(fresh.clone());
-                    // Rearm the expiry timer against the refreshed grant_expiry.
-                    if self.session_control.is_some() {
+                    // Refresh the registered teardown bindings (the re-authorized
+                    // context may carry drifted node_labels / allowed_logins, so a
+                    // lock on the NEW facet still tears this live session down) and
+                    // rearm the expiry timer against the refreshed grant_expiry.
+                    if let Some(control) = self.session_control.clone() {
+                        control.update_bindings(fresh.bindings.clone());
                         self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
                     }
                     authz = fresh;
@@ -719,7 +733,7 @@ impl SshHandler {
         // (d) Local lock-set (deny wins, independent of the datastore). A live match
         // is also being torn down by the feed; refusing here closes the race window.
         if let Some(lock) = self.deps.lock_set.matching(&authz.bindings) {
-            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %lock.lock_id, outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock");
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %sanitize(&lock.lock_id), outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock");
             self.close_with(channel, session, SshOutcome::PolicyDenied);
             return Err(());
         }
@@ -770,7 +784,7 @@ impl SshHandler {
         self.expiry_task = Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(wait)).await;
             tracing::info!(session_id = %session_id, outcome = "grant_expired", "mid-session grant expiry: tearing session down");
-            control.terminate("grant expired");
+            control.terminate();
         }));
     }
 
@@ -1209,10 +1223,21 @@ impl Handler for SshHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // A strict-mode recording failure tears the session down; do not forward
-        // further (un-recorded) bytes to the node while the disconnect is in flight.
+        // A lock or strict-mode teardown flips the shared abort flag; stop
+        // forwarding client bytes to the node AT ONCE — before the async
+        // disconnect lands — so no keystroke/command reaches the node after a lock
+        // (the client->node half of the teardown, matching the node->client pump's
+        // should_abort() gate). Covers both the strict recorder (torn) and the
+        // non-strict/disabled recorder (which shares only the session_abort flag).
+        if self
+            .session_abort
+            .as_ref()
+            .is_some_and(|a| a.load(Ordering::SeqCst))
+        {
+            return Ok(());
+        }
         if let Some(rec) = &self.recorder {
-            if rec.is_torn_down() {
+            if rec.should_abort() {
                 return Ok(());
             }
             // Tap the input stream (`i`) BEFORE forwarding.
@@ -1424,8 +1449,9 @@ fn is_unsafe_display(c: char) -> bool {
 /// Sanitize a client/CP-supplied string for a log field or a terminal line: drop
 /// control + format/bidi characters and bound the length (log-injection /
 /// terminal-escape / bidi-spoofing guard). Never applied to secrets — those are
-/// not rendered at all.
-fn sanitize(s: &str) -> String {
+/// not rendered at all. `pub(crate)` so the lock feed sanitizes CP-supplied
+/// lock ids the same way (a breached CP must not inject control chars into logs).
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| !is_unsafe_display(*c))
         .take(256)

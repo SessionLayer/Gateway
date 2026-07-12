@@ -270,7 +270,8 @@ mod tests {
         let (leaf, sk) = code_signer(&ca);
         let ctx = sample_context();
         let (signed, sig) = sign(&sk, &ctx);
-        let out = verify_decision_context(&signed, &sig, &leaf, std::slice::from_ref(&ca.der)).unwrap();
+        let out =
+            verify_decision_context(&signed, &sig, &leaf, std::slice::from_ref(&ca.der)).unwrap();
         assert_eq!(out.identity, "alice");
         assert_eq!(out.session_id, "sess");
         assert_eq!(out.node_labels, vec!["env=prod".to_string()]);
@@ -282,7 +283,9 @@ mod tests {
         let (leaf, sk) = code_signer(&ca);
         let (mut signed, sig) = sign(&sk, &sample_context());
         signed[0] ^= 0xff; // flip a byte after signing
-        assert!(verify_decision_context(&signed, &sig, &leaf, std::slice::from_ref(&ca.der)).is_err());
+        assert!(
+            verify_decision_context(&signed, &sig, &leaf, std::slice::from_ref(&ca.der)).is_err()
+        );
     }
 
     #[test]
@@ -303,7 +306,9 @@ mod tests {
         // A valid server leaf (no signer marker, no codeSigning) cannot masquerade.
         let (leaf, sk) = issue(&ca, vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth], None);
         let (signed, sig) = sign(&sk, &sample_context());
-        assert!(verify_decision_context(&signed, &sig, &leaf, std::slice::from_ref(&ca.der)).is_err());
+        assert!(
+            verify_decision_context(&signed, &sig, &leaf, std::slice::from_ref(&ca.der)).is_err()
+        );
     }
 
     #[test]

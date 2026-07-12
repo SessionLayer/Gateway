@@ -91,7 +91,8 @@ pub fn target_matches(target: &LockTarget, b: &LockBindings) -> bool {
 /// A DENY expires conservatively (LATE): the lock keeps denying until clearly past
 /// its expiry, the opposite of a grant. `expires_at == 0` means no TTL.
 fn lock_active(lock: &Lock, now_secs: i64, skew_secs: i64) -> bool {
-    lock.expires_at_epoch_seconds == 0 || now_secs <= lock.expires_at_epoch_seconds + skew_secs
+    lock.expires_at_epoch_seconds == 0
+        || now_secs <= lock.expires_at_epoch_seconds.saturating_add(skew_secs)
 }
 
 fn now_epoch_secs() -> i64 {
@@ -213,9 +214,21 @@ impl LockSet {
 /// The out-of-band control surface for one live session: trips the shared abort
 /// flag (so the bridge stops forwarding bytes at once) and disconnects the outer
 /// SSH connection, which runs the handler's Drop → recorder finalize path.
+/// The single generic mid-session teardown message shown to the SSH user for ANY
+/// policy teardown (lock or grant-expiry) — §7.1 non-disclosure: the specific
+/// cause (deliberate lock vs routine expiry) stays in the operator log only, so an
+/// actively-locked attacker cannot tell they were deliberately cut off.
+const TEARDOWN_DISCONNECT: &str = "session closed by policy";
+
+/// The out-of-band control surface for one live session: trips the shared abort
+/// flag (so the bridge stops plaintext at once) and disconnects the outer SSH
+/// connection, which runs the handler's Drop → recorder finalize path.
 #[derive(Clone)]
 pub struct SessionControl {
-    bindings: LockBindings,
+    /// The lock-matchable facts, updatable on a mid-connection re-authorize so a
+    /// lock targeting a drifted facet (e.g. a relabeled node) still tears the live
+    /// session down. Shared across all clones (registry + handler).
+    bindings: Arc<Mutex<LockBindings>>,
     handle: russh::server::Handle,
     /// Shared with the session's recorder: `should_abort()` reads it, so tearing
     /// down here stops plaintext immediately (mirrors S9 strict-mode teardown).
@@ -231,16 +244,27 @@ impl SessionControl {
         abort: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            bindings,
+            bindings: Arc::new(Mutex::new(bindings)),
             handle,
             abort,
             terminated: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// Refresh the lock-matchable facts after a mid-connection re-authorize (the
+    /// signed context may carry drifted node_labels / allowed_logins).
+    pub fn update_bindings(&self, bindings: LockBindings) {
+        *self.bindings.lock().unwrap() = bindings;
+    }
+
+    fn matches(&self, target: &LockTarget) -> bool {
+        target_matches(target, &self.bindings.lock().unwrap())
+    }
+
     /// Tear the session down immediately (idempotent). Non-blocking: the outer
-    /// disconnect is spawned; the connection end drives the recorder finalize.
-    pub fn terminate(&self, reason: &'static str) {
+    /// disconnect is spawned; the connection end drives the recorder finalize. The
+    /// user sees the SAME generic message for a lock and an expiry (§7.1).
+    pub fn terminate(&self) {
         self.abort.store(true, Ordering::SeqCst);
         if self.terminated.swap(true, Ordering::SeqCst) {
             return;
@@ -250,7 +274,7 @@ impl SessionControl {
             let _ = handle
                 .disconnect(
                     russh::Disconnect::ByApplication,
-                    reason.to_string(),
+                    TEARDOWN_DISCONNECT.to_string(),
                     String::new(),
                 )
                 .await;
@@ -291,12 +315,12 @@ impl LiveSessionRegistry {
             let sessions = self.sessions.lock().unwrap();
             sessions
                 .values()
-                .filter(|c| target_matches(target, &c.bindings))
+                .filter(|c| c.matches(target))
                 .cloned()
                 .collect()
         };
         for c in &victims {
-            c.terminate("session locked");
+            c.terminate();
         }
         victims.len()
     }
@@ -313,18 +337,15 @@ impl LiveSessionRegistry {
             sessions
                 .values()
                 .filter(|c| {
-                    active.iter().any(|l| {
-                        l.target
-                            .as_ref()
-                            .map(|t| target_matches(t, &c.bindings))
-                            .unwrap_or(false)
-                    })
+                    active
+                        .iter()
+                        .any(|l| l.target.as_ref().map(|t| c.matches(t)).unwrap_or(false))
                 })
                 .cloned()
                 .collect()
         };
         for c in &victims {
-            c.terminate("session locked");
+            c.terminate();
         }
         victims.len()
     }
