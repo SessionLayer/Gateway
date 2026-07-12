@@ -12,6 +12,7 @@
 //! (the recording is not failed).
 
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::pb::FileTransferAudit;
 use crate::ssh::bridge::TapDirection;
@@ -43,15 +44,20 @@ pub struct ScpDecoder {
     /// The direction that carries the file protocol (input for upload).
     protocol_dir: TapDirection,
     upload: bool,
+    /// The scp target argument (from `scp -t <target>` / `-f <target>`), prepended
+    /// to each file's C-message name so the audit path is the destination, not the
+    /// bare basename (#20).
+    base: Vec<u8>,
     dirs: Vec<Vec<u8>>,
-    line: Vec<u8>,
+    line: Zeroizing<Vec<u8>>,
     state: State,
     broken: bool,
 }
 
 impl ScpDecoder {
-    /// A decoder for an `scp -t` (`upload = true`) or `scp -f` transfer.
-    pub fn new(upload: bool) -> Self {
+    /// A decoder for an `scp -t` (`upload = true`) or `scp -f` transfer against the
+    /// given `target` path argument.
+    pub fn new(upload: bool, target: Vec<u8>) -> Self {
         Self {
             protocol_dir: if upload {
                 TapDirection::Input
@@ -59,8 +65,9 @@ impl ScpDecoder {
                 TapDirection::Output
             },
             upload,
+            base: target,
             dirs: Vec::new(),
-            line: Vec::new(),
+            line: Zeroizing::new(Vec::new()),
             state: State::Control,
             broken: false,
         }
@@ -168,8 +175,10 @@ impl ScpDecoder {
                 self.dirs.pop();
             }
             // Timestamps: advisory, ignored. A leading \0 (an ack that leaked onto
-            // the protocol direction) is tolerated.
-            Some(b'T') | Some(0) => {}
+            // the protocol direction) is tolerated. `\x01` (warning) / `\x02`
+            // (fatal) are in-band scp messages — consume the line, do NOT break the
+            // decoder (#15).
+            Some(b'T') | Some(0) | Some(1) | Some(2) => {}
             // Anything else on the protocol direction is not scp framing.
             Some(_) => self.broken = true,
             None => {}
@@ -177,8 +186,16 @@ impl ScpDecoder {
         let _ = audits; // audits only produced from the Trailer state
     }
 
+    /// The destination path prefix: the scp `target` argument, then any nested
+    /// directory (`D`/`E`) stack.
     fn dir_prefix(&self) -> Vec<u8> {
         let mut p = Vec::new();
+        if !self.base.is_empty() {
+            p.extend_from_slice(&self.base);
+            if p.last() != Some(&b'/') {
+                p.push(b'/');
+            }
+        }
         for d in &self.dirs {
             p.extend_from_slice(d);
             p.push(b'/');
@@ -191,7 +208,8 @@ impl ScpDecoder {
             operation: if self.upload { "put" } else { "get" }.to_string(),
             path: String::from_utf8_lossy(name).into_owned(),
             direction: if self.upload { "upload" } else { "download" }.to_string(),
-            size: size as i64,
+            // Clamp a hostile / oversized size to a non-negative i64 (#21).
+            size: i64::try_from(size).unwrap_or(i64::MAX),
             sha256: chain::format_sha256(&sha.finalize()),
         }
     }
@@ -248,7 +266,7 @@ mod tests {
 
     #[test]
     fn decodes_scp_upload() {
-        let mut d = ScpDecoder::new(true);
+        let mut d = ScpDecoder::new(true, Vec::new());
         let content = b"hello scp world";
         let mut stream = Vec::new();
         stream.extend_from_slice(format!("C0644 {} greeting.txt\n", content.len()).as_bytes());
@@ -266,14 +284,14 @@ mod tests {
 
     #[test]
     fn ack_direction_is_ignored() {
-        let mut d = ScpDecoder::new(true);
+        let mut d = ScpDecoder::new(true, Vec::new());
         // Acks arrive on Output for an upload; they must not be parsed.
         assert!(d.feed(TapDirection::Output, &[0, 0, 0]).is_empty());
     }
 
     #[test]
     fn decodes_download_on_output_direction() {
-        let mut d = ScpDecoder::new(false);
+        let mut d = ScpDecoder::new(false, Vec::new());
         let content = b"downloaded";
         let mut stream = format!("C0600 {} f.bin\n", content.len()).into_bytes();
         stream.extend_from_slice(content);
@@ -306,7 +324,7 @@ mod tests {
 
     #[test]
     fn reassembles_content_split_across_chunks() {
-        let mut d = ScpDecoder::new(true);
+        let mut d = ScpDecoder::new(true, Vec::new());
         let content = b"splitcontent";
         let mut header = format!("C0644 {} s.txt\n", content.len()).into_bytes();
         // Feed header, then content in two pieces, then the trailing NUL.
@@ -317,5 +335,21 @@ mod tests {
         let audits = d.feed(TapDirection::Input, &[0]);
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].sha256, chain::sha256_hex(content));
+    }
+
+    #[test]
+    fn audit_path_is_target_prefixed_and_messages_are_tolerated() {
+        // Target dir prefixes the C-message basename (#20); an in-band \x01 warning
+        // line does not break decoding (#15).
+        let mut d = ScpDecoder::new(true, b"/srv/data".to_vec());
+        let content = b"x";
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x01scp: warning: something\n"); // in-band warning
+        stream.extend_from_slice(format!("C0644 {} f.txt\n", content.len()).as_bytes());
+        stream.extend_from_slice(content);
+        stream.push(0);
+        let audits = d.feed(TapDirection::Input, &stream);
+        assert_eq!(audits.len(), 1, "warning line must not break decoding");
+        assert_eq!(audits[0].path, "/srv/data/f.txt");
     }
 }

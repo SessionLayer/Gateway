@@ -131,13 +131,18 @@ pub struct RecorderConfig {
     ///
     /// [`SshOutcome::RecordingUnavailable`]: crate::ssh::outcome::SshOutcome::RecordingUnavailable
     pub strict: bool,
-    /// Directory for the **ciphertext** spool (a per-recording temp file). `None`
-    /// buffers the ciphertext in memory (fine for short sessions). Plaintext is
-    /// NEVER written here — only sealed frames (§3/§15).
+    /// Directory for the **ciphertext** spool file (used once a recording exceeds
+    /// [`Self::spool_memory_threshold_bytes`]). `None` uses the system temp dir.
+    /// Plaintext is NEVER written here — only sealed frames (§3/§15).
     pub spool_dir: Option<PathBuf>,
-    /// Ciphertext bytes held in memory before spilling to [`Self::spool_dir`] (if
-    /// set). Bounds Gateway memory for a long session.
+    /// Ciphertext bytes held in memory before spilling to a temp file. Enforced
+    /// ALWAYS (a large recording spills even with no `spool_dir`), bounding Gateway
+    /// RAM per session.
     pub spool_memory_threshold_bytes: usize,
+    /// Hard cap on a single recording's ciphertext object. Exceeding it fails
+    /// closed (strict: tear the session down; non-strict: stop recording loudly) —
+    /// an unbounded session can never OOM the Gateway.
+    pub max_object_bytes: u64,
     /// Plaintext bytes buffered before a frame is sealed + flushed. Larger frames
     /// mean less per-frame AEAD overhead; smaller frames bound the plaintext held
     /// in memory on the hot path.
@@ -145,10 +150,13 @@ pub struct RecorderConfig {
     /// Bound (seconds) on the whole ciphertext PUT to the presigned WORM URL
     /// (fail-closed): a hung object store never hangs finalize forever.
     pub upload_timeout_secs: u64,
-    /// Bound (seconds) on the BeginRecording / FinalizeRecording CP RPCs. Reuses
-    /// the outer CP RPC timeout when unset-to-zero is not desired; kept explicit
-    /// so recording RPCs can be tuned independently of auth RPCs.
-    pub rpc_timeout_secs: u64,
+    /// Max attempts (incl. the first) for the end-of-session RequestUpload + PUT.
+    /// A transient store fault is retried with exponential backoff; the recording
+    /// is marked failed only after these are exhausted (fail-closed, never silent).
+    pub upload_max_attempts: u32,
+    /// Require the WORM store URL to be **https** in production. Set `false` only
+    /// for the plain-http MinIO E2E; a plain-http upload is otherwise refused.
+    pub require_https: bool,
     /// Optional PEM trust anchor for an **https** WORM store (prod). When the
     /// presigned URL is https and this is empty, the upload fails closed (no
     /// implicit web-PKI roots — supply-chain policy). Plain-http upload (the E2E
@@ -162,9 +170,11 @@ impl Default for RecorderConfig {
             strict: true,
             spool_dir: None,
             spool_memory_threshold_bytes: 8 * 1024 * 1024,
+            max_object_bytes: 4 * 1024 * 1024 * 1024,
             frame_plaintext_bytes: 16 * 1024,
             upload_timeout_secs: 30,
-            rpc_timeout_secs: 10,
+            upload_max_attempts: 4,
+            require_https: true,
             upload_ca_pem_path: None,
         }
     }

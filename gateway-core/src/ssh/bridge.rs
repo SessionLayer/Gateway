@@ -54,6 +54,14 @@ pub trait RecorderTap: Send + Sync {
     /// → an asciicast `r` event. Defaulted so [`NullRecorder`] and non-recording
     /// call sites need not implement it (additive, S9).
     fn resize(&self, _channel: ChannelId, _cols: u16, _rows: u16) {}
+
+    /// Whether a strict-mode recording failure has torn (or is tearing) the session
+    /// down. The output pump checks this and STOPS forwarding node output the moment
+    /// recording fails, so no un-recorded bytes reach the client during the async
+    /// disconnect (fail closed, mirrors the input path). Defaulted to `false`.
+    fn should_abort(&self) -> bool {
+        false
+    }
 }
 
 /// The Session-Eight recorder: captures nothing. The bridge is fully wired to the
@@ -65,28 +73,41 @@ impl RecorderTap for NullRecorder {
     fn tap(&self, _channel: ChannelId, _direction: TapDirection, _ext: Option<u32>, _data: &[u8]) {}
 }
 
+/// A legacy scp-over-exec transfer mode, decoded ADDITIVELY on a terminal channel.
+#[derive(Debug, Clone)]
+pub struct ScpMode {
+    /// `true` for `scp -t` (client→node upload), `false` for `scp -f` (download).
+    pub upload: bool,
+    /// The scp target path argument (from the exec command line), for the audit.
+    pub target: Vec<u8>,
+}
+
 /// How a bridged channel's plaintext is captured (Design §12.1). The handler
-/// classifies the channel at open time so the tap routes its bytes: a terminal
-/// channel → asciicast v2; an SFTP/SCP channel → protocol-decoded file-transfer
-/// audit (metadata only, never the file content).
+/// classifies the channel at open time so the tap routes its bytes.
+///
+/// **Every shell/exec channel is ALWAYS recorded as asciicast v2** — the exec
+/// command string can never suppress mandatory content capture (a legacy
+/// scp-over-exec is decoded for file-transfer audit *in addition to*, never
+/// instead of, the asciicast stream). Only the sftp SUBSYSTEM (the node runs
+/// `sftp-server`, no shell) is decode-only.
 #[derive(Debug, Clone)]
 pub enum RecChannelKind {
-    /// Interactive shell or plain exec: recorded as asciicast v2. For a non-PTY
-    /// exec, `command` carries the exec command line (recorded as an input event).
+    /// Interactive shell or exec: asciicast v2 (output + input). `command` is the
+    /// exec command line (recorded as an input event); `scp`, when set, additively
+    /// decodes a legacy scp-over-exec transfer; `cols`/`rows` seed the asciicast
+    /// header (0 ⇒ default 80×24).
     Terminal {
         /// The exec command line, if this is an exec (not an interactive shell).
         command: Option<Vec<u8>>,
+        /// Additive legacy scp-over-exec decode, when the exec is `scp -t`/`-f`.
+        scp: Option<ScpMode>,
+        /// PTY columns (0 ⇒ unknown → 80).
+        cols: u16,
+        /// PTY rows (0 ⇒ unknown → 24).
+        rows: u16,
     },
-    /// The SFTP subsystem: decoded into per-operation file-transfer audit.
+    /// The SFTP subsystem: decoded into per-operation file-transfer audit only.
     Sftp,
-    /// Legacy scp-over-exec: `upload` = `scp -t` (client→node), else `scp -f`
-    /// (node→client). `path` is the scp target argument.
-    Scp {
-        /// `true` for `scp -t` (upload), `false` for `scp -f` (download).
-        upload: bool,
-        /// The scp target path argument (from the exec command line).
-        path: Vec<u8>,
-    },
 }
 
 /// The inputs [`RecorderFactory::begin`] needs to register + key a recording. The
@@ -211,19 +232,26 @@ pub(crate) async fn pump_inner_to_outer(
     tap: Arc<dyn RecorderTap>,
 ) {
     while let Some(msg) = inner.wait().await {
+        // Fail closed: if recording has failed under strict mode, STOP forwarding
+        // node output immediately — no un-recorded bytes reach the client while the
+        // disconnect is in flight (mirrors the input path; red-team output-teardown
+        // race). The connection is being torn down; drop the channel.
+        if tap.should_abort() {
+            break;
+        }
         match msg {
             // The bulk streams go through the outer WRITE HALF, whose `data_bytes`
             // blocks on the client's channel window → the node is throttled to the
             // client's receive rate (no unbounded buffering, F-bridge-backpressure-1).
             ChannelMsg::Data { data } => {
                 tap.tap(outer, TapDirection::Output, None, &data);
-                if outer_write.data_bytes(data).await.is_err() {
+                if tap.should_abort() || outer_write.data_bytes(data).await.is_err() {
                     break;
                 }
             }
             ChannelMsg::ExtendedData { data, ext } => {
                 tap.tap(outer, TapDirection::Output, Some(ext), &data);
-                if outer_write.extended_data_bytes(ext, data).await.is_err() {
+                if tap.should_abort() || outer_write.extended_data_bytes(ext, data).await.is_err() {
                     break;
                 }
             }

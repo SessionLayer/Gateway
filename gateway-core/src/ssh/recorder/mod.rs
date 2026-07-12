@@ -27,12 +27,12 @@ pub mod upload;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use russh::server::Handle;
 use russh::ChannelId;
@@ -58,17 +58,74 @@ use seal::RecordingCipher;
 use sftp::SftpDecoder;
 use upload::HttpUploader;
 
-/// How a bridged channel's plaintext is being captured.
+/// Tracks in-flight end-of-session finalize tasks so a graceful shutdown can wait
+/// for live recordings to flush → seal → upload → FinalizeRecording before the
+/// process exits, instead of losing them (#3). Connection-preservation drain is
+/// still S14 (F-drain, Accepted-Risk); only recordings are drained here.
+#[derive(Clone, Default)]
+pub struct FinalizeTracker {
+    inner: Arc<FinalizeInner>,
+}
+
+#[derive(Default)]
+struct FinalizeInner {
+    count: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl FinalizeTracker {
+    /// Spawn a finalize future, tracked so [`Self::drain`] can await it.
+    pub fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        self.inner.count.fetch_add(1, Ordering::SeqCst);
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            fut.await;
+            if inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+                inner.notify.notify_waiters();
+            }
+        });
+    }
+
+    /// Await all in-flight finalize tasks, or until `grace` elapses (fail-safe: a
+    /// hung upload never blocks shutdown forever).
+    pub async fn drain(&self, grace: Duration) {
+        let deadline = tokio::time::sleep(grace);
+        tokio::pin!(deadline);
+        loop {
+            // Register the waiter BEFORE checking the count (no lost wakeup).
+            let notified = self.inner.notify.notified();
+            if self.inner.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tokio::select! {
+                _ = &mut deadline => return,
+                _ = notified => {}
+            }
+        }
+    }
+}
+
+/// How a bridged channel's plaintext is being captured. A terminal channel is
+/// ALWAYS asciicast (output + input); a legacy scp-over-exec additionally runs an
+/// SCP decoder for file-transfer audit — the command never suppresses capture.
 enum ChannelRec {
-    Terminal { out: Utf8Chunker, inp: Utf8Chunker },
+    Terminal {
+        out: Utf8Chunker,
+        inp: Utf8Chunker,
+        scp: Option<ScpDecoder>,
+    },
     Sftp(SftpDecoder),
-    Scp(ScpDecoder),
 }
 
 /// The synchronous capture core (all state behind the recorder's mutex). Generic
 /// over the channel key so it is unit-testable without a real [`ChannelId`].
 struct Capture<K: Eq + std::hash::Hash + Copy> {
     started: Instant,
+    /// Unix seconds at recording start (the asciicast header `timestamp`).
+    started_unix: u64,
+    /// Whether the asciicast v2 header line has been written yet. Deferred to the
+    /// first terminal channel so the header carries the real PTY size (#10).
+    header_written: bool,
     chain: HashChain,
     sealer: RecordingCipher,
     spool: CipherSpool,
@@ -88,7 +145,7 @@ struct Capture<K: Eq + std::hash::Hash + Copy> {
 
 /// The result of draining + sealing a recording at finalize.
 struct FinalizedObject {
-    object: io::Result<Vec<u8>>,
+    source: io::Result<upload::UploadSource>,
     capture_failed: bool,
     chain_head: String,
     content_digest: String,
@@ -103,14 +160,19 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
         let mut spool = CipherSpool::new(
             config.spool_dir.clone(),
             config.spool_memory_threshold_bytes,
+            config.max_object_bytes,
         );
         spool.write_all(sealer.header())?;
-        let ts = SystemTime::now()
+        let started_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut cap = Self {
+        // The asciicast header is written lazily (on the first terminal channel /
+        // at finalize) so it can carry the real PTY size (#10).
+        Ok(Self {
             started: Instant::now(),
+            started_unix,
+            header_written: false,
             chain: HashChain::new(),
             sealer,
             spool,
@@ -121,76 +183,105 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
             sftp_audit: Vec::new(),
             failed: None,
             finalized: false,
-        };
-        cap.push_asciicast(asciicast::header_line(80, 24, ts))
-            .map_err(io::Error::other)?;
-        Ok(cap)
+        })
     }
 
     fn elapsed(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
 
+    /// Write the asciicast v2 header exactly once (line 0 of the sealed stream),
+    /// carrying `cols`×`rows` (0 ⇒ default 80×24).
+    fn ensure_header(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+        if self.header_written {
+            return Ok(());
+        }
+        self.header_written = true;
+        let w = if cols == 0 { 80 } else { cols };
+        let h = if rows == 0 { 24 } else { rows };
+        self.push_asciicast(asciicast::header_line(w, h, self.started_unix))
+    }
+
     fn open_channel(&mut self, channel: K, kind: RecChannelKind) -> Result<(), String> {
         match kind {
-            RecChannelKind::Terminal { command } => {
+            RecChannelKind::Terminal {
+                command,
+                scp,
+                cols,
+                rows,
+            } => {
+                self.ensure_header(cols, rows)?;
                 self.channels.insert(
                     channel,
                     ChannelRec::Terminal {
                         out: Utf8Chunker::default(),
                         inp: Utf8Chunker::default(),
+                        scp: scp.map(|m| ScpDecoder::new(m.upload, m.target)),
                     },
                 );
                 if let Some(cmd) = command {
-                    // A non-PTY exec: record the command line as an input event.
+                    // Record the exec command line as an input event (ALWAYS — even
+                    // for a legacy scp-over-exec, whose content is ALSO captured).
                     let text = String::from_utf8_lossy(&cmd).into_owned();
                     let line = asciicast::event_line(self.elapsed(), EventCode::Input, &text);
                     self.push_asciicast(line)?;
                 }
             }
             RecChannelKind::Sftp => {
+                self.ensure_header(0, 0)?;
                 self.channels
                     .insert(channel, ChannelRec::Sftp(SftpDecoder::new()));
-            }
-            RecChannelKind::Scp { upload, .. } => {
-                self.channels
-                    .insert(channel, ChannelRec::Scp(ScpDecoder::new(upload)));
             }
         }
         Ok(())
     }
 
-    fn tap(&mut self, channel: K, direction: TapDirection, data: &[u8]) -> Result<(), String> {
+    fn tap(
+        &mut self,
+        channel: K,
+        direction: TapDirection,
+        ext: Option<u32>,
+        data: &[u8],
+    ) -> Result<(), String> {
         let elapsed = self.elapsed();
         // Produce records under a scoped channel borrow, then fold them in.
-        let produced = match self.channels.get_mut(&channel) {
-            Some(ChannelRec::Terminal { out, inp }) => {
+        let (lines, audits) = match self.channels.get_mut(&channel) {
+            Some(ChannelRec::Terminal { out, inp, scp }) => {
+                // ALWAYS asciicast (stderr `ext=Some(1)` still folds into `o`).
                 let (chunker, code) = match direction {
                     TapDirection::Output => (out, EventCode::Output),
                     TapDirection::Input => (inp, EventCode::Input),
                 };
                 let text = chunker.push(data);
-                if text.is_empty() {
-                    Produced::Lines(Vec::new())
+                let mut lines = Vec::new();
+                if !text.is_empty() {
+                    lines.push(asciicast::event_line(elapsed, code, &text));
+                }
+                // ADDITIVELY decode a legacy scp-over-exec transfer — only the
+                // PRIMARY data stream (never stderr; #6) is protocol bytes.
+                let audits = match scp {
+                    Some(d) if ext.is_none() => d.feed(direction, data),
+                    _ => Vec::new(),
+                };
+                (lines, audits)
+            }
+            // The sftp subsystem is protocol on the primary stream only (stderr,
+            // if any, is not SFTP framing — never feed it to the decoder; #6).
+            Some(ChannelRec::Sftp(d)) => {
+                let audits = if ext.is_none() {
+                    d.feed(direction, data)
                 } else {
-                    Produced::Lines(vec![asciicast::event_line(elapsed, code, &text)])
-                }
+                    Vec::new()
+                };
+                (Vec::new(), audits)
             }
-            Some(ChannelRec::Sftp(d)) => Produced::Audits(d.feed(direction, data)),
-            Some(ChannelRec::Scp(d)) => Produced::Audits(d.feed(direction, data)),
-            None => Produced::Lines(Vec::new()),
+            None => (Vec::new(), Vec::new()),
         };
-        match produced {
-            Produced::Lines(lines) => {
-                for l in lines {
-                    self.push_asciicast(l)?;
-                }
-            }
-            Produced::Audits(audits) => {
-                for a in audits {
-                    self.push_audit(a);
-                }
-            }
+        for l in lines {
+            self.push_asciicast(l)?;
+        }
+        for a in audits {
+            self.push_audit(a)?;
         }
         Ok(())
     }
@@ -213,7 +304,11 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
     fn drain_channel(&mut self, ch: ChannelRec) {
         let elapsed = self.elapsed();
         match ch {
-            ChannelRec::Terminal { mut out, mut inp } => {
+            ChannelRec::Terminal {
+                mut out,
+                mut inp,
+                scp,
+            } => {
                 if let Some(t) = out.flush() {
                     let r =
                         self.push_asciicast(asciicast::event_line(elapsed, EventCode::Output, &t));
@@ -224,15 +319,17 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                         self.push_asciicast(asciicast::event_line(elapsed, EventCode::Input, &t));
                     self.note_push(r);
                 }
+                if let Some(mut d) = scp {
+                    for a in d.finish() {
+                        let r = self.push_audit(a);
+                        self.note_push(r);
+                    }
+                }
             }
             ChannelRec::Sftp(mut d) => {
                 for a in d.finish() {
-                    self.push_audit(a);
-                }
-            }
-            ChannelRec::Scp(mut d) => {
-                for a in d.finish() {
-                    self.push_audit(a);
+                    let r = self.push_audit(a);
+                    self.note_push(r);
                 }
             }
         }
@@ -247,13 +344,17 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
     /// Flush all channels, seal the remaining plaintext, and read back the object.
     fn finalize_object(&mut self) -> FinalizedObject {
         self.finalized = true;
+        // A recording with no terminal channel (or none at all) still gets a valid
+        // asciicast v2 header so the object is well-formed.
+        let r = self.ensure_header(0, 0);
+        self.note_push(r);
         let channels = std::mem::take(&mut self.channels);
         for (_id, ch) in channels {
             self.drain_channel(ch);
         }
         let capture_failed = self.failed.is_some() || self.seal_remaining().is_err();
         FinalizedObject {
-            object: self.spool.read_object(),
+            source: self.spool.take_source(),
             capture_failed,
             chain_head: self.chain.head_hex(),
             content_digest: self.spool.content_digest_hex(),
@@ -275,9 +376,16 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
         }
     }
 
-    fn push_audit(&mut self, a: FileTransferAudit) {
-        self.chain.extend(&sftp::canonical(&a));
+    /// Record a file-transfer audit BOTH as an asciicast `m` marker in the sealed
+    /// stream (so the hash-chain — computed over the sealed line stream — commits
+    /// to it and the object is independently verifiable, #7) AND as a cleartext
+    /// convenience copy for the CP's audit correlation (FinalizeRecording).
+    fn push_audit(&mut self, a: FileTransferAudit) -> Result<(), String> {
+        let label = audit_marker_label(&a);
+        let line = asciicast::event_line(self.elapsed(), EventCode::Marker, &label);
+        self.push_asciicast(line)?;
         self.sftp_audit.push(a);
+        Ok(())
     }
 
     fn seal_ready_frames(&mut self) -> Result<(), String> {
@@ -313,9 +421,19 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
     }
 }
 
-enum Produced {
-    Lines(Vec<Vec<u8>>),
-    Audits(Vec<FileTransferAudit>),
+/// The canonical marker label for a file-transfer audit (an asciicast `m` event
+/// payload). A replay verifier reconstructs the file-transfer records from these,
+/// and the hash-chain (over the sealed stream) commits to them.
+fn audit_marker_label(a: &FileTransferAudit) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": "file-transfer",
+        "operation": a.operation,
+        "path": a.path,
+        "direction": a.direction,
+        "size": a.size,
+        "sha256": a.sha256,
+    }))
+    .expect("audit marker serializes")
 }
 
 /// The per-session recorder handed to the SSH handler and (upcast) to the bridge.
@@ -330,9 +448,44 @@ pub struct Recorder {
     recording_id: String,
     cpauth: Arc<CpAuthClient>,
     uploader: Arc<HttpUploader>,
+    upload_max_attempts: u32,
 }
 
 impl Recorder {
+    /// Fetch a fresh credential and PUT the object, retrying transient faults with
+    /// exponential backoff up to `upload_max_attempts` (#4). Each attempt mints a
+    /// fresh short-lived credential and a fresh streaming body.
+    async fn upload_with_retry(&self, source: &upload::UploadSource) -> bool {
+        let mut backoff = std::time::Duration::from_millis(200);
+        for attempt in 1..=self.upload_max_attempts {
+            let cred = match self.cpauth.request_upload(&self.recording_id).await {
+                Ok(resp) => resp.upload,
+                Err(e) => {
+                    tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, attempt, error = %e, "RequestUpload failed");
+                    None
+                }
+            };
+            if let Some(cred) = cred {
+                let headers: BTreeMap<String, String> = cred.required_headers.into_iter().collect();
+                match self.uploader.put(&cred.url, &headers, source).await {
+                    Ok(()) => return true,
+                    Err(e) if e.is_retryable() && attempt < self.upload_max_attempts => {
+                        tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, attempt, error = %e, "WORM upload failed; retrying");
+                    }
+                    Err(e) => {
+                        tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, attempt, error = %e, "WORM upload failed; no more retries");
+                        return false;
+                    }
+                }
+            } else if attempt >= self.upload_max_attempts {
+                return false;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+        }
+        false
+    }
+
     /// After a capture failure: strict ⇒ tear the connection down (once);
     /// non-strict ⇒ log loudly and continue unrecorded (never silently drop).
     fn on_capture_failure(&self) {
@@ -363,13 +516,13 @@ impl Recorder {
 }
 
 impl RecorderTap for Recorder {
-    fn tap(&self, channel: ChannelId, direction: TapDirection, _ext: Option<u32>, data: &[u8]) {
+    fn tap(&self, channel: ChannelId, direction: TapDirection, ext: Option<u32>, data: &[u8]) {
         let failed = {
             let mut cap = self.cap.lock().unwrap();
             if cap.finalized || cap.failed.is_some() {
                 return;
             }
-            match cap.tap(channel, direction, data) {
+            match cap.tap(channel, direction, ext, data) {
                 Ok(()) => false,
                 Err(e) => {
                     cap.failed = Some(e);
@@ -380,6 +533,10 @@ impl RecorderTap for Recorder {
         if failed {
             self.on_capture_failure();
         }
+    }
+
+    fn should_abort(&self) -> bool {
+        self.torn.load(Ordering::SeqCst)
     }
 
     fn resize(&self, channel: ChannelId, cols: u16, rows: u16) {
@@ -444,39 +601,28 @@ impl SessionRecorder for Recorder {
                 cap.finalize_object()
             };
 
-            // Obtain a FRESH short-lived upload credential now (at session end),
-            // then PUT the (possibly partial but hash-chained) ciphertext object and
-            // commit the integrity metadata + audit. Bytes never traverse the CP.
-            // Issuing the credential here (not at BeginRecording) keeps its TTL to
-            // the PUT — a session-long begin-time credential would expire before a
-            // long session's end-of-session upload (§12.2; no long-lived creds).
-            let upload_ok = match &prepared.object {
-                Ok(bytes) => match self.cpauth.request_upload(&self.recording_id).await {
-                    Ok(resp) => match resp.upload {
-                        Some(cred) => {
-                            let headers: BTreeMap<String, String> =
-                                cred.required_headers.into_iter().collect();
-                            self.uploader
-                                .put(&cred.url, &headers, bytes.clone())
-                                .await
-                                .is_ok()
-                        }
-                        None => {
-                            tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, "RequestUpload returned no credential; recording not uploaded");
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, error = %e, "RequestUpload failed; recording not uploaded");
-                        false
-                    }
-                },
-                Err(_) => false,
+            // Upload the (possibly partial but hash-chained) ciphertext object with
+            // a FRESH short-lived credential fetched now (at session end) — a
+            // session-long begin-time credential would expire before a long
+            // session's PUT (§12.2). Bounded retry with backoff (#4). Bytes never
+            // traverse the CP.
+            let upload_ok = match &prepared.source {
+                Ok(source) => self.upload_with_retry(source).await,
+                Err(e) => {
+                    tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, error = %e, outcome = "recording_failed", "recording object unavailable (spool error); not uploaded");
+                    false
+                }
             };
             let status = match (prepared.capture_failed, upload_ok) {
                 (false, true) => RecordingStatus::Finalized,
                 (true, true) => RecordingStatus::Truncated,
                 (_, false) => RecordingStatus::Failed,
+            };
+            let outcome = match status {
+                RecordingStatus::Finalized => "recording_finalized",
+                RecordingStatus::Truncated => "recording_truncated",
+                _ if prepared.capture_failed => "recording_failed",
+                _ => "recording_upload_failed",
             };
 
             let req = FinalizeRecordingRequest {
@@ -488,18 +634,28 @@ impl SessionRecorder for Recorder {
                 sftp_audit: prepared.audits,
             };
             match self.cpauth.finalize_recording(req).await {
-                Ok(_) => tracing::info!(
+                Ok(_) if status == RecordingStatus::Finalized => tracing::info!(
                     session_id = %self.session_id,
                     recording_id = %self.recording_id,
-                    status = ?status,
+                    outcome,
                     byte_len = prepared.byte_len,
                     "recording finalized"
+                ),
+                // A non-final status is committed (never silently dropped) but logged
+                // loudly at warn so the incomplete recording is visible (#16).
+                Ok(_) => tracing::warn!(
+                    session_id = %self.session_id,
+                    recording_id = %self.recording_id,
+                    outcome,
+                    status = ?status,
+                    "recording committed with a NON-FINAL status"
                 ),
                 Err(e) => tracing::warn!(
                     session_id = %self.session_id,
                     recording_id = %self.recording_id,
+                    outcome,
                     error = %e,
-                    "FinalizeRecording failed (recording object was uploaded; metadata not committed)"
+                    "FinalizeRecording failed; recording metadata not committed"
                 ),
             }
         })
@@ -527,6 +683,7 @@ impl RecorderFactoryImpl {
         };
         let uploader = Arc::new(HttpUploader::new(
             std::time::Duration::from_secs(config.upload_timeout_secs),
+            config.require_https,
             tls,
         ));
         Ok(Self {
@@ -577,80 +734,145 @@ impl RecorderFactory for RecorderFactoryImpl {
                 recording_id: resp.recording_id,
                 cpauth: self.cpauth.clone(),
                 uploader: self.uploader.clone(),
+                upload_max_attempts: self.config.upload_max_attempts.max(1),
             }) as Arc<dyn SessionRecorder>)
         })
     }
 }
 
-/// A ciphertext-only spool: an in-memory buffer that spills to a per-recording
-/// temp file once it exceeds a threshold (when a spool dir is configured). It
-/// streams the object's SHA-256 content digest + byte length as bytes are
-/// written. **Only sealed ciphertext is ever written here** (§3/§15).
+/// A ciphertext-only spool. It holds the sealed object in memory up to a
+/// threshold, then **always spills** (even with no configured dir — the system
+/// temp dir) to a per-recording temp file written by a DEDICATED BLOCKING THREAD,
+/// so no file I/O happens on the tokio reactor under the recorder lock (#9). It
+/// enforces a hard `max_object_bytes` cap (fail closed, #2) and tracks the object
+/// content digest + byte length. **Only sealed ciphertext is ever written here.**
 struct CipherSpool {
     digest: Sha256,
     len: u64,
-    mem: Vec<u8>,
-    file: Option<std::fs::File>,
-    path: Option<PathBuf>,
-    spool_dir: Option<PathBuf>,
+    max_bytes: u64,
     threshold: usize,
+    spool_dir: Option<PathBuf>,
+    state: SpoolState,
+}
+
+enum SpoolState {
+    /// Ciphertext buffered in memory (short session). Not secret — sealed frames.
+    Mem(Vec<u8>),
+    /// Spilled to a temp file, fed by a dedicated blocking writer thread.
+    File(FileSink),
+}
+
+struct FileSink {
+    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    handle: Option<std::thread::JoinHandle<io::Result<()>>>,
+    /// Set by the writer thread on an I/O error (surfaced on the next write).
+    err: Arc<AtomicBool>,
+    path: PathBuf,
 }
 
 impl CipherSpool {
-    fn new(spool_dir: Option<PathBuf>, threshold: usize) -> Self {
+    fn new(spool_dir: Option<PathBuf>, threshold: usize, max_bytes: u64) -> Self {
         Self {
             digest: Sha256::new(),
             len: 0,
-            mem: Vec::new(),
-            file: None,
-            path: None,
-            spool_dir,
+            max_bytes,
             threshold,
+            spool_dir,
+            state: SpoolState::Mem(Vec::new()),
         }
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.digest.update(bytes);
-        self.len += bytes.len() as u64;
-        if let Some(f) = &mut self.file {
-            return f.write_all(bytes);
+        let new_len = self.len + bytes.len() as u64;
+        if new_len > self.max_bytes {
+            return Err(io::Error::other("recording exceeds max_object_bytes"));
         }
-        self.mem.extend_from_slice(bytes);
-        if let Some(dir) = self.spool_dir.clone() {
-            if self.mem.len() > self.threshold {
-                self.spill(&dir)?;
+        self.digest.update(bytes);
+        self.len = new_len;
+        match &mut self.state {
+            SpoolState::Mem(buf) => {
+                buf.extend_from_slice(bytes);
+                if buf.len() > self.threshold {
+                    self.spill()?;
+                }
+                Ok(())
+            }
+            SpoolState::File(sink) => {
+                if sink.err.load(Ordering::Relaxed) {
+                    return Err(io::Error::other("recording spool writer failed"));
+                }
+                sink.tx
+                    .as_ref()
+                    .expect("sender live before finalize")
+                    .send(bytes.to_vec())
+                    .map_err(|_| io::Error::other("recording spool writer gone"))
             }
         }
-        Ok(())
     }
 
-    fn spill(&mut self, dir: &std::path::Path) -> io::Result<()> {
-        let name = format!("slrec-{}.tmp", random_hex());
-        let path = dir.join(name);
+    /// Transition Mem→File: create the temp file + writer thread, hand over the
+    /// buffered ciphertext. File writes happen off the reactor on that thread (#9).
+    fn spill(&mut self) -> io::Result<()> {
+        let dir = self.spool_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("slrec-{}.tmp", random_hex()));
         let mut opts = std::fs::OpenOptions::new();
-        opts.create_new(true).write(true).read(true);
+        opts.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&path)?;
-        f.write_all(&self.mem)?;
-        self.mem = Vec::new();
-        self.file = Some(f);
-        self.path = Some(path);
+        let file = opts.open(&path)?;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let err = Arc::new(AtomicBool::new(false));
+        let err_thread = err.clone();
+        let handle = std::thread::Builder::new()
+            .name("slrec-spool".to_string())
+            .spawn(move || -> io::Result<()> {
+                let mut w = io::BufWriter::new(file);
+                while let Ok(chunk) = rx.recv() {
+                    if let Err(e) = w.write_all(&chunk) {
+                        err_thread.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                }
+                w.flush()
+            })?;
+        // Hand over the in-memory ciphertext, then switch to the file sink.
+        if let SpoolState::Mem(buf) = &mut self.state {
+            let buffered = std::mem::take(buf);
+            tx.send(buffered)
+                .map_err(|_| io::Error::other("recording spool writer gone"))?;
+        }
+        self.state = SpoolState::File(FileSink {
+            tx: Some(tx),
+            handle: Some(handle),
+            err,
+            path,
+        });
         Ok(())
     }
 
-    fn read_object(&mut self) -> io::Result<Vec<u8>> {
-        if let Some(f) = &mut self.file {
-            f.flush()?;
-            f.seek(io::SeekFrom::Start(0))?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)?;
-            Ok(buf)
-        } else {
-            Ok(self.mem.clone())
+    /// Close the spool and produce the upload source (a fresh body per attempt).
+    /// For the file sink this joins the writer thread (flush + surface any error).
+    fn take_source(&mut self) -> io::Result<upload::UploadSource> {
+        match &mut self.state {
+            SpoolState::Mem(buf) => Ok(upload::UploadSource::Mem(bytes::Bytes::from(
+                std::mem::take(buf),
+            ))),
+            SpoolState::File(sink) => {
+                drop(sink.tx.take()); // close the channel → writer flushes + exits
+                match sink.handle.take() {
+                    Some(h) => h
+                        .join()
+                        .map_err(|_| io::Error::other("recording spool writer panicked"))??,
+                    None => return Err(io::Error::other("recording spool already finalized")),
+                }
+                Ok(upload::UploadSource::File {
+                    path: sink.path.clone(),
+                    len: self.len,
+                })
+            }
         }
     }
 
@@ -668,8 +890,8 @@ impl CipherSpool {
 
 impl Drop for CipherSpool {
     fn drop(&mut self) {
-        if let Some(p) = &self.path {
-            let _ = std::fs::remove_file(p);
+        if let SpoolState::File(sink) = &self.state {
+            let _ = std::fs::remove_file(&sink.path);
         }
     }
 }
@@ -701,6 +923,31 @@ mod tests {
         Capture::new(sealer, config).unwrap()
     }
 
+    /// The ciphertext object bytes from a finalized source (in-memory or spilled).
+    fn object_bytes(source: io::Result<upload::UploadSource>) -> Vec<u8> {
+        match source.unwrap() {
+            upload::UploadSource::Mem(b) => b.to_vec(),
+            upload::UploadSource::File { path, .. } => std::fs::read(path).unwrap(),
+        }
+    }
+
+    /// Recompute the hash-chain head from a decrypted asciicast object (each `\n`-
+    /// terminated line is one record) — the independent verification of #7.
+    fn recompute_chain(plaintext: &[u8]) -> String {
+        let mut c = HashChain::new();
+        let mut start = 0;
+        for i in 0..plaintext.len() {
+            if plaintext[i] == b'\n' {
+                c.extend(&plaintext[start..=i]);
+                start = i + 1;
+            }
+        }
+        if start < plaintext.len() {
+            c.extend(&plaintext[start..]);
+        }
+        c.head_hex()
+    }
+
     /// Parse an asciicast v2 object (decrypted) into (header, events) where an
     /// event is (code, data).
     fn parse_asciicast(plaintext: &[u8]) -> (String, Vec<(String, String)>) {
@@ -729,25 +976,39 @@ mod tests {
         let config = RecorderConfig::default();
         let mut cap = capture(&config, &pub_der);
 
-        cap.open_channel(1, RecChannelKind::Terminal { command: None })
-            .unwrap();
+        cap.open_channel(
+            1,
+            RecChannelKind::Terminal {
+                command: None,
+                scp: None,
+                cols: 0,
+                rows: 0,
+            },
+        )
+        .unwrap();
         cap.resize(1, 132, 43).unwrap();
-        cap.tap(1, TapDirection::Input, b"echo hi\r").unwrap();
-        cap.tap(1, TapDirection::Output, b"hi\r\n").unwrap();
-        cap.tap(1, TapDirection::Output, b"user@node:~$ ").unwrap();
+        cap.tap(1, TapDirection::Input, None, b"echo hi\r").unwrap();
+        cap.tap(1, TapDirection::Output, None, b"hi\r\n").unwrap();
+        cap.tap(1, TapDirection::Output, None, b"user@node:~$ ")
+            .unwrap();
         cap.close_channel(1);
         let head_before = cap.chain.head_hex();
 
         let fin = cap.finalize_object();
-        let object = fin.object.unwrap();
-        assert_eq!(fin.chain_head, head_before);
-        assert!(fin.byte_len as usize == object.len());
-        assert_eq!(fin.content_digest, chain::sha256_hex(&object));
+        let chain_head = fin.chain_head.clone();
+        let content_digest = fin.content_digest.clone();
+        let byte_len = fin.byte_len;
+        let object = object_bytes(fin.source);
+        assert_eq!(chain_head, head_before);
+        assert_eq!(byte_len as usize, object.len());
+        assert_eq!(content_digest, chain::sha256_hex(&object));
 
         // Decrypt with the customer private key → the exact asciicast v2 file.
         let header = seal::parse_header(&object).unwrap();
         let key = seal::unseal_data_key(&header, &secret).unwrap();
         let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
+        // #7: the hash-chain head is recomputable from the decrypted object alone.
+        assert_eq!(recompute_chain(&plaintext), chain_head);
         let (hdr, events) = parse_asciicast(&plaintext);
         assert!(hdr.contains("\"version\":2"));
 
@@ -770,6 +1031,56 @@ mod tests {
         );
     }
 
+    /// Red-team #1: an exec whose command LOOKS like a legacy scp still records
+    /// asciicast for ALL I/O — the command string can never suppress mandatory
+    /// content capture (the SCP decoder runs additively, not instead of).
+    #[test]
+    fn scp_classified_exec_still_records_asciicast() {
+        let (pub_der, secret) = customer_keypair();
+        let config = RecorderConfig::default();
+        let mut cap = capture(&config, &pub_der);
+        cap.open_channel(
+            1,
+            RecChannelKind::Terminal {
+                command: Some(b"scp -t /x; echo pwned".to_vec()),
+                scp: Some(crate::ssh::bridge::ScpMode {
+                    upload: true,
+                    target: b"/x".to_vec(),
+                }),
+                cols: 0,
+                rows: 0,
+            },
+        )
+        .unwrap();
+        // Output that a command-string-driven capture bypass would have hidden.
+        cap.tap(1, TapDirection::Output, None, b"pwned\n").unwrap();
+        cap.close_channel(1);
+
+        let object = object_bytes(cap.finalize_object().source);
+        let header = seal::parse_header(&object).unwrap();
+        let key = seal::unseal_data_key(&header, &secret).unwrap();
+        let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
+        let (_h, events) = parse_asciicast(&plaintext);
+        let out: String = events
+            .iter()
+            .filter(|(c, _)| c == "o")
+            .map(|(_, d)| d.clone())
+            .collect();
+        let inp: String = events
+            .iter()
+            .filter(|(c, _)| c == "i")
+            .map(|(_, d)| d.clone())
+            .collect();
+        assert!(
+            out.contains("pwned"),
+            "post-; output MUST be recorded (no bypass)"
+        );
+        assert!(
+            inp.contains("scp -t /x; echo pwned"),
+            "exec command recorded"
+        );
+    }
+
     /// Part D: altering a recorded record changes the hash-chain head (tamper
     /// detection at the record layer).
     #[test]
@@ -778,23 +1089,41 @@ mod tests {
         let config = RecorderConfig::default();
 
         let mut a = capture(&config, &pub_der);
-        a.open_channel(1, RecChannelKind::Terminal { command: None })
+        a.open_channel(
+            1,
+            RecChannelKind::Terminal {
+                command: None,
+                scp: None,
+                cols: 0,
+                rows: 0,
+            },
+        )
+        .unwrap();
+        a.tap(1, TapDirection::Output, None, b"secret output")
             .unwrap();
-        a.tap(1, TapDirection::Output, b"secret output").unwrap();
         let head_a = a.finalize_object().chain_head;
 
         let mut b = capture(&config, &pub_der);
-        b.open_channel(1, RecChannelKind::Terminal { command: None })
+        b.open_channel(
+            1,
+            RecChannelKind::Terminal {
+                command: None,
+                scp: None,
+                cols: 0,
+                rows: 0,
+            },
+        )
+        .unwrap();
+        b.tap(1, TapDirection::Output, None, b"secret 0utput")
             .unwrap();
-        b.tap(1, TapDirection::Output, b"secret 0utput").unwrap();
         let head_b = b.finalize_object().chain_head;
 
         assert_ne!(head_a, head_b, "a changed record must change the head");
     }
 
-    /// Part B: an SFTP upload+download over the tap yields per-op file-transfer
-    /// audit (path/direction/size/SHA-256) folded into the chain, and NO asciicast
-    /// events (file-transfer channels do not produce terminal recording).
+    /// Part B + #7: an SFTP upload over the tap yields a per-op file-transfer audit
+    /// (cleartext copy) AND folds it into the sealed stream as an `m` marker, so
+    /// the decrypted object carries the transfer record and no terminal I/O.
     #[test]
     fn sftp_channel_produces_file_transfer_audit_only() {
         let (pub_der, secret) = customer_keypair();
@@ -807,37 +1136,42 @@ mod tests {
         let mut open = 1u32.to_be_bytes().to_vec();
         open.extend_from_slice(&sftp_string(b"f"));
         open.extend_from_slice(&0u32.to_be_bytes());
-        cap.tap(2, TapDirection::Input, &sftp_packet(3, &open))
+        cap.tap(2, TapDirection::Input, None, &sftp_packet(3, &open))
             .unwrap();
         let mut handle = 1u32.to_be_bytes().to_vec();
         handle.extend_from_slice(&sftp_string(b"h"));
-        cap.tap(2, TapDirection::Output, &sftp_packet(102, &handle))
+        cap.tap(2, TapDirection::Output, None, &sftp_packet(102, &handle))
             .unwrap();
         let mut write = 2u32.to_be_bytes().to_vec();
         write.extend_from_slice(&sftp_string(b"h"));
         write.extend_from_slice(&0u64.to_be_bytes());
         write.extend_from_slice(&sftp_string(content));
-        cap.tap(2, TapDirection::Input, &sftp_packet(6, &write))
+        cap.tap(2, TapDirection::Input, None, &sftp_packet(6, &write))
             .unwrap();
         let mut close = 3u32.to_be_bytes().to_vec();
         close.extend_from_slice(&sftp_string(b"h"));
-        cap.tap(2, TapDirection::Input, &sftp_packet(4, &close))
+        cap.tap(2, TapDirection::Input, None, &sftp_packet(4, &close))
             .unwrap();
         cap.close_channel(2);
 
         let fin = cap.finalize_object();
+        let chain_head = fin.chain_head.clone();
         assert_eq!(fin.audits.len(), 1);
         assert_eq!(fin.audits[0].direction, "upload");
         assert_eq!(fin.audits[0].size, content.len() as i64);
         assert_eq!(fin.audits[0].sha256, chain::sha256_hex(content));
 
-        // The object decrypts to an asciicast with only the header (no events).
-        let object = fin.object.unwrap();
+        // The object decrypts to an asciicast whose only event is the `m` marker
+        // for the transfer (no terminal I/O), and the head recomputes from it (#7).
+        let object = object_bytes(fin.source);
         let header = seal::parse_header(&object).unwrap();
         let key = seal::unseal_data_key(&header, &secret).unwrap();
         let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
+        assert_eq!(recompute_chain(&plaintext), chain_head);
         let (_hdr, events) = parse_asciicast(&plaintext);
-        assert!(events.is_empty(), "sftp channel adds no terminal events");
+        assert_eq!(events.len(), 1, "one file-transfer marker, no terminal I/O");
+        assert_eq!(events[0].0, "m");
+        assert!(events[0].1.contains("upload"), "marker carries the audit");
     }
 
     /// Part F mechanics (detection): a spool write to an unwritable dir makes the
@@ -855,10 +1189,18 @@ mod tests {
             ..RecorderConfig::default()
         };
         let mut cap = capture(&config, &pub_der);
-        cap.open_channel(1, RecChannelKind::Terminal { command: None })
-            .unwrap();
+        cap.open_channel(
+            1,
+            RecChannelKind::Terminal {
+                command: None,
+                scp: None,
+                cols: 0,
+                rows: 0,
+            },
+        )
+        .unwrap();
         // Enough output that sealing crosses the threshold → spill to the bad dir.
-        let err = cap.tap(1, TapDirection::Output, &vec![b'x'; 200_000]);
+        let err = cap.tap(1, TapDirection::Output, None, &vec![b'x'; 200_000]);
         assert!(
             err.is_err(),
             "an unwritable spool must surface a capture error"
@@ -913,7 +1255,12 @@ mod tests {
                 )),
                 std::time::Duration::from_millis(1),
             )),
-            uploader: Arc::new(HttpUploader::new(std::time::Duration::from_secs(1), None)),
+            uploader: Arc::new(HttpUploader::new(
+                std::time::Duration::from_secs(1),
+                false,
+                None,
+            )),
+            upload_max_attempts: 1,
         }
     }
 

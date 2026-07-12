@@ -44,9 +44,10 @@ sha2 = { workspace = true }
 aes-gcm = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
+bytes = { workspace = true }
 tokio-rustls = { workspace = true }
-bytes = "1"
 
 # tokio-uring is Linux-only; keep it target-gated so the crate still builds on
 # other platforms (the epoll fallback carries them).

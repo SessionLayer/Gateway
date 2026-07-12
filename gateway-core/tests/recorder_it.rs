@@ -230,6 +230,12 @@ async fn start_gateway(
 }
 
 fn gw_config(recorder: RecorderConfig) -> SshServerConfig {
+    // The E2E uploads to a plain-http MinIO, so https is not required here (prod
+    // defaults to require_https = true).
+    let recorder = RecorderConfig {
+        require_https: false,
+        ..recorder
+    };
     SshServerConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         login_grace_secs: 60,
@@ -655,6 +661,68 @@ async fn long_session_uploads_with_upload_time_credential() -> anyhow::Result<()
     let keys = cp.recorded_object_keys();
     let (status, _obj) = get_object(&s3, &keys[0]).await?;
     assert_eq!(status, 200, "the object landed in the WORM bucket");
+
+    drop(node);
+    drop(minio);
+    Ok(())
+}
+
+// ── The ciphertext spool spills to a temp file (low threshold) and STREAMS to
+//    the PUT — a large recording never doubles peak RAM (#2/#9) ──────────────
+
+#[tokio::test]
+async fn spilled_recording_streams_from_temp_file() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let (minio, s3) = start_minio().await?;
+    cp.set_s3_target(s3.clone());
+    let (cust_pub_der, cust_secret) = customer_keypair();
+    cp.set_customer_key(
+        "ck",
+        cust_pub_der,
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    grant(&cp, &pin);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    // Threshold 0 ⇒ the ciphertext spills to a temp file (system temp dir) from the
+    // first frame, so the whole recording streams to the PUT off the reactor.
+    let recorder = RecorderConfig {
+        spool_memory_threshold_bytes: 0,
+        ..RecorderConfig::default()
+    };
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(recorder))).await;
+    let client = client_container(&pin).await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(gw_port, &[], "deploy%node-e2e", "echo SPILLED_OK"),
+    )
+    .await;
+    assert_eq!(code, Some(0), "session must run; stderr={stderr}");
+    assert!(stdout.contains("SPILLED_OK"));
+
+    let fin = await_finalized(&cp).await;
+    assert_eq!(fin.status, RecordingStatus::Finalized as i32);
+
+    // The streamed object decrypts to the original terminal bytes.
+    let keys = cp.recorded_object_keys();
+    let (status, object) = get_object(&s3, &keys[0]).await?;
+    assert_eq!(status, 200);
+    assert_eq!(
+        object.len() as i64,
+        fin.byte_len,
+        "streamed len matches finalize"
+    );
+    assert_eq!(chain::sha256_hex(&object), fin.content_digest);
+    let header = seal::parse_header(&object).unwrap();
+    let key = seal::unseal_data_key(&header, &cust_secret).unwrap();
+    let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
+    assert!(String::from_utf8_lossy(&plaintext).contains("SPILLED_OK"));
 
     drop(node);
     drop(minio);

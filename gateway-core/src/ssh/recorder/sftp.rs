@@ -39,10 +39,12 @@ const FXP_HANDLE: u8 = 102;
 const FXP_DATA: u8 = 103;
 
 /// The largest single SFTP packet we will buffer (guards against a hostile length
-/// prefix); real SFTP packets are far smaller than this.
-const MAX_PACKET: usize = 512 * 1024;
+/// prefix). OpenSSH's max is ~256 KiB payload; 1 MiB is comfortable headroom.
+const MAX_PACKET: usize = 1024 * 1024;
 /// Bound on tracked handles / in-flight correlations (hostile-client guard).
 const MAX_TRACKED: usize = 4096;
+/// Cap on a retained path (hostile-client memory guard, #21).
+const MAX_PATH: usize = 4096;
 
 /// A per-handle transfer accumulator (streaming size + SHA-256, no content).
 struct HandleState {
@@ -52,6 +54,29 @@ struct HandleState {
     read_size: u64,
     sha_write: Sha256,
     sha_read: Sha256,
+    /// Next expected WRITE / READ offset; a mismatch means a resumed/parallel/
+    /// reordered transfer whose arrival-order SHA-256 would be wrong (#8).
+    next_write_off: u64,
+    next_read_off: u64,
+    write_ordered: bool,
+    read_ordered: bool,
+}
+
+impl HandleState {
+    fn new(path: Vec<u8>, is_dir: bool) -> Self {
+        Self {
+            path,
+            is_dir,
+            write_size: 0,
+            read_size: 0,
+            sha_write: Sha256::new(),
+            sha_read: Sha256::new(),
+            next_write_off: 0,
+            next_read_off: 0,
+            write_ordered: true,
+            read_ordered: true,
+        }
+    }
 }
 
 /// Stateful SFTP decoder for one bridged channel. The reassembly buffers
@@ -63,8 +88,9 @@ pub struct SftpDecoder {
     handles: HashMap<Vec<u8>, HandleState>,
     /// OPEN/OPENDIR request-id → (path, is_dir), awaiting the HANDLE reply.
     pending_open: HashMap<u32, (Vec<u8>, bool)>,
-    /// READ request-id → handle, awaiting the DATA reply (download correlation).
-    pending_read: HashMap<u32, Vec<u8>>,
+    /// READ request-id → (handle, offset), awaiting the DATA reply (download
+    /// correlation + offset-order check, #8).
+    pending_read: HashMap<u32, (Vec<u8>, u64)>,
     broken: bool,
 }
 
@@ -109,19 +135,24 @@ impl SftpDecoder {
             }
             let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
             if len == 0 || len > MAX_PACKET {
-                self.broken = true; // implausible framing: stop decoding this channel
+                // Implausible framing (or a packet larger than we will buffer):
+                // stop decoding, but leave a VISIBLE marker so the audit gap is not
+                // silent (#14) — also an evasion vector otherwise.
+                self.broken = true;
+                audits.push(audit_incomplete());
                 break;
             }
             if buf.len() < 4 + len {
                 break; // packet not fully arrived yet
             }
-            // Extract the packet body (type + payload) and advance the buffer.
-            let packet: Vec<u8> = {
+            // Extract the packet body (type + payload) and advance the buffer. The
+            // copy transiently holds file plaintext → scrub on drop (#22).
+            let packet: Zeroizing<Vec<u8>> = {
                 let buf = match dir {
                     TapDirection::Input => &mut self.in_buf,
                     TapDirection::Output => &mut self.out_buf,
                 };
-                let p = buf[4..4 + len].to_vec();
+                let p = Zeroizing::new(buf[4..4 + len].to_vec());
                 buf.drain(..4 + len);
                 p
             };
@@ -162,15 +193,22 @@ impl SftpDecoder {
             FXP_OPEN | FXP_OPENDIR => {
                 let is_dir = ptype == FXP_OPENDIR;
                 if let (Some(id), Some(path)) = (c.u32(), c.string()) {
-                    self.pending_open.insert(id, (path.to_vec(), is_dir));
+                    self.pending_open.insert(id, (cap_path(path), is_dir));
                 }
             }
             FXP_WRITE => {
                 // id, string handle, uint64 offset, string data.
-                if let (Some(_id), Some(handle), Some(_off), Some(chunk)) =
+                if let (Some(_id), Some(handle), Some(off), Some(chunk)) =
                     (c.u32(), c.string(), c.u64(), c.string())
                 {
                     if let Some(st) = self.handles.get_mut(handle) {
+                        // Sequential arrival is assumed for the streaming digest; a
+                        // non-contiguous offset means a resumed/parallel transfer
+                        // whose arrival-order hash would be wrong → flag it (#8).
+                        if off != st.next_write_off {
+                            st.write_ordered = false;
+                        }
+                        st.next_write_off = off.saturating_add(chunk.len() as u64);
                         st.write_size += chunk.len() as u64;
                         st.sha_write.update(chunk);
                     }
@@ -178,8 +216,8 @@ impl SftpDecoder {
             }
             FXP_READ => {
                 // id, string handle, uint64 offset, uint32 len → await DATA.
-                if let (Some(id), Some(handle)) = (c.u32(), c.string()) {
-                    self.pending_read.insert(id, handle.to_vec());
+                if let (Some(id), Some(handle), Some(off)) = (c.u32(), c.string(), c.u64()) {
+                    self.pending_read.insert(id, (handle.to_vec(), off));
                 }
             }
             FXP_CLOSE => {
@@ -210,7 +248,7 @@ impl SftpDecoder {
 
     fn metadata(&mut self, c: &mut Reader<'_>, op: &str, audits: &mut Vec<FileTransferAudit>) {
         if let (Some(_id), Some(path)) = (c.u32(), c.string()) {
-            audits.push(metadata_audit(op, path.to_vec()));
+            audits.push(metadata_audit(op, cap_path(path)));
         }
     }
 
@@ -221,25 +259,20 @@ impl SftpDecoder {
                 // id, string handle → bind the handle to the pending OPEN/OPENDIR.
                 if let (Some(id), Some(handle)) = (c.u32(), c.string()) {
                     if let Some((path, is_dir)) = self.pending_open.remove(&id) {
-                        self.handles.insert(
-                            handle.to_vec(),
-                            HandleState {
-                                path,
-                                is_dir,
-                                write_size: 0,
-                                read_size: 0,
-                                sha_write: Sha256::new(),
-                                sha_read: Sha256::new(),
-                            },
-                        );
+                        self.handles
+                            .insert(handle.to_vec(), HandleState::new(path, is_dir));
                     }
                 }
             }
             FXP_DATA => {
                 // id, string data → download bytes for the correlated READ handle.
                 if let (Some(id), Some(chunk)) = (c.u32(), c.string()) {
-                    if let Some(handle) = self.pending_read.remove(&id) {
+                    if let Some((handle, off)) = self.pending_read.remove(&id) {
                         if let Some(st) = self.handles.get_mut(&handle) {
+                            if off != st.next_read_off {
+                                st.read_ordered = false;
+                            }
+                            st.next_read_off = off.saturating_add(chunk.len() as u64);
                             st.read_size += chunk.len() as u64;
                             st.sha_read.update(chunk);
                         }
@@ -251,8 +284,15 @@ impl SftpDecoder {
     }
 }
 
+/// Cap a retained path to [`MAX_PATH`] bytes (hostile-client memory guard, #21).
+fn cap_path(path: &[u8]) -> Vec<u8> {
+    path[..path.len().min(MAX_PATH)].to_vec()
+}
+
 /// Emit the audit(s) for a handle being closed (upload and/or download; else an
 /// open record for a handle that transferred nothing, e.g. a stat/opendir).
+/// A digest computed over out-of-order arrivals would be wrong, so when the
+/// transfer's offsets were non-contiguous the digest is dropped (size-only, #8).
 fn emit_handle_audit(st: HandleState, audits: &mut Vec<FileTransferAudit>) {
     let mut emitted = false;
     if st.write_size > 0 {
@@ -260,8 +300,8 @@ fn emit_handle_audit(st: HandleState, audits: &mut Vec<FileTransferAudit>) {
             operation: "write".to_string(),
             path: String::from_utf8_lossy(&st.path).into_owned(),
             direction: "upload".to_string(),
-            size: st.write_size as i64,
-            sha256: chain::format_sha256(&st.sha_write.finalize()),
+            size: clamp_i64(st.write_size),
+            sha256: transfer_digest(st.sha_write, st.write_ordered),
         });
         emitted = true;
     }
@@ -270,8 +310,8 @@ fn emit_handle_audit(st: HandleState, audits: &mut Vec<FileTransferAudit>) {
             operation: "read".to_string(),
             path: String::from_utf8_lossy(&st.path).into_owned(),
             direction: "download".to_string(),
-            size: st.read_size as i64,
-            sha256: chain::format_sha256(&st.sha_read.finalize()),
+            size: clamp_i64(st.read_size),
+            sha256: transfer_digest(st.sha_read, st.read_ordered),
         });
         emitted = true;
     }
@@ -286,6 +326,21 @@ fn emit_handle_audit(st: HandleState, audits: &mut Vec<FileTransferAudit>) {
     }
 }
 
+/// The streaming digest, or `order-uncertain` when arrivals were non-contiguous
+/// (the size is still exact; the content hash is not trustworthy).
+fn transfer_digest(sha: Sha256, ordered: bool) -> String {
+    if ordered {
+        chain::format_sha256(&sha.finalize())
+    } else {
+        "order-uncertain".to_string()
+    }
+}
+
+/// Clamp a transfer size to a non-negative i64 (#21).
+fn clamp_i64(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
 fn metadata_audit(op: &str, path: Vec<u8>) -> FileTransferAudit {
     FileTransferAudit {
         operation: op.to_string(),
@@ -296,20 +351,16 @@ fn metadata_audit(op: &str, path: Vec<u8>) -> FileTransferAudit {
     }
 }
 
-/// The canonical byte serialization of a file-transfer audit record for the
-/// hash-chain (order-sensitive, NUL-delimited).
-pub fn canonical(a: &FileTransferAudit) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.extend_from_slice(a.operation.as_bytes());
-    v.push(0);
-    v.extend_from_slice(a.path.as_bytes());
-    v.push(0);
-    v.extend_from_slice(a.direction.as_bytes());
-    v.push(0);
-    v.extend_from_slice(&a.size.to_be_bytes());
-    v.push(0);
-    v.extend_from_slice(a.sha256.as_bytes());
-    v
+/// A visible marker that a channel's file-transfer auditing was cut short (an
+/// oversized/implausible packet) — the gap is recorded, never silent (#14).
+fn audit_incomplete() -> FileTransferAudit {
+    FileTransferAudit {
+        operation: "audit_incomplete".to_string(),
+        path: String::new(),
+        direction: String::new(),
+        size: 0,
+        sha256: String::new(),
+    }
 }
 
 /// A fail-closed big-endian reader for SFTP payload fields.

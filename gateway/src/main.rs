@@ -119,15 +119,58 @@ fn run() -> anyhow::Result<()> {
             );
         }
 
+        // Shutdown is broadcast to the accept loop AND the drain step (SIGTERM +
+        // Ctrl-C). A `watch` retains the value so neither observer loses the signal.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            wait_for_shutdown().await;
+            let _ = shutdown_tx.send(true);
+        });
+
         // Outer SSH leg (Session Seven): started only when configured AND the
         // Gateway holds a CP mTLS identity to delegate auth to (fail closed).
-        start_outer_leg(&cfg, renew.as_ref()).await?;
+        let finalize_tracker =
+            start_outer_leg(&cfg, renew.as_ref(), shutdown_rx.clone()).await?;
 
-        tracing::info!("awaiting shutdown signal (Ctrl-C)");
-        tokio::signal::ctrl_c().await?;
+        tracing::info!("awaiting shutdown signal (SIGTERM / Ctrl-C)");
+        let mut sd = shutdown_rx;
+        let _ = sd.wait_for(|v| *v).await;
         tracing::info!("shutdown signal received; Gateway stopping");
+
+        // Graceful shutdown: the accept loop has stopped; give live sessions'
+        // recordings a bounded grace to finalize + upload before we exit, so they
+        // are not lost (#3). In-flight connection preservation is S14 (F-drain).
+        if let Some(tracker) = finalize_tracker {
+            let grace = Duration::from_secs(cfg.ssh.recorder.upload_timeout_secs.saturating_add(10));
+            tracing::info!(grace_secs = grace.as_secs(), "draining in-flight recording finalizes");
+            tracker.drain(grace).await;
+        }
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Resolve when the process should shut down: SIGTERM (container/systemd stop) or
+/// Ctrl-C (SIGINT). On non-unix only Ctrl-C is available.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Establish the Gateway's mTLS identity per config and spawn the renew-ahead
@@ -269,15 +312,16 @@ async fn bootstrap_identity(cfg: &GatewayConfig) -> anyhow::Result<Option<identi
 async fn start_outer_leg(
     cfg: &GatewayConfig,
     renew: Option<&identity::RenewHandle>,
-) -> anyhow::Result<()> {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<ssh::recorder::FinalizeTracker>> {
     if cfg.ssh.listen_addr.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let Some(renew) = renew else {
         tracing::warn!(
             "ssh.listen_addr is set but the Gateway has no CP mTLS identity; refusing to start the outer leg (fail closed)"
         );
-        return Ok(());
+        return Ok(None);
     };
 
     let server_name = host_from_endpoint(&cfg.cp_mtls_endpoint).ok_or_else(|| {
@@ -314,6 +358,7 @@ async fn start_outer_leg(
         cpauth.clone(),
         cfg.ssh.recorder.clone(),
     )?);
+    let finalize_tracker = ssh::recorder::FinalizeTracker::default();
     let deps = ssh::handler::HandlerDeps {
         cpauth,
         connector: Arc::new(ssh::connector::AgentlessDial::new(Duration::from_secs(
@@ -321,19 +366,21 @@ async fn start_outer_leg(
         ))),
         resolver: Arc::new(ssh::target::IdentityResolver),
         recorder_factory,
+        finalize_tracker: finalize_tracker.clone(),
         config: ssh_cfg.clone(),
     };
 
     let server = ssh::bind(ssh_cfg, deps).await?;
     tracing::info!(addr = %server.local_addr(), "outer SSH leg started");
+    let mut shutdown = shutdown;
     tokio::spawn(async move {
         server
-            .run(async {
-                let _ = tokio::signal::ctrl_c().await;
+            .run(async move {
+                let _ = shutdown.wait_for(|v| *v).await;
             })
             .await;
     });
-    Ok(())
+    Ok(Some(finalize_tracker))
 }
 
 /// Snapshot a credential for the CP channel factory (leaf/key + trust anchors).

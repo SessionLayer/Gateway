@@ -1628,6 +1628,7 @@ pub async fn outer_leg_deps_with(
         connector,
         resolver: Arc::new(IdentityResolver),
         recorder_factory,
+        finalize_tracker: gateway_core::ssh::recorder::FinalizeTracker::default(),
         config,
     }
 }

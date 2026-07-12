@@ -121,6 +121,9 @@ pub struct HandlerDeps {
     /// authorized session (holding its data key, asciicast stream, SFTP decoder,
     /// hash-chain, ciphertext spool, uploader).
     pub recorder_factory: Arc<dyn RecorderFactory>,
+    /// Tracks in-flight recording finalizes so a graceful shutdown can await them
+    /// (Session Nine, #3). Cheap to clone (an `Arc`).
+    pub finalize_tracker: crate::ssh::recorder::FinalizeTracker,
     /// SSH server configuration (target separator, device-flow timing, inner-leg
     /// bounds, recorder policy, …).
     pub config: Arc<SshServerConfig>,
@@ -547,8 +550,14 @@ impl SshHandler {
         let inner = self.inner.as_ref().expect("inner client established above");
 
         // (4) Open the matching channel on the node, replaying any PTY. Classify
-        // the channel for the recorder BEFORE `kind` is moved into the node open.
-        let rec_kind = classify_rec_kind(&kind);
+        // the channel for the recorder BEFORE `kind` is moved into the node open,
+        // carrying the PTY size so the asciicast header reflects it (#10).
+        let (pty_cols, pty_rows) = self
+            .pty
+            .get(&channel)
+            .map(|p| (p.col as u16, p.row as u16))
+            .unwrap_or((0, 0));
+        let rec_kind = classify_rec_kind(&kind, pty_cols, pty_rows);
         let pty = self.pty.get(&channel);
         let inner_chan = match inner.open_channel(kind, pty).await {
             Ok(c) => c,
@@ -571,13 +580,10 @@ impl SshHandler {
         };
         let (_outer_read, outer_write) = outer_chan.split();
 
-        // Classify + register the channel with the recorder, replay the initial PTY
-        // size as a resize, then hand the recorder (as a tap) to the pump.
+        // Register the channel with the recorder (the asciicast header already
+        // carries the PTY size via `rec_kind`), then hand it to the pump as a tap.
         let recorder = self.recorder.clone().expect("recorder set above");
         recorder.open_channel(channel, rec_kind);
-        if let Some(p) = self.pty.get(&channel) {
-            recorder.resize(channel, p.col as u16, p.row as u16);
-        }
         let tap: Arc<dyn RecorderTap> = recorder;
 
         let pump = tokio::spawn(bridge::pump_inner_to_outer(
@@ -788,10 +794,11 @@ impl Drop for SshHandler {
             pump.abort();
         }
         // Finalize the recording off the Drop path (flush → seal-final → upload →
-        // FinalizeRecording). Spawned so teardown never blocks; the recorder holds
-        // its own CP client + uploader.
+        // FinalizeRecording). Spawned via the tracker so teardown never blocks but a
+        // graceful shutdown can still await it (#3); the recorder holds its own CP
+        // client + uploader.
         if let Some(rec) = self.recorder.take() {
-            tokio::spawn(rec.finalize());
+            self.deps.finalize_tracker.spawn(rec.finalize());
         }
     }
 }
@@ -1110,22 +1117,35 @@ fn required_capabilities(kind: &ChannelKind) -> &'static [Capability] {
     }
 }
 
-/// Classify a bridged channel for the recorder (Design §12.1): a shell / plain
-/// exec is a terminal (asciicast v2), the sftp subsystem and a legacy scp-over-
-/// exec are file-transfer channels (protocol-decoded audit, no terminal capture).
-fn classify_rec_kind(kind: &ChannelKind) -> RecChannelKind {
+/// Classify a bridged channel for the recorder (Design §12.1, red-team #1): a
+/// shell / exec is ALWAYS a terminal (asciicast v2) — a legacy scp-over-exec
+/// additionally runs the SCP decoder for file-transfer audit, but NEVER instead of
+/// asciicast, so the exec command string can never suppress content capture. Only
+/// the sftp SUBSYSTEM (the node runs sftp-server, no shell) is decode-only.
+fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind {
     match kind {
-        ChannelKind::Shell => RecChannelKind::Terminal { command: None },
-        ChannelKind::Exec(cmd) => match crate::ssh::recorder::scp::parse_scp_command(cmd) {
-            Some((upload, path)) => RecChannelKind::Scp { upload, path },
-            None => RecChannelKind::Terminal {
-                command: Some(cmd.clone()),
-            },
+        ChannelKind::Shell => RecChannelKind::Terminal {
+            command: None,
+            scp: None,
+            cols,
+            rows,
+        },
+        ChannelKind::Exec(cmd) => RecChannelKind::Terminal {
+            command: Some(cmd.clone()),
+            scp: crate::ssh::recorder::scp::parse_scp_command(cmd)
+                .map(|(upload, target)| crate::ssh::bridge::ScpMode { upload, target }),
+            cols,
+            rows,
         },
         ChannelKind::Subsystem(name) if name == "sftp" => RecChannelKind::Sftp,
         // Only the sftp subsystem is ever bridged (the capability gate refuses the
         // rest); default to an opaque terminal for safety.
-        ChannelKind::Subsystem(_) => RecChannelKind::Terminal { command: None },
+        ChannelKind::Subsystem(_) => RecChannelKind::Terminal {
+            command: None,
+            scp: None,
+            cols,
+            rows,
+        },
     }
 }
 

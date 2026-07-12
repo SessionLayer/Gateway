@@ -14,12 +14,15 @@ buffers are scrubbed on drop:
 - the ECIES **KEK** + wrapped-key scratch — `Zeroizing`;
 - the asciicast **plaintext accumulator** `Capture.pending_pt` and each drained
   **frame** buffer — `Zeroizing<Vec<u8>>`;
-- the **SFTP reassembly buffers** `SftpDecoder.in_buf/out_buf` (which transit
-  WRITE/DATA file content before hashing) — `Zeroizing<Vec<u8>>`.
+- the **SFTP reassembly buffers** `SftpDecoder.in_buf/out_buf`, the per-packet copy,
+  and the **SCP control-line** buffer (which transit WRITE/DATA file content before
+  hashing) — `Zeroizing<Vec<u8>>`.
 
-The residual is **imperfect** in the same class as
-[F-innerkey-zeroize-1](F-innerkey-zeroize-1.md): a handful of short-lived
-transient copies of already-in-flight plaintext are not individually scrubbed:
+The SFTP reassembly buffers, the SFTP per-packet copy, and the SCP control-line
+buffer are ALSO `Zeroizing` (the file-content path is fully scrubbed). The
+residual is **imperfect** in the same class as
+[F-innerkey-zeroize-1](F-innerkey-zeroize-1.md): the remaining short-lived copies
+of already-in-flight plaintext are not individually scrubbed:
 
 1. **asciicast event strings** — `Utf8Chunker::push` returns a `String` and
    `asciicast::event_line` serializes it into a `Vec<u8>` via `serde_json` (whose
@@ -27,10 +30,6 @@ transient copies of already-in-flight plaintext are not individually scrubbed:
    `pending_pt`. Same residual class as F-zeroize-1's accepted `serde_json` scratch.
 2. **`Utf8Chunker.pending`** — the ≤3-byte incomplete-UTF-8 tail held between
    chunks (and, only on malformed input, a larger slice) is a plain `Vec<u8>`.
-3. **SCP `line`** — legacy-scp control lines (`C<mode> <size> <name>`, metadata,
-   not file content — content streams straight to the hasher without buffering).
-4. **packet slices** — `SftpDecoder` copies each whole packet out of the (zeroized)
-   reassembly buffer into a transient `Vec` to parse it.
 
 The source bytes at the tap are a borrowed `&[u8]` into russh's `CryptoVec`, which
 russh itself zeroizes; these are copies of bytes already in flight, dropped
