@@ -34,23 +34,25 @@ use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
 use gateway_core::pb::recording_server::{Recording, RecordingServer};
 use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningServer};
 use gateway_core::pb::{
-    lock_event, AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest,
-    BeginDeviceFlowResponse, BeginRecordingRequest, BeginRecordingResponse, Capability,
-    ClientHello, ComponentInfo, CustomerKey, Decision, DecisionContext, DeviceFlowStatus,
-    EnrollGatewayRequest, EnrollGatewayResponse, FinalizeRecordingRequest,
+    lock_event, AccessModel, AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest,
+    BeginDeviceFlowResponse, BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution,
+    Capability, ClientHello, ComponentInfo, CustomerKey, Decision, DecisionContext,
+    DeviceFlowStatus, EnrollGatewayRequest, EnrollGatewayResponse, FinalizeRecordingRequest,
     FinalizeRecordingResponse, Heartbeat, HostVerification, KeySealAlgorithm, Lock, LockEvent,
     LockRemoval, LockSnapshot, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
     ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse,
-    RequestUploadRequest, RequestUploadResponse, ResolveOtpRequest, ResolveOtpResponse,
-    ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse,
-    ResolvedIdentity, ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse,
-    StreamLocksRequest, UploadCredential, WormMode,
+    RequestUploadRequest, RequestUploadResponse, ResolveBreakglassCodeRequest,
+    ResolveBreakglassCodeResponse, ResolveBreakglassKeyRequest, ResolveBreakglassKeyResponse,
+    ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse,
+    ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity, ServerHello,
+    SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
+    UploadCredential, WormMode,
 };
 use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
 use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
 use gateway_core::ssh::handler::HandlerDeps;
 use gateway_core::ssh::lockfeed::LockFeedClientTask;
-use gateway_core::ssh::locks::{LiveSessionRegistry, LockSet};
+use gateway_core::ssh::locks::{target_matches, LiveSessionRegistry, LockBindings, LockSet};
 use gateway_core::ssh::target::IdentityResolver;
 use gateway_core::{decisionctx, mtls, version};
 use p256::ecdsa::signature::Signer;
@@ -232,6 +234,26 @@ struct AllowRule {
     principal: String,
 }
 
+/// A minted single-use break-glass token (Session Thirteen): the resolution binds
+/// {gateway, identity, node, source_ip}; Authorize consumes it once.
+struct BreakglassTokenRecord {
+    gateway_id: String,
+    identity: String,
+    principals: Vec<String>,
+    node_id: String,
+    source_ip: String,
+    used: bool,
+}
+
+/// A recorded break-glass activation (Session Thirteen): the CP creates it ON USE
+/// at Authorize (before the allow/deny is decided) and fires the high-priority
+/// alert. Tests assert it happened.
+#[derive(Clone, Debug)]
+struct BreakglassActivation {
+    identity: String,
+    node_id: String,
+}
+
 /// Mutable + immutable mock CP state shared by the three service handlers.
 struct MockState {
     ca: TestCa,
@@ -286,6 +308,17 @@ struct MockState {
     /// When set, every OuterLegAuth resolve RPC returns UNAVAILABLE (CP-down
     /// during authentication).
     resolve_unavailable: Mutex<bool>,
+
+    // ---- Session Thirteen: break-glass (FIDO2 key / offline code) ------------
+    /// Registered break-glass FIDO2 keys: OpenSSH wire blob → resolved record.
+    break_glass_keys: Mutex<HashMap<Vec<u8>, ResolvedRecord>>,
+    /// Registered single-use break-glass offline codes: code → resolved record
+    /// (consumed on validate, single-use).
+    offline_codes: Mutex<HashMap<String, ResolvedRecord>>,
+    /// Minted break-glass tokens, consumed atomically (single-use) at Authorize.
+    breakglass_tokens: Mutex<HashMap<String, BreakglassTokenRecord>>,
+    /// Break-glass activations recorded ON USE at Authorize (the alert fires here).
+    breakglass_activations: Mutex<Vec<BreakglassActivation>>,
 
     // ---- Session Nine: recorder (Recording service + WORM presign) ----------
     /// Recording tokens minted on Authorize ALLOW (single-use, gateway/session-
@@ -836,60 +869,96 @@ impl OuterLegAuth for MockSvc {
             identity: Some(identity),
         }))
     }
+
+    async fn resolve_breakglass_key(
+        &self,
+        request: Request<ResolveBreakglassKeyRequest>,
+    ) -> Result<Response<ResolveBreakglassKeyResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let resolution = {
+            let keys = self.break_glass_keys.lock().unwrap();
+            match keys.get(&r.sk_public_key_blob) {
+                Some(rec) if rec.source_ip.as_deref().is_none_or(|s| s == r.source_ip) => {
+                    self.mint_break_glass(&gid, rec, &r.source_ip, &r.node_id)
+                }
+                _ => not_resolved_break_glass(),
+            }
+        };
+        Ok(Response::new(ResolveBreakglassKeyResponse {
+            resolution: Some(resolution),
+        }))
+    }
+
+    async fn resolve_breakglass_code(
+        &self,
+        request: Request<ResolveBreakglassCodeRequest>,
+    ) -> Result<Response<ResolveBreakglassCodeResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        // Single-use: consume (atomic mark-used) on a source-matched hit.
+        let resolution = {
+            let mut codes = self.offline_codes.lock().unwrap();
+            match codes.get(&r.code) {
+                Some(rec) if rec.source_ip.as_deref().is_none_or(|s| s == r.source_ip) => {
+                    let rec = codes.remove(&r.code).unwrap();
+                    self.mint_break_glass(&gid, &rec, &r.source_ip, &r.node_id)
+                }
+                _ => not_resolved_break_glass(),
+            }
+        };
+        Ok(Response::new(ResolveBreakglassCodeResponse {
+            resolution: Some(resolution),
+        }))
+    }
 }
 
-#[tonic::async_trait]
-impl Authorization for MockSvc {
-    async fn authorize(
+/// The generic non-resolution for a break-glass resolve (no identity, no token).
+fn not_resolved_break_glass() -> BreakglassResolution {
+    BreakglassResolution {
+        identity: Some(not_resolved()),
+        breakglass_token: String::new(),
+    }
+}
+
+impl MockState {
+    /// Mint a single-use break-glass token bound to {gateway, identity, node,
+    /// source_ip} and return the resolution (identity + token).
+    fn mint_break_glass(
         &self,
-        request: Request<AuthorizeRequest>,
-    ) -> Result<Response<AuthorizeResponse>, Status> {
-        let gid = require_gateway(&request, self)?;
-        if *self.authorize_unavailable.lock().unwrap() {
-            return Err(Status::unavailable("control plane temporarily unavailable"));
-        }
-        let r = request.into_inner();
-
-        // Unknown node → generic DENY (§7.1, no existence disclosure).
-        if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
-            return Ok(Response::new(deny_response()));
-        }
-        let allowed = self.allow_rules.lock().unwrap().iter().any(|rule| {
-            rule.identity == r.identity
-                && rule.node_id == r.node_id
-                && rule.principal == r.requested_principal
-        });
-        if !allowed {
-            return Ok(Response::new(deny_response()));
-        }
-
-        // ALLOW: mint a single-use session token bound to {gateway, session,
-        // node, principal} (reusing the S4 token machinery) + a decision context.
-        let token = random_token("sess");
-        self.tokens.lock().unwrap().insert(
+        gid: &str,
+        rec: &ResolvedRecord,
+        source_ip: &str,
+        node_id: &str,
+    ) -> BreakglassResolution {
+        let token = random_token("bg");
+        self.breakglass_tokens.lock().unwrap().insert(
             token.clone(),
-            TokenRecord {
-                gateway_id: gid.clone(),
-                session_id: r.session_id.clone(),
-                node_id: r.node_id.clone(),
-                principal: r.requested_principal.clone(),
-                exp: SystemTime::now() + Duration::from_secs(120),
+            BreakglassTokenRecord {
+                gateway_id: gid.to_string(),
+                identity: rec.identity.clone(),
+                principals: rec.principals.clone(),
+                node_id: node_id.to_string(),
+                source_ip: source_ip.to_string(),
                 used: false,
             },
         );
-        // Session Nine: a SECOND single-use token, same binding, for BeginRecording.
-        let recording_token = random_token("rec");
-        self.recording_tokens.lock().unwrap().insert(
-            recording_token.clone(),
-            TokenRecord {
-                gateway_id: gid.clone(),
-                session_id: r.session_id.clone(),
-                node_id: r.node_id.clone(),
-                principal: r.requested_principal.clone(),
-                exp: SystemTime::now() + Duration::from_secs(120),
-                used: false,
-            },
-        );
+        BreakglassResolution {
+            identity: Some(resolved(rec)),
+            breakglass_token: token,
+        }
+    }
+
+    /// Build the decision context for a resolved, authorized target (shared by the
+    /// standing and break-glass ALLOW paths). `access_model` is signed into it.
+    fn context_for(
+        &self,
+        gid: &str,
+        r: &AuthorizeRequest,
+        access_model: AccessModel,
+    ) -> DecisionContext {
         let now = unix_now() as i64;
         let capabilities = self
             .node_capabilities
@@ -905,7 +974,7 @@ impl Authorization for MockSvc {
             .get(&r.node_id)
             .cloned()
             .unwrap_or_default();
-        let context = DecisionContext {
+        DecisionContext {
             node_id: r.node_id.clone(),
             node_name: r.node_id.clone(),
             allowed_logins: vec![r.requested_principal.clone()],
@@ -914,28 +983,59 @@ impl Authorization for MockSvc {
             grant_expiry_epoch_seconds: now + 3600,
             policy_epoch: 1,
             decision_ttl_seconds: 45,
-            gateway_id: gid,
+            gateway_id: gid.to_string(),
             session_id: r.session_id.clone(),
             source_address: r.source_ip.clone(),
             issued_at_epoch_seconds: now,
             identity: r.identity.clone(),
             identity_groups: r.identity_groups.clone(),
             node_labels,
-        };
-        // Part E: the per-node connection material (dial + host trust), if the
-        // test registered it. Absent → the Gateway fails closed (no connection /
-        // never TOFU).
+            access_model: access_model as i32,
+        }
+    }
+
+    /// Build an ALLOW response for a pre-built context: mint the single-use session
+    /// and recording tokens (gateway/session-bound), attach the node connection, and
+    /// sign the context (the Gateway verifies it before caching).
+    fn allow_response_with_context(
+        &self,
+        gid: &str,
+        r: &AuthorizeRequest,
+        context: DecisionContext,
+    ) -> AuthorizeResponse {
+        let token = random_token("sess");
+        self.tokens.lock().unwrap().insert(
+            token.clone(),
+            TokenRecord {
+                gateway_id: gid.to_string(),
+                session_id: r.session_id.clone(),
+                node_id: r.node_id.clone(),
+                principal: r.requested_principal.clone(),
+                exp: SystemTime::now() + Duration::from_secs(120),
+                used: false,
+            },
+        );
+        let recording_token = random_token("rec");
+        self.recording_tokens.lock().unwrap().insert(
+            recording_token.clone(),
+            TokenRecord {
+                gateway_id: gid.to_string(),
+                session_id: r.session_id.clone(),
+                node_id: r.node_id.clone(),
+                principal: r.requested_principal.clone(),
+                exp: SystemTime::now() + Duration::from_secs(120),
+                used: false,
+            },
+        );
         let node_connection = self
             .node_connections
             .lock()
             .unwrap()
             .get(&r.node_id)
             .cloned();
-        // Session Ten: the decision context is SIGNED (the Gateway verifies it
-        // before caching + running per-channel local checks against it).
         let (signed_context, signature, signer_certificate, signer_ca_chain) =
             self.sign_context(&context);
-        Ok(Response::new(AuthorizeResponse {
+        AuthorizeResponse {
             decision: Decision::Allow as i32,
             context: Some(context),
             signed_context,
@@ -945,7 +1045,110 @@ impl Authorization for MockSvc {
             session_token: token,
             node_connection,
             recording_token,
-        }))
+        }
+    }
+
+    fn allow_response(
+        &self,
+        gid: &str,
+        r: &AuthorizeRequest,
+        access_model: AccessModel,
+    ) -> AuthorizeResponse {
+        let context = self.context_for(gid, r, access_model);
+        self.allow_response_with_context(gid, r, context)
+    }
+
+    /// Whether any active lock matches this context's bindings — deny wins even in
+    /// break-glass (Design §8.4, FR-ACC-6: a locked target refuses break-glass).
+    fn lock_denies(&self, context: &DecisionContext) -> bool {
+        let bindings = LockBindings::from_context(context);
+        self.locks.lock().unwrap().iter().any(|l| {
+            l.target
+                .as_ref()
+                .map(|t| target_matches(t, &bindings))
+                .unwrap_or(false)
+        })
+    }
+
+    /// The break-glass Authorize path (Session Thirteen): consume the single-use
+    /// token (replay → fail closed), record the activation + fire the alert ON USE,
+    /// force access_model = BREAKGLASS, and evaluate the always-available break-glass
+    /// allow SUBJECT TO the top-tier Lock (a matching Lock still denies — deny wins).
+    fn authorize_break_glass(&self, gid: &str, r: &AuthorizeRequest) -> AuthorizeResponse {
+        let consumed = {
+            let mut toks = self.breakglass_tokens.lock().unwrap();
+            match toks.get_mut(&r.breakglass_token) {
+                Some(t) if !t.used && t.gateway_id == gid => {
+                    t.used = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !consumed {
+            // Replay / unknown / wrong-gateway token → generic DENY (fail closed).
+            return deny_response();
+        }
+        // The activation + high-priority alert happen ON USE, before the decision.
+        self.breakglass_activations
+            .lock()
+            .unwrap()
+            .push(BreakglassActivation {
+                identity: r.identity.clone(),
+                node_id: r.node_id.clone(),
+            });
+        if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
+            return deny_response();
+        }
+        let context = self.context_for(gid, r, AccessModel::Breakglass);
+        // Deny wins: a top-tier Lock refuses break-glass on a locked target.
+        if self.lock_denies(&context) {
+            return deny_response();
+        }
+        // Break-glass BYPASSES the standing dp_rule deny (always-available path).
+        self.allow_response_with_context(gid, r, context)
+    }
+}
+
+#[tonic::async_trait]
+impl Authorization for MockSvc {
+    async fn authorize(
+        &self,
+        request: Request<AuthorizeRequest>,
+    ) -> Result<Response<AuthorizeResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        if *self.authorize_unavailable.lock().unwrap() {
+            return Err(Status::unavailable("control plane temporarily unavailable"));
+        }
+        let r = request.into_inner();
+
+        // Break-glass connect (Session Thirteen): a present token routes to the
+        // always-available break-glass path (consume token + activation/alert + force
+        // BREAKGLASS + Lock-checked allow). Empty ⇒ the standing/JIT path below.
+        if !r.breakglass_token.is_empty() {
+            return Ok(Response::new(self.authorize_break_glass(&gid, &r)));
+        }
+
+        // Unknown node → generic DENY (§7.1, no existence disclosure).
+        if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
+            return Ok(Response::new(deny_response()));
+        }
+        let allowed = self.allow_rules.lock().unwrap().iter().any(|rule| {
+            rule.identity == r.identity
+                && rule.node_id == r.node_id
+                && rule.principal == r.requested_principal
+        });
+        if !allowed {
+            return Ok(Response::new(deny_response()));
+        }
+
+        // ALLOW (standing): mint the single-use session + recording tokens + the
+        // SIGNED decision context (Part E node connection attached if registered).
+        Ok(Response::new(self.allow_response(
+            &gid,
+            &r,
+            AccessModel::Standing,
+        )))
     }
 }
 
@@ -1270,6 +1473,10 @@ impl MockCpBuilder {
             node_capabilities: Mutex::new(HashMap::new()),
             authorize_unavailable: Mutex::new(false),
             resolve_unavailable: Mutex::new(false),
+            break_glass_keys: Mutex::new(HashMap::new()),
+            offline_codes: Mutex::new(HashMap::new()),
+            breakglass_tokens: Mutex::new(HashMap::new()),
+            breakglass_activations: Mutex::new(Vec::new()),
             recording_tokens: Mutex::new(HashMap::new()),
             customer_key: Mutex::new(None),
             s3: Mutex::new(None),
@@ -1676,6 +1883,65 @@ impl MockCp {
     /// (they return UNAVAILABLE) — CP-down during authentication.
     pub fn set_resolve_unavailable(&self, on: bool) {
         *self.state.resolve_unavailable.lock().unwrap() = on;
+    }
+
+    // ---- Session Thirteen break-glass knobs ---------------------------------
+
+    /// Register a break-glass FIDO2 key: the OpenSSH wire blob of an `sk-ecdsa`/
+    /// `sk-ed25519` public key resolves to `{identity, principals}` (no source
+    /// binding). The key is public; the CP maps it to a break-glass credential.
+    pub fn register_break_glass_key(
+        &self,
+        sk_public_key_blob: Vec<u8>,
+        identity: &str,
+        principals: &[&str],
+    ) {
+        self.state.break_glass_keys.lock().unwrap().insert(
+            sk_public_key_blob,
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    /// Register a single-use break-glass OFFLINE CODE resolving to `{identity,
+    /// principals}` (consumed on validate, single-use).
+    pub fn register_offline_code(&self, code: &str, identity: &str, principals: &[&str]) {
+        self.state.offline_codes.lock().unwrap().insert(
+            code.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    /// The number of break-glass tokens minted by a resolve (test assertion for the
+    /// FIDO2/offline-code resolution path).
+    pub fn breakglass_token_count(&self) -> usize {
+        self.state.breakglass_tokens.lock().unwrap().len()
+    }
+
+    /// The number of break-glass activations recorded at Authorize (the alert fires
+    /// once per activation, ON USE).
+    pub fn breakglass_activation_count(&self) -> usize {
+        self.state.breakglass_activations.lock().unwrap().len()
+    }
+
+    /// The {identity, node_id} pairs of the recorded break-glass activations.
+    pub fn breakglass_activations(&self) -> Vec<(String, String)> {
+        self.state
+            .breakglass_activations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| (a.identity.clone(), a.node_id.clone()))
+            .collect()
     }
 
     // ---- Session Nine recorder knobs ----------------------------------------
