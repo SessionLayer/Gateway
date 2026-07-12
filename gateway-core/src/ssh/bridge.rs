@@ -19,10 +19,15 @@
 
 use std::sync::Arc;
 
-use russh::server::Handle;
-use russh::{ChannelId, ChannelMsg};
+use russh::server::{Handle, Msg as ServerMsg};
+use russh::{ChannelId, ChannelMsg, ChannelWriteHalf};
 
 use crate::ssh::innerleg::InnerReadHalf;
+
+/// The outer (client-facing) channel write half. Its `data_bytes` blocks on the
+/// client's channel window (real end-to-end backpressure) — unlike `Handle::data`,
+/// which buffers without bound (F-bridge-backpressure-1).
+pub(crate) type OuterWriteHalf = ChannelWriteHalf<ServerMsg>;
 
 /// Direction of a plaintext chunk at the tap (asciicast v2 event kinds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,26 +63,32 @@ impl RecorderTap for NullRecorder {
 /// channel id the node output is written back to.
 pub(crate) async fn pump_inner_to_outer(
     mut inner: InnerReadHalf,
+    outer_write: OuterWriteHalf,
     handle: Handle,
     outer: ChannelId,
     tap: Arc<dyn RecorderTap>,
 ) {
     while let Some(msg) = inner.wait().await {
         match msg {
+            // The bulk streams go through the outer WRITE HALF, whose `data_bytes`
+            // blocks on the client's channel window → the node is throttled to the
+            // client's receive rate (no unbounded buffering, F-bridge-backpressure-1).
             ChannelMsg::Data { data } => {
                 tap.tap(outer, TapDirection::Output, None, &data);
-                if handle.data(outer, data).await.is_err() {
+                if outer_write.data_bytes(data).await.is_err() {
                     break;
                 }
             }
             ChannelMsg::ExtendedData { data, ext } => {
                 tap.tap(outer, TapDirection::Output, Some(ext), &data);
-                if handle.extended_data(outer, ext, data).await.is_err() {
+                if outer_write.extended_data_bytes(ext, data).await.is_err() {
                     break;
                 }
             }
+            // With the data path backpressured the outbound backlog stays ~empty,
+            // so these control messages do not overtake buffered stdout.
             ChannelMsg::ExitStatus { exit_status } => {
-                let _ = handle.exit_status_request(outer, exit_status).await;
+                let _ = outer_write.exit_status(exit_status).await;
             }
             ChannelMsg::ExitSignal {
                 signal_name,
@@ -90,7 +101,7 @@ pub(crate) async fn pump_inner_to_outer(
                     .await;
             }
             ChannelMsg::Eof => {
-                let _ = handle.eof(outer).await;
+                let _ = outer_write.eof().await;
             }
             ChannelMsg::Close => break,
             _ => {}
@@ -98,5 +109,5 @@ pub(crate) async fn pump_inner_to_outer(
     }
     // The node closed the channel (or we broke on a write error): close the outer
     // channel so the client's session ends cleanly.
-    let _ = handle.close(outer).await;
+    let _ = outer_write.close().await;
 }

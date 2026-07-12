@@ -148,9 +148,19 @@ pub struct SshHandler {
     inner_failed: Option<SshOutcome>,
     /// PTY parameters stashed per channel (replayed to the node at channel start).
     pty: HashMap<ChannelId, PtyParams>,
+    /// Retained outer channel objects (kept from `channel_open_session` so their
+    /// write half can drive the backpressured node→client direction). The read
+    /// half is dropped — outer→inner still flows via the `data` callback.
+    pending_channels: HashMap<ChannelId, Channel<russh::server::Msg>>,
     /// Per-bridged-channel inner write half — the outer `data`/`eof`/window-change
     /// callbacks forward to it (outer → inner direction).
     writers: HashMap<ChannelId, InnerWriteHalf>,
+    /// Per-bridged-channel inner→outer pump task, aborted on channel/connection
+    /// close for deterministic teardown (no leak-until-disconnect).
+    pumps: HashMap<ChannelId, tokio::task::JoinHandle<()>>,
+    /// Count of session channels opened on this connection (Tier-0 cap, russh
+    /// enforces none).
+    channels_opened: usize,
     /// Count of credential-resolution attempts (bounds the CP-RPC amplification
     /// per connection — russh does NOT enforce its own `max_auth_attempts`).
     auth_attempts: usize,
@@ -186,7 +196,10 @@ impl SshHandler {
             inner: None,
             inner_failed: None,
             pty: HashMap::new(),
+            pending_channels: HashMap::new(),
             writers: HashMap::new(),
+            pumps: HashMap::new(),
+            channels_opened: 0,
             auth_attempts: 0,
             conn,
         }
@@ -456,11 +469,15 @@ impl SshHandler {
         }
         let authz = self.authz.clone().expect("authorized cached above");
 
-        // (2) Capability gate at channel-open (FR-SESS-2): a channel for a
-        // capability not in the decision context is refused (generic denial).
-        let capability = required_capability(&kind);
-        if !authz.capabilities.contains(&(capability as i32)) {
-            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "capability_withheld", capability = ?capability, "channel refused: capability not granted");
+        // (2) Capability gate at channel-open (FR-SESS-2): the channel is admitted
+        // only if one of its acceptable capabilities is granted; UNSPECIFIED (the
+        // "never granted" sentinel for an unknown subsystem) is rejected outright.
+        let accepts = required_capabilities(&kind);
+        let granted = accepts
+            .iter()
+            .any(|c| *c != Capability::Unspecified && authz.capabilities.contains(&(*c as i32)));
+        if !granted {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "capability_withheld", accepts = ?accepts, "channel refused: capability not granted");
             self.close_with(channel, session, SshOutcome::PolicyDenied);
             return;
         }
@@ -497,13 +514,22 @@ impl SshHandler {
         // outer via the pump task. The recorder taps both directions (S9).
         let (read, write) = crate::ssh::innerleg::split_channel(inner_chan);
         self.writers.insert(channel, write);
-        tokio::spawn(bridge::pump_inner_to_outer(
+        // Drive node→client through the outer channel's WRITE half (backpressured);
+        // the read half is dropped (outer→inner flows via the `data` callback).
+        let Some(outer_chan) = self.pending_channels.remove(&channel) else {
+            self.close_with(channel, session, SshOutcome::NodeUnreachable);
+            return;
+        };
+        let (_outer_read, outer_write) = outer_chan.split();
+        let pump = tokio::spawn(bridge::pump_inner_to_outer(
             read,
+            outer_write,
             session.handle(),
             channel,
             self.deps.recorder.clone(),
         ));
-        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, "inner leg bridged; session flowing");
+        self.pumps.insert(channel, pump);
+        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "bridged", "inner leg bridged; session flowing");
     }
 
     /// Resolve the target, apply the credential reducer, call `Authorize`, and on
@@ -669,7 +695,7 @@ impl SshHandler {
         match InnerClient::establish(stream, verifier, &authz.node.principal, cert, key, &cfg).await
         {
             Ok(inner) => {
-                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&authz.node.node_id), host_verified = ?inner.verified(), key_id = %sanitize(&signed.key_id), "inner leg established; node host identity verified (no TOFU)");
+                tracing::info!(outcome = "host_verified", source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&authz.node.node_id), host_verified = ?inner.verified(), key_id = %sanitize(&signed.key_id), "inner leg established; node host identity verified (no TOFU)");
                 Ok(inner)
             }
             Err(InnerLegError::HostVerification(reason)) => {
@@ -690,6 +716,16 @@ impl SshHandler {
             window_size: inner.window_bytes,
             max_packet_size: inner.max_packet_bytes,
             idle_timeout: Duration::from_secs(inner.max_session_idle_secs),
+        }
+    }
+}
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        // Connection end: abort any live pump tasks deterministically (dropping the
+        // inner client also closes the node transport, but this bounds the teardown).
+        for (_, pump) in self.pumps.drain() {
+            pump.abort();
         }
     }
 }
@@ -803,10 +839,20 @@ impl Handler for SshHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<russh::server::Msg>,
+        channel: Channel<russh::server::Msg>,
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Tier-0 per-connection channel cap (bounds pump tasks + node channels +
+        // buffers; russh enforces none). Over the cap → reject (drop the reply).
+        self.channels_opened += 1;
+        if self.channels_opened > self.deps.config.inner.max_channels_per_connection {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection channel cap exceeded; refusing channel open");
+            return Ok(());
+        }
+        // Retain the channel so its write half drives the backpressured node→client
+        // direction (see `pending_channels`).
+        self.pending_channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
     }
@@ -913,6 +959,12 @@ impl Handler for SshHandler {
         if let Some(w) = self.writers.remove(&channel) {
             let _ = w.close().await;
         }
+        // Deterministic teardown: abort the pump rather than wait for the node to
+        // propagate Close (no leak-until-disconnect, F-channelcap-1).
+        if let Some(pump) = self.pumps.remove(&channel) {
+            pump.abort();
+        }
+        self.pending_channels.remove(&channel);
         self.pty.remove(&channel);
         Ok(())
     }
@@ -962,26 +1014,20 @@ impl Handler for SshHandler {
     }
 }
 
-/// The SSH capability a channel kind requires (FR-SESS-2). A legacy `scp` exec is
-/// gated by SCP, an unknown subsystem by the never-granted `UNSPECIFIED` (refused).
-fn required_capability(kind: &ChannelKind) -> Capability {
+/// The SSH capabilities that admit a channel kind (FR-SESS-2) — the channel is
+/// allowed if ANY is granted. Legacy `scp` is `exec` of the `scp` binary with
+/// attacker-controlled argv (`scp -S <prog>`, shell metacharacters), so it can
+/// never be a safe standalone capability: it requires **EXEC** (F-capgate-scp-1).
+/// Modern scp runs over the SFTP subsystem, so SCP is honored there alongside SFTP
+/// (Design §12.1, both SCP modes). An unknown subsystem has NO acceptable
+/// capability → always refused (fail closed).
+fn required_capabilities(kind: &ChannelKind) -> &'static [Capability] {
     match kind {
-        ChannelKind::Shell => Capability::Shell,
-        ChannelKind::Exec(cmd) if is_scp_command(cmd) => Capability::Scp,
-        ChannelKind::Exec(_) => Capability::Exec,
-        ChannelKind::Subsystem(name) if name == "sftp" => Capability::Sftp,
-        ChannelKind::Subsystem(_) => Capability::Unspecified,
+        ChannelKind::Shell => &[Capability::Shell],
+        ChannelKind::Exec(_) => &[Capability::Exec],
+        ChannelKind::Subsystem(name) if name == "sftp" => &[Capability::Sftp, Capability::Scp],
+        ChannelKind::Subsystem(_) => &[],
     }
-}
-
-/// Whether an exec command is a legacy `scp` transfer. Best-effort — the node
-/// re-enforces the principal regardless (FR-SESS-1, both SCP modes).
-fn is_scp_command(cmd: &[u8]) -> bool {
-    String::from_utf8_lossy(cmd)
-        .split_whitespace()
-        .next()
-        .map(|w| w.rsplit('/').next().unwrap_or(w) == "scp")
-        .unwrap_or(false)
 }
 
 /// The granted capabilities from the decision context; default shell+exec when
@@ -1098,5 +1144,52 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    /// Capability gate (FR-SESS-2): a legacy `scp` exec is gated by EXEC (never a
+    /// standalone SCP), an unknown subsystem is never granted, and UNSPECIFIED is
+    /// never an acceptable capability (F-capgate-scp-1 / F-capgate-unspec-1).
+    #[test]
+    fn capability_gate_never_admits_scp_exec_or_unknown_subsystem() {
+        // A file-transfer-only grant (scp+sftp, no exec/shell).
+        let scp_only = [Capability::Scp as i32, Capability::Sftp as i32];
+        let admits = |kind: &ChannelKind, granted: &[i32]| {
+            required_capabilities(kind)
+                .iter()
+                .any(|c| *c != Capability::Unspecified && granted.contains(&(*c as i32)))
+        };
+
+        // `scp -S /bin/sh …` and metacharacter smuggling are plain exec → need EXEC,
+        // so an scp-only grant must NOT admit them.
+        for cmd in [
+            "scp -S /bin/sh a b",
+            "scp x y; id",
+            "/usr/bin/scp -o ProxyCommand=id a b",
+        ] {
+            let kind = ChannelKind::Exec(cmd.as_bytes().to_vec());
+            assert_eq!(required_capabilities(&kind), &[Capability::Exec]);
+            assert!(
+                !admits(&kind, &scp_only),
+                "scp-only must not admit exec {cmd:?}"
+            );
+        }
+        // An honest exec is admitted only by EXEC.
+        assert!(admits(
+            &ChannelKind::Exec(b"id".to_vec()),
+            &[Capability::Exec as i32]
+        ));
+
+        // Modern scp uses the sftp subsystem → SFTP or SCP admits it.
+        let sftp = ChannelKind::Subsystem("sftp".into());
+        assert!(admits(&sftp, &scp_only));
+        assert!(admits(&sftp, &[Capability::Sftp as i32]));
+        assert!(!admits(&sftp, &[Capability::Exec as i32]));
+
+        // Unknown subsystem: no acceptable capability → refused even against a set
+        // literally containing UNSPECIFIED (0).
+        let unknown = ChannelKind::Subsystem("netconf".into());
+        assert!(required_capabilities(&unknown).is_empty());
+        assert!(!admits(&unknown, &[Capability::Unspecified as i32]));
+        assert!(!admits(&unknown, &[Capability::Sftp as i32]));
     }
 }

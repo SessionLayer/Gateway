@@ -75,6 +75,11 @@ pub(crate) enum InnerLegError {
 pub(crate) struct InnerClient {
     handle: Handle<InnerHandler>,
     verified: HostVerified,
+    /// Fail-closed bound on post-transport node round-trips (userauth already
+    /// applied in `establish`; channel-open here), so a node that passes KEX +
+    /// host-verify but then stalls cannot park the outer connection on the idle
+    /// timer (F-innertimeout-1).
+    op_timeout: Duration,
 }
 
 impl InnerClient {
@@ -133,16 +138,24 @@ impl InnerClient {
             }
         };
 
+        // Bound userauth too (not just KEX): a node that passes host-verify but
+        // stalls at userauth must fail closed within handshake_timeout, not park
+        // the outer connection on the idle timer (F-innertimeout-1).
         let key = Arc::new(key);
-        let auth = handle
-            .authenticate_openssh_cert(principal, key.clone(), cert)
-            .await
-            .map_err(|e| InnerLegError::Handshake(e.to_string()));
+        let auth_call = handle.authenticate_openssh_cert(principal, key.clone(), cert);
+        let auth = match tokio::time::timeout(cfg.handshake_timeout, auth_call).await {
+            Ok(r) => r.map_err(|e| InnerLegError::Handshake(e.to_string())),
+            Err(_) => Err(InnerLegError::HandshakeTimeout),
+        };
         drop(key); // zeroize the inner private key immediately after the handshake
         if !auth?.success() {
             return Err(InnerLegError::AuthRejected);
         }
-        Ok(Self { handle, verified })
+        Ok(Self {
+            handle,
+            verified,
+            op_timeout: cfg.handshake_timeout,
+        })
     }
 
     /// Open a session channel on the node, replay the PTY (if any) and the
@@ -152,26 +165,36 @@ impl InnerClient {
         kind: ChannelKind,
         pty: Option<&PtyParams>,
     ) -> Result<Channel<Msg>, InnerLegError> {
-        let channel = self
-            .handle
-            .channel_open_session()
-            .await
-            .map_err(|e| InnerLegError::ChannelOpen(e.to_string()))?;
-
-        if let Some(p) = pty {
-            channel
-                .request_pty(false, &p.term, p.col, p.row, p.pix_w, p.pix_h, &p.modes)
+        // Bound channel-open + replay by the op timeout so a stalled node cannot
+        // park the (shared) handler task on the idle timer (F-innertimeout-1).
+        let open = async {
+            let channel = self
+                .handle
+                .channel_open_session()
                 .await
                 .map_err(|e| InnerLegError::ChannelOpen(e.to_string()))?;
-        }
 
-        let result = match kind {
-            ChannelKind::Shell => channel.request_shell(false).await,
-            ChannelKind::Exec(cmd) => channel.exec(false, cmd).await,
-            ChannelKind::Subsystem(name) => channel.request_subsystem(false, name).await,
+            if let Some(p) = pty {
+                channel
+                    .request_pty(false, &p.term, p.col, p.row, p.pix_w, p.pix_h, &p.modes)
+                    .await
+                    .map_err(|e| InnerLegError::ChannelOpen(e.to_string()))?;
+            }
+
+            let result = match kind {
+                ChannelKind::Shell => channel.request_shell(false).await,
+                ChannelKind::Exec(cmd) => channel.exec(false, cmd).await,
+                ChannelKind::Subsystem(name) => channel.request_subsystem(false, name).await,
+            };
+            result.map_err(|e| InnerLegError::ChannelOpen(e.to_string()))?;
+            Ok(channel)
         };
-        result.map_err(|e| InnerLegError::ChannelOpen(e.to_string()))?;
-        Ok(channel)
+        match tokio::time::timeout(self.op_timeout, open).await {
+            Ok(r) => r,
+            Err(_) => Err(InnerLegError::ChannelOpen(
+                "node channel-open timed out".into(),
+            )),
+        }
     }
 }
 

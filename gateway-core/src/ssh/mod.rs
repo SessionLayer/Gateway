@@ -301,6 +301,26 @@ fn validate_config(config: &SshServerConfig) -> Result<(), SshServerError> {
             config.inner.max_session_idle_secs, config.login_grace_secs
         )));
     }
+    // Inner-leg bounds must be fail-closed: non-zero timeouts (0 would make the
+    // node dial/handshake unbounded), a channel window ≥ the packet size, and at
+    // least one channel allowed.
+    let inner = &config.inner;
+    if inner.connect_timeout_secs == 0 || inner.handshake_timeout_secs == 0 {
+        return Err(SshServerError::Config(
+            "inner.connect_timeout_secs and inner.handshake_timeout_secs must be > 0".to_string(),
+        ));
+    }
+    if inner.max_packet_bytes == 0 || inner.window_bytes < inner.max_packet_bytes {
+        return Err(SshServerError::Config(format!(
+            "inner.window_bytes ({}) must be >= inner.max_packet_bytes ({} > 0)",
+            inner.window_bytes, inner.max_packet_bytes
+        )));
+    }
+    if inner.max_channels_per_connection == 0 {
+        return Err(SshServerError::Config(
+            "inner.max_channels_per_connection must be >= 1".to_string(),
+        ));
+    }
     Ok(())
 }
 
