@@ -212,6 +212,19 @@ async fn issue_server_config(
     )
     .map_err(|_| AgentTransportError::ServerCertificate)?;
 
+    // The CP — not us — chooses the SANs, and an Agent verifies this Gateway by its
+    // enrolled NAME. If the name the CP stamped is not the one we believe we have, every
+    // Agent would fail the TLS name check; surface that here rather than as a fleet of
+    // unexplained handshake failures.
+    if !issued.gateway_name.is_empty() && issued.gateway_name != deps.gateway_name {
+        tracing::error!(
+            expected = %deps.gateway_name,
+            stamped = %issued.gateway_name,
+            "the Control Plane stamped a different gateway name into the agent-facing certificate; agents would fail to verify this Gateway"
+        );
+        return Err(AgentTransportError::ServerCertificate);
+    }
+
     // The client-cert trust anchors are the SAME internal mTLS CA the Gateway already
     // pins for the CP channel — no new trust distribution, and renewal-aware.
     let anchors = deps.cpauth.current_ca_chain();

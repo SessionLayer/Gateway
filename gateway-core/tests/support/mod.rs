@@ -111,10 +111,33 @@ impl TestCa {
         rcgen::Issuer::new(self.params.clone(), key)
     }
 
-    /// Sign an externally-generated PKCS#10 CSR (DER), returning the leaf DER.
-    pub fn sign_csr(&self, csr_der: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+    /// Parse a CSR the way the REAL CP does. Its shared PKCS#10 parser (Enroll / Renew /
+    /// IssueGatewayServerCertificate) refuses a CSR with a **blank subject CN** — which a
+    /// CSR whose names are all chosen by the CA would naturally have — so the mock refuses
+    /// one too. A mock that were laxer than the CP would let the Gateway ship a CSR that
+    /// the real CP rejects, with every test still green.
+    fn parse_csr(csr_der: &[u8]) -> Result<rcgen::CertificateSigningRequestParams, rcgen::Error> {
         let typed = rustls::pki_types::CertificateSigningRequestDer::from(csr_der.to_vec());
         let csr = rcgen::CertificateSigningRequestParams::from_der(&typed)?;
+        let has_cn = csr
+            .params
+            .distinguished_name
+            .get(&rcgen::DnType::CommonName)
+            .map(|cn| match cn {
+                rcgen::DnValue::Utf8String(s) => !s.trim().is_empty(),
+                rcgen::DnValue::PrintableString(s) => !s.as_str().trim().is_empty(),
+                _ => true,
+            })
+            .unwrap_or(false);
+        if !has_cn {
+            return Err(rcgen::Error::CouldNotParseCertificationRequest);
+        }
+        Ok(csr)
+    }
+
+    /// Sign an externally-generated PKCS#10 CSR (DER), returning the leaf DER.
+    pub fn sign_csr(&self, csr_der: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+        let csr = Self::parse_csr(csr_der)?;
         let cert = csr.signed_by(&self.issuer())?;
         Ok(cert.der().to_vec())
     }
@@ -152,8 +175,12 @@ impl TestCa {
         gateway_id: &str,
         ttl: Duration,
     ) -> Result<Vec<u8>, rcgen::Error> {
-        let typed = rustls::pki_types::CertificateSigningRequestDer::from(csr_der.to_vec());
-        let mut csr = rcgen::CertificateSigningRequestParams::from_der(&typed)?;
+        let mut csr = Self::parse_csr(csr_der)?;
+        // The CP discards every name the CSR asks for and stamps its own.
+        csr.params.distinguished_name = rcgen::DistinguishedName::new();
+        csr.params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, gateway_name);
         csr.params.subject_alt_names = vec![
             rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(gateway_name).unwrap()),
             rcgen::SanType::URI(

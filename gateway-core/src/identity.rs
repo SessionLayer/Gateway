@@ -227,9 +227,18 @@ impl std::fmt::Debug for KeypairCsr {
 ///
 /// Each call generates a **fresh** keypair, which is what gives the agent-facing
 /// serverAuth leaf key separation from the mTLS client identity.
+///
+/// The subject **CN is set explicitly**. The CP discards every name we ask for (it
+/// stamps the leaf from the `gateway_identity` row it already holds), but its PKCS#10
+/// parser *rejects a CSR with a blank CN* — for Enroll and Renew as much as for the
+/// server-certificate RPC. Relying on rcgen's placeholder default to satisfy that would
+/// make all three break the day the default changes.
 pub fn generate_keypair_and_csr(gateway_name: &str) -> Result<KeypairCsr, IdentityError> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-    let params = rcgen::CertificateParams::new(vec![gateway_name.to_string()])?;
+    let mut params = rcgen::CertificateParams::new(vec![gateway_name.to_string()])?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, gateway_name);
     let csr = params.serialize_request(&key)?;
     Ok(KeypairCsr {
         key_pem: Zeroizing::new(key.serialize_pem()),
@@ -819,6 +828,37 @@ mod tests {
                 .windows(16)
                 .any(|w| w == &kc.key_pem.as_bytes()[..16]),
             "no fragment of the private key may appear in the CSR"
+        );
+    }
+
+    /// The Control Plane's shared PKCS#10 parser (Enroll / Renew /
+    /// IssueGatewayServerCertificate) refuses a CSR with a blank CN or a non-P-256 key.
+    /// The mock CP is deliberately strict about this too, but assert it at the source: a
+    /// silent regression here would break enrollment against the real CP, not just the
+    /// agent transport.
+    #[test]
+    fn csr_carries_a_non_blank_cn_and_a_p256_key() {
+        use x509_parser::certification_request::X509CertificationRequest;
+        use x509_parser::prelude::FromDer;
+
+        let kc = generate_keypair_and_csr("gw-1").unwrap();
+        let (_, csr) = X509CertificationRequest::from_der(&kc.csr_der).unwrap();
+        let info = &csr.certification_request_info;
+
+        let cn = info
+            .subject
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .unwrap_or_default();
+        assert!(!cn.trim().is_empty(), "the CP rejects a blank-CN CSR");
+        assert_eq!(cn, "gw-1", "the CN is ours, not an rcgen placeholder");
+
+        // ECDSA P-256 (id-ecPublicKey + prime256v1); anything else is refused.
+        assert!(csr.verify_signature().is_ok(), "proof of possession");
+        assert_eq!(
+            info.subject_pki.algorithm.algorithm.to_id_string(),
+            "1.2.840.10045.2.1"
         );
     }
 
