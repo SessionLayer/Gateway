@@ -37,6 +37,15 @@ pub const CONTROL_PATH: &str = "/agent/v1/control";
 /// The per-session dial-back path (contract §1).
 pub const DIALBACK_PATH: &str = "/agent/v1/dialback";
 
+/// Normative bound on the `heartbeat_interval_secs` we propose in `HELLO_ACK`
+/// (contract §3): below 1 is a self-inflicted DoS, above 300 a dead peer goes undetected
+/// too long.
+pub const HEARTBEAT_INTERVAL_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
+
+/// Normative bound on the `max_frame_bytes` we propose in `HELLO_ACK` (contract §3): it
+/// must clear the inner leg's max packet with headroom, and bound per-connection memory.
+pub const MAX_FRAME_BYTES_RANGE: std::ops::RangeInclusive<usize> = 4096..=1_048_576;
+
 /// The URI SAN scheme the CP stamps into an agent's identity certificate.
 const AGENT_URI_PREFIX: &str = "sessionlayer://agent/";
 

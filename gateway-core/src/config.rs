@@ -660,6 +660,10 @@ mod tests {
         // The two ordering invariants validate_config enforces hold at the defaults.
         assert!((a.dial_back_timeout_secs as i64) < a.dial_back_token_ttl_secs);
         assert!(a.max_frame_bytes > InnerLegServerConfig::default().max_packet_bytes as usize);
+        // …and the defaults sit inside the wire-contract §3 ranges the Agent also enforces,
+        // so an out-of-the-box Gateway is one every Agent will accept.
+        assert!(crate::agent::MAX_FRAME_BYTES_RANGE.contains(&a.max_frame_bytes));
+        assert!(crate::agent::HEARTBEAT_INTERVAL_SECS_RANGE.contains(&a.heartbeat_interval_secs));
     }
 
     #[test]
