@@ -277,3 +277,62 @@ async fn renew_ahead_stops_on_repair_needed_rejection() {
     assert_eq!(cp.recorded_generation(&gateway_id), Some(0));
     let _ = loop_task.await;
 }
+
+/// The S12 busy-renew bug, ported from the Agent (which hit it first): a certificate
+/// whose renew trigger is ALREADY past yields a zero delay, so after a successful
+/// renewal the loop would re-derive the same zero delay and renew again immediately —
+/// hammering the CP and burning a generation per iteration.
+///
+/// This exercises the LOOP, not `compute_renew_delay`: the existing unit tests assert
+/// the ZERO delay is *correct* and would never have caught the spin it causes.
+#[tokio::test]
+async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past() {
+    let cp = MockCp::builder()
+        .cert_ttl(Duration::from_secs(3600))
+        .start()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = identity::IdentityStore::open(dir.path()).unwrap();
+    let params = cp.channel_params(CT, RT);
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &cp.mint_enrollment_token(),
+        "gw-storm",
+    )
+    .await
+    .unwrap();
+    let gateway_id = cred.gateway_id.clone();
+
+    let renew_ahead = identity::RenewAhead::new(
+        store,
+        identity::RenewAheadConfig {
+            // fraction 0 => the trigger instant is not_before, which is always in the
+            // past => compute_renew_delay returns ZERO on EVERY iteration.
+            renew_ahead_fraction: 0.0,
+            renew_jitter_fraction: 0.0,
+            retry_backoff: Duration::from_millis(20),
+            channel: params,
+        },
+        cred,
+    );
+    let loop_task = tokio::spawn(async move {
+        renew_ahead
+            .run(Box::pin(std::future::pending::<()>()))
+            .await;
+    });
+
+    // Give the loop a couple of seconds of wall-clock to misbehave in.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    loop_task.abort();
+
+    // With the floor: the first iteration renews at once (correct — a credential loaded
+    // past its trigger should refresh), then waits RENEW_MIN_INTERVAL (60s). So exactly
+    // ONE renewal. Without it, the loop would have burned dozens.
+    assert_eq!(
+        cp.recorded_generation(&gateway_id),
+        Some(1),
+        "the post-renewal floor must bound the loop to one renewal in this window"
+    );
+}

@@ -21,6 +21,7 @@
 
 #![allow(dead_code)] // shared across several test binaries; not all use every item.
 
+pub mod docker;
 pub mod sigv4;
 
 use gateway_core::config::SshServerConfig;
@@ -2296,6 +2297,21 @@ pub async fn outer_leg_deps_with(
     connector: Arc<dyn NodeConnector>,
     recorder: RecorderChoice,
 ) -> HandlerDeps {
+    outer_leg_deps_named(cp, config, connector, recorder, "gw-s8")
+        .await
+        .0
+}
+
+/// Like [`outer_leg_deps_with`], but enrolls under an explicit Gateway **name** and also
+/// returns the credential — the agent transport needs both (its serverAuth leaf carries
+/// the name, and every dial-back token is bound to the gateway id).
+pub async fn outer_leg_deps_named(
+    cp: &MockCp,
+    config: Arc<SshServerConfig>,
+    connector: Arc<dyn NodeConnector>,
+    recorder: RecorderChoice,
+    gateway_name: &str,
+) -> (HandlerDeps, identity::Credential) {
     let dir = tempfile::tempdir().unwrap();
     let store = identity::IdentityStore::open(dir.path()).unwrap();
     let params = cp.channel_params(Duration::from_secs(5), Duration::from_secs(10));
@@ -2304,10 +2320,11 @@ pub async fn outer_leg_deps_with(
         &params,
         &cp.bootstrap_anchors(),
         &cp.mint_enrollment_token(),
-        "gw-s8",
+        gateway_name,
     )
     .await
     .unwrap();
+    let credential = cred.clone();
 
     let factory = Arc::new(CpChannelFactory::fixed(
         cp.channel_params(Duration::from_secs(5), Duration::from_secs(10)),
@@ -2356,16 +2373,19 @@ pub async fn outer_leg_deps_with(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    HandlerDeps {
-        cpauth,
-        connector,
-        resolver: Arc::new(IdentityResolver),
-        recorder_factory,
-        finalize_tracker: gateway_core::ssh::recorder::FinalizeTracker::default(),
-        lock_set,
-        live_sessions,
-        config,
-    }
+    (
+        HandlerDeps {
+            cpauth,
+            connector,
+            resolver: Arc::new(IdentityResolver),
+            recorder_factory,
+            finalize_tracker: gateway_core::ssh::recorder::FinalizeTracker::default(),
+            lock_set,
+            live_sessions,
+            config,
+        },
+        credential,
+    )
 }
 
 /// Spawn a bare TLS listener that presents `server_config` and completes (or
