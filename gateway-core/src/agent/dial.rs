@@ -92,9 +92,9 @@ impl NodeConnector for AgentDial {
             };
             let now = now_epoch_secs();
             let not_after = now.saturating_add(self.token_ttl_secs);
-            let (jti, token) = self
-                .signer
-                .mint(&self.gateway_id, &binding, self.token_ttl_secs, now);
+            let (jti, token) =
+                self.signer
+                    .mint(&self.gateway_id, &binding, self.token_ttl_secs, now);
             let request_id = random_request_id();
 
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

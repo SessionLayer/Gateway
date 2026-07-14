@@ -751,7 +751,10 @@ impl SessionSigning for MockSvc {
         let resp = self.sign_inner(&r.subject_public_key, &principal, &session_id)?;
         // FR-AUD-4: the key-id the node's own sshd will log on this certificate — the
         // join between the CP's trail and the node-local one.
-        self.signed_key_ids.lock().unwrap().push(resp.key_id.clone());
+        self.signed_key_ids
+            .lock()
+            .unwrap()
+            .push(resp.key_id.clone());
         Ok(Response::new(resp))
     }
 }

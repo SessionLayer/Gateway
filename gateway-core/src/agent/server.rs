@@ -39,9 +39,7 @@ use crate::config::AgentTransportConfig;
 use crate::cpauth::CpAuthClient;
 use crate::identity;
 use crate::pb::ComponentInfo;
-use crate::pbagent::{
-    GatewayHelloAck, Ping, StreamOpen, VersionReject, WireErrorCode,
-};
+use crate::pbagent::{GatewayHelloAck, Ping, StreamOpen, VersionReject, WireErrorCode};
 use crate::ssh::locks::{LockBindings, LockSet};
 use crate::version;
 
@@ -283,7 +281,8 @@ fn spawn_server_cert_renewal(
     tokio::spawn(async move {
         let mut not_before = std::time::SystemTime::now();
         loop {
-            let delay = identity::reissue_delay(std::time::SystemTime::now(), not_before, not_after);
+            let delay =
+                identity::reissue_delay(std::time::SystemTime::now(), not_before, not_after);
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|v| *v) => return,
@@ -386,12 +385,21 @@ async fn accept_agent(inner: Arc<Inner>, tcp: TcpStream) -> Result<(), ConnError
 }
 
 /// TLS + peer resolution + the WebSocket upgrade + the version preface.
-#[allow(clippy::type_complexity)]
+// The upgrade callback's `Err` type is fixed by tungstenite's `Callback` trait (an
+// `http::Response`); it cannot be boxed, hence the large-Err allow.
+#[allow(clippy::type_complexity, clippy::result_large_err)]
 async fn handshake(
     inner: &Arc<Inner>,
     tcp: TcpStream,
-) -> Result<(WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>, AgentPeer, Role, u8), ConnError>
-{
+) -> Result<
+    (
+        WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>,
+        AgentPeer,
+        Role,
+        u8,
+    ),
+    ConnError,
+> {
     let _ = tcp.set_nodelay(true);
     let acceptor = TlsAcceptor::from(inner.tls.borrow().clone());
     let tls = acceptor.accept(tcp).await.map_err(ConnError::Tls)?;
@@ -405,19 +413,17 @@ async fn handshake(
         peer_identity(leaf.as_ref())?
     };
 
+    // Only the two contracted paths exist; anything else is refused at the upgrade.
     let mut role = None;
     let ws = accept_hdr_async_with_config(
         tls,
-        |req: &Request, resp: Response| match req.uri().path() {
-            CONTROL_PATH => {
-                role = Some(Role::Control);
-                Ok(resp)
-            }
-            DIALBACK_PATH => {
-                role = Some(Role::DialBack);
-                Ok(resp)
-            }
-            _ => Err(ErrorResponse::new(None)),
+        |req: &Request, resp: Response| {
+            role = match req.uri().path() {
+                CONTROL_PATH => Some(Role::Control),
+                DIALBACK_PATH => Some(Role::DialBack),
+                _ => return Err(ErrorResponse::new(None)),
+            };
+            Ok(resp)
         },
         Some(crate::agent::ws_config(inner.max_frame_bytes)),
     )
@@ -503,12 +509,7 @@ fn negotiate(client: &ComponentInfo) -> Option<(u32, u32)> {
     if min.0 != max.0 {
         return None; // a range must never straddle majors (VERSIONING §3)
     }
-    version::resolve_common_version(
-        version::PROTOCOL_MIN,
-        version::PROTOCOL_MAX,
-        min,
-        max,
-    )
+    version::resolve_common_version(version::PROTOCOL_MIN, version::PROTOCOL_MAX, min, max)
 }
 
 // ---- control role -------------------------------------------------------------
@@ -531,7 +532,11 @@ where
     }
 
     let (tx, mut rx) = mpsc::channel::<ControlOut>(16);
-    let registration = match inner.deps.registry.register(&peer.node_name, &peer.agent_id, tx) {
+    let registration = match inner
+        .deps
+        .registry
+        .register(&peer.node_name, &peer.agent_id, tx)
+    {
         Ok(r) => r,
         Err(e) => {
             let err = ConnError::Registry(e);
@@ -721,20 +726,18 @@ where
 
     // (1)(2)(3) Envelope + signature over the transmitted bytes + this process's
     // signer + this Gateway + the validity window. Verify-then-decode.
-    let payload = inner
-        .deps
-        .signer
-        .verify(&auth.token, &inner.deps.gateway_id, now_epoch_secs())?;
+    let payload =
+        inner
+            .deps
+            .signer
+            .verify(&auth.token, &inner.deps.gateway_id, now_epoch_secs())?;
 
     // (5) The connection's mTLS identity IS the agent the token was issued to, and
     // that agent owns the node. A token captured by a different Agent — even a valid,
     // unlocked one — is worthless to it.
     if payload.agent_id != peer.agent_id
         || payload.node_name != peer.node_name
-        || !inner
-            .deps
-            .registry
-            .owns(&peer.agent_id, &payload.node_name)
+        || !inner.deps.registry.owns(&peer.agent_id, &payload.node_name)
     {
         return Err(ConnError::Token(TokenError::WrongAgent));
     }

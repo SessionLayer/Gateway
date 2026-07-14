@@ -253,7 +253,10 @@ mod tests {
         drop(listener);
         let dialer = AgentlessDial::new(Duration::from_millis(500));
         assert!(
-            dialer.connect(&agentless_dial(&addr.to_string())).await.is_err(),
+            dialer
+                .connect(&agentless_dial(&addr.to_string()))
+                .await
+                .is_err(),
             "an unreachable node must fail closed"
         );
     }

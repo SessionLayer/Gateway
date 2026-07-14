@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 lock,
                 common.clone(),
             ],
-            &[proto_root.clone()],
+            std::slice::from_ref(&proto_root),
         )?;
 
     // The wire payloads carry `ComponentInfo` / `ProtocolVersion` from the CP

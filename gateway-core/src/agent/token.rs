@@ -198,7 +198,10 @@ impl DialBackSigner {
         if payload.gateway_id != gateway_id {
             return Err(TokenError::WrongGateway);
         }
-        if payload.issued_at_epoch_seconds.saturating_sub(ISSUED_AT_SKEW_SECS) > now
+        if payload
+            .issued_at_epoch_seconds
+            .saturating_sub(ISSUED_AT_SKEW_SECS)
+            > now
             || now >= payload.not_after_epoch_seconds
         {
             return Err(TokenError::Expired);
@@ -316,7 +319,13 @@ impl PendingDialBacks {
     /// with `accepted = false`), so the Gateway need not wait out the deadline.
     /// Dropping the entry drops its sender, which wakes the waiting connector.
     pub fn fail_request(&self, request_id: &str) {
-        let jti = self.inner.lock().unwrap().by_request.get(request_id).cloned();
+        let jti = self
+            .inner
+            .lock()
+            .unwrap()
+            .by_request
+            .get(request_id)
+            .cloned();
         if let Some(jti) = jti {
             self.abandon(&jti);
         }
@@ -555,14 +564,11 @@ mod tests {
         // until its own timeout (that is the point of the fast-fail).
         let pending = PendingDialBacks::default();
         let (tx, rx) = oneshot::channel();
-        pending.insert(
-            "j".into(),
-            "req-j".into(),
-            binding(),
-            NOW + TTL,
-            tx,
-        );
+        pending.insert("j".into(), "req-j".into(), binding(), NOW + TTL, tx);
         pending.fail_request("req-j");
-        assert!(rx.blocking_recv().is_err(), "sender dropped => connector errors");
+        assert!(
+            rx.blocking_recv().is_err(),
+            "sender dropped => connector errors"
+        );
     }
 }

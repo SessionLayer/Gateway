@@ -52,8 +52,12 @@ const GW_NAME: &str = "gw-agent-e2e";
 async fn build_images() -> anyhow::Result<()> {
     build_image("ssh-client", CLIENT_IMAGE).await?;
     build_image("sshd", NODE_IMAGE).await?;
-    docker::build_image_with_args("agent-node", AGENT_NODE_IMAGE, &[("NODE_IMAGE", NODE_IMAGE)])
-        .await
+    docker::build_image_with_args(
+        "agent-node",
+        AGENT_NODE_IMAGE,
+        &[("NODE_IMAGE", NODE_IMAGE)],
+    )
+    .await
 }
 
 struct KeyMat {
@@ -100,7 +104,10 @@ async fn start_agent_node(
     .with_env_var("TRUSTED_USER_CA", cp.session_ca_public_line())
     .with_env_var(
         "AGENT_ENDPOINT",
-        format!("wss://{}:{gateway_port}", docker::container_reachable_host_ip()),
+        format!(
+            "wss://{}:{gateway_port}",
+            docker::container_reachable_host_ip()
+        ),
     )
     .with_env_var("AGENT_SERVER_NAME", GW_NAME)
     .with_env_var("AGENT_NODE_NAME", node_name)
@@ -220,7 +227,10 @@ async fn start_gateway(cp: &MockCp, recorder: RecorderChoice) -> anyhow::Result<
         signer,
         deps.lock_set.clone(),
         cred.gateway_id.clone(),
-        format!("wss://{}:{agent_port}", docker::container_reachable_host_ip()),
+        format!(
+            "wss://{}:{agent_port}",
+            docker::container_reachable_host_ip()
+        ),
         config.agent.dial_back_token_ttl_secs,
         Duration::from_secs(config.agent.dial_back_timeout_secs),
     ));
@@ -383,14 +393,8 @@ async fn ssh_runs_on_a_real_node_through_the_agent_path_in_a_mixed_fleet() -> an
 
     // The agent node: the CP declares OUTBOUND_AGENT and gives NO dial address. The
     // Gateway structurally cannot dial it — it can only signal its Agent.
-    let agent_node = start_agent_node(
-        &cp,
-        &agent_host_key,
-        gw.agent_port,
-        AGENT_NODE,
-        AGENT_ID,
-    )
-    .await?;
+    let agent_node =
+        start_agent_node(&cp, &agent_host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
     cp.set_agent_node_connection(
         AGENT_NODE,
         AGENT_NODE,
@@ -440,7 +444,11 @@ async fn ssh_runs_on_a_real_node_through_the_agent_path_in_a_mixed_fleet() -> an
         ),
     )
     .await;
-    assert_eq!(code, Some(0), "an interactive PTY must work over the splice");
+    assert_eq!(
+        code,
+        Some(0),
+        "an interactive PTY must work over the splice"
+    );
     assert!(
         stdout.contains("PTY_deploy"),
         "the PTY session runs as the inner-cert principal; stdout={stdout:?}"
@@ -613,15 +621,22 @@ async fn a_session_over_the_agent_path_is_still_recorded() -> anyhow::Result<()>
     // The customer holds the key: the platform seals to the public half and cannot read
     // the recording back (S9). We keep the private half only to prove that.
     let customer = p256::SecretKey::random(&mut OsRng);
-    let customer_pub = customer.public_key().to_public_key_der()?.as_bytes().to_vec();
-    cp.set_customer_key("cust-1", customer_pub, KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm);
+    let customer_pub = customer
+        .public_key()
+        .to_public_key_der()?
+        .as_bytes()
+        .to_vec();
+    cp.set_customer_key(
+        "cust-1",
+        customer_pub,
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
 
     let (_minio, s3) = docker::start_minio().await?;
     cp.set_s3_target(s3.clone());
 
     let gw = start_gateway(&cp, RecorderChoice::Real).await?;
-    let agent_node =
-        start_agent_node(&cp, &host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
+    let agent_node = start_agent_node(&cp, &host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
     cp.set_agent_node_connection(
         AGENT_NODE,
         AGENT_NODE,
@@ -642,7 +657,11 @@ async fn a_session_over_the_agent_path_is_still_recorded() -> anyhow::Result<()>
         ),
     )
     .await;
-    assert_eq!(code, Some(0), "the recorded agent session must run; {stderr}");
+    assert_eq!(
+        code,
+        Some(0),
+        "the recorded agent session must run; {stderr}"
+    );
     assert!(stdout.contains(marker));
 
     // The recorder tap is above the connector seam, so it sees the same bytes it always

@@ -57,7 +57,7 @@ impl<S> WsByteStream<S> {
 }
 
 fn ws_err(e: tokio_tungstenite::tungstenite::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 fn frame_err(e: FrameError) -> io::Error {
@@ -92,12 +92,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsByteStream<S> {
             };
             match msg {
                 Message::Binary(bytes) => {
-                    let frame = wire::decode(
-                        Bytes::copy_from_slice(&bytes),
-                        me.max_frame_bytes,
-                        me.ver,
-                    )
-                    .map_err(frame_err)?;
+                    let frame =
+                        wire::decode(Bytes::copy_from_slice(&bytes), me.max_frame_bytes, me.ver)
+                            .map_err(frame_err)?;
                     match frame.msg_type {
                         MsgType::StreamData => me.pending = frame.payload,
                         MsgType::StreamClose => {
@@ -117,9 +114,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsByteStream<S> {
                 // tungstenite answers a WebSocket Ping itself on the next flush.
                 Message::Ping(_) | Message::Pong(_) => {}
                 Message::Text(_) => return Poll::Ready(Err(frame_err(FrameError::NotBinary))),
-                Message::Frame(_) => {
-                    return Poll::Ready(Err(frame_err(FrameError::UnknownType)))
-                }
+                Message::Frame(_) => return Poll::Ready(Err(frame_err(FrameError::UnknownType))),
             }
         }
     }
@@ -256,7 +251,11 @@ mod tests {
         ))))
         .await
         .unwrap();
-        assert_eq!(stream.read(&mut buf).await.unwrap(), 0, "STREAM_CLOSE = EOF");
+        assert_eq!(
+            stream.read(&mut buf).await.unwrap(),
+            0,
+            "STREAM_CLOSE = EOF"
+        );
 
         // An orderly WebSocket close is the same end-of-stream.
         let (mut stream, mut peer) = pair().await;
@@ -321,8 +320,9 @@ mod tests {
         // A peer that never reads must NOT let the Gateway buffer without bound: once
         // the socket is full, poll_write is Pending (F-bridge-backpressure).
         let (a, _b) = tokio::io::duplex(512);
-        let ws = WebSocketStream::from_raw_socket(a, Role::Server, Some(super::super::ws_config(MAX)))
-            .await;
+        let ws =
+            WebSocketStream::from_raw_socket(a, Role::Server, Some(super::super::ws_config(MAX)))
+                .await;
         let mut stream = WsByteStream::new(ws, VER, MAX);
 
         let mut written = 0usize;

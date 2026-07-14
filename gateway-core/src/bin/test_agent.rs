@@ -9,7 +9,10 @@ use clap::Parser;
 use gateway_core::agent::testclient::AgentClient;
 
 #[derive(Parser, Debug)]
-#[command(name = "test-agent", about = "Test-only SessionLayer Agent (wire contract client)")]
+#[command(
+    name = "test-agent",
+    about = "Test-only SessionLayer Agent (wire contract client)"
+)]
 struct Cli {
     /// `wss://host:port` of the Gateway's agent transport.
     #[arg(long)]
@@ -87,7 +90,9 @@ async fn main() -> anyhow::Result<()> {
 /// is owned by the process's own UID.
 fn is_root() -> bool {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").map(|m| m.uid() == 0).unwrap_or(false)
+    std::fs::metadata("/proc/self")
+        .map(|m| m.uid() == 0)
+        .unwrap_or(false)
 }
 
 fn pem_certs(path: &std::path::Path) -> anyhow::Result<Vec<Vec<u8>>> {

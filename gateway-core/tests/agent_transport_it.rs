@@ -151,7 +151,10 @@ impl Harness {
     fn spawn_control(
         &self,
         client: &AgentClient,
-    ) -> (tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<bool>) {
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
         let (tx, mut rx) = tokio::sync::watch::channel(false);
         let c = client.clone();
         let task = tokio::spawn(async move {
@@ -231,7 +234,10 @@ async fn an_agent_registers_over_real_mtls_and_the_dial_back_splices_bytes() {
 
     let mut buf = [0u8; 15];
     stream.read_exact(&mut buf).await.unwrap();
-    assert_eq!(&buf, b"SSH-2.0-probe\r\n", "bytes cross the splice verbatim");
+    assert_eq!(
+        &buf, b"SSH-2.0-probe\r\n",
+        "bytes cross the splice verbatim"
+    );
 
     // The token was consumed by the dial-back: nothing is left redeemable.
     assert!(h.pending.is_empty());
@@ -263,7 +269,10 @@ async fn a_locked_agent_cannot_register() {
         wire::as_wire_error(&frame).unwrap().code,
         WireErrorCode::Unauthorized as i32
     );
-    assert!(h.registry.is_empty(), "a locked agent must not be registered");
+    assert!(
+        h.registry.is_empty(),
+        "a locked agent must not be registered"
+    );
 
     // …and its node is therefore simply offline.
     assert!(matches!(
@@ -368,7 +377,10 @@ async fn capture_dial_back(
         let _keep = ws;
         std::future::pending::<()>().await;
     });
-    assert!(!h.pending.is_empty(), "the captured token must still be live");
+    assert!(
+        !h.pending.is_empty(),
+        "the captured token must still be live"
+    );
     req
 }
 
@@ -458,7 +470,8 @@ async fn an_expired_token_is_refused() {
     // but long dead. The window is checked independently of the ledger.
     let (jti, token) = h.signer.mint(&h.gateway_id, &binding, 30, now - 3600);
     let (tx, _rx) = tokio::sync::oneshot::channel();
-    h.pending.insert(jti, "req-old".into(), binding, now + 30, tx);
+    h.pending
+        .insert(jti, "req-old".into(), binding, now + 30, tx);
 
     let req = gateway_core::pbagent::DialBackRequest {
         request_id: "req-old".into(),
@@ -490,7 +503,11 @@ async fn a_locked_agent_cannot_redeem_a_dial_back_issued_before_the_lock() {
     });
 
     assert_unauthorized(&redeem(&h, &client, &req).await);
-    assert_eq!(h.pending.len(), 1, "a locked redemption does not consume it");
+    assert_eq!(
+        h.pending.len(),
+        1,
+        "a locked redemption does not consume it"
+    );
 }
 
 // ── Framing / protocol guards ───────────────────────────────────────────────
@@ -500,7 +517,10 @@ async fn an_unknown_request_path_is_rejected() {
     let h = Harness::start().await;
     let client = h.agent(AGENT, NODE);
     assert!(
-        client.connect(&h.endpoint, "/agent/v1/admin").await.is_err(),
+        client
+            .connect(&h.endpoint, "/agent/v1/admin")
+            .await
+            .is_err(),
         "only the two contracted paths exist"
     );
     assert!(client.connect(&h.endpoint, "/").await.is_err());
