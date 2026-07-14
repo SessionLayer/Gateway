@@ -19,6 +19,8 @@ pub mod dial;
 pub mod registry;
 pub mod server;
 pub mod stream;
+#[cfg(feature = "test-agent")]
+pub mod testclient;
 pub mod token;
 pub mod wire;
 

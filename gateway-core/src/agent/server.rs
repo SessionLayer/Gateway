@@ -128,16 +128,8 @@ impl BoundAgentTransport {
                         Ok((tcp, peer)) => {
                             let inner = inner.clone();
                             tokio::spawn(async move {
-                                // The whole TLS + WS + preface handshake is bounded, so
-                                // a peer that connects and stalls cannot hold a slot.
-                                let bound = tokio::time::timeout(
-                                    inner.handshake_timeout,
-                                    accept_agent(inner.clone(), tcp),
-                                ).await;
-                                match bound {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(e)) => tracing::info!(peer = %peer, error = %e, "agent connection refused"),
-                                    Err(_) => tracing::info!(peer = %peer, "agent handshake timed out"),
+                                if let Err(e) = accept_agent(inner, tcp).await {
+                                    tracing::info!(peer = %peer, error = %e, "agent connection refused");
                                 }
                             });
                         }
@@ -354,6 +346,8 @@ enum ConnError {
     NoCommonVersion,
     #[error("connection closed before the preface completed")]
     Closed,
+    #[error("handshake did not complete within the bound")]
+    HandshakeTimeout,
     #[error("registry: {0}")]
     Registry(#[from] RegistryError),
     #[error("dial-back token: {0}")]
@@ -376,7 +370,28 @@ impl ConnError {
     }
 }
 
+/// Accept one agent connection: bound the **handshake** (TLS + WebSocket + preface), then
+/// run the role for as long as it lives. The bound covers only the handshake — a control
+/// channel is long-lived by design, and a spliced dial-back runs for the whole session.
 async fn accept_agent(inner: Arc<Inner>, tcp: TcpStream) -> Result<(), ConnError> {
+    let (ws, peer, role, ver) =
+        match tokio::time::timeout(inner.handshake_timeout, handshake(&inner, tcp)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(ConnError::HandshakeTimeout),
+        };
+    match role {
+        Role::Control => run_control(ws, inner, peer, ver).await,
+        Role::DialBack => run_dial_back(ws, inner, peer, ver).await,
+    }
+}
+
+/// TLS + peer resolution + the WebSocket upgrade + the version preface.
+#[allow(clippy::type_complexity)]
+async fn handshake(
+    inner: &Arc<Inner>,
+    tcp: TcpStream,
+) -> Result<(WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>, AgentPeer, Role, u8), ConnError>
+{
     let _ = tcp.set_nodelay(true);
     let acceptor = TlsAcceptor::from(inner.tls.borrow().clone());
     let tls = acceptor.accept(tcp).await.map_err(ConnError::Tls)?;
@@ -389,10 +404,6 @@ async fn accept_agent(inner: Arc<Inner>, tcp: TcpStream) -> Result<(), ConnError
         let leaf = certs.first().ok_or(PeerError::NoCertificate)?;
         peer_identity(leaf.as_ref())?
     };
-
-    // Deny wins (§8.4): a locked agent identity cannot register — and, re-checked
-    // below, cannot redeem a dial-back either.
-    refuse_if_locked(&inner, &peer)?;
 
     let mut role = None;
     let ws = accept_hdr_async_with_config(
@@ -415,19 +426,14 @@ async fn accept_agent(inner: Arc<Inner>, tcp: TcpStream) -> Result<(), ConnError
     let role = role.ok_or(ConnError::UnknownPath)?;
 
     let mut ws = ws;
-    let ver = match preface(&mut ws, &inner).await {
+    let ver = match preface(&mut ws, inner).await {
         Ok(ver) => ver,
         Err(e) => {
             let _ = send_error(&mut ws, version::PROTOCOL_MAX.0 as u8, &e).await;
             return Err(e);
         }
     };
-
-    let outcome = match role {
-        Role::Control => run_control(ws, inner, peer, ver).await,
-        Role::DialBack => run_dial_back(ws, inner, peer, ver).await,
-    };
-    outcome
+    Ok((ws, peer, role, ver))
 }
 
 fn refuse_if_locked(inner: &Inner, peer: &AgentPeer) -> Result<(), ConnError> {
@@ -516,6 +522,14 @@ async fn run_control<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // Deny wins (§8.4): a locked agent identity cannot register — and, re-checked at
+    // every dial-back and on every heartbeat, cannot stay registered either.
+    if let Err(e) = refuse_if_locked(&inner, &peer) {
+        let _ = send_error(&mut ws, ver, &e).await;
+        let _ = ws.close(None).await;
+        return Err(e);
+    }
+
     let (tx, mut rx) = mpsc::channel::<ControlOut>(16);
     let registration = match inner.deps.registry.register(&peer.node_name, &peer.agent_id, tx) {
         Ok(r) => r,
@@ -639,7 +653,16 @@ async fn run_dial_back<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ready = match authorize_dial_back(&mut ws, &inner, &peer, ver).await {
+    // Every pre-splice round-trip with the Agent is bounded (the S8 lesson): a peer that
+    // opens a dial-back and then stalls must not hold the pending session open.
+    let authorized = tokio::time::timeout(
+        inner.handshake_timeout,
+        authorize_dial_back(&mut ws, &inner, &peer, ver),
+    )
+    .await
+    .unwrap_or(Err(ConnError::HandshakeTimeout));
+
+    let ready = match authorized {
         Ok(ready) => ready,
         Err(e) => {
             // Any failure ⇒ ERROR(UNAUTHORIZED) + close. The specific reason goes to
@@ -657,8 +680,14 @@ where
     };
 
     // The stream is handed to the inner leg ONLY after STREAM_OPEN — i.e. only once
-    // the Agent's loopback splice is actually live, never before.
-    let frame = next_frame(&mut ws, inner.max_frame_bytes, ver).await?;
+    // the Agent's loopback splice is actually live, never before. Bounded: an Agent that
+    // accepts the token and then never opens must not park the session.
+    let frame = tokio::time::timeout(
+        inner.handshake_timeout,
+        next_frame(&mut ws, inner.max_frame_bytes, ver),
+    )
+    .await
+    .unwrap_or(Err(ConnError::HandshakeTimeout))?;
     if frame.msg_type != MsgType::StreamOpen {
         let e = ConnError::Frame(FrameError::UnknownType);
         let _ = send_error(&mut ws, ver, &e).await;
