@@ -77,6 +77,13 @@ change the contract.**
   as the handshake-smoke legacy endpoint. **Ports** (dev, parent Makefile): CP
   REST `:8080`, CP mTLS gRPC `:9443`, Postgres `:5432`, NATS `:4222/:8222`,
   MinIO `:9000/:9001`, oidc-mock `:8090`, target-sshd `:2222`.
+- **Agent transport** (Session Fourteen) at `:9444` (dev) — the Gateway's **only
+  TLS server**: `wss://`, TLS 1.3, **client certificate required** (the internal
+  mTLS CA). Agents dial OUT to it. Off by default (`ssh.agent.listen_addr` empty),
+  and an `OUTBOUND_AGENT` node is then simply offline (never a silent fallback to
+  an agentless dial). Wire contract:
+  `../ControlPlane-API/contracts/wire/agent-gateway-v1.md`; payloads are generated
+  into `gateway_core::pbagent` from the vendored `proto/sessionlayer/agent/v1/`.
 - Structured logging via `tracing` (`RUST_LOG`, default `info`). Never log
   plaintext — and never log SSH secrets/keys/OTP/tokens (Session Seven).
 - Edition 2021, toolchain pinned in `rust-toolchain.toml` (`1.95.0`).

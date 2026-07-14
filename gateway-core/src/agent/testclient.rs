@@ -152,7 +152,6 @@ impl AgentClient {
                 .ok_or_else(|| anyhow::anyhow!("connection closed"))??;
             match msg {
                 Message::Binary(bytes) => {
-                    let bytes = bytes::Bytes::copy_from_slice(&bytes);
                     // The preface reply may carry the Gateway's own major; accept the
                     // byte as-is and let the caller judge.
                     let seen = *bytes.first().unwrap_or(&ver);
@@ -185,7 +184,7 @@ impl AgentClient {
                 msg = ws.next() => {
                     let Some(msg) = msg else { return Ok(()) };
                     let Message::Binary(bytes) = msg? else { continue };
-                    let frame = wire::decode(bytes::Bytes::copy_from_slice(&bytes), negotiated.max_frame_bytes, ver)?;
+                    let frame = wire::decode(bytes, negotiated.max_frame_bytes, ver)?;
                     match frame.msg_type {
                         MsgType::Ping => {
                             let nonce = wire::as_ping(&frame)?.nonce;

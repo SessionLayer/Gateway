@@ -50,3 +50,50 @@ alert with the Gateway's session by `session_id`.
 - A break-glass session is **time-boxed**: `break_glass.mid_session_expiry` must be
   `grace_then_kill` or `hard_kill` (never `run_to_ttl` — startup rejects it). A Lock
   always overrides with immediate teardown.
+
+## Outbound-agent transport (Session Fourteen; Design §9.2, FR-CONN-1/2/3, FR-HA-8)
+
+An `OUTBOUND_AGENT` node is never dialled by the Gateway. Its Agent dials **out** to
+`ssh.agent.listen_addr` (dev `:9444`) over `wss://` with mutual TLS, registers a control
+channel, and — when signalled — dials back and splices the session to its own
+`127.0.0.1:22`. The node needs **zero inbound reachability**.
+
+### Configuration (fail-closed; startup rejects a bad combination)
+
+- `ssh.agent.listen_addr` — empty (default) disables the transport. An `OUTBOUND_AGENT`
+  node is then simply **offline** — never a silent fallback to an agentless dial.
+- `ssh.agent.advertise_url` — the `wss://` URL agents dial back to. **Required when
+  `listen_addr` binds a wildcard** (`0.0.0.0`/`::`): the address rides in the signal, so
+  advertising `0.0.0.0` would leave the whole agent fleet unreachable. Startup aborts.
+- `max_frame_bytes` (64 KiB) must exceed `inner.max_packet_bytes`; `dial_back_timeout_secs`
+  must be less than `dial_back_token_ttl_secs`. Both are checked at startup.
+
+The Gateway obtains its agent-facing **serverAuth** certificate from the CP
+(`GatewayIdentity.IssueGatewayServerCertificate`) over a separate, never-persisted
+keypair. If the CP will not issue one, the transport does **not** start: an Agent must be
+able to verify this Gateway, and there is no TOFU on this path either.
+
+### Log outcomes / reasons
+
+- `"no agent is connected for this node"` / `"the agent refused or could not serve the
+  dial-back"` / `"node dial timed out"` — the user always sees the single generic §7.1
+  outcome ("target node is offline or unavailable"). Check whether the node's Agent is
+  registered (a control channel is logged as "agent control channel registered").
+- `"agent missed two heartbeats; deregistering"` — the Agent is gone (network or process
+  death); its node is unreachable until it reconnects. Reconnection is the Agent's job.
+- `"control channel superseded by a newer connection"` — normal after an Agent reconnect
+  (e.g. a partition healed). The newer connection wins by design; a stale channel must
+  never lock a node out.
+- `"refusing a locked agent (deny wins)"` / `"dial-back refused (fail closed)"` — a Lock
+  covers this agent identity, or a dial-back token failed one of its bindings. The agent
+  sees only the coarse `UNAUTHORIZED`; the specific reason is here, in the operator log.
+  A dial-back token is **never** logged, persisted, or echoed.
+
+### Node-local second trail (FR-AUD-4)
+
+In the agent model the node's own `sshd` log is a **tamper-independent** second record:
+the Gateway's inner certificate carries `key_id = session_id + principal`, and a node
+running `LogLevel VERBOSE` logs that key-id on every accepted certificate. The two trails
+cross-correlate on the session id with **no trust in the Agent** — which is exactly what
+makes the second trail independent. To investigate a session on the node:
+`journalctl -u ssh | grep '<session_id>'`.

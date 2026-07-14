@@ -460,6 +460,15 @@ async fn start_agent_transport(
     .await?;
     let local_addr = transport.local_addr();
     let advertise = agent::server::advertise_url(acfg, local_addr);
+    // The dial-back address rides in the signal (contract §5), so it must be an address an
+    // Agent can actually dial. A wildcard bind with no explicit `advertise_url` would send
+    // every Agent to `0.0.0.0` and leave the whole agent fleet silently unreachable — fail
+    // closed at startup instead of discovering it one dead session at a time.
+    if local_addr.ip().is_unspecified() && acfg.advertise_url.is_empty() {
+        anyhow::bail!(
+            "ssh.agent.listen_addr binds a wildcard address ({local_addr}); set ssh.agent.advertise_url to the wss:// URL agents should dial back to"
+        );
+    }
     tracing::info!(addr = %local_addr, advertise = %advertise, "outbound-agent transport started");
 
     let mut sd = shutdown;

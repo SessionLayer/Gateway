@@ -91,10 +91,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsByteStream<S> {
                 }
             };
             match msg {
+                // `Message::Binary` already owns a `bytes::Bytes` (tungstenite re-exports
+                // it), so the frame — and the STREAM_DATA payload the reader takes from it
+                // — is sliced, never copied. This is the session hot path.
                 Message::Binary(bytes) => {
                     let frame =
-                        wire::decode(Bytes::copy_from_slice(&bytes), me.max_frame_bytes, me.ver)
-                            .map_err(frame_err)?;
+                        wire::decode(bytes, me.max_frame_bytes, me.ver).map_err(frame_err)?;
                     match frame.msg_type {
                         MsgType::StreamData => me.pending = frame.payload,
                         MsgType::StreamClose => {

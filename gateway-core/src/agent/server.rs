@@ -770,11 +770,7 @@ fn to_frame(
     ver: u8,
 ) -> Result<Option<Frame>, ConnError> {
     match msg.map_err(ConnError::Handshake)? {
-        Message::Binary(bytes) => Ok(Some(wire::decode(
-            bytes::Bytes::copy_from_slice(&bytes),
-            max_frame_bytes,
-            ver,
-        )?)),
+        Message::Binary(bytes) => Ok(Some(wire::decode(bytes, max_frame_bytes, ver)?)),
         Message::Ping(_) | Message::Pong(_) => Ok(None),
         Message::Close(_) => Err(ConnError::Closed),
         Message::Text(_) => Err(ConnError::Frame(FrameError::NotBinary)),
@@ -811,7 +807,6 @@ where
         let msg = ws.next().await.ok_or(ConnError::Closed)?;
         match msg.map_err(ConnError::Handshake)? {
             Message::Binary(bytes) => {
-                let bytes = bytes::Bytes::copy_from_slice(&bytes);
                 let ver = *bytes.first().ok_or(ConnError::Frame(FrameError::Short))?;
                 return Ok(wire::decode(bytes, max_frame_bytes, ver)?);
             }
