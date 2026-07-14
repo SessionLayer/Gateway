@@ -204,6 +204,9 @@ struct IssuedCredential {
 pub struct KeypairCsr {
     /// PEM of the private key (never leaves the Gateway; zeroized on drop).
     pub key_pem: Zeroizing<String>,
+    /// PKCS#8 DER of the same private key — what a rustls `ServerConfig` takes
+    /// directly (the agent transport's serverAuth leaf, Session Fourteen).
+    pub key_pkcs8_der: Zeroizing<Vec<u8>>,
     /// The PKCS#10 CertificationRequest, DER.
     pub csr_der: Vec<u8>,
 }
@@ -212,6 +215,7 @@ impl std::fmt::Debug for KeypairCsr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeypairCsr")
             .field("key_pem", &"<redacted>")
+            .field("key_pkcs8_der", &"<redacted>")
             .field("csr_der_len", &self.csr_der.len())
             .finish()
     }
@@ -220,12 +224,16 @@ impl std::fmt::Debug for KeypairCsr {
 /// Generate a fresh ECDSA P-256 keypair and a PKCS#10 CSR whose subject
 /// alternative name is `gateway_name`. The private key stays local; only the CSR
 /// (public key + proof of possession) is ever sent (D2/§15).
+///
+/// Each call generates a **fresh** keypair, which is what gives the agent-facing
+/// serverAuth leaf key separation from the mTLS client identity.
 pub fn generate_keypair_and_csr(gateway_name: &str) -> Result<KeypairCsr, IdentityError> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let params = rcgen::CertificateParams::new(vec![gateway_name.to_string()])?;
     let csr = params.serialize_request(&key)?;
     Ok(KeypairCsr {
         key_pem: Zeroizing::new(key.serialize_pem()),
+        key_pkcs8_der: Zeroizing::new(key.serialize_der()),
         csr_der: csr.der().to_vec(),
     })
 }
@@ -547,7 +555,7 @@ fn systemtime_from_epoch(epoch_seconds: i64) -> Option<SystemTime> {
 /// a panic, and (used in `persist_issued` before the write) never persisted to
 /// disk, so a hostile response can't brick the Gateway into a load-time
 /// crash-loop (NFR-2).
-fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), IdentityError> {
+pub fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), IdentityError> {
     if nb < 0 || na < 0 {
         return Err(IdentityError::Corrupt(format!(
             "certificate validity epoch is negative (not_before {nb}, not_after {na})"
@@ -566,6 +574,41 @@ fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), Identi
 }
 
 // ---- renew-ahead loop ---------------------------------------------------------
+
+/// Minimum spacing between two *consecutive* successful renewals.
+///
+/// After a renewal the loop re-derives its schedule from the NEW certificate. If that
+/// certificate is already past its renew trigger — a short TTL with a clock-skew
+/// backdate (FR-BOOT-4), an inverted window, or a CP clock ahead of ours —
+/// [`compute_renew_delay`] returns `ZERO` and the loop would renew back-to-back,
+/// hammering the CP and burning generations. Flooring the *post-renewal* wait bounds
+/// that to ≈1 renewal/min. (The Agent hit this in S12; the Gateway shared the bug.)
+const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Apply the post-renewal minimum-interval floor, never delaying past expiry (the
+/// floor is capped at half the remaining TTL). Pure, for unit testing.
+fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
+    base.max(RENEW_MIN_INTERVAL.min(remaining / 2))
+}
+
+/// When to re-issue a certificate that is NOT the persisted identity — the
+/// agent-facing serverAuth leaf (Session Fourteen), which is held only in memory.
+///
+/// Same renew-ahead schedule as the identity (2/3 of TTL, jittered), always floored:
+/// this is called immediately after an issue, so it is by definition the
+/// post-success case the floor exists for.
+pub fn reissue_delay(now: SystemTime, not_before: SystemTime, not_after: SystemTime) -> Duration {
+    let base = compute_renew_delay(
+        now,
+        not_before,
+        not_after,
+        2.0 / 3.0,
+        0.1,
+        random_jitter_sample(),
+    );
+    let remaining = not_after.duration_since(now).unwrap_or(Duration::ZERO);
+    floor_after_renew(base, remaining)
+}
 
 /// A handle to trigger a renewal on demand and to observe the current credential.
 ///
@@ -648,9 +691,10 @@ impl RenewAhead {
     /// renews with persist-before-adopt and publishes the new credential. A
     /// generation-mismatch security event stops the loop (fail closed).
     pub async fn run(mut self, mut shutdown: impl std::future::Future<Output = ()> + Unpin) {
+        let mut just_renewed = false;
         loop {
             let current = self.current_rx.borrow().clone();
-            let delay = compute_renew_delay(
+            let base = compute_renew_delay(
                 SystemTime::now(),
                 current.not_before,
                 current.not_after,
@@ -658,6 +702,19 @@ impl RenewAhead {
                 self.config.renew_jitter_fraction,
                 random_jitter_sample(),
             );
+            // A credential loaded near expiry SHOULD renew at once, so the floor applies
+            // only after a successful renewal — where a zero delay would be a hot spin
+            // against the CP rather than a legitimate catch-up.
+            let delay = if just_renewed {
+                let remaining = current
+                    .not_after
+                    .duration_since(SystemTime::now())
+                    .unwrap_or(Duration::ZERO);
+                floor_after_renew(base, remaining)
+            } else {
+                base
+            };
+            just_renewed = false;
 
             tokio::select! {
                 biased;
@@ -681,6 +738,7 @@ impl RenewAhead {
                         "renewed mTLS identity (persist-before-adopt)"
                     );
                     let _ = self.current_tx.send(std::sync::Arc::new(new_cred));
+                    just_renewed = true;
                 }
                 Err(IdentityError::GenerationMismatch { expected, got }) => {
                     // Security event (§8.2): refuse + flag + stop. Do NOT keep
@@ -793,6 +851,44 @@ mod tests {
         assert!(
             delay <= Duration::from_secs(285),
             "must renew before expiry, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn floor_after_renew_bounds_a_busy_renew_but_never_delays_past_expiry() {
+        // The bug: a certificate born past its own renew trigger yields a ZERO delay,
+        // so the post-renewal loop would spin on the CP.
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::from_secs(3600)),
+            RENEW_MIN_INTERVAL
+        );
+        // A healthy schedule is untouched.
+        assert_eq!(
+            floor_after_renew(Duration::from_secs(600), Duration::from_secs(3600)),
+            Duration::from_secs(600)
+        );
+        // Near expiry the floor is capped at half the remaining TTL, so flooring can
+        // never push a renewal past the certificate's own expiry.
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn reissue_delay_is_always_floored() {
+        // The server-certificate schedule: a zero-TTL-fraction window must not spin.
+        let now = SystemTime::now();
+        let delay = reissue_delay(now, now, now + Duration::from_secs(3600));
+        assert!(delay >= RENEW_MIN_INTERVAL, "got {delay:?}");
+        // An already-expired window yields zero remaining => no delay to floor.
+        assert_eq!(
+            reissue_delay(now, now - Duration::from_secs(10), now),
+            Duration::ZERO
         );
     }
 

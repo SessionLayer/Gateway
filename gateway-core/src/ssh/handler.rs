@@ -38,8 +38,8 @@ use crate::config::SshServerConfig;
 use crate::cpauth::{CpAuthClient, CpError};
 use crate::decisionctx;
 use crate::pb::{
-    AccessModel, AuthorizeRequest, Capability, Decision, DecisionContext, DeviceFlowStatus,
-    ResolvedIdentity, SignContext,
+    AccessModel, AuthorizeRequest, Capability, ConnectorKind, Decision, DecisionContext,
+    DeviceFlowStatus, ResolvedIdentity, SignContext,
 };
 use crate::signing::InnerKeyPair;
 use crate::ssh::bridge::{
@@ -1037,6 +1037,16 @@ impl SshHandler {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = "node_unreachable", reason = "no_host_verification_material", "aborting: node has no host-verification anchor (never TOFU)");
                     return Err(SshOutcome::NodeUnreachable);
                 }
+                // Per-node connector selection (Session Fourteen, FR-CONN-3). An
+                // OUTBOUND_AGENT node is joined to its Agent by the CP-stamped
+                // enrollment NAME; without one there is no join key, so fail closed to
+                // node-offline rather than dial anything.
+                if nc.connector_kind == ConnectorKind::OutboundAgent as i32
+                    && nc.node_name.is_empty()
+                {
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = "node_unreachable", reason = "agent_node_without_name", "outbound-agent node has no enrollment name; failing closed");
+                    return Err(SshOutcome::NodeUnreachable);
+                }
                 // Part A: trust the decision context only because its signature
                 // verifies (chain to the pinned internal mTLS CA + signer marker +
                 // codeSigning EKU + ECDSA-P256/SHA-256). Fail closed on any doubt.
@@ -1092,6 +1102,10 @@ impl SshHandler {
                     dial: NodeDial {
                         node_id,
                         dial_address: nc.dial_address,
+                        connector_kind: nc.connector_kind,
+                        node_name: nc.node_name,
+                        session_id: self.session_id.clone(),
+                        principal: target.login.clone(),
                     },
                     trust,
                     grant: SessionGrant {
@@ -1125,10 +1139,12 @@ impl SshHandler {
     /// no TOFU), and authenticate. Fail-closed with the §7.1 outcome at every step;
     /// a host-verification abort is generic to the user, specific in the log.
     async fn establish_inner(&self, authz: &Authorized) -> Result<InnerClient, SshOutcome> {
+        // The connector is selected per node (agentless dial vs outbound-agent
+        // dial-back); everything below this line is identical either way (D21/D23).
         let stream = match self.deps.connector.connect(&authz.dial).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "node_unreachable", "agentless dial failed");
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, connector_kind = authz.dial.connector_kind, error = %e, outcome = "node_unreachable", "node connect failed");
                 return Err(SshOutcome::NodeUnreachable);
             }
         };

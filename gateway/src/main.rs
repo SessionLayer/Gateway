@@ -11,6 +11,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gateway_core::{
+    agent,
     asyncio::{self, IoBackend},
     config::GatewayConfig,
     cpauth, handshake, health, identity, mtls, ssh, tls,
@@ -375,11 +376,28 @@ async fn start_outer_leg(
         cfg.ssh.recorder.clone(),
     )?);
     let finalize_tracker = ssh::recorder::FinalizeTracker::default();
-    let deps = ssh::handler::HandlerDeps {
-        cpauth,
-        connector: Arc::new(ssh::connector::AgentlessDial::new(Duration::from_secs(
+
+    // Session Fourteen: the outbound-agent transport (Design §9.2). Started only when
+    // configured; a node whose inventory declares OUTBOUND_AGENT is otherwise simply
+    // offline (fail closed — never a silent fallback to an agentless dial).
+    let agent_connector = start_agent_transport(
+        cfg,
+        &renew.current(),
+        cpauth.clone(),
+        lock_set.clone(),
+        shutdown.clone(),
+    )
+    .await?;
+
+    let connector = Arc::new(ssh::connector::DispatchConnector::new(
+        Arc::new(ssh::connector::AgentlessDial::new(Duration::from_secs(
             ssh_cfg.inner.connect_timeout_secs,
         ))),
+        agent_connector,
+    ));
+    let deps = ssh::handler::HandlerDeps {
+        cpauth,
+        connector,
         resolver: Arc::new(ssh::target::IdentityResolver),
         recorder_factory,
         finalize_tracker: finalize_tracker.clone(),
@@ -399,6 +417,70 @@ async fn start_outer_leg(
             .await;
     });
     Ok(Some(finalize_tracker))
+}
+
+/// Start the outbound-agent WSS transport if `ssh.agent.listen_addr` is configured,
+/// returning the agent `NodeConnector` to dispatch OUTBOUND_AGENT nodes to.
+///
+/// Fail-closed: if the transport is configured but cannot stand up (the CP will not
+/// issue the agent-facing serverAuth leaf, the port is taken), startup **aborts** —
+/// running the SSH front door while every agent node is silently unreachable would be
+/// a worse failure than not starting.
+async fn start_agent_transport(
+    cfg: &GatewayConfig,
+    cred: &identity::Credential,
+    cpauth: Arc<cpauth::CpAuthClient>,
+    lock_set: Arc<ssh::locks::LockSet>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<Arc<dyn ssh::connector::NodeConnector>>> {
+    let acfg = &cfg.ssh.agent;
+    if acfg.listen_addr.is_empty() {
+        return Ok(None);
+    }
+
+    let registry = Arc::new(agent::registry::AgentRegistry::new(acfg.max_agents));
+    let pending = Arc::new(agent::token::PendingDialBacks::default());
+    // Per-process, in-memory, never persisted: a token from a previous boot or another
+    // Gateway cannot be redeemed here (contract §6).
+    let signer = Arc::new(agent::token::DialBackSigner::generate());
+
+    let transport = agent::server::bind(
+        agent::server::AgentTransportDeps {
+            cpauth,
+            gateway_id: cred.gateway_id.clone(),
+            gateway_name: cred.gateway_name.clone(),
+            registry: registry.clone(),
+            pending: pending.clone(),
+            signer: signer.clone(),
+            lock_set: lock_set.clone(),
+            config: acfg.clone(),
+        },
+        shutdown.clone(),
+    )
+    .await?;
+    let local_addr = transport.local_addr();
+    let advertise = agent::server::advertise_url(acfg, local_addr);
+    tracing::info!(addr = %local_addr, advertise = %advertise, "outbound-agent transport started");
+
+    let mut sd = shutdown;
+    tokio::spawn(async move {
+        transport
+            .run(async move {
+                let _ = sd.wait_for(|v| *v).await;
+            })
+            .await;
+    });
+
+    Ok(Some(Arc::new(agent::dial::AgentDial::new(
+        registry,
+        pending,
+        signer,
+        lock_set,
+        cred.gateway_id.clone(),
+        advertise,
+        acfg.dial_back_token_ttl_secs,
+        Duration::from_secs(acfg.dial_back_timeout_secs),
+    ))))
 }
 
 /// Snapshot a credential for the CP channel factory (leaf/key + trust anchors).

@@ -40,10 +40,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (LockFeed: StreamLocks — server-streaming). The Gateway is a client; the
     // server side is generated for the in-process mock CP.
     let lock = proto_root.join("sessionlayer/controlplane/v1/lock.proto");
+    // Session Fourteen addition (frozen upstream): the Agent <-> Gateway wire
+    // payloads. NOT gRPC — these are the payloads of a framed binary protocol over
+    // a mutually-authenticated WebSocket, and the Control Plane is not a party to
+    // it (contracts/wire/agent-gateway-v1.md).
+    let agent_wire = proto_root.join("sessionlayer/agent/v1/wire.proto");
 
     // Regenerate only when the vendored contract (or this script) changes.
     for p in [
-        &common, &handshake, &identity, &signing, &authz, &auth, &recording, &lock,
+        &common,
+        &handshake,
+        &identity,
+        &signing,
+        &authz,
+        &auth,
+        &recording,
+        &lock,
+        &agent_wire,
     ] {
         println!("cargo:rerun-if-changed={}", p.display());
     }
@@ -57,10 +70,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .compile_protos(
             &[
-                handshake, identity, signing, authz, auth, recording, lock, common,
+                handshake,
+                identity,
+                signing,
+                authz,
+                auth,
+                recording,
+                lock,
+                common.clone(),
             ],
-            &[proto_root],
+            &[proto_root.clone()],
         )?;
+
+    // The wire payloads carry `ComponentInfo` / `ProtocolVersion` from the CP
+    // package. `extern_path` points those at the types already generated above
+    // (`crate::pb`) instead of emitting a second, incompatible copy.
+    tonic_prost_build::configure()
+        .build_client(false)
+        .build_server(false)
+        .extern_path(".sessionlayer.controlplane.v1", "crate::pb")
+        .compile_protos(&[agent_wire], &[proto_root])?;
 
     Ok(())
 }

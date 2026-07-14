@@ -196,6 +196,19 @@ message NodeConnection {
   // absent, or carries neither a host-CA key nor a pinned key, the Gateway
   // aborts the session (fail closed).
   HostVerification host_verification = 3;
+
+  // The node's stable enrollment NAME. For OUTBOUND_AGENT this is the join key
+  // between a session and an agent: the Gateway matches it against the dNSName
+  // SAN of the agent's mTLS certificate (which the CP itself stamped from
+  // node.name at enrollment/renewal) to find the control channel that owns this
+  // node. Required and non-empty when connector_kind is OUTBOUND_AGENT; the
+  // Gateway fails closed to "node offline" without it.
+  //
+  // It is carried explicitly rather than reusing the Gateway's node_id because
+  // node_id is whatever the Gateway's target resolver produced — an identifier
+  // whose relationship to node.name is the resolver's business, not this
+  // contract's. Added in Session Fourteen (additive; protocol stays 1.1).
+  string node_name = 4;
 }
 
 // HostVerification carries the trust the Gateway checks the node's presented host

@@ -20,14 +20,17 @@ use tonic::transport::Channel;
 
 use crate::mtls::{self, ChannelParams, ClientIdentity, MtlsError};
 use crate::pb::authorization_client::AuthorizationClient;
+use crate::pb::gateway_identity_client::GatewayIdentityClient;
 use crate::pb::outer_leg_auth_client::OuterLegAuthClient;
 use crate::pb::recording_client::RecordingClient;
 use crate::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
     BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution, FinalizeRecordingRequest,
-    FinalizeRecordingResponse, PollDeviceFlowRequest, PollDeviceFlowResponse, RequestUploadRequest,
-    RequestUploadResponse, ResolveBreakglassCodeRequest, ResolveBreakglassKeyRequest,
-    ResolveOtpRequest, ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity,
+    FinalizeRecordingResponse, IssueGatewayServerCertificateRequest,
+    IssueGatewayServerCertificateResponse, PollDeviceFlowRequest, PollDeviceFlowResponse,
+    RequestUploadRequest, RequestUploadResponse, ResolveBreakglassCodeRequest,
+    ResolveBreakglassKeyRequest, ResolveOtpRequest, ResolvePinRequest, ResolveUserCertRequest,
+    ResolvedIdentity,
 };
 
 /// A failure calling the CP. Fail-closed at every variant.
@@ -392,6 +395,29 @@ impl CpAuthClient {
     /// is picked up.
     pub fn current_ca_chain(&self) -> Vec<Vec<u8>> {
         self.factory.current_ca_chain()
+    }
+
+    /// Obtain the **serverAuth** leaf for the agent-facing WSS listener (Session
+    /// Fourteen, Design §9.2). Authenticated by the Gateway's current mTLS client
+    /// certificate; the CP — not the caller — chooses the SANs, so a compromised
+    /// Gateway cannot obtain a server certificate for a name it does not own. Only the
+    /// CSR is sent: the TLS server key is generated locally and never leaves (D2).
+    pub async fn issue_gateway_server_certificate(
+        &self,
+        pkcs10_csr: Vec<u8>,
+    ) -> Result<IssueGatewayServerCertificateResponse, CpError> {
+        self.call(move |ch| {
+            let req = IssueGatewayServerCertificateRequest {
+                pkcs10_csr,
+                client: Some(crate::version::component_info()),
+            };
+            async move {
+                GatewayIdentityClient::new(ch)
+                    .issue_gateway_server_certificate(req)
+                    .await
+            }
+        })
+        .await
     }
 
     /// Register a session recording (Session Nine, §12/§15): consume the single-use

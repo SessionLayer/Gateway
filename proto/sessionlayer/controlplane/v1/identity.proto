@@ -40,6 +40,29 @@ service GatewayIdentity {
   // the caller's current mTLS client certificate; a locked/revoked identity or a
   // generation mismatch is refused and flagged (§8.2). Renew-ahead per FR-JOIN-4.
   rpc RenewGatewayIdentity(RenewGatewayIdentityRequest) returns (RenewGatewayIdentityResponse);
+
+  // IssueGatewayServerCertificate issues the Gateway a serverAuth leaf for its
+  // AGENT-FACING TLS listener (the WebSocket control + dial-back transport,
+  // Design §9.2/§10.2; FR-CONN-2). Added in Session Fourteen (additive; protocol
+  // stays 1.1).
+  //
+  // WHY A SECOND LEAF. The identity certificate from Enroll/Renew is stamped
+  // clientAuth (LeafPurpose.CLIENT) — exactly one EKU per leaf, by design — so it
+  // cannot serve TLS: an Agent validating it as a server certificate would
+  // (correctly) reject it. Agents must verify the Gateway against an anchor they
+  // already hold (the internal mTLS CA) rather than trust it on first use, so the
+  // Gateway needs a genuine serverAuth leaf from that same CA.
+  //
+  // AUTHORITY. REQUIRES the caller's current mTLS client certificate; the CP
+  // resolves the gateway_identity from its SAN and refuses a locked/inactive one.
+  // The CP — not the caller — chooses the certificate's SANs, stamping them from
+  // the gateway_identity row it already holds. A Gateway therefore cannot obtain
+  // a server certificate for a name it does not own, even if compromised.
+  //
+  // KEY CUSTODY. The Gateway generates a SEPARATE keypair for this leaf (key
+  // separation from the client identity) and sends only a CSR (D2).
+  rpc IssueGatewayServerCertificate(IssueGatewayServerCertificateRequest)
+      returns (IssueGatewayServerCertificateResponse);
 }
 
 // EnrollGatewayRequest carries the bootstrap credential and the CSR.
@@ -112,4 +135,40 @@ message RenewGatewayIdentityResponse {
 
   int64 not_before_epoch_seconds = 5;
   int64 not_after_epoch_seconds = 6;
+}
+
+// IssueGatewayServerCertificateRequest asks for a serverAuth leaf for the
+// caller's agent-facing listener. Authenticated by the caller's CURRENT mTLS
+// client certificate.
+message IssueGatewayServerCertificateRequest {
+  // A PKCS#10 CSR (DER) for a keypair the Gateway generated for its TLS server —
+  // deliberately NOT the client-identity keypair.
+  bytes pkcs10_csr = 1;
+
+  // The caller's identity/version. Carries NO secrets.
+  ComponentInfo client = 2;
+}
+
+// IssueGatewayServerCertificateResponse returns the serverAuth leaf. There is no
+// generation counter: this certificate is not an identity, it is a TLS server
+// credential derived from one. Revocation is by locking the gateway_identity —
+// the CP then refuses to reissue, and the leaf expires.
+message IssueGatewayServerCertificateResponse {
+  // The issued serverAuth X.509 leaf (DER). Its SANs are chosen by the CP from
+  // the gateway_identity row: dNSName = the gateway's enrolled name, plus the
+  // URI SAN sessionlayer://gateway/<gateway_id>. An Agent verifies the presented
+  // certificate against the internal mTLS CA with the gateway name as the
+  // expected server name.
+  bytes certificate = 1;
+
+  // The issuing CA chain (DER; issuing CA first, root last).
+  repeated bytes ca_chain = 2;
+
+  // The name the CP stamped as the dNSName SAN — the server name an Agent must
+  // use to verify this Gateway. Returned so the Gateway can log/serve it without
+  // re-parsing its own certificate.
+  string gateway_name = 3;
+
+  int64 not_before_epoch_seconds = 4;
+  int64 not_after_epoch_seconds = 5;
 }
