@@ -19,11 +19,19 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use tokio::sync::watch;
 
 use crate::agent::registry::AgentRegistry;
 use crate::cpauth::{CpAuthClient, CpError};
 use crate::pb::PresenceHeartbeatResponse;
+
+/// Bounded concurrency for a heartbeat tick's per-node RPCs (M1). A serial loop scales linearly
+/// with the owned-node count, so a healthy Gateway holding hundreds of nodes at ~100ms/RPC could
+/// fail to refresh every node inside the staleness TTL — the CP would then mark its OWN nodes
+/// stale and new sessions to them fail closed. Fanning out ~16-wide keeps a large fleet's
+/// full-refresh well inside the TTL without stampeding the CP.
+const HEARTBEAT_CONCURRENCY: usize = 16;
 
 /// The authoritative post-heartbeat presence state the CP returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,35 +273,43 @@ impl HeartbeatLoop {
 
         // Release nodes we owned last tick but no longer hold a channel for (accelerates the
         // failover window on a control-channel drop; the CP staleness TTL is the backstop).
-        for gone in owned_prev.difference(&current) {
-            if let Err(e) = self.store.release(gone).await {
-                tracing::debug!(node = %gone, error = %e, "presence release on channel drop failed (staleness TTL will cover it)");
-            }
-        }
+        // Bounded concurrency (M1) so shedding a large batch does not serialize.
+        let gone: Vec<String> = owned_prev.difference(&current).cloned().collect();
+        futures_util::stream::iter(gone)
+            .for_each_concurrent(HEARTBEAT_CONCURRENCY, |node| async move {
+                if let Err(e) = self.store.release(&node).await {
+                    tracing::debug!(node = %node, error = %e, "presence release on channel drop failed (staleness TTL will cover it)");
+                }
+            })
+            .await;
 
-        for node in &current {
-            match self.store.heartbeat(node, &self.gateway_addr).await {
-                Ok(state) => {
-                    self.cache.observe(
-                        node,
-                        &state.owning_gateway_id,
-                        &state.gateway_addr,
-                        state.nonce,
-                    );
-                    if !state.is_self_owner {
-                        // A standby learns another Gateway owns this node (it holds the
-                        // channel but lost the ownership race). It keeps the channel and
-                        // keeps heartbeating so it can take over when the owner goes stale.
-                        tracing::debug!(node = %node, owner = %state.owning_gateway_id, "presence: standby (another gateway owns this node)");
+        // Heartbeat every owned node with bounded concurrency (M1): a full refresh must complete
+        // inside the staleness TTL even for a Gateway holding hundreds of nodes.
+        futures_util::stream::iter(current.iter().cloned())
+            .for_each_concurrent(HEARTBEAT_CONCURRENCY, |node| async move {
+                match self.store.heartbeat(&node, &self.gateway_addr).await {
+                    Ok(state) => {
+                        self.cache.observe(
+                            &node,
+                            &state.owning_gateway_id,
+                            &state.gateway_addr,
+                            state.nonce,
+                        );
+                        if !state.is_self_owner {
+                            // A standby learns another Gateway owns this node (it holds the
+                            // channel but lost the ownership race). It keeps the channel and
+                            // keeps heartbeating so it can take over when the owner goes stale.
+                            tracing::debug!(node = %node, owner = %state.owning_gateway_id, "presence: standby (another gateway owns this node)");
+                        }
+                    }
+                    Err(e) => {
+                        // Fail closed: we simply do not own the node this tick (a session routed
+                        // here would fail closed). Not fatal — retry next tick.
+                        tracing::debug!(node = %node, error = %e, "presence heartbeat failed; not owning this tick");
                     }
                 }
-                Err(e) => {
-                    // Fail closed: we simply do not own the node this tick (a session routed
-                    // here would fail closed). Not fatal — retry next tick.
-                    tracing::debug!(node = %node, error = %e, "presence heartbeat failed; not owning this tick");
-                }
-            }
-        }
+            })
+            .await;
 
         *owned_prev = current;
     }
@@ -338,12 +354,14 @@ mod tests {
         assert_eq!(cache.len(), 1, "but it remains cached until overwritten");
     }
 
-    /// An in-memory presence store recording heartbeats + releases, with a self-owner knob.
+    /// An in-memory presence store recording heartbeats + releases, with a self-owner knob and
+    /// an optional per-RPC delay (to exercise the M1 concurrency budget).
     struct FakeStore {
         heartbeats: Mutex<Vec<(String, String)>>,
         releases: Mutex<Vec<String>>,
         self_owner: AtomicBool,
         fail: AtomicBool,
+        rpc_delay: Mutex<Duration>,
     }
 
     impl FakeStore {
@@ -353,13 +371,24 @@ mod tests {
                 releases: Mutex::new(Vec::new()),
                 self_owner: AtomicBool::new(self_owner),
                 fail: AtomicBool::new(false),
+                rpc_delay: Mutex::new(Duration::ZERO),
             })
+        }
+
+        fn with_delay(self_owner: bool, delay: Duration) -> Arc<Self> {
+            let s = Self::new(self_owner);
+            *s.rpc_delay.lock().unwrap() = delay;
+            s
         }
     }
 
     impl PresenceStore for FakeStore {
         fn heartbeat<'a>(&'a self, node_id: &'a str, gateway_addr: &'a str) -> PresenceFuture<'a> {
             Box::pin(async move {
+                let delay = *self.rpc_delay.lock().unwrap();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 if self.fail.load(Ordering::SeqCst) {
                     return Err(PresenceError::Cp(CpError::CircuitOpen));
                 }
@@ -465,6 +494,40 @@ mod tests {
         assert!(
             cache.get("node-a").is_none(),
             "a failed heartbeat records no owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_fleet_refreshes_concurrently_within_the_ttl_budget() {
+        // M1: a Gateway holding many nodes must refresh them within the staleness TTL. With a
+        // per-RPC delay a SERIAL loop would take node_count * delay (well past any TTL); the
+        // bounded fan-out completes in ~ceil(node_count / K) * delay. 100 nodes @ 20ms serial is
+        // 2s; concurrent (~16-wide) is ~140ms — assert we are comfortably under a 1s budget AND
+        // that every node was actually heartbeated.
+        let store = FakeStore::with_delay(true, Duration::from_millis(20));
+        let names: Vec<String> = (0..100).map(|i| format!("node-{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let registry = registry_with(&refs);
+        let cache = Arc::new(OwnerCache::new(Duration::from_secs(30)));
+        let loop_ = HeartbeatLoop::new(
+            store.clone(),
+            registry,
+            cache,
+            "gw-self:9444".into(),
+            Duration::from_secs(10),
+        );
+        let mut prev = HashSet::new();
+        let started = std::time::Instant::now();
+        loop_.tick(&mut prev).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            store.heartbeats.lock().unwrap().len(),
+            100,
+            "every node heartbeated"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the concurrent fan-out must beat the serial budget; took {elapsed:?}"
         );
     }
 }

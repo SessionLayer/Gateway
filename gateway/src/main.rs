@@ -120,17 +120,23 @@ fn run() -> anyhow::Result<()> {
             );
         }
 
-        // Shutdown is broadcast to the accept loop AND the drain step (SIGTERM +
-        // Ctrl-C). A `watch` retains the value so neither observer loses the signal.
+        // Two signals (Session Fifteen, M3 / FR-HA-7 ordering):
+        //   * `shutdown` — the OS signal (SIGTERM / Ctrl-C); only `run` observes it, to SEQUENCE
+        //     the drain.
+        //   * `drain` — begin-drain: stop accepting, release presence, stop serving new relays,
+        //     close agent control channels. The servers + background loops watch THIS, and it
+        //     fires only AFTER the pre-drain grace, so the LB deregisters us while we still accept.
+        // A `watch` retains the value so no observer loses the edge.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             wait_for_shutdown().await;
             let _ = shutdown_tx.send(true);
         });
+        let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
 
         // Outer SSH leg (Session Seven): started only when configured AND the
         // Gateway holds a CP mTLS identity to delegate auth to (fail closed).
-        let outer = start_outer_leg(&cfg, renew.as_ref(), shutdown_rx.clone()).await?;
+        let outer = start_outer_leg(&cfg, renew.as_ref(), drain_rx.clone()).await?;
 
         // Readiness surface (Session Fifteen): `ready` until we start draining. A
         // separate `readyz_stop` keeps the /readyz listener alive THROUGH the drain (so
@@ -146,15 +152,29 @@ fn run() -> anyhow::Result<()> {
         let _ = sd.wait_for(|v| *v).await;
         tracing::info!("shutdown signal received; Gateway stopping");
 
-        // Graceful drain (Session Fifteen, §10.3 — closes S9 F-drain). (1) Flip unready so
-        // the LB deregisters us and stops sending NEW connections; (2) the accept loops have
-        // already stopped, and the heartbeat loop releases presence so a standby claims;
-        // (3) FINISH live sessions to a bounded deadline (they are not dropped instantly —
-        // that is the F-drain fix); (4) finalize + upload their recordings.
+        // Graceful drain (Session Fifteen, §10.3 — closes S9 F-drain; M3 ordering).
+        // (1) Flip `/readyz` to 503 but KEEP ACCEPTING for the pre-drain grace, so the LB
+        //     observes unready and deregisters us FIRST (no window where it still routes a new
+        //     connection to a Gateway that has stopped listening).
         let _ = ready_tx.send(false);
+        let pre_grace = Duration::from_secs(cfg.ha.drain.pre_drain_grace_secs);
+        if !pre_grace.is_zero() {
+            tracing::info!(grace_secs = pre_grace.as_secs(), "pre-drain grace: unready but still accepting so the LB can deregister");
+            tokio::time::sleep(pre_grace).await;
+        }
+        // (2) BEGIN drain: stop accepting, the heartbeat loop releases presence so a standby
+        //     claims, and agent control channels close so agents fail over.
+        let _ = drain_tx.send(true);
+        // (3) FINISH live sessions AND owner-role relays to a bounded deadline (not dropped
+        //     instantly — the F-drain fix + M2). (4) Any still-live session at the deadline is
+        //     torn down via the recorder-finalize path (L4). (5) drain in-flight finalizes.
         if let Some(outer) = outer {
             let deadline = Duration::from_secs(cfg.ha.drain.deadline_secs);
-            drain_live_sessions(&outer.live_sessions, deadline).await;
+            drain_live_sessions(&outer.live_sessions, outer.served_relays.as_ref(), deadline).await;
+            let remaining = outer.live_sessions.terminate_all();
+            if remaining > 0 {
+                tracing::warn!(remaining, "tearing down sessions still live at the drain deadline via the recorder-finalize path (L4)");
+            }
             let grace = Duration::from_secs(cfg.ssh.recorder.upload_timeout_secs.saturating_add(10));
             tracing::info!(grace_secs = grace.as_secs(), "draining in-flight recording finalizes");
             outer.finalize_tracker.drain(grace).await;
@@ -329,21 +349,32 @@ async fn bootstrap_identity(cfg: &GatewayConfig) -> anyhow::Result<Option<identi
 struct OuterLeg {
     finalize_tracker: ssh::recorder::FinalizeTracker,
     live_sessions: Arc<ssh::locks::LiveSessionRegistry>,
+    /// Relays this Gateway serves AS AN OWNER for peer ingresses (M2). They have no
+    /// LiveSessionRegistry of their own, so the drain waits on this counter too — otherwise a
+    /// pure owner/relay Gateway would cut its live relayed sessions the instant it exits.
+    served_relays: Option<Arc<ha::peer_client::ServedRelays>>,
 }
 
-/// Wait for live sessions to finish, bounded by `deadline` (the S9 F-drain fix: live
-/// sessions are finished-to-deadline, not dropped instantly).
-async fn drain_live_sessions(live: &ssh::locks::LiveSessionRegistry, deadline: Duration) {
+/// Wait for both this Gateway's own live sessions AND the relays it serves as an owner to
+/// finish, bounded by `deadline` (the S9 F-drain fix + M2: sessions are finished-to-deadline,
+/// not dropped instantly, on either role).
+async fn drain_live_sessions(
+    live: &ssh::locks::LiveSessionRegistry,
+    served_relays: Option<&Arc<ha::peer_client::ServedRelays>>,
+    deadline: Duration,
+) {
     let start = std::time::Instant::now();
     loop {
-        let n = live.len();
-        if n == 0 {
+        let sessions = live.len();
+        let relays = served_relays.map(|r| r.active()).unwrap_or(0);
+        if sessions == 0 && relays == 0 {
             return;
         }
         if start.elapsed() >= deadline {
             tracing::warn!(
-                remaining = n,
-                "drain deadline reached with live sessions still open; finalizing and exiting"
+                remaining_sessions = sessions,
+                remaining_relays = relays,
+                "drain deadline reached with sessions/relays still open; finalizing and exiting"
             );
             return;
         }
@@ -424,7 +455,7 @@ async fn start_outer_leg(
     // Session Fourteen: the outbound-agent transport (Design §9.2). Started only when
     // configured; a node whose inventory declares OUTBOUND_AGENT is otherwise simply
     // offline (fail closed — never a silent fallback to an agentless dial).
-    let agent_connector = start_agent_transport(
+    let (agent_connector, served_relays) = match start_agent_transport(
         cfg,
         &renew.current(),
         cpauth.clone(),
@@ -432,7 +463,11 @@ async fn start_outer_leg(
         snap_rx,
         shutdown.clone(),
     )
-    .await?;
+    .await?
+    {
+        Some((connector, served_relays)) => (Some(connector), Some(served_relays)),
+        None => (None, None),
+    };
 
     let connector = Arc::new(ssh::connector::DispatchConnector::new(
         Arc::new(ssh::connector::AgentlessDial::new(Duration::from_secs(
@@ -464,6 +499,7 @@ async fn start_outer_leg(
     Ok(Some(OuterLeg {
         finalize_tracker,
         live_sessions,
+        served_relays,
     }))
 }
 
@@ -474,7 +510,7 @@ async fn start_outer_leg(
 /// issue the agent-facing serverAuth leaf, the port is taken), startup **aborts** —
 /// running the SSH front door while every agent node is silently unreachable would be
 /// a worse failure than not starting.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 async fn start_agent_transport(
     cfg: &GatewayConfig,
     cred: &identity::Credential,
@@ -482,7 +518,12 @@ async fn start_agent_transport(
     lock_set: Arc<ssh::locks::LockSet>,
     cred_watch: tokio::sync::watch::Receiver<cpauth::CredentialSnapshot>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<Option<Arc<dyn ssh::connector::NodeConnector>>> {
+) -> anyhow::Result<
+    Option<(
+        Arc<dyn ssh::connector::NodeConnector>,
+        Arc<ha::peer_client::ServedRelays>,
+    )>,
+> {
     let acfg = &cfg.ssh.agent;
     if acfg.listen_addr.is_empty() {
         return Ok(None);
@@ -504,6 +545,9 @@ async fn start_agent_transport(
     let owner_cache = Arc::new(ha::presence::OwnerCache::new(Duration::from_secs(
         cfg.ha.routing.cache_ttl_secs,
     )));
+    // In-flight served-relay registry: bounds concurrent relays per node (F4) and lets the
+    // graceful drain wait for live relays this Gateway is serving as an owner (M2).
+    let served_relays = Arc::new(ha::peer_client::ServedRelays::default());
     let self_name = cred.gateway_name.clone();
 
     let transport = agent::server::bind(
@@ -581,6 +625,7 @@ async fn start_agent_transport(
             local_connector: agent_dial.clone(),
             registry,
             owner_cache: owner_cache.clone(),
+            served_relays: served_relays.clone(),
             credential: cred_watch,
             max_frame_bytes: acfg.max_frame_bytes,
             handshake_timeout: Duration::from_secs(acfg.handshake_timeout_secs),
@@ -601,12 +646,13 @@ async fn start_agent_transport(
             Duration::from_secs(cfg.ha.routing.relay_timeout_secs),
             Duration::from_secs(cfg.ha.routing.relay_timeout_secs + 20),
         ));
-    Ok(Some(Arc::new(ha::connector::AgentRouter::new(
+    let router: Arc<dyn ssh::connector::NodeConnector> = Arc::new(ha::connector::AgentRouter::new(
         self_name,
         agent_dial,
         remote,
         owner_cache,
-    ))))
+    ));
+    Ok(Some((router, served_relays)))
 }
 
 /// Build the coordination signal bus from the HA config (Session Fifteen). In-process by

@@ -52,9 +52,11 @@ impl NodeConnector for AgentRouter {
     fn connect<'a>(&'a self, dial: &'a NodeDial) -> ConnectFuture<'a> {
         Box::pin(async move {
             // Fold the Authorize owner into the local cache (observability/staleness); the
-            // per-session AUTHORITATIVE owner is this dial's field, not the cache.
+            // per-session AUTHORITATIVE owner is this dial's field, not the cache. Keyed by node
+            // NAME so it agrees with the owner-side HeartbeatLoop/serve_relay, which key the same
+            // shared cache by name (F9 consistency) — HA routing speaks node names throughout.
             self.cache.observe(
-                &dial.node_id,
+                &dial.node_name,
                 &dial.owning_gateway_id,
                 &dial.owning_gateway_addr,
                 dial.owner_nonce,
@@ -236,7 +238,8 @@ mod tests {
         assert!(router.connect(&dial(SELF)).await.is_ok());
         assert!(local.0.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!remote.0.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(cache.get("node-uuid").unwrap().owner_id, SELF);
+        // Keyed by node NAME (consistent with the owner side), not the UUID.
+        assert_eq!(cache.get("node-a").unwrap().owner_id, SELF);
     }
 
     #[tokio::test]

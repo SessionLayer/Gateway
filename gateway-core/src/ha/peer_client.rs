@@ -8,7 +8,9 @@
 //! that runs at the ingress (D21/D23 unchanged). gw-B only splices raw bytes between the
 //! node stream and the relay socket.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -22,12 +24,93 @@ use tokio_tungstenite::{client_async_with_config, WebSocketStream};
 
 use crate::agent::stream::WsByteStream;
 use crate::agent::wire::{self, FrameError, MsgType};
-use crate::agent::{ws_config, PEER_RELAY_PATH};
+use crate::agent::{ws_config, PEER_RELAY_PATH, WIRE_PROTOCOL_MAX, WIRE_PROTOCOL_MIN};
 use crate::cpauth::CredentialSnapshot;
 use crate::ha::coordination::CoordinationBackend;
 use crate::pbagent::AgentHello;
 use crate::pbgw::DialBackSignal;
 use crate::ssh::connector::{NodeConnector, NodeDial};
+
+/// Default per-node ceiling on concurrently-served relays (§8/§7.6, F4). Bounds the
+/// signalling-amplification an attacker with bus-publish access can drive: even authorized to
+/// publish, they cannot make the owner perform unbounded concurrent node dial-backs for one node.
+const DEFAULT_PER_NODE_RELAY_CAP: usize = 8;
+
+/// Tracks in-flight served relays, for two purposes:
+///   * a **per-node concurrency cap** (§7.6 / F4) so a flood of `DialBackSignal`s for one node
+///     cannot amplify into unbounded local node dial-backs, and
+///   * the **graceful-drain wait** (M2): a draining owner finishes its live relays to the drain
+///     deadline instead of cutting them instantly (the relay path has no session registry of its
+///     own — these detached tasks would otherwise be dropped the moment the process exits).
+///
+/// Cheap to share (`Arc`). A [`RelaySlot`] guard releases its reservation on drop.
+pub struct ServedRelays {
+    per_node: Mutex<HashMap<String, usize>>,
+    active: AtomicUsize,
+    per_node_cap: usize,
+}
+
+impl Default for ServedRelays {
+    fn default() -> Self {
+        Self::new(DEFAULT_PER_NODE_RELAY_CAP)
+    }
+}
+
+impl ServedRelays {
+    /// A registry with an explicit per-node cap.
+    pub fn new(per_node_cap: usize) -> Self {
+        Self {
+            per_node: Mutex::new(HashMap::new()),
+            active: AtomicUsize::new(0),
+            per_node_cap: per_node_cap.max(1),
+        }
+    }
+
+    /// Reserve a slot for `node`, or `None` if the per-node cap is already reached (fail closed
+    /// — the signal is dropped, the ingress times out). The returned guard releases on drop.
+    pub fn begin(self: &Arc<Self>, node: &str) -> Option<RelaySlot> {
+        let mut map = self.per_node.lock().unwrap_or_else(|e| e.into_inner());
+        let count = map.entry(node.to_string()).or_insert(0);
+        if *count >= self.per_node_cap {
+            return None;
+        }
+        *count += 1;
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Some(RelaySlot {
+            registry: Arc::clone(self),
+            node: node.to_string(),
+        })
+    }
+
+    /// Total relays in flight across every node — the graceful drain waits for this to reach 0.
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+}
+
+/// An in-flight served-relay reservation; releasing it (on drop) decrements the per-node and
+/// total counters.
+pub struct RelaySlot {
+    registry: Arc<ServedRelays>,
+    node: String,
+}
+
+impl Drop for RelaySlot {
+    fn drop(&mut self) {
+        let mut map = self
+            .registry
+            .per_node
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.node) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.node);
+            }
+        }
+        self.registry.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Everything the owner-side signal handler needs. Cheap to clone (all `Arc`).
 #[derive(Clone)]
@@ -43,6 +126,9 @@ pub struct PeerClientDeps {
     /// The shared owner cache the heartbeat loop updates (R1 / FR-HA-5): the owner-side
     /// anti-stale guard checks it currently believes WE own the node before serving.
     pub owner_cache: Arc<crate::ha::presence::OwnerCache>,
+    /// In-flight served-relay registry: the per-node concurrency cap (F4) and the graceful-drain
+    /// wait (M2).
+    pub served_relays: Arc<ServedRelays>,
     /// The renewing mTLS client credential (presented on the relay connection; its CA chain
     /// verifies the ingress's serverAuth leaf).
     pub credential: watch::Receiver<CredentialSnapshot>,
@@ -58,6 +144,10 @@ pub struct PeerClientDeps {
 enum RelayError {
     #[error("this gateway does not own the signalled node")]
     NotOwner,
+    #[error("the signal's owner_nonce is older than the current ownership epoch (stale/replay)")]
+    StaleNonce,
+    #[error("at the per-node concurrent-relay cap")]
+    PerNodeCap,
     #[error("the local agent dial-back failed")]
     LocalDial,
     #[error("the ingress relay endpoint could not be reached")]
@@ -123,23 +213,52 @@ async fn serve_relay(deps: PeerClientDeps, signal: DialBackSignal) -> Result<(),
     // to serve unless its OWN heartbeat loop currently believes it owns the node (the OwnerCache
     // reflects the last Presence.Heartbeat: is_self_owner). A superseded owner refuses ⇒ the
     // ingress fails closed within relay_timeout ⇒ the client re-routes to the true owner.
-    let is_self_owner = deps
-        .owner_cache
-        .get(&signal.node_name)
+    let observed = deps.owner_cache.get(&signal.node_name);
+    let is_self_owner = observed
+        .as_ref()
         .map(|o| o.owner_id == deps.self_gateway_id)
         .unwrap_or(false);
     if !is_self_owner {
         return Err(RelayError::NotOwner);
     }
-    // (1b) …and we must still hold a LIVE agent control channel to the node (the backstop for a
+    // (1b) Drop a stale/replayed signal whose `owner_nonce` is OLDER than the ownership epoch we
+    // last observed (§8, F4): a failover has advanced the nonce past this signal, so serving it
+    // would relay a superseded route. Dropping here means NO node dial-back for a replayed signal.
+    if let Some(o) = &observed {
+        if signal.owner_nonce < o.nonce {
+            return Err(RelayError::StaleNonce);
+        }
+    }
+    // (1c) …and we must still hold a LIVE agent control channel to the node (the backstop for a
     // truly-dead owner — a gateway without the channel cannot reach the node regardless of any
     // cache). Both guards must hold.
     if deps.registry.lookup(&signal.node_name).is_err() {
         return Err(RelayError::NotOwner);
     }
 
-    // (2) Produce the node byte stream locally (the S14 agent dial-back mints its OWN SLDB1
-    // token and splices to the node's loopback sshd — full reuse, no confused deputy).
+    // (1d) Reserve a per-node relay slot (F4 concurrency cap) BEFORE any costly work, and register
+    // the relay so the graceful drain (M2) waits for it. The guard releases on every return path.
+    let Some(_slot) = deps.served_relays.begin(&signal.node_name) else {
+        return Err(RelayError::PerNodeCap);
+    };
+
+    // (2) Validate the INGRESS FIRST (redteam SSRF reorder). Establish the relay connection —
+    // TCP + TLS (the ingress serverAuth leaf MUST chain to our pinned internal CA and match
+    // `ingress_gateway_id`) + preface + RELAY_OPEN/ACCEPT — BEFORE producing the node byte
+    // stream. `ingress_relay_addr` is bus-controlled, so a forged address must not be able to
+    // make us dial a node: it fails the TLS certificate check and aborts here. The residual (a
+    // bounded blind TCP-connect + ClientHello to a wire address) needs bus-publish authorization
+    // (§8) and cannot complete without a valid internal-CA gateway certificate — Accepted-Risk.
+    // All bounded so a stalled ingress never parks anything.
+    let relay_ws = tokio::time::timeout(deps.handshake_timeout, open_relay(&deps, &signal))
+        .await
+        .map_err(|_| RelayError::Handshake)??;
+    let mut relay_stream = WsByteStream::new(relay_ws.ws, relay_ws.ver, relay_ws.max_frame_bytes);
+
+    // (3) Only now — the ingress cryptographically proven — produce the node byte stream locally
+    // (the S14 agent dial-back mints its OWN SLDB1 token and splices to the node's loopback sshd;
+    // full reuse, no confused deputy). A failure here fails closed: the relay stream is dropped,
+    // the ingress's inner leg sees EOF and denies the session.
     let node_dial = NodeDial {
         node_id: signal.node_id.clone(),
         connector_kind: crate::pb::ConnectorKind::OutboundAgent as i32,
@@ -154,16 +273,12 @@ async fn serve_relay(deps: PeerClientDeps, signal: DialBackSignal) -> Result<(),
         .await
         .map_err(|_| RelayError::LocalDial)?;
 
-    // (3)(4) Dial the ingress relay endpoint (TLS+WS), preface, present the token, await
-    // RELAY_ACCEPT — all bounded so a stalled ingress never parks the node stream.
-    let relay_ws = tokio::time::timeout(deps.handshake_timeout, open_relay(&deps, &signal))
-        .await
-        .map_err(|_| RelayError::Handshake)??;
-    let mut relay_stream = WsByteStream::new(relay_ws.ws, relay_ws.ver, deps.max_frame_bytes);
-
-    // (5) Dumb bidirectional copy: node ByteStream ↔ peer-relay STREAM_DATA frames. No inner
-    // leg, no recorder — the ingress owns the session + recording.
+    // (4) Dumb bidirectional copy: node ByteStream ↔ peer-relay STREAM_DATA frames. No inner
+    // leg, no recorder — the ingress owns the session + recording. Structured outcome logs give
+    // interim relay-throughput visibility until the metrics framework lands (item 19).
+    tracing::info!(node = %signal.node_name, peer = %signal.ingress_gateway_id, event = "peer_relay_serving", "serving a peer relay as owner");
     let _ = tokio::io::copy_bidirectional(&mut node_stream, &mut relay_stream).await;
+    tracing::info!(node = %signal.node_name, peer = %signal.ingress_gateway_id, event = "peer_relay_closed", "peer relay closed");
     Ok(())
 }
 
@@ -171,6 +286,15 @@ async fn serve_relay(deps: PeerClientDeps, signal: DialBackSignal) -> Result<(),
 struct OpenRelay {
     ws: WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
     ver: u8,
+    /// The frame bound to decode the relay stream with — the HELLO_ACK-negotiated value clamped
+    /// to our configured ceiling (F10b), so it agrees with what the ingress will frame.
+    max_frame_bytes: usize,
+}
+
+/// What the HELLO_ACK negotiated: the wire major (in the VER byte) and the ingress's max frame.
+struct Negotiated {
+    ver: u8,
+    max_frame_bytes: usize,
 }
 
 async fn open_relay(
@@ -196,7 +320,8 @@ async fn open_relay(
         .map_err(|_| RelayError::Connect)?;
 
     // Preface: HELLO → HELLO_ACK (reuse the shared negotiation); then RELAY_OPEN → RELAY_ACCEPT.
-    let ver = preface(&mut ws, deps.max_frame_bytes).await?;
+    let negotiated = preface(&mut ws, deps.max_frame_bytes).await?;
+    let ver = negotiated.ver;
     ws.send(Message::Binary(WsBytes::from(wire::encode_msg(
         ver,
         MsgType::RelayOpen,
@@ -209,22 +334,30 @@ async fn open_relay(
 
     let frame = next_frame(&mut ws, deps.max_frame_bytes, ver).await?;
     match frame.msg_type {
-        MsgType::RelayAccept => Ok(OpenRelay { ws, ver }),
+        MsgType::RelayAccept => Ok(OpenRelay {
+            ws,
+            ver,
+            max_frame_bytes: negotiated.max_frame_bytes,
+        }),
         // RELAY_REJECT or anything else ⇒ fail closed (the ingress refused the binding).
         _ => Err(RelayError::Handshake),
     }
 }
 
-/// Client-side preface: send `HELLO` with our wire component info, read `HELLO_ACK`, return
-/// the negotiated wire major. A `VERSION_REJECT` or any other frame fails closed.
-async fn preface<S>(ws: &mut WebSocketStream<S>, max_frame_bytes: usize) -> Result<u8, RelayError>
+/// Client-side preface: send `HELLO` with our wire component info, read `HELLO_ACK`, and return
+/// the negotiated wire major + frame bound. A `VERSION_REJECT`, a major outside the wire range
+/// (F6), or any other frame fails closed.
+async fn preface<S>(
+    ws: &mut WebSocketStream<S>,
+    max_frame_bytes: usize,
+) -> Result<Negotiated, RelayError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let hello = AgentHello {
         component: Some(crate::agent::wire_component_info()),
     };
-    let ver = crate::agent::WIRE_PROTOCOL_MAX.0 as u8;
+    let ver = WIRE_PROTOCOL_MAX.0 as u8;
     ws.send(Message::Binary(WsBytes::from(wire::encode_msg(
         ver,
         MsgType::Hello,
@@ -233,7 +366,8 @@ where
     .await
     .map_err(|_| RelayError::Handshake)?;
 
-    // The HELLO_ACK carries the negotiated major in its VER byte.
+    // The HELLO_ACK carries the negotiated major in its VER byte and the ingress's proposed
+    // frame bound in its payload.
     loop {
         let msg = ws.next().await.ok_or(RelayError::Handshake)?;
         match msg.map_err(|_| RelayError::Handshake)? {
@@ -241,10 +375,28 @@ where
                 let ack_ver = *bytes.first().ok_or(RelayError::Handshake)?;
                 let frame = wire::decode(bytes, max_frame_bytes, ack_ver)
                     .map_err(|_| RelayError::Handshake)?;
-                return match frame.msg_type {
-                    MsgType::HelloAck => Ok(frame.ver),
-                    _ => Err(RelayError::Handshake), // VERSION_REJECT / anything else: fail closed
+                if frame.msg_type != MsgType::HelloAck {
+                    return Err(RelayError::Handshake); // VERSION_REJECT / anything else: fail closed
+                }
+                // (F6) Refuse a negotiated major outside the wire range — moot at 1.0, load-bearing
+                // the moment the wire profile gains a minor. Never proceed on a version we cannot
+                // actually speak.
+                if frame.ver < WIRE_PROTOCOL_MIN.0 as u8 || frame.ver > WIRE_PROTOCOL_MAX.0 as u8 {
+                    return Err(RelayError::Handshake);
+                }
+                // (F10b) Adopt the ingress's HELLO_ACK-negotiated frame bound, clamped to our
+                // configured ceiling so the decode bound never exceeds our WS-layer cap. `0`
+                // (an ack without the field) falls back to our configured value.
+                let ack: crate::pbagent::GatewayHelloAck =
+                    wire::as_hello_ack(&frame).map_err(|_| RelayError::Handshake)?;
+                let negotiated_frame = match ack.max_frame_bytes as usize {
+                    0 => max_frame_bytes,
+                    n => n.min(max_frame_bytes),
                 };
+                return Ok(Negotiated {
+                    ver: frame.ver,
+                    max_frame_bytes: negotiated_frame,
+                });
             }
             Message::Ping(_) | Message::Pong(_) => {}
             _ => return Err(RelayError::Handshake),
@@ -310,4 +462,43 @@ fn client_tls_config(cred: &CredentialSnapshot) -> Result<Arc<ClientConfig>, Rel
         .with_client_auth_cert(cert_chain, key)
         .map_err(|_| RelayError::Tls)?;
     Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn served_relays_caps_per_node_and_counts_active_for_drain() {
+        let relays = Arc::new(ServedRelays::new(2));
+        assert_eq!(relays.active(), 0);
+
+        // Two concurrent relays for one node are allowed; the third is refused (fail closed).
+        let a = relays.begin("web-01").expect("first slot");
+        let b = relays.begin("web-01").expect("second slot");
+        assert!(
+            relays.begin("web-01").is_none(),
+            "per-node cap refuses the third"
+        );
+        // A DIFFERENT node is independent (the cap is per-node, not global).
+        let c = relays
+            .begin("web-02")
+            .expect("other node has its own budget");
+        assert_eq!(
+            relays.active(),
+            3,
+            "the drain wait sees every in-flight relay"
+        );
+
+        // Releasing a slot frees per-node capacity and decrements the drain counter.
+        drop(a);
+        assert_eq!(relays.active(), 2);
+        let _d = relays.begin("web-01").expect("a freed slot is reusable");
+        assert_eq!(relays.active(), 3);
+
+        drop(b);
+        drop(c);
+        drop(_d);
+        assert_eq!(relays.active(), 0, "all relays drained");
+    }
 }

@@ -355,6 +355,21 @@ impl LiveSessionRegistry {
         victims.len()
     }
 
+    /// Tear down EVERY live session (the graceful-drain deadline, L4): trips each session's
+    /// abort so its recorder finalize path runs to a bounded deadline, rather than dropping the
+    /// tasks un-finalized when the process exits (which would leave un-finalized WORM objects).
+    /// Idempotent (a no-op once the registry is empty). Returns the count torn down.
+    pub fn terminate_all(&self) -> usize {
+        let victims: Vec<SessionControl> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.values().cloned().collect()
+        };
+        for c in &victims {
+            c.terminate();
+        }
+        victims.len()
+    }
+
     /// After a snapshot/resync, tear down any live session matching any active
     /// lock (a resync may introduce locks that arrived while disconnected).
     pub fn reconcile(&self, lock_set: &LockSet) -> usize {

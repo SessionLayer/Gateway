@@ -23,7 +23,7 @@ use gateway_core::config::{
 use gateway_core::cpauth::CredentialSnapshot;
 use gateway_core::ha::connector::{AgentRouter, RemoteGatewayConnector};
 use gateway_core::ha::coordination::{CoordinationBackend, InProcessBackend, PublishFuture};
-use gateway_core::ha::peer_client::{self, PeerClientDeps};
+use gateway_core::ha::peer_client::{self, PeerClientDeps, ServedRelays};
 use gateway_core::ha::presence::{CpPresenceStore, HeartbeatLoop, OwnerCache};
 use gateway_core::ha::relay_token::{PendingRelays, RelaySigner};
 use gateway_core::pb::Capability;
@@ -42,7 +42,9 @@ const CLIENT_IMAGE: &str = "sessionlayer-gw-sshclient:s14";
 const NODE_IMAGE: &str = "sessionlayer-gw-testnode:s14";
 const AGENT_NODE_IMAGE: &str = "sessionlayer-gw-agentnode:s14";
 
-const NODE: &str = "node-ha";
+// A REAL human node name (NOT UUID-shaped): the HA path resolves ownership by node NAME, and a
+// UUID-shaped name would mask the name->node.id resolution the CP performs (T3 item 1).
+const NODE: &str = "web-01";
 const AGENT_ID: &str = "agent-ha";
 const GW_A: &str = "gw-a-ha"; // ingress
 const GW_B: &str = "gw-b-ha"; // owner (holds the agent)
@@ -247,6 +249,7 @@ async fn start_owner(
             local_connector: agent_dial,
             registry: registry.clone(),
             owner_cache,
+            served_relays: Arc::new(ServedRelays::default()),
             credential: cred_rx,
             max_frame_bytes: config.agent.max_frame_bytes,
             handshake_timeout: Duration::from_secs(config.agent.handshake_timeout_secs),

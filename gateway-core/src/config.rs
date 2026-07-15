@@ -225,9 +225,12 @@ impl Default for PresenceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
-    /// How long (seconds) the ingress waits for the owner to establish the direct relay
-    /// before failing closed to "node offline". MUST be less than the SSH LoginGraceTime
-    /// — a hung peer must never hang the handshake (§8: 10s).
+    /// How long (seconds) the ingress waits for the owner to establish the direct relay before
+    /// failing closed to "node offline". Sits ABOVE the owner's worst-case establish budget —
+    /// its local agent dial-back plus the relay handshake, each independently bounded (default
+    /// ~10s + ~10s = ~20s) — so a slow-but-HEALTHY owner is not abandoned (L1); and well BELOW
+    /// the SSH LoginGraceTime (300s) so a hung peer never hangs the handshake. The SLGW1 token
+    /// TTL is set above this in turn (main.rs).
     pub relay_timeout_secs: u64,
     /// The owner cache TTL (seconds); an entry older than this is stale (§8: 30s, =
     /// presence staleness). The per-session authoritative owner is the Authorize
@@ -238,7 +241,7 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            relay_timeout_secs: 10,
+            relay_timeout_secs: 25,
             cache_ttl_secs: 30,
         }
     }
@@ -248,7 +251,14 @@ impl Default for RoutingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DrainConfig {
-    /// How long (seconds) SIGTERM waits for live sessions to finish before finalizing
+    /// After SIGTERM, flip `/readyz` to 503 but KEEP ACCEPTING new connections for this long
+    /// (M3, FR-HA-7 order) — so the L4/L7 LB observes the unready state and deregisters this
+    /// Gateway BEFORE it stops accepting, closing the window where the LB still routes a new
+    /// connection to a Gateway that has already stopped listening. Set to a small multiple of
+    /// the LB's probe interval × unhealthy-threshold. `0` disables the grace (stop accepting at
+    /// once). Default 5s.
+    pub pre_drain_grace_secs: u64,
+    /// How long (seconds) drain waits for live sessions to finish before finalizing
     /// recordings and exiting. Live sessions are finished-to-deadline, not dropped
     /// instantly (§8: 30s).
     pub deadline_secs: u64,
@@ -261,6 +271,7 @@ pub struct DrainConfig {
 impl Default for DrainConfig {
     fn default() -> Self {
         Self {
+            pre_drain_grace_secs: 5,
             deadline_secs: 30,
             readyz_addr: String::new(),
         }
@@ -914,12 +925,15 @@ mod tests {
         assert!(ha.peer_relay_advertise_addr.is_empty());
         assert_eq!(ha.presence.heartbeat_interval_secs, 10);
         assert_eq!(ha.presence.staleness_ttl_secs, 30);
-        assert_eq!(ha.routing.relay_timeout_secs, 10);
+        assert_eq!(ha.routing.relay_timeout_secs, 25);
         assert_eq!(ha.routing.cache_ttl_secs, 30);
+        assert_eq!(ha.drain.pre_drain_grace_secs, 5);
         assert_eq!(ha.drain.deadline_secs, 30);
-        // The relay deadline must sit under the SSH login grace so a hung peer never
-        // hangs the handshake.
+        // The relay deadline must sit under the SSH login grace so a hung peer never hangs the
+        // handshake — AND above the owner's worst-case establish budget (dial-back + handshake,
+        // ~20s) so a slow-but-healthy owner is not abandoned (L1).
         assert!((ha.routing.relay_timeout_secs) < GatewayConfig::default().ssh.login_grace_secs);
+        assert!(ha.routing.relay_timeout_secs > 20);
     }
 
     #[test]

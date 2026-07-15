@@ -16,7 +16,7 @@ use gateway_core::agent::token::{DialBackSigner, PendingDialBacks};
 use gateway_core::cpauth::{CpAuthClient, CpChannelFactory, CredentialSnapshot};
 use gateway_core::ha::connector::RemoteGatewayConnector;
 use gateway_core::ha::coordination::{CoordinationBackend, InProcessBackend};
-use gateway_core::ha::peer_client::{self, PeerClientDeps};
+use gateway_core::ha::peer_client::{self, PeerClientDeps, ServedRelays};
 use gateway_core::ha::presence::OwnerCache;
 use gateway_core::ha::relay_token::{PendingRelays, RelaySigner};
 use gateway_core::identity;
@@ -175,6 +175,7 @@ async fn start_owner(
             local_connector: Arc::new(EchoNode),
             registry,
             owner_cache,
+            served_relays: Arc::new(ServedRelays::default()),
             credential: cred_rx,
             max_frame_bytes: 64 * 1024,
             handshake_timeout: Duration::from_secs(5),

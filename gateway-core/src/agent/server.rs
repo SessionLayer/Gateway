@@ -127,6 +127,10 @@ struct Inner {
     /// Caps concurrently-handshaking connections (sockets), so an unauthenticated peer
     /// cannot exhaust the Gateway before presenting a certificate (F-agentdos-1).
     connection_slots: Arc<tokio::sync::Semaphore>,
+    /// Begin-drain signal (Session Fifteen, L5): a live control channel watches it and closes
+    /// promptly so the agent fails over to another Gateway (Presence.Release + standby covers
+    /// correctness; this makes the failover fast).
+    shutdown: watch::Receiver<bool>,
 }
 
 /// A bound, ready-to-run agent transport.
@@ -212,7 +216,7 @@ pub async fn bind(
     if let Some(pr) = &deps.peer_relay {
         spawn_relay_pending_gc(pr.pending_relays.clone(), shutdown.clone());
     }
-    spawn_pending_gc(deps.pending.clone(), shutdown);
+    spawn_pending_gc(deps.pending.clone(), shutdown.clone());
 
     let listener = TcpListener::bind(&deps.config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
@@ -223,6 +227,7 @@ pub async fn bind(
         max_frame_bytes: deps.config.max_frame_bytes,
         connection_slots: Arc::new(tokio::sync::Semaphore::new(deps.config.max_connections)),
         tls: tls_rx,
+        shutdown,
         deps,
     });
 
@@ -721,9 +726,17 @@ where
     // liveness (the agent answers in order), so a slow-but-alive agent whose round-trip
     // approaches the interval is not flapped offline (F-agentliveness-1).
     let mut outstanding: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut shutdown = inner.shutdown.clone();
 
     let outcome = loop {
         tokio::select! {
+            // Begin-drain (L5): close the control channel so the agent fails over promptly.
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
+                    tracing::info!(node = %sanitize(&peer.node_name), "gateway draining; closing the agent control channel so it fails over");
+                    break Ok(());
+                }
+            }
             _ = ticker.tick() => {
                 // Two missed intervals ⇒ the peer is dead (contract §7): a ping unanswered
                 // across two ticks, NOT merely "the latest ping is unanswered".

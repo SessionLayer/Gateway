@@ -197,6 +197,33 @@ impl TestCa {
         Ok(csr.signed_by(&self.issuer())?.der().to_vec())
     }
 
+    /// Sign an enrollment/renewal CSR as a **gateway identity** (clientAuth) leaf whose SANs
+    /// THIS CA chooses, mirroring the real CP `EnrollGateway`/`RenewGatewayIdentity`: dNSName =
+    /// the gateway's enrolled name (the HA routing key) PLUS the `sessionlayer://gateway/<id>`
+    /// URI SAN. The CSR contributes only its public key. Stamping the URI SAN keeps the mock
+    /// faithful to production so the peer-relay positive gateway-SAN check (F10a) is exercised.
+    pub fn sign_csr_as_gateway_identity(
+        &self,
+        csr_der: &[u8],
+        gateway_name: &str,
+        gateway_id: &str,
+    ) -> Result<Vec<u8>, rcgen::Error> {
+        let mut csr = Self::parse_csr(csr_der)?;
+        csr.params.distinguished_name = rcgen::DistinguishedName::new();
+        csr.params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, gateway_name);
+        csr.params.subject_alt_names = vec![
+            rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(gateway_name).unwrap()),
+            rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("sessionlayer://gateway/{gateway_id}"))
+                    .unwrap(),
+            ),
+        ];
+        csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        Ok(csr.signed_by(&self.issuer())?.der().to_vec())
+    }
+
     /// Issue an **agent identity** leaf: a clientAuth leaf carrying the two SANs the
     /// Gateway resolves an agent peer from (contract §1) — the URI SAN
     /// `sessionlayer://agent/<agent_id>` and the dNSName SAN = the node's name.
@@ -606,16 +633,17 @@ impl GatewayIdentity for MockSvc {
                 return Err(Status::permission_denied("enrollment denied"));
             }
         }
-        let leaf_der = self
-            .ca
-            .sign_csr(&r.pkcs10_csr)
-            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
-
         let gateway_id = {
             let mut id = self.next_id.lock().unwrap();
             *id += 1;
             format!("gw-{id:08}")
         };
+        // Stamp the gateway URI SAN + dNSName exactly as the real CP does (F10a faithfulness).
+        let leaf_der = self
+            .ca
+            .sign_csr_as_gateway_identity(&r.pkcs10_csr, &r.gateway_name, &gateway_id)
+            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
+
         self.gateways.lock().unwrap().insert(
             gateway_id.clone(),
             GatewayRecord {
@@ -662,9 +690,10 @@ impl GatewayIdentity for MockSvc {
             return Err(Status::failed_precondition("stale generation"));
         }
 
+        let gateway_name = rec.name.clone();
         let new_leaf = self
             .ca
-            .sign_csr(&r.pkcs10_csr)
+            .sign_csr_as_gateway_identity(&r.pkcs10_csr, &gateway_name, &gid)
             .map_err(|_| Status::invalid_argument("invalid CSR"))?;
 
         let bad = {
