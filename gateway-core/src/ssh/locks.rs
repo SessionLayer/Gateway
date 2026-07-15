@@ -28,6 +28,25 @@ pub struct LockBindings {
 }
 
 impl LockBindings {
+    /// The matchable facts for an **agent peer** (Session Fourteen): an agent has no
+    /// decision context, only the two facts its CP-stamped certificate carries — the
+    /// agent identity and the node it is bound to. Used to refuse a locked agent at
+    /// registration and at every dial-back (contract §1/§6; deny wins).
+    ///
+    /// A lock scoped to the node's CP *id* (rather than its name) is enforced on the
+    /// session path instead: the handler matches the signed decision context — which
+    /// carries the real `node_id` — before it ever reaches the connector.
+    pub fn for_agent(agent_id: &str, node_name: &str) -> Self {
+        Self {
+            identity: agent_id.to_string(),
+            groups: Vec::new(),
+            node_id: node_name.to_string(),
+            node_labels: Vec::new(),
+            allowed_logins: Vec::new(),
+            principal: String::new(),
+        }
+    }
+
     /// Derive the matchable facts from a verified decision context.
     pub fn from_context(ctx: &DecisionContext) -> Self {
         Self {
@@ -458,6 +477,35 @@ mod tests {
             &b
         ));
         assert!(target_matches(&LockTarget { all: true, ..tgt() }, &b));
+    }
+
+    #[test]
+    fn an_agent_peer_is_matched_by_identity_node_or_a_global_lock() {
+        let b = LockBindings::for_agent("agent-7", "node-a");
+        assert!(target_matches(
+            &LockTarget {
+                identities: vec!["agent-7".into()],
+                ..tgt()
+            },
+            &b
+        ));
+        assert!(target_matches(
+            &LockTarget {
+                node_ids: vec!["node-a".into()],
+                ..tgt()
+            },
+            &b
+        ));
+        assert!(target_matches(&LockTarget { all: true, ..tgt() }, &b));
+        // A lock aimed at some other agent or node does not touch this one.
+        assert!(!target_matches(
+            &LockTarget {
+                identities: vec!["agent-8".into()],
+                node_ids: vec!["node-b".into()],
+                ..tgt()
+            },
+            &b
+        ));
     }
 
     #[test]

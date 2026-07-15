@@ -10,18 +10,27 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::pb::DecisionContext;
+use crate::pb::{ConnectorKind, DecisionContext};
 
 /// A bidirectional byte stream to a node's `sshd` — the object the inner leg
 /// drives the russh client over. Aligned with the [`AsyncIo`](crate::asyncio)
 /// reactor seam that backs the hot byte-copy.
 pub trait ByteStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> ByteStream for T {}
+
+/// Opaque by design: a byte stream carries session plaintext, so it renders as a
+/// placeholder and never its contents.
+impl std::fmt::Debug for dyn ByteStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ByteStream")
+    }
+}
 
 /// The target node the outer leg resolved for this connection.
 #[derive(Debug, Clone)]
@@ -32,14 +41,26 @@ pub struct NodeTarget {
     pub principal: String,
 }
 
-/// How to reach the node — the CP-resolved connector kind + dial address
-/// (Design §9.2). Session Eight dials only the agentless address.
+/// How to reach the node — the CP-resolved connector kind + whatever that kind needs
+/// (Design §9.2). Selection is per-node (FR-CONN-3): a fleet mixes both models.
 #[derive(Debug, Clone)]
 pub struct NodeDial {
     /// The CP node identifier (for correlation/logging).
     pub node_id: String,
-    /// `host:port` of the node's `sshd` (agentless model).
+    /// `host:port` of the node's `sshd` (agentless model only).
     pub dial_address: String,
+    /// The CP-declared connector model (proto `ConnectorKind`). `UNSPECIFIED` or an
+    /// unknown value is an explicit deny — never an accidental fallthrough.
+    pub connector_kind: i32,
+    /// The node's stable enrollment **name** — the join key between a session and the
+    /// Agent that owns the node (outbound-agent model; matched against the dNSName SAN
+    /// of the agent's certificate).
+    pub node_name: String,
+    /// The Gateway session this dial serves (bound into the dial-back token).
+    pub session_id: String,
+    /// The resolved Linux principal (bound into the dial-back token; enforcement lives
+    /// in the inner-leg certificate, never in the Agent).
+    pub principal: String,
 }
 
 /// What a successful outer leg hands the inner leg: the CP's signed decision
@@ -81,6 +102,31 @@ pub enum NodeConnectError {
     /// The dial did not complete within the bounded connect timeout.
     #[error("node dial timed out after {0:?}")]
     Timeout(Duration),
+    /// An outbound-agent node whose CP record carries no enrollment name: there is no
+    /// join key to any Agent, so refuse rather than guess (FR-CONN-3).
+    #[error("outbound-agent node has no enrollment name")]
+    NoNodeName,
+    /// No Agent is registered for this node (never connected, disconnected, or its
+    /// control channel died). The node is simply offline (§7.1 / FR-SESS-5).
+    #[error("no agent is connected for this node")]
+    NoAgent,
+    /// The Agent is covered by a Lock (deny wins, §8.4).
+    #[error("the node's agent is locked")]
+    AgentLocked,
+    /// The Agent declined the dial-back, or its own dial to the node's `sshd` failed.
+    #[error("the agent refused or could not serve the dial-back")]
+    AgentRefused,
+    /// The Agent is registered and (probably) alive, but its control-channel signal queue
+    /// stayed saturated for the whole bound — a shed under load, distinct from a dead agent.
+    #[error("the node's agent control channel is saturated")]
+    AgentBusy,
+    /// The CP declared a connector model this Gateway does not implement — including
+    /// `UNSPECIFIED`. Fail closed; never fall back to another model.
+    #[error("unsupported connector kind {0}")]
+    UnsupportedConnector(i32),
+    /// The node is outbound-agent but this Gateway has no agent transport configured.
+    #[error("the agent transport is not enabled on this Gateway")]
+    AgentTransportDisabled,
 }
 
 /// The boxed future returned by [`NodeConnector::connect`].
@@ -137,19 +183,66 @@ impl NodeConnector for AgentlessDial {
     }
 }
 
+/// Per-node connector selection (FR-CONN-3, Design §9.2): the CP declares the model
+/// per node and a fleet mixes both. An `UNSPECIFIED` or unrecognised kind is an
+/// **explicit deny** — before Session Fourteen such a node fell through to an
+/// agentless dial with an empty address and died as `NoAddress`, which was fail-closed
+/// by accident rather than by design.
+pub struct DispatchConnector {
+    agentless: Arc<dyn NodeConnector>,
+    /// `None` when this Gateway has no agent transport configured.
+    agent: Option<Arc<dyn NodeConnector>>,
+}
+
+impl DispatchConnector {
+    /// Dispatch between the agentless dialer and (optionally) the outbound-agent one.
+    pub fn new(agentless: Arc<dyn NodeConnector>, agent: Option<Arc<dyn NodeConnector>>) -> Self {
+        Self { agentless, agent }
+    }
+}
+
+impl NodeConnector for DispatchConnector {
+    fn connect<'a>(&'a self, dial: &'a NodeDial) -> ConnectFuture<'a> {
+        match ConnectorKind::try_from(dial.connector_kind) {
+            Ok(ConnectorKind::Agentless) => self.agentless.connect(dial),
+            Ok(ConnectorKind::OutboundAgent) => match &self.agent {
+                Some(agent) => agent.connect(dial),
+                None => Box::pin(std::future::ready(Err(
+                    NodeConnectError::AgentTransportDisabled,
+                ))),
+            },
+            Ok(ConnectorKind::Unspecified) | Err(_) => {
+                let kind = dial.connector_kind;
+                Box::pin(std::future::ready(Err(
+                    NodeConnectError::UnsupportedConnector(kind),
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `NodeDial` for the agentless model (the S8 shape).
+    fn agentless_dial(addr: &str) -> NodeDial {
+        NodeDial {
+            node_id: "n1".into(),
+            dial_address: addr.into(),
+            connector_kind: ConnectorKind::Agentless as i32,
+            node_name: "node-1".into(),
+            session_id: "sess-1".into(),
+            principal: "deploy".into(),
+        }
+    }
 
     #[tokio::test]
     async fn agentless_dial_reaches_a_listener() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let dialer = AgentlessDial::new(Duration::from_secs(2));
-        let dial = NodeDial {
-            node_id: "n1".into(),
-            dial_address: addr.to_string(),
-        };
+        let dial = agentless_dial(&addr.to_string());
         let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
         let stream = dialer.connect(&dial).await;
         assert!(stream.is_ok(), "dial to a live listener must succeed");
@@ -163,12 +256,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let dialer = AgentlessDial::new(Duration::from_millis(500));
-        let dial = NodeDial {
-            node_id: "n1".into(),
-            dial_address: addr.to_string(),
-        };
         assert!(
-            dialer.connect(&dial).await.is_err(),
+            dialer
+                .connect(&agentless_dial(&addr.to_string()))
+                .await
+                .is_err(),
             "an unreachable node must fail closed"
         );
     }
@@ -176,13 +268,78 @@ mod tests {
     #[tokio::test]
     async fn empty_address_is_rejected() {
         let dialer = AgentlessDial::new(Duration::from_secs(1));
-        let dial = NodeDial {
-            node_id: "n1".into(),
-            dial_address: String::new(),
-        };
         assert!(matches!(
-            dialer.connect(&dial).await,
+            dialer.connect(&agentless_dial("")).await,
             Err(NodeConnectError::NoAddress)
+        ));
+    }
+
+    /// A connector that records whether it was reached (never actually dials).
+    struct Spy(&'static str);
+
+    impl NodeConnector for Spy {
+        fn connect<'a>(&'a self, _dial: &'a NodeDial) -> ConnectFuture<'a> {
+            let which = self.0;
+            Box::pin(async move { Err(NodeConnectError::BadAddress(which.to_string())) })
+        }
+    }
+
+    fn dispatcher(with_agent: bool) -> DispatchConnector {
+        DispatchConnector::new(
+            Arc::new(Spy("agentless")),
+            with_agent.then(|| Arc::new(Spy("agent")) as Arc<dyn NodeConnector>),
+        )
+    }
+
+    fn dial_of_kind(kind: i32) -> NodeDial {
+        NodeDial {
+            connector_kind: kind,
+            ..agentless_dial("10.0.0.5:22")
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_selects_the_connector_declared_per_node() {
+        let d = dispatcher(true);
+        // A mixed fleet: each node reaches its own model, in the same process.
+        assert!(matches!(
+            d.connect(&dial_of_kind(ConnectorKind::Agentless as i32)).await,
+            Err(NodeConnectError::BadAddress(w)) if w == "agentless"
+        ));
+        assert!(matches!(
+            d.connect(&dial_of_kind(ConnectorKind::OutboundAgent as i32)).await,
+            Err(NodeConnectError::BadAddress(w)) if w == "agent"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unspecified_or_unknown_connector_kind_is_an_explicit_deny() {
+        // Never an accidental fallthrough to the agentless dial: a node whose model
+        // the CP did not declare must not be reachable by guessing.
+        let d = dispatcher(true);
+        for kind in [ConnectorKind::Unspecified as i32, 7, -1, i32::MAX] {
+            assert!(
+                matches!(
+                    d.connect(&dial_of_kind(kind)).await,
+                    Err(NodeConnectError::UnsupportedConnector(k)) if k == kind
+                ),
+                "kind {kind} must be denied explicitly"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_node_on_a_gateway_without_the_transport_fails_closed() {
+        let d = dispatcher(false);
+        assert!(matches!(
+            d.connect(&dial_of_kind(ConnectorKind::OutboundAgent as i32))
+                .await,
+            Err(NodeConnectError::AgentTransportDisabled)
+        ));
+        // …while agentless nodes on the same Gateway still work.
+        assert!(matches!(
+            d.connect(&dial_of_kind(ConnectorKind::Agentless as i32)).await,
+            Err(NodeConnectError::BadAddress(w)) if w == "agentless"
         ));
     }
 

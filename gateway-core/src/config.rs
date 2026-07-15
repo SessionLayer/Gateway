@@ -119,6 +119,71 @@ pub struct SshServerConfig {
     /// always-available, IdP-independent override path (FIDO2 `sk-ecdsa` primary,
     /// offline codes fallback) and its per-model mid-session-expiry behaviour.
     pub break_glass: BreakGlassConfig,
+    /// Outbound-agent transport (Session Fourteen, Design §9.2/§10.2): the
+    /// agent-facing WebSocket listener, the dial-back token/timeout bounds, and the
+    /// liveness cadence. A blank `listen_addr` leaves the transport OFF (agentless
+    /// only) — mirroring the [`SshServerConfig::listen_addr`] convention.
+    pub agent: AgentTransportConfig,
+}
+
+/// The agent-facing WebSocket transport (Session Fourteen; contract
+/// `agent-gateway-v1.md`). The Agent dials **out** to this listener over TLS 1.3 with
+/// mutual TLS and registers a control channel; the Gateway signals it to dial back for
+/// each session. All bounds are fail-closed and validated at startup
+/// (`ssh::validate_config`); `deny_unknown_fields` fails misconfiguration closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentTransportConfig {
+    /// TCP listen address (`host:port`) for the agent WSS transport. **Empty
+    /// disables it** (the default): an `OUTBOUND_AGENT` node is then simply offline.
+    /// Dev port is `9444` (the CP mTLS gRPC plane is `9443`).
+    pub listen_addr: String,
+    /// The `wss://` URL the Gateway tells an Agent to dial back to (contract §5:
+    /// the address rides in the signal, so no service discovery is needed). When
+    /// empty it is derived from [`Self::listen_addr`].
+    pub advertise_url: String,
+    /// PING cadence (seconds) on the control channel. **Two missed intervals ⇒ the
+    /// peer is dead**: the Gateway deregisters the agent and its node becomes
+    /// unreachable (§7.1).
+    pub heartbeat_interval_secs: u64,
+    /// The maximum frame payload either peer may send (DoS bound, negotiated in
+    /// `HELLO_ACK`). MUST exceed [`InnerLegServerConfig::max_packet_bytes`] so a
+    /// full inner-leg SSH packet always fits in one frame.
+    pub max_frame_bytes: usize,
+    /// TTL (seconds) of a minted dial-back token. MUST exceed
+    /// [`Self::dial_back_timeout_secs`]: the token has to outlive the window in
+    /// which it may legitimately be redeemed.
+    pub dial_back_token_ttl_secs: i64,
+    /// How long (seconds) the connector waits for the signalled Agent to reach
+    /// `STREAM_OPEN` before failing closed to "node offline" (FR-SESS-5).
+    pub dial_back_timeout_secs: u64,
+    /// Bound (seconds) on the whole TLS + WebSocket + preface handshake, so a peer
+    /// that connects and stalls cannot hold a slot.
+    pub handshake_timeout_secs: u64,
+    /// Cap on live agent control channels (bounded resource use).
+    pub max_agents: usize,
+    /// Cap on concurrently-handshaking **connections** (sockets), distinct from
+    /// [`Self::max_agents`] which caps registered nodes. A connection over the cap is
+    /// dropped at accept *before* any TLS work, so an unauthenticated peer cannot exhaust
+    /// the Gateway before it ever presents a certificate (F-agentdos-1). Sized to leave room
+    /// for one control channel plus concurrent dial-backs per agent.
+    pub max_connections: usize,
+}
+
+impl Default for AgentTransportConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: String::new(),
+            advertise_url: String::new(),
+            heartbeat_interval_secs: 20,
+            max_frame_bytes: 64 * 1024,
+            dial_back_token_ttl_secs: 30,
+            dial_back_timeout_secs: 10,
+            handshake_timeout_secs: 10,
+            max_agents: 1024,
+            max_connections: 4096,
+        }
+    }
 }
 
 /// Break-glass access-model policy (Session Thirteen; Design §7, FR-ACC-6/8). The
@@ -346,6 +411,7 @@ impl Default for SshServerConfig {
             recorder: RecorderConfig::default(),
             reeval: ReevalConfig::default(),
             break_glass: BreakGlassConfig::default(),
+            agent: AgentTransportConfig::default(),
         }
     }
 }
@@ -587,6 +653,36 @@ mod tests {
         let result: Result<GatewayConfig, _> =
             serde_json::from_str(r#"{"ssh":{"break_glass":{"enable":false}}}"#);
         assert!(result.is_err(), "unknown break_glass key must be rejected");
+    }
+
+    #[test]
+    fn agent_transport_is_off_by_default_with_fail_closed_bounds() {
+        let a = GatewayConfig::default().ssh.agent;
+        assert!(a.listen_addr.is_empty(), "agent transport off by default");
+        assert_eq!(a.heartbeat_interval_secs, 20);
+        assert_eq!(a.max_frame_bytes, 64 * 1024);
+        assert_eq!(a.dial_back_token_ttl_secs, 30);
+        assert_eq!(a.dial_back_timeout_secs, 10);
+        assert_eq!(a.max_agents, 1024);
+        assert_eq!(a.max_connections, 4096);
+        assert!(
+            a.max_connections >= a.max_agents,
+            "room for one socket per node"
+        );
+        // The two ordering invariants validate_config enforces hold at the defaults.
+        assert!((a.dial_back_timeout_secs as i64) < a.dial_back_token_ttl_secs);
+        assert!(a.max_frame_bytes > InnerLegServerConfig::default().max_packet_bytes as usize);
+        // …and the defaults sit inside the wire-contract §3 ranges the Agent also enforces,
+        // so an out-of-the-box Gateway is one every Agent will accept.
+        assert!(crate::agent::MAX_FRAME_BYTES_RANGE.contains(&a.max_frame_bytes));
+        assert!(crate::agent::HEARTBEAT_INTERVAL_SECS_RANGE.contains(&a.heartbeat_interval_secs));
+    }
+
+    #[test]
+    fn agent_unknown_key_fails_closed() {
+        let result: Result<GatewayConfig, _> =
+            serde_json::from_str(r#"{"ssh":{"agent":{"listen_address":"0.0.0.0:9444"}}}"#);
+        assert!(result.is_err(), "unknown agent key must be rejected");
     }
 
     #[test]

@@ -277,3 +277,129 @@ async fn renew_ahead_stops_on_repair_needed_rejection() {
     assert_eq!(cp.recorded_generation(&gateway_id), Some(0));
     let _ = loop_task.await;
 }
+
+/// The S12 busy-renew bug, ported from the Agent (which hit it first): a certificate
+/// whose renew trigger is ALREADY past yields a zero delay, so after a successful
+/// renewal the loop would re-derive the same zero delay and renew again immediately —
+/// hammering the CP and burning a generation per iteration.
+///
+/// This exercises the LOOP, not `compute_renew_delay`: the existing unit tests assert
+/// the ZERO delay is *correct* and would never have caught the spin it causes.
+#[tokio::test]
+async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past() {
+    let cp = MockCp::builder()
+        .cert_ttl(Duration::from_secs(3600))
+        .start()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = identity::IdentityStore::open(dir.path()).unwrap();
+    let params = cp.channel_params(CT, RT);
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &cp.mint_enrollment_token(),
+        "gw-storm",
+    )
+    .await
+    .unwrap();
+    let gateway_id = cred.gateway_id.clone();
+
+    let renew_ahead = identity::RenewAhead::new(
+        store,
+        identity::RenewAheadConfig {
+            // fraction 0 => the trigger instant is not_before, which is always in the
+            // past => compute_renew_delay returns ZERO on EVERY iteration.
+            renew_ahead_fraction: 0.0,
+            renew_jitter_fraction: 0.0,
+            retry_backoff: Duration::from_millis(20),
+            channel: params,
+        },
+        cred,
+    );
+    let loop_task = tokio::spawn(async move {
+        renew_ahead
+            .run(Box::pin(std::future::pending::<()>()))
+            .await;
+    });
+
+    // Give the loop a couple of seconds of wall-clock to misbehave in.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    loop_task.abort();
+
+    // With the floor: the first iteration renews at once (correct — a credential loaded
+    // past its trigger should refresh), then waits RENEW_MIN_INTERVAL (60s). So exactly
+    // ONE renewal. Without it, the loop would have burned dozens.
+    assert_eq!(
+        cp.recorded_generation(&gateway_id),
+        Some(1),
+        "the post-renewal floor must bound the loop to one renewal in this window"
+    );
+}
+
+/// F-renewstorm-1 (HIGH): the S14 floor closed the `base == 0` trigger but left the
+/// `remaining == 0` one open. When the CP issues a certificate that is ALREADY EXPIRED at
+/// the Gateway's clock (clock skew beyond the TTL, or a near-zero CP TTL), the `remaining/2`
+/// cap collapsed the floor to zero and the loop renewed at RPC rate — 40 generations in 2s
+/// in the reliability repro. The RPC keeps *succeeding* (the CP validates against its own
+/// clock), so nothing self-limits, and each iteration churns the generation counter, which
+/// is the §8.2 clone-detection primitive.
+///
+/// This drives the real LOOP (not the helper) with `cert_ttl(0)` — `validity_window()` then
+/// returns not_after = now, i.e. "the certificate the CP issued is already expired at us".
+/// The fix bounds the renewals to ~1/min (retry-bounded, NOT terminal — a terminal exit on a
+/// fleet-wide CP misconfig would be fail-deadly; cross-repo aligned with the Agent), so a few
+/// generations over the window instead of hundreds, and the loop keeps running.
+#[tokio::test]
+async fn renew_ahead_loop_does_not_storm_when_the_cp_issues_an_already_expired_cert() {
+    let cp = MockCp::builder()
+        .cert_ttl(Duration::from_secs(0))
+        .start()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = identity::IdentityStore::open(dir.path()).unwrap();
+    let params = cp.channel_params(CT, RT);
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &cp.mint_enrollment_token(),
+        "gw-storm2",
+    )
+    .await
+    .unwrap();
+    let gateway_id = cred.gateway_id.clone();
+
+    let renew_ahead = identity::RenewAhead::new(
+        store,
+        identity::RenewAheadConfig {
+            renew_ahead_fraction: 2.0 / 3.0,
+            renew_jitter_fraction: 0.1,
+            retry_backoff: Duration::from_millis(20),
+            channel: params,
+        },
+        cred,
+    );
+    let loop_task = tokio::spawn(async move {
+        renew_ahead
+            .run(Box::pin(std::future::pending::<()>()))
+            .await;
+    });
+
+    // Three seconds of wall-clock for the loop to storm in if it were going to.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Retry-bounded: the floor caps the loop to ~1 renewal/min, so a small handful of
+    // generations over this window — NOT the ~40+ of the storm. And the loop must still be
+    // RUNNING (not terminal), so a transient clock fault self-heals once the clock is fixed.
+    let gens = cp.recorded_generation(&gateway_id).unwrap_or(0);
+    assert!(
+        (1..=5).contains(&gens),
+        "generations={gens}: expected a bounded 1..=5 (storm would be dozens; 0 means it never renewed)"
+    );
+    assert!(
+        !loop_task.is_finished(),
+        "the loop must keep retrying (bounded), not exit"
+    );
+    loop_task.abort();
+}

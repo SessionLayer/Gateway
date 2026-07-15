@@ -334,6 +334,79 @@ fn validate_config(config: &SshServerConfig) -> Result<(), SshServerError> {
             "inner.max_channels_per_connection must be >= 1".to_string(),
         ));
     }
+    validate_agent_config(&config.agent, inner)?;
+    Ok(())
+}
+
+/// Validate the agent transport (Session Fourteen). Only checked when the transport is
+/// enabled; every bound is fail-closed.
+///
+/// The two values the Gateway proposes in `HELLO_ACK` are bounded by the **contract**
+/// (§3), not by numbers chosen here, and the Agent enforces the *same* range from its end.
+/// Rejecting them at startup is the whole point: a Gateway that accepted an out-of-range
+/// value would come up healthy and then be refused by every Agent in the fleet — a
+/// misconfiguration that fails to a silent fleet-wide outage instead of failing at boot.
+fn validate_agent_config(
+    agent: &crate::config::AgentTransportConfig,
+    inner: &crate::config::InnerLegServerConfig,
+) -> Result<(), SshServerError> {
+    use crate::agent::{HEARTBEAT_INTERVAL_SECS_RANGE, MAX_FRAME_BYTES_RANGE};
+
+    if agent.listen_addr.is_empty() {
+        return Ok(());
+    }
+
+    if !MAX_FRAME_BYTES_RANGE.contains(&agent.max_frame_bytes) {
+        return Err(SshServerError::Config(format!(
+            "ssh.agent.max_frame_bytes ({}) is outside the wire-contract §3 range {}-{}; an Agent would refuse this HELLO_ACK",
+            agent.max_frame_bytes,
+            MAX_FRAME_BYTES_RANGE.start(),
+            MAX_FRAME_BYTES_RANGE.end()
+        )));
+    }
+    // Within the contract range, a frame must still clear THIS Gateway's inner-leg packet
+    // size, or a max-size SSH packet could not cross the splice at all.
+    if agent.max_frame_bytes <= inner.max_packet_bytes as usize {
+        return Err(SshServerError::Config(format!(
+            "ssh.agent.max_frame_bytes ({}) must be > inner.max_packet_bytes ({})",
+            agent.max_frame_bytes, inner.max_packet_bytes
+        )));
+    }
+    if !HEARTBEAT_INTERVAL_SECS_RANGE.contains(&agent.heartbeat_interval_secs) {
+        return Err(SshServerError::Config(format!(
+            "ssh.agent.heartbeat_interval_secs ({}) is outside the wire-contract §3 range {}-{}; an Agent would refuse this HELLO_ACK",
+            agent.heartbeat_interval_secs,
+            HEARTBEAT_INTERVAL_SECS_RANGE.start(),
+            HEARTBEAT_INTERVAL_SECS_RANGE.end()
+        )));
+    }
+    // The token must outlive the window in which it may legitimately be redeemed;
+    // otherwise a dial-back that is still in flight fails on an expired token.
+    if agent.dial_back_timeout_secs as i64 >= agent.dial_back_token_ttl_secs {
+        return Err(SshServerError::Config(format!(
+            "ssh.agent.dial_back_timeout_secs ({}) must be < dial_back_token_ttl_secs ({})",
+            agent.dial_back_timeout_secs, agent.dial_back_token_ttl_secs
+        )));
+    }
+    // Zero timeouts are unbounded waits (never fail closed).
+    if agent.dial_back_timeout_secs == 0 || agent.handshake_timeout_secs == 0 {
+        return Err(SshServerError::Config(
+            "ssh.agent.dial_back_timeout_secs and handshake_timeout_secs must be > 0".to_string(),
+        ));
+    }
+    if agent.max_agents == 0 {
+        return Err(SshServerError::Config(
+            "ssh.agent.max_agents must be >= 1".to_string(),
+        ));
+    }
+    // At least one connection per registered node, or a full fleet could never all be
+    // connected at once (F-agentdos-1: the cap bounds sockets, not registrations).
+    if agent.max_connections < agent.max_agents {
+        return Err(SshServerError::Config(format!(
+            "ssh.agent.max_connections ({}) must be >= max_agents ({})",
+            agent.max_connections, agent.max_agents
+        )));
+    }
     Ok(())
 }
 
@@ -455,6 +528,129 @@ mod tests {
                 ..Default::default()
             };
             assert!(validate_config(&ok).is_ok(), "{mode:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn agent_transport_bounds_fail_closed() {
+        use crate::config::AgentTransportConfig;
+
+        // Disabled (the default): nothing to validate.
+        assert!(validate_config(&SshServerConfig::default()).is_ok());
+
+        let enabled = |agent: AgentTransportConfig| SshServerConfig {
+            agent,
+            ..Default::default()
+        };
+        let on = AgentTransportConfig {
+            listen_addr: "0.0.0.0:9444".into(),
+            ..Default::default()
+        };
+        assert!(validate_config(&enabled(on.clone())).is_ok());
+
+        // A frame smaller than an inner-leg packet could not carry one.
+        assert!(matches!(
+            validate_config(&enabled(AgentTransportConfig {
+                max_frame_bytes: 32 * 1024, // == inner.max_packet_bytes
+                ..on.clone()
+            })),
+            Err(SshServerError::Config(_))
+        ));
+
+        // Wire-contract §3 bounds on the two values HELLO_ACK proposes. The Agent enforces
+        // the SAME range, so a Gateway outside it would boot healthy and then be refused by
+        // every Agent in the fleet — reject it at startup, loudly.
+        for outside in [
+            AgentTransportConfig {
+                max_frame_bytes: 2 * 1024 * 1024, // > 1 MiB
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                max_frame_bytes: 2048, // < 4 KiB
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                heartbeat_interval_secs: 600, // > 300 s: a dead peer goes unnoticed
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                heartbeat_interval_secs: 0, // < 1 s
+                ..on.clone()
+            },
+        ] {
+            assert!(
+                matches!(
+                    validate_config(&enabled(outside.clone())),
+                    Err(SshServerError::Config(_))
+                ),
+                "outside the contract §3 range, must be refused at startup: {outside:?}"
+            );
+        }
+
+        // …and the legal edges of the contract range are ACCEPTED (a bound that rejected
+        // valid configuration would be its own outage).
+        for edge in [
+            AgentTransportConfig {
+                max_frame_bytes: 1024 * 1024,
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                heartbeat_interval_secs: 1,
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                heartbeat_interval_secs: 300,
+                ..on.clone()
+            },
+        ] {
+            assert!(
+                validate_config(&enabled(edge.clone())).is_ok(),
+                "the contract range is inclusive: {edge:?}"
+            );
+        }
+        // A dial-back deadline at/over the token TTL would expire a token still in
+        // legitimate flight.
+        assert!(matches!(
+            validate_config(&enabled(AgentTransportConfig {
+                dial_back_timeout_secs: 30,
+                dial_back_token_ttl_secs: 30,
+                ..on.clone()
+            })),
+            Err(SshServerError::Config(_))
+        ));
+        // Zero bounds are unbounded waits / busy loops.
+        for zeroed in [
+            AgentTransportConfig {
+                dial_back_timeout_secs: 0,
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                handshake_timeout_secs: 0,
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                heartbeat_interval_secs: 0,
+                ..on.clone()
+            },
+            AgentTransportConfig {
+                max_agents: 0,
+                ..on.clone()
+            },
+            // Fewer connection slots than registrable nodes: a full fleet could never all
+            // be connected (F-agentdos-1).
+            AgentTransportConfig {
+                max_connections: 512,
+                max_agents: 1024,
+                ..on.clone()
+            },
+        ] {
+            assert!(
+                matches!(
+                    validate_config(&enabled(zeroed.clone())),
+                    Err(SshServerError::Config(_))
+                ),
+                "must reject {zeroed:?}"
+            );
         }
     }
 

@@ -99,6 +99,17 @@ http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
+# Session Fourteen — the agent-facing WebSocket transport (Design §9.2/§10.2). The
+# Agent dials OUT; the Gateway is the TLS+WS server. No TLS features here: the TLS
+# is our own `tokio_rustls` (ring) stream, handed to tungstenite already
+# established, so tungstenite never selects a crypto stack of its own.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+# Sink/Stream polling for the WsByteStream hot path (poll_ready IS the backpressure
+# signal — see agent/stream.rs; F-bridge-backpressure).
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# base64url (no padding) for the SLDB1 dial-back token envelope (contract §6).
+base64 = "0.22"
+
 # Observability.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

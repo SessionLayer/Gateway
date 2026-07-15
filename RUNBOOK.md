@@ -50,3 +50,83 @@ alert with the Gateway's session by `session_id`.
 - A break-glass session is **time-boxed**: `break_glass.mid_session_expiry` must be
   `grace_then_kill` or `hard_kill` (never `run_to_ttl` — startup rejects it). A Lock
   always overrides with immediate teardown.
+
+## Outbound-agent transport (Session Fourteen; Design §9.2, FR-CONN-1/2/3, FR-HA-8)
+
+An `OUTBOUND_AGENT` node is never dialled by the Gateway. Its Agent dials **out** to
+`ssh.agent.listen_addr` (dev `:9444`) over `wss://` with mutual TLS, registers a control
+channel, and — when signalled — dials back and splices the session to its own
+`127.0.0.1:22`. The node needs **zero inbound reachability**.
+
+### Configuration (fail-closed; startup rejects a bad combination)
+
+- `ssh.agent.listen_addr` — empty (default) disables the transport. An `OUTBOUND_AGENT`
+  node is then simply **offline** — never a silent fallback to an agentless dial.
+- `ssh.agent.advertise_url` — the `wss://` URL agents dial back to. **Required when
+  `listen_addr` binds a wildcard** (`0.0.0.0`/`::`): the address rides in the signal, so
+  advertising `0.0.0.0` would leave the whole agent fleet unreachable. Startup aborts.
+- `max_frame_bytes` (64 KiB) must exceed `inner.max_packet_bytes`; `dial_back_timeout_secs`
+  must be less than `dial_back_token_ttl_secs`. Both are checked at startup.
+- `heartbeat_interval_secs` (1–300) and `max_frame_bytes` (4 KiB–1 MiB) are bounded by the
+  **wire contract §3** and enforced from BOTH ends: a value outside the range is refused at
+  startup, precisely so the Gateway cannot boot healthy and then be refused by every Agent.
+- `max_connections` (4096) caps concurrent sockets — distinct from `max_agents` (registered
+  nodes) — and must be `>= max_agents`.
+
+### Deny fails closed on the agent surface
+
+The agent transport honours the actively-pushed Lock deny-set exactly as the session path
+does: **a deny-feed that cannot be confirmed is treated as a deny.** Consequences an
+operator should expect:
+
+- On boot, the transport does **not** accept agent connections until the lock feed has
+  delivered its first snapshot (log: `"agent transport waiting for the lock feed before
+  serving agents"`). If the CP lock stream is down, **no agent nodes are served** — they are
+  "offline" (§7.1). This is the correct deny-wins trade; usually the CP being down also means
+  `Authorize` is failing closed, so few sessions were possible anyway. It self-heals the
+  moment the feed connects.
+- Mid-life, if the lock stream drops, new registrations and dial-back redemptions are refused
+  (log `reason=lock_feed_unhealthy`) until it reconnects. Already-spliced sessions continue.
+
+The Gateway obtains its agent-facing **serverAuth** certificate from the CP
+(`GatewayIdentity.IssueGatewayServerCertificate`) over a separate, never-persisted
+keypair. If the CP will not issue one, the transport does **not** start: an Agent must be
+able to verify this Gateway, and there is no TOFU on this path either.
+
+### Log outcomes / reasons
+
+- `"no agent is connected for this node"` / `"the agent refused or could not serve the
+  dial-back"` / `"node dial timed out"` — the user always sees the single generic §7.1
+  outcome ("target node is offline or unavailable"). Check whether the node's Agent is
+  registered (a control channel is logged as "agent control channel registered").
+- `"agent missed two heartbeats; deregistering"` (`reason=missed_heartbeats`) — the Agent is
+  gone (network or process death); its node is unreachable until it reconnects. A
+  slow-but-alive agent whose round-trip approaches the heartbeat is NOT killed (a late PONG
+  still counts), so this line means genuinely no answer for two intervals.
+- `reason=agent_signal_saturated` — the node's Agent is registered and answering, but its
+  control-channel queue stayed full for the whole dial-back window: a **capacity shed under
+  load**, NOT a dead agent. Do not chase the agent; look at session concurrency to that node.
+- `reason=dial_back_timeout` / `reason=agent_refused_or_local_dial_failed` /
+  `reason=no_agent_registered` — the distinct node-offline causes, each its own structured
+  event so an alert can key on the cause rather than a free-text field.
+- `"SECURITY/OPS: adopted a certificate already expired at this Gateway's clock"` — the CP
+  issued a cert already expired at this host's clock (clock skew beyond the TTL, or a CP TTL
+  misconfig). The renew loop **stops** rather than storm the CP / burn the generation counter.
+  **Fix NTP or the CP certificate TTL, then restart the Gateway.** Its identity will expire;
+  treat this as urgent.
+- `"control channel superseded by a newer connection"` — normal after an Agent reconnect
+  (e.g. a partition healed). The newer connection wins by design; a stale channel must
+  never lock a node out.
+- `"refusing a locked agent (deny wins)"` / `"dial-back refused (fail closed)"` — a Lock
+  covers this agent identity, or a dial-back token failed one of its bindings. The agent
+  sees only the coarse `UNAUTHORIZED`; the specific reason is here, in the operator log.
+  A dial-back token is **never** logged, persisted, or echoed.
+
+### Node-local second trail (FR-AUD-4)
+
+In the agent model the node's own `sshd` log is a **tamper-independent** second record:
+the Gateway's inner certificate carries `key_id = session_id + principal`, and a node
+running `LogLevel VERBOSE` logs that key-id on every accepted certificate. The two trails
+cross-correlate on the session id with **no trust in the Agent** — which is exactly what
+makes the second trail independent. To investigate a session on the node:
+`journalctl -u ssh | grep '<session_id>'`.

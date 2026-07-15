@@ -16,15 +16,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SRC="../ControlPlane-API/contracts/proto/sessionlayer/controlplane/v1"
-DST="proto/sessionlayer/controlplane/v1"
+SRC_ROOT="../ControlPlane-API/contracts/proto"
 
-if [[ ! -d "$SRC" ]]; then
-  echo "[sync-contracts] source $SRC not present (expected in CI or a lone checkout); nothing to do."
+if [[ ! -d "$SRC_ROOT" ]]; then
+  echo "[sync-contracts] source $SRC_ROOT not present (expected in CI or a lone checkout); nothing to do."
   exit 0
 fi
 
-mkdir -p "$DST"
 # Session Four added identity.proto (GatewayIdentity: EnrollGateway,
 # RenewGatewayIdentity) and signing.proto (SessionSigning:
 # SignSessionCertificate) as additive services on the mTLS plane. Session Five
@@ -38,9 +36,26 @@ mkdir -p "$DST"
 # Session Thirteen added break-glass auth resolution to auth.proto
 # (OuterLegAuth: ResolveBreakglassKey / ResolveBreakglassCode) + additive
 # breakglass_token (AuthorizeRequest) and access_model (DecisionContext) on authz.
-for f in common.proto handshake.proto identity.proto signing.proto authz.proto auth.proto recording.proto lock.proto; do
-  cp -v "$SRC/$f" "$DST/$f"
+# Session Fourteen added agent/v1/wire.proto (the Agent<->Gateway wire payloads —
+# messages only, no gRPC service; the framed WebSocket protocol itself is
+# specified in contracts/wire/agent-gateway-v1.md), an additive node_name on
+# authz NodeConnection, and IssueGatewayServerCertificate on identity.proto.
+RELS=(
+  "sessionlayer/controlplane/v1/common.proto"
+  "sessionlayer/controlplane/v1/handshake.proto"
+  "sessionlayer/controlplane/v1/identity.proto"
+  "sessionlayer/controlplane/v1/signing.proto"
+  "sessionlayer/controlplane/v1/authz.proto"
+  "sessionlayer/controlplane/v1/auth.proto"
+  "sessionlayer/controlplane/v1/recording.proto"
+  "sessionlayer/controlplane/v1/lock.proto"
+  "sessionlayer/agent/v1/wire.proto"
+)
+
+for rel in "${RELS[@]}"; do
+  mkdir -p "proto/$(dirname "$rel")"
+  cp -v "$SRC_ROOT/$rel" "proto/$rel"
 done
 
-echo "[sync-contracts] vendored proto re-synced from $SRC"
+echo "[sync-contracts] vendored proto re-synced from $SRC_ROOT"
 echo "[sync-contracts] NOTE: contracts are FROZEN; re-sync only after a versioned change (contracts/VERSIONING.md), then rebuild."

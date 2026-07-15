@@ -16,6 +16,17 @@ default = []
 # Opt-in io_uring reactor for the byte-copy hot path (Linux only). The epoll
 # reactor stays the portable default and fallback. See src/asyncio.rs.
 io-uring = ["dep:tokio-uring"]
+# TEST-ONLY: builds `test-agent`, an independent client-side implementation of the
+# frozen Agent<->Gateway wire contract, used by the Docker agent-path E2E (it runs
+# INSIDE the node container as a non-root user and splices to 127.0.0.1:22). Never
+# enabled in a production build; the E2E test is `#[cfg]`-gated on the same feature.
+test-agent = ["dep:clap", "dep:anyhow", "dep:tracing-subscriber"]
+
+# The E2E drives the test agent as a subprocess via CARGO_BIN_EXE_test-agent.
+[[bin]]
+name = "test-agent"
+path = "src/bin/test_agent.rs"
+required-features = ["test-agent"]
 
 [dependencies]
 tonic = { workspace = true }
@@ -49,6 +60,16 @@ http-body = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 tokio-rustls = { workspace = true }
+
+# Session Fourteen agent transport: the WebSocket carriage over our own TLS stream,
+# Sink/Stream polling for the byte-stream hot path, and base64url for the dial-back
+# token envelope. `clap` is pulled in only by the test-agent feature.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 # tokio-uring is Linux-only; keep it target-gated so the crate still builds on
 # other platforms (the epoll fallback carries them).
@@ -88,3 +109,7 @@ sha2 = { workspace = true }
 # The recorder E2E generates a customer P-256 keypair (seal to the public half,
 # decrypt with the private half to prove the platform cannot read the recording).
 p256 = { workspace = true }
+# The agent-transport IT drives the wire protocol directly (adversarial framing:
+# replayed tokens, oversized frames, an unknown path) against the real WSS server.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

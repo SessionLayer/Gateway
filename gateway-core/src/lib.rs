@@ -27,6 +27,10 @@
 //! - [`cpauth`] — the outer-leg CP client (the five `OuterLegAuth` RPCs +
 //!   `Authorize`) over the authenticated mTLS channel, fail-closed.
 //! - [`netmatch`] — dependency-free CIDR containment for the source-IP controls.
+//! - [`agent`] — the **outbound-agent transport** (Session Fourteen): the
+//!   mutually-authenticated WebSocket server agents dial OUT to, the single-use
+//!   dial-back token, and the agent `NodeConnector`. It changes only *how* the
+//!   Gateway obtains the node byte stream — everything above the seam is unchanged.
 //!
 //! The **inner** SSH leg (client to the node, host verification, byte bridge) is
 //! Session Eight; the outer leg stops at the `NodeConnector` seam.
@@ -35,6 +39,7 @@
 //! (see the root `Cargo.toml`); this crate additionally warns on missing docs.
 #![warn(missing_docs)]
 
+pub mod agent;
 pub mod asyncio;
 pub mod config;
 pub mod cpauth;
@@ -57,4 +62,14 @@ pub mod version;
 pub mod pb {
     #![allow(missing_docs)]
     tonic::include_proto!("sessionlayer.controlplane.v1");
+}
+
+/// Generated payload types for the frozen **Agent <-> Gateway** wire contract
+/// (`sessionlayer.agent.v1`). Not gRPC: these are the payloads of the framed binary
+/// protocol carried over a mutually-authenticated WebSocket
+/// (`contracts/wire/agent-gateway-v1.md`), and the Control Plane is not a party to it.
+/// Cross-package types (`ComponentInfo`, `ProtocolVersion`) resolve to [`pb`].
+pub mod pbagent {
+    #![allow(missing_docs)]
+    tonic::include_proto!("sessionlayer.agent.v1");
 }

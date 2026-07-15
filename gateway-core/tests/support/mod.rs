@@ -21,6 +21,7 @@
 
 #![allow(dead_code)] // shared across several test binaries; not all use every item.
 
+pub mod docker;
 pub mod sigv4;
 
 use gateway_core::config::SshServerConfig;
@@ -36,17 +37,17 @@ use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningSer
 use gateway_core::pb::{
     lock_event, AccessModel, AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest,
     BeginDeviceFlowResponse, BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution,
-    Capability, ClientHello, ComponentInfo, CustomerKey, Decision, DecisionContext,
+    Capability, ClientHello, ComponentInfo, ConnectorKind, CustomerKey, Decision, DecisionContext,
     DeviceFlowStatus, EnrollGatewayRequest, EnrollGatewayResponse, FinalizeRecordingRequest,
-    FinalizeRecordingResponse, Heartbeat, HostVerification, KeySealAlgorithm, Lock, LockEvent,
-    LockRemoval, LockSnapshot, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
-    ProtocolVersion, RenewGatewayIdentityRequest, RenewGatewayIdentityResponse,
-    RequestUploadRequest, RequestUploadResponse, ResolveBreakglassCodeRequest,
-    ResolveBreakglassCodeResponse, ResolveBreakglassKeyRequest, ResolveBreakglassKeyResponse,
-    ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse,
-    ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity, ServerHello,
-    SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
-    UploadCredential, WormMode,
+    FinalizeRecordingResponse, Heartbeat, HostVerification, IssueGatewayServerCertificateRequest,
+    IssueGatewayServerCertificateResponse, KeySealAlgorithm, Lock, LockEvent, LockRemoval,
+    LockSnapshot, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse, ProtocolVersion,
+    RenewGatewayIdentityRequest, RenewGatewayIdentityResponse, RequestUploadRequest,
+    RequestUploadResponse, ResolveBreakglassCodeRequest, ResolveBreakglassCodeResponse,
+    ResolveBreakglassKeyRequest, ResolveBreakglassKeyResponse, ResolveOtpRequest,
+    ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest,
+    ResolveUserCertResponse, ResolvedIdentity, ServerHello, SignSessionCertificateRequest,
+    SignSessionCertificateResponse, StreamLocksRequest, UploadCredential, WormMode,
 };
 use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
 use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
@@ -110,10 +111,33 @@ impl TestCa {
         rcgen::Issuer::new(self.params.clone(), key)
     }
 
-    /// Sign an externally-generated PKCS#10 CSR (DER), returning the leaf DER.
-    pub fn sign_csr(&self, csr_der: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+    /// Parse a CSR the way the REAL CP does. Its shared PKCS#10 parser (Enroll / Renew /
+    /// IssueGatewayServerCertificate) refuses a CSR with a **blank subject CN** — which a
+    /// CSR whose names are all chosen by the CA would naturally have — so the mock refuses
+    /// one too. A mock that were laxer than the CP would let the Gateway ship a CSR that
+    /// the real CP rejects, with every test still green.
+    fn parse_csr(csr_der: &[u8]) -> Result<rcgen::CertificateSigningRequestParams, rcgen::Error> {
         let typed = rustls::pki_types::CertificateSigningRequestDer::from(csr_der.to_vec());
         let csr = rcgen::CertificateSigningRequestParams::from_der(&typed)?;
+        let has_cn = csr
+            .params
+            .distinguished_name
+            .get(&rcgen::DnType::CommonName)
+            .map(|cn| match cn {
+                rcgen::DnValue::Utf8String(s) => !s.trim().is_empty(),
+                rcgen::DnValue::PrintableString(s) => !s.as_str().trim().is_empty(),
+                _ => true,
+            })
+            .unwrap_or(false);
+        if !has_cn {
+            return Err(rcgen::Error::CouldNotParseCertificationRequest);
+        }
+        Ok(csr)
+    }
+
+    /// Sign an externally-generated PKCS#10 CSR (DER), returning the leaf DER.
+    pub fn sign_csr(&self, csr_der: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+        let csr = Self::parse_csr(csr_der)?;
         let cert = csr.signed_by(&self.issuer())?;
         Ok(cert.der().to_vec())
     }
@@ -132,6 +156,63 @@ impl TestCa {
         params.not_before = nb;
         params.not_after = na;
         params.extended_key_usages = ekus;
+        let cert = params.signed_by(&key, &self.issuer()).unwrap();
+        IssuedLeaf {
+            cert_der: cert.der().to_vec(),
+            key_pem: key.serialize_pem(),
+            key_pkcs8_der: key.serialize_der(),
+        }
+    }
+
+    /// Sign an externally-generated CSR as a **serverAuth** leaf whose SANs THIS CA
+    /// chooses (Session Fourteen `IssueGatewayServerCertificate`): dNSName = the
+    /// gateway's enrolled name, plus the `sessionlayer://gateway/<id>` URI SAN. The
+    /// CSR contributes only its public key — never its requested names.
+    pub fn sign_csr_as_server(
+        &self,
+        csr_der: &[u8],
+        gateway_name: &str,
+        gateway_id: &str,
+        ttl: Duration,
+    ) -> Result<Vec<u8>, rcgen::Error> {
+        let mut csr = Self::parse_csr(csr_der)?;
+        // The CP discards every name the CSR asks for and stamps its own.
+        csr.params.distinguished_name = rcgen::DistinguishedName::new();
+        csr.params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, gateway_name);
+        csr.params.subject_alt_names = vec![
+            rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(gateway_name).unwrap()),
+            rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("sessionlayer://gateway/{gateway_id}"))
+                    .unwrap(),
+            ),
+        ];
+        csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        csr.params.not_before = offset_now() - time::Duration::minutes(5);
+        csr.params.not_after = offset_now() + time::Duration::seconds(ttl.as_secs() as i64);
+        Ok(csr.signed_by(&self.issuer())?.der().to_vec())
+    }
+
+    /// Issue an **agent identity** leaf: a clientAuth leaf carrying the two SANs the
+    /// Gateway resolves an agent peer from (contract §1) — the URI SAN
+    /// `sessionlayer://agent/<agent_id>` and the dNSName SAN = the node's name.
+    pub fn issue_agent_leaf(&self, agent_id: &str, node_name: &str) -> IssuedLeaf {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.not_before = offset_now() - time::Duration::minutes(5);
+        params.not_after = offset_now() + time::Duration::hours(1);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, agent_id);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        params.subject_alt_names = vec![
+            rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("sessionlayer://agent/{agent_id}"))
+                    .unwrap(),
+            ),
+            rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(node_name).unwrap()),
+        ];
         let cert = params.signed_by(&key, &self.issuer()).unwrap();
         IssuedLeaf {
             cert_der: cert.der().to_vec(),
@@ -368,6 +449,10 @@ struct MockState {
     /// The current lock set (pushed to every `StreamLocks` subscriber as the
     /// snapshot). Tests mutate it via [`MockCp::add_lock`]/[`MockCp::remove_lock`].
     locks: Mutex<Vec<Lock>>,
+    /// Session Fourteen: the TTL of an issued agent-facing serverAuth leaf, and the
+    /// key-ids of every inner-leg cert signed (the FR-AUD-4 correlation value).
+    server_cert_ttl: Mutex<Duration>,
+    signed_key_ids: Mutex<Vec<String>>,
     /// Broadcast of incremental lock add/remove events to live `StreamLocks`
     /// subscribers (the fan-out hub).
     lock_events: tokio::sync::broadcast::Sender<LockEvent>,
@@ -585,6 +670,53 @@ impl GatewayIdentity for MockSvc {
             not_after_epoch_seconds: na,
         }))
     }
+
+    /// Session Fourteen: issue the **serverAuth** leaf for the Gateway's agent-facing
+    /// WSS listener. Requires the caller's current mTLS client certificate; a locked
+    /// identity is refused. The CP — not the caller — chooses the SANs, stamping them
+    /// from the gateway_identity row it already holds, so a compromised Gateway cannot
+    /// obtain a server certificate for a name it does not own.
+    async fn issue_gateway_server_certificate(
+        &self,
+        request: Request<IssueGatewayServerCertificateRequest>,
+    ) -> Result<Response<IssueGatewayServerCertificateResponse>, Status> {
+        let peer = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = peer
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+            .as_ref()
+            .to_vec();
+        let gid = self.resolve_gateway_id(&leaf)?;
+
+        let gateway_name = {
+            let gws = self.gateways.lock().unwrap();
+            let rec = gws
+                .get(&gid)
+                .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
+            if rec.locked {
+                return Err(Status::permission_denied("identity locked"));
+            }
+            rec.name.clone()
+        };
+
+        let r = request.into_inner();
+        let ttl = *self.server_cert_ttl.lock().unwrap();
+        let certificate = self
+            .ca
+            .sign_csr_as_server(&r.pkcs10_csr, &gateway_name, &gid, ttl)
+            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
+
+        let now = SystemTime::now();
+        Ok(Response::new(IssueGatewayServerCertificateResponse {
+            certificate,
+            ca_chain: vec![self.ca.cert_der().to_vec()],
+            gateway_name,
+            not_before_epoch_seconds: epoch_of(now),
+            not_after_epoch_seconds: epoch_of(now + ttl),
+        }))
+    }
 }
 
 #[tonic::async_trait]
@@ -644,6 +776,12 @@ impl SessionSigning for MockSvc {
         };
 
         let resp = self.sign_inner(&r.subject_public_key, &principal, &session_id)?;
+        // FR-AUD-4: the key-id the node's own sshd will log on this certificate — the
+        // join between the CP's trail and the node-local one.
+        self.signed_key_ids
+            .lock()
+            .unwrap()
+            .push(resp.key_id.clone());
         Ok(Response::new(resp))
     }
 }
@@ -1364,6 +1502,15 @@ fn deny_response() -> AuthorizeResponse {
     }
 }
 
+/// `time::OffsetDateTime::now_utc()`, for rcgen validity windows.
+fn offset_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
+}
+
+fn epoch_of(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
 impl MockState {
     fn validity_window(&self) -> (i64, i64) {
         let now = unix_now();
@@ -1531,6 +1678,8 @@ impl MockCpBuilder {
             context_signer_key,
             node_labels: Mutex::new(HashMap::new()),
             locks: Mutex::new(Vec::new()),
+            server_cert_ttl: Mutex::new(Duration::from_secs(3600)),
+            signed_key_ids: Mutex::new(Vec::new()),
             lock_events: tokio::sync::broadcast::channel(64).0,
             feed_epoch: AtomicU64::new(1),
         });
@@ -1774,11 +1923,47 @@ impl MockCp {
         self.state.node_connections.lock().unwrap().insert(
             node_id.to_string(),
             NodeConnection {
-                connector_kind: gateway_core::pb::ConnectorKind::Agentless as i32,
+                connector_kind: ConnectorKind::Agentless as i32,
                 dial_address: dial_address.to_string(),
                 host_verification: Some(host),
+                node_name: node_id.to_string(),
             },
         );
+    }
+
+    /// Declare `node_id` an **outbound-agent** node (Session Fourteen, FR-CONN-3):
+    /// no dial address, and the enrollment `node_name` the Gateway joins to the
+    /// agent's control channel by (its certificate's dNSName SAN).
+    pub fn set_agent_node_connection(
+        &self,
+        node_id: &str,
+        node_name: &str,
+        host: HostVerification,
+    ) {
+        self.state.node_connections.lock().unwrap().insert(
+            node_id.to_string(),
+            NodeConnection {
+                connector_kind: ConnectorKind::OutboundAgent as i32,
+                dial_address: String::new(),
+                host_verification: Some(host),
+                node_name: node_name.to_string(),
+            },
+        );
+    }
+
+    /// Issue an **agent identity** leaf from this CP's internal mTLS CA: the S12
+    /// credential an Agent presents on both wire roles (URI SAN
+    /// `sessionlayer://agent/<agent_id>` + dNSName SAN = the node's enrollment name).
+    pub fn issue_agent_identity(&self, agent_id: &str, node_name: &str) -> IssuedLeaf {
+        self.state.ca.issue_agent_leaf(agent_id, node_name)
+    }
+
+    /// The key-ids (`session_id + principal`) of every inner-leg certificate this CP
+    /// has signed. The node's own `sshd` VERBOSE log records the same value on every
+    /// accepted certificate, which is what makes the node-local trail an independent
+    /// second record (FR-AUD-4).
+    pub fn signed_key_ids(&self) -> Vec<String> {
+        self.state.signed_key_ids.lock().unwrap().clone()
     }
 
     /// Override the granted capabilities for `node_id` (default shell+exec).
@@ -2142,6 +2327,21 @@ pub async fn outer_leg_deps_with(
     connector: Arc<dyn NodeConnector>,
     recorder: RecorderChoice,
 ) -> HandlerDeps {
+    outer_leg_deps_named(cp, config, connector, recorder, "gw-s8")
+        .await
+        .0
+}
+
+/// Like [`outer_leg_deps_with`], but enrolls under an explicit Gateway **name** and also
+/// returns the credential — the agent transport needs both (its serverAuth leaf carries
+/// the name, and every dial-back token is bound to the gateway id).
+pub async fn outer_leg_deps_named(
+    cp: &MockCp,
+    config: Arc<SshServerConfig>,
+    connector: Arc<dyn NodeConnector>,
+    recorder: RecorderChoice,
+    gateway_name: &str,
+) -> (HandlerDeps, identity::Credential) {
     let dir = tempfile::tempdir().unwrap();
     let store = identity::IdentityStore::open(dir.path()).unwrap();
     let params = cp.channel_params(Duration::from_secs(5), Duration::from_secs(10));
@@ -2150,10 +2350,11 @@ pub async fn outer_leg_deps_with(
         &params,
         &cp.bootstrap_anchors(),
         &cp.mint_enrollment_token(),
-        "gw-s8",
+        gateway_name,
     )
     .await
     .unwrap();
+    let credential = cred.clone();
 
     let factory = Arc::new(CpChannelFactory::fixed(
         cp.channel_params(Duration::from_secs(5), Duration::from_secs(10)),
@@ -2202,16 +2403,19 @@ pub async fn outer_leg_deps_with(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    HandlerDeps {
-        cpauth,
-        connector,
-        resolver: Arc::new(IdentityResolver),
-        recorder_factory,
-        finalize_tracker: gateway_core::ssh::recorder::FinalizeTracker::default(),
-        lock_set,
-        live_sessions,
-        config,
-    }
+    (
+        HandlerDeps {
+            cpauth,
+            connector,
+            resolver: Arc::new(IdentityResolver),
+            recorder_factory,
+            finalize_tracker: gateway_core::ssh::recorder::FinalizeTracker::default(),
+            lock_set,
+            live_sessions,
+            config,
+        },
+        credential,
+    )
 }
 
 /// Spawn a bare TLS listener that presents `server_config` and completes (or

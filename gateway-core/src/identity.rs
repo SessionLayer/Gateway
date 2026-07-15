@@ -204,6 +204,9 @@ struct IssuedCredential {
 pub struct KeypairCsr {
     /// PEM of the private key (never leaves the Gateway; zeroized on drop).
     pub key_pem: Zeroizing<String>,
+    /// PKCS#8 DER of the same private key — what a rustls `ServerConfig` takes
+    /// directly (the agent transport's serverAuth leaf, Session Fourteen).
+    pub key_pkcs8_der: Zeroizing<Vec<u8>>,
     /// The PKCS#10 CertificationRequest, DER.
     pub csr_der: Vec<u8>,
 }
@@ -212,6 +215,7 @@ impl std::fmt::Debug for KeypairCsr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeypairCsr")
             .field("key_pem", &"<redacted>")
+            .field("key_pkcs8_der", &"<redacted>")
             .field("csr_der_len", &self.csr_der.len())
             .finish()
     }
@@ -220,12 +224,25 @@ impl std::fmt::Debug for KeypairCsr {
 /// Generate a fresh ECDSA P-256 keypair and a PKCS#10 CSR whose subject
 /// alternative name is `gateway_name`. The private key stays local; only the CSR
 /// (public key + proof of possession) is ever sent (D2/§15).
+///
+/// Each call generates a **fresh** keypair, which is what gives the agent-facing
+/// serverAuth leaf key separation from the mTLS client identity.
+///
+/// The subject **CN is set explicitly**. The CP discards every name we ask for (it
+/// stamps the leaf from the `gateway_identity` row it already holds), but its PKCS#10
+/// parser *rejects a CSR with a blank CN* — for Enroll and Renew as much as for the
+/// server-certificate RPC. Relying on rcgen's placeholder default to satisfy that would
+/// make all three break the day the default changes.
 pub fn generate_keypair_and_csr(gateway_name: &str) -> Result<KeypairCsr, IdentityError> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-    let params = rcgen::CertificateParams::new(vec![gateway_name.to_string()])?;
+    let mut params = rcgen::CertificateParams::new(vec![gateway_name.to_string()])?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, gateway_name);
     let csr = params.serialize_request(&key)?;
     Ok(KeypairCsr {
         key_pem: Zeroizing::new(key.serialize_pem()),
+        key_pkcs8_der: Zeroizing::new(key.serialize_der()),
         csr_der: csr.der().to_vec(),
     })
 }
@@ -547,7 +564,7 @@ fn systemtime_from_epoch(epoch_seconds: i64) -> Option<SystemTime> {
 /// a panic, and (used in `persist_issued` before the write) never persisted to
 /// disk, so a hostile response can't brick the Gateway into a load-time
 /// crash-loop (NFR-2).
-fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), IdentityError> {
+pub fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), IdentityError> {
     if nb < 0 || na < 0 {
         return Err(IdentityError::Corrupt(format!(
             "certificate validity epoch is negative (not_before {nb}, not_after {na})"
@@ -566,6 +583,62 @@ fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), Identi
 }
 
 // ---- renew-ahead loop ---------------------------------------------------------
+
+/// Minimum spacing between two *consecutive* successful renewals.
+///
+/// After a renewal the loop re-derives its schedule from the NEW certificate. If that
+/// certificate is already past its renew trigger — a short TTL with a clock-skew
+/// backdate (FR-BOOT-4) or a CP clock ahead of ours — [`compute_renew_delay`] returns
+/// `ZERO` and the loop would renew back-to-back, hammering the CP and burning
+/// generations. Flooring the *post-renewal* wait bounds that. (The Agent hit this in S12;
+/// the Gateway shared the bug.)
+const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Apply the post-renewal floor. When there is a real remaining window the floor is capped
+/// at half of it (so the loop still renews before the certificate expires); when the window
+/// is **already gone** (`remaining == 0`) the cap would collapse the floor to zero
+/// (F-renewstorm-1: the S14 floor closed the `base == 0` trigger but left this one open), so
+/// the **full [`RENEW_MIN_INTERVAL`]** applies instead.
+///
+/// **Retry-bounded, NOT terminal** (cross-repo alignment with the Agent's identical helper).
+/// The likeliest cause of an already-expired *issued* certificate is the **CP's** clock or
+/// TTL config, common to the whole fleet — a terminal exit here would make every Gateway and
+/// Agent stop simultaneously on one central misconfig (fail-deadly). So the loop keeps
+/// renewing, bounded to ≈1/min, and logs the condition loudly instead; the generation
+/// counter (a §8.2 clone-detection signal) stays usable rather than being churned or frozen.
+fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
+    let floor = if remaining.is_zero() {
+        RENEW_MIN_INTERVAL
+    } else {
+        RENEW_MIN_INTERVAL.min(remaining / 2)
+    };
+    base.max(floor)
+}
+
+/// Whether a freshly-adopted certificate is **already expired at this host's clock** — a
+/// clock-skew / CP-TTL fault the caller logs loudly (the renewal proceeds, bounded).
+pub fn expired_at_issue(now: SystemTime, not_after: SystemTime) -> bool {
+    not_after
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+        .is_zero()
+}
+
+/// The post-renewal delay for a certificate that is NOT the persisted identity — the
+/// agent-facing serverAuth leaf (Session Fourteen), held only in memory. Same schedule +
+/// same storm floor as the identity; always the post-success case, so it is always floored.
+pub fn reissue_delay(now: SystemTime, not_before: SystemTime, not_after: SystemTime) -> Duration {
+    let base = compute_renew_delay(
+        now,
+        not_before,
+        not_after,
+        2.0 / 3.0,
+        0.1,
+        random_jitter_sample(),
+    );
+    let remaining = not_after.duration_since(now).unwrap_or(Duration::ZERO);
+    floor_after_renew(base, remaining)
+}
 
 /// A handle to trigger a renewal on demand and to observe the current credential.
 ///
@@ -648,9 +721,10 @@ impl RenewAhead {
     /// renews with persist-before-adopt and publishes the new credential. A
     /// generation-mismatch security event stops the loop (fail closed).
     pub async fn run(mut self, mut shutdown: impl std::future::Future<Output = ()> + Unpin) {
+        let mut just_renewed = false;
         loop {
             let current = self.current_rx.borrow().clone();
-            let delay = compute_renew_delay(
+            let base = compute_renew_delay(
                 SystemTime::now(),
                 current.not_before,
                 current.not_after,
@@ -658,6 +732,30 @@ impl RenewAhead {
                 self.config.renew_jitter_fraction,
                 random_jitter_sample(),
             );
+            // A credential loaded near expiry SHOULD renew at once, so the floor applies
+            // only after a successful renewal — where a zero delay would be a hot spin
+            // against the CP rather than a legitimate catch-up.
+            let delay = if just_renewed {
+                let now = SystemTime::now();
+                // An already-expired issued cert is a clock/CP-TTL fault: log it loudly, then
+                // keep renewing BOUNDED (not terminal — a terminal exit on a fleet-wide CP
+                // misconfig would be fail-deadly). The floor turns the storm into ~1/min.
+                if expired_at_issue(now, current.not_after) {
+                    tracing::error!(
+                        gateway_id = %current.gateway_id,
+                        generation = current.generation,
+                        "RENEW-STORM GUARD: adopted a certificate already expired at this Gateway's clock (clock skew beyond the certificate TTL, or a CP TTL misconfiguration) — renewal continues bounded to ~1/min; fix NTP / the CP certificate TTL (operator action required)"
+                    );
+                }
+                let remaining = current
+                    .not_after
+                    .duration_since(now)
+                    .unwrap_or(Duration::ZERO);
+                floor_after_renew(base, remaining)
+            } else {
+                base
+            };
+            just_renewed = false;
 
             tokio::select! {
                 biased;
@@ -681,6 +779,7 @@ impl RenewAhead {
                         "renewed mTLS identity (persist-before-adopt)"
                     );
                     let _ = self.current_tx.send(std::sync::Arc::new(new_cred));
+                    just_renewed = true;
                 }
                 Err(IdentityError::GenerationMismatch { expected, got }) => {
                     // Security event (§8.2): refuse + flag + stop. Do NOT keep
@@ -764,6 +863,37 @@ mod tests {
         );
     }
 
+    /// The Control Plane's shared PKCS#10 parser (Enroll / Renew /
+    /// IssueGatewayServerCertificate) refuses a CSR with a blank CN or a non-P-256 key.
+    /// The mock CP is deliberately strict about this too, but assert it at the source: a
+    /// silent regression here would break enrollment against the real CP, not just the
+    /// agent transport.
+    #[test]
+    fn csr_carries_a_non_blank_cn_and_a_p256_key() {
+        use x509_parser::certification_request::X509CertificationRequest;
+        use x509_parser::prelude::FromDer;
+
+        let kc = generate_keypair_and_csr("gw-1").unwrap();
+        let (_, csr) = X509CertificationRequest::from_der(&kc.csr_der).unwrap();
+        let info = &csr.certification_request_info;
+
+        let cn = info
+            .subject
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .unwrap_or_default();
+        assert!(!cn.trim().is_empty(), "the CP rejects a blank-CN CSR");
+        assert_eq!(cn, "gw-1", "the CN is ours, not an rcgen placeholder");
+
+        // ECDSA P-256 (id-ecPublicKey + prime256v1); anything else is refused.
+        assert!(csr.verify_signature().is_ok(), "proof of possession");
+        assert_eq!(
+            info.subject_pki.algorithm.algorithm.to_id_string(),
+            "1.2.840.10045.2.1"
+        );
+    }
+
     #[test]
     fn compute_renew_delay_two_thirds_no_jitter() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
@@ -794,6 +924,46 @@ mod tests {
             delay <= Duration::from_secs(285),
             "must renew before expiry, got {delay:?}"
         );
+    }
+
+    #[test]
+    fn floor_after_renew_never_collapses_to_zero() {
+        // A certificate born past its own renew trigger yields a ZERO base; the floor must
+        // not let the post-renewal loop spin on the CP.
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::from_secs(3600)),
+            RENEW_MIN_INTERVAL
+        );
+        // A healthy schedule is untouched.
+        assert_eq!(
+            floor_after_renew(Duration::from_secs(600), Duration::from_secs(3600)),
+            Duration::from_secs(600)
+        );
+        // A real short window keeps the `remaining/2` cap (renew before expiry).
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::from_secs(10)),
+            Duration::from_secs(5) // min(60, 10/2)
+        );
+        // The exact collapse-to-zero case: `remaining == 0` applies the FULL floor, not the
+        // (now-zero) cap (F-renewstorm-1). Matches the Agent's identical helper.
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::ZERO),
+            RENEW_MIN_INTERVAL
+        );
+    }
+
+    #[test]
+    fn expired_at_issue_detects_an_already_dead_certificate() {
+        let now = SystemTime::now();
+        assert!(expired_at_issue(now, now)); // not_after == now => nothing left
+        assert!(expired_at_issue(now, now - Duration::from_secs(10)));
+        assert!(!expired_at_issue(now, now + Duration::from_secs(60)));
+        // reissue_delay is always floored (never zero), even for an expired window.
+        assert_eq!(
+            reissue_delay(now, now - Duration::from_secs(10), now),
+            RENEW_MIN_INTERVAL
+        );
+        assert!(reissue_delay(now, now, now + Duration::from_secs(3600)) >= Duration::from_secs(1));
     }
 
     #[test]
