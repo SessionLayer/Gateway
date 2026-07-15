@@ -53,7 +53,7 @@ use crate::ssh::innerleg::{
 };
 use crate::ssh::locks::{LiveSessionRegistry, LockBindings, LockSet, SessionControl, SessionGuard};
 use crate::ssh::outcome::{SshOutcome, DEVICE_FLOW_TIMEOUT, SERVICE_UNAVAILABLE};
-use crate::ssh::target::{parse_username, TargetResolver};
+use crate::ssh::target::{parse_username, strip_dns_suffix, TargetResolver};
 use crate::version;
 
 /// Per-connection state shared with the accept loop: whether authentication
@@ -332,6 +332,12 @@ impl SshHandler {
         let username = self.username.as_deref().unwrap_or_default();
         parse_username(username, self.deps.config.target_separator)
             .ok()
+            .map(|mut t| {
+                // Wildcard DNS (Part B): strip the configured suffix so a break-glass session
+                // addressed as `user@web-01.ssh.corp` scopes to the same node as `user%web-01`.
+                t.node = strip_dns_suffix(&t.node, &self.deps.config.node_dns_suffixes);
+                t
+            })
             .and_then(|t| self.deps.resolver.resolve_node_id(&t))
             .unwrap_or_default()
     }
@@ -989,10 +995,16 @@ impl SshHandler {
             return Err(SshOutcome::AuthFailed);
         };
         let username = self.username.as_deref().unwrap_or_default();
-        let Ok(target) = parse_username(username, self.deps.config.target_separator) else {
+        let Ok(mut target) = parse_username(username, self.deps.config.target_separator) else {
             tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), outcome = "policy_denied", reason = "malformed_target", "generic denial");
             return Err(SshOutcome::PolicyDenied);
         };
+        // Wildcard DNS (Session Sixteen, Part B): fold `web-01.ssh.corp` (from the ssh_config
+        // `Host *.ssh.corp` → `User %r%%%h` convenience) back to the bare node name before
+        // resolution, so it reaches the same node as a plain `login%web-01`. A no-op when no
+        // configured `ssh.node_dns_suffixes` matches (default), so the baseline encoding is
+        // untouched.
+        target.node = strip_dns_suffix(&target.node, &self.deps.config.node_dns_suffixes);
 
         // Credential-principal reducer (deny-only): a login-scoped credential may
         // only be used for a login it is scoped to (FR-AUTH-15 spirit, §5.4/§5.5).
@@ -1009,6 +1021,12 @@ impl SshHandler {
         let req = AuthorizeRequest {
             identity: auth.identity.clone(),
             identity_groups: auth.groups.clone(),
+            // Session Sixteen Part A (FR-ADDR-1): forward the parsed node NAME (already
+            // wildcard-DNS-normalized by Part B above). The CP resolves it to runtime.node.id via
+            // findByName — authoritative, server-side — and returns the id in the NodeConnection;
+            // node_id is kept only for back-compat (the CP ignores it when node_name is set, and
+            // falls back to it when node_name is empty).
+            node_name: target.node.clone(),
             node_id: node_id.clone(),
             requested_principal: target.login.clone(),
             source_ip: self.source_ip(),

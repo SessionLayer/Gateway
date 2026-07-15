@@ -321,6 +321,17 @@ pub struct SshServerConfig {
     /// The username-encoding target separator (`login%node`, Design §11). `%` by
     /// default; wildcard-DNS and ProxyJump host-cert modes are Session Sixteen.
     pub target_separator: char,
+    /// Wildcard-DNS node domains (Session Sixteen, Part B, Design §11, FR-ADDR-2).
+    /// Under the ssh_config convenience `Host *.ssh.corp` → `Hostname gw`,
+    /// `User %r%%%h`, an `ssh user@web-01.ssh.corp` arrives as the username
+    /// `user%web-01.ssh.corp`; after the `%` split the Gateway strips a matching
+    /// suffix here to recover the bare node name (`web-01`) for the name→id lookup.
+    /// Each entry is a domain suffix, with or without a leading dot
+    /// (e.g. `"ssh.corp"` or `".ssh.corp"`); matching is case-insensitive and the
+    /// most-specific (longest) match wins. **Empty (default) disables wildcard DNS**
+    /// — a target with no matching suffix is passed through unchanged, so the plain
+    /// `login%node` encoding is unaffected.
+    pub node_dns_suffixes: Vec<String>,
     /// OIDC device-flow presentation + polling knobs (FR-AUTH-4).
     pub device_flow: DeviceFlowConfig,
     /// Bound (seconds) on establishing the CP mTLS transport for an auth/authorize
@@ -627,6 +638,7 @@ impl Default for SshServerConfig {
             proxy: ProxyProtocolConfig::default(),
             source_ip_allowlist: Vec::new(),
             target_separator: '%',
+            node_dns_suffixes: Vec::new(),
             device_flow: DeviceFlowConfig::default(),
             cp_connect_timeout_secs: 5,
             cp_rpc_timeout_secs: 10,
@@ -823,6 +835,10 @@ mod tests {
         let cfg = GatewayConfig::default();
         assert!(cfg.ssh.listen_addr.is_empty(), "SSH server off by default");
         assert_eq!(cfg.ssh.target_separator, '%');
+        assert!(
+            cfg.ssh.node_dns_suffixes.is_empty(),
+            "wildcard DNS off by default"
+        );
         assert!(cfg.ssh.proxy.lb_cidrs.is_empty(), "PROXY off by default");
         assert!(
             cfg.ssh.source_ip_allowlist.is_empty(),
@@ -831,6 +847,23 @@ mod tests {
         // The device flow must fit inside the login grace window.
         assert!(cfg.ssh.device_flow.poll_timeout_secs < cfg.ssh.login_grace_secs);
         assert_eq!(cfg.ssh.device_flow.heartbeat_interval_secs, 10);
+    }
+
+    #[test]
+    fn wildcard_dns_suffixes_parse_and_deny_unknown_keys() {
+        // Session Sixteen Part B: the wildcard-DNS node domains parse from config.
+        let cfg: GatewayConfig =
+            serde_json::from_str(r#"{"ssh":{"node_dns_suffixes":["ssh.corp",".db.internal"]}}"#)
+                .unwrap();
+        assert_eq!(
+            cfg.ssh.node_dns_suffixes,
+            vec!["ssh.corp".to_string(), ".db.internal".to_string()]
+        );
+        // A misspelled key still fails closed (deny_unknown_fields).
+        assert!(serde_json::from_str::<GatewayConfig>(
+            r#"{"ssh":{"node_dns_suffix":["ssh.corp"]}}"#
+        )
+        .is_err());
     }
 
     #[test]
