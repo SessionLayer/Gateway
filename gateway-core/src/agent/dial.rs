@@ -212,6 +212,7 @@ mod tests {
             node_name: node_name.into(),
             session_id: "sess-1".into(),
             principal: "deploy".into(),
+            ..Default::default()
         }
     }
 

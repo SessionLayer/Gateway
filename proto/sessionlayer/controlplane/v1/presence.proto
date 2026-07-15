@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "PresenceProto";
+
+// Presence is the CP-owned authority for node ownership in HA (Design §10.2/§10.3;
+// FR-HA-2). runtime.presence (node -> owning_gateway, addr, monotonic nonce) is
+// authoritative in Postgres in BOTH single-instance and HA modes (mode-symmetry —
+// only the signalling transport differs). The Gateway has no database access; it
+// heartbeats and releases ownership through this service so the datastore boundary
+// (Design D11: the CP is the sole Postgres owner) is preserved. `LISTEN/NOTIFY` is
+// NOT used (global commit-lock). Added in Session Fifteen (additive; protocol 1.1).
+//
+// TIER. mTLS-required (gateway-identity): the OWNER is the authenticated mTLS peer
+// (gateway_id), NEVER a request field — a Gateway can only claim/refresh/release
+// ownership for itself, exactly as with the minted session/recording tokens.
+//
+// The routing READ path is folded into Authorization.Authorize (NodeConnection
+// owner fields) because the CP already does the authz round-trip there; this
+// service is the WRITE path (heartbeat/claim + release).
+service Presence {
+  // Heartbeat claims or refreshes ownership of a node whose agent control channel
+  // this Gateway currently holds. Semantics (applied transactionally, honouring
+  // the monotonic-nonce trigger):
+  //   * no current owner, or the current owner is stale (last_seen older than the
+  //     staleness TTL) -> CLAIM: owner := caller, nonce := current+1 (new nonce_id).
+  //   * caller is the current owner -> REFRESH: last_seen := now (nonce unchanged).
+  //   * caller is not owner and the owner is fresh -> STANDBY: no write.
+  // The response always returns the authoritative post-state so a warm standby
+  // learns it is not the owner. A lower-nonce write is rejected (stale ownership,
+  // FR-HA-5) and surfaces as a failed RPC; the Gateway treats that as "not owner".
+  rpc Heartbeat(PresenceHeartbeatRequest) returns (PresenceHeartbeatResponse);
+
+  // Release relinquishes ownership on graceful drain or control-channel loss so a
+  // standby Gateway claims immediately (closing the failover window). It is a
+  // no-op unless the caller is the currently recorded owner (idempotent, fail-safe).
+  rpc Release(PresenceReleaseRequest) returns (PresenceReleaseResponse);
+}
+
+message PresenceHeartbeatRequest {
+  // The node whose ownership is being claimed/refreshed, identified by its stable
+  // enrollment NAME (runtime.node.name) — NOT its UUID. The Gateway has no database
+  // and knows its owned nodes only by the name it reads from each agent's mTLS
+  // dNSName SAN (the agent registry is keyed by name), so it can only address a node
+  // by name. The CP resolves the name to the node row and keys runtime.presence by
+  // the resolved runtime.node.id; an unknown name is refused (fail closed). Node
+  // names are unique (runtime.node.name UNIQUE). Field number stable since S15.
+  string node_name = 1;
+
+  // The caller's peer-relay advertise address (host:port) that a peer ingress
+  // Gateway would be told to expect the relay dial-back from. Stored as
+  // presence.gateway_addr. The OWNER identity itself is the authenticated mTLS
+  // peer gateway_id — never taken from this message.
+  string gateway_addr = 2;
+}
+
+message PresenceHeartbeatResponse {
+  // The authoritative owner after applying this heartbeat (gateway_identity.name).
+  string owning_gateway_id = 1;
+  string gateway_addr = 2;
+  // The authoritative monotonic nonce + nonce_id after this heartbeat.
+  uint64 nonce = 3;
+  string nonce_id = 4;
+  // Owner last_seen as unix epoch milliseconds (domain time).
+  int64 last_seen_epoch_ms = 5;
+  // True iff the caller is the owner after this heartbeat (claimed or refreshed).
+  bool is_self_owner = 6;
+}
+
+message PresenceReleaseRequest {
+  // The node's stable enrollment NAME (see PresenceHeartbeatRequest.node_name);
+  // the CP resolves it to the runtime.node.id keying runtime.presence.
+  string node_name = 1;
+}
+
+message PresenceReleaseResponse {
+  // True iff this call actually relinquished ownership (caller was the owner).
+  bool released = 1;
+}

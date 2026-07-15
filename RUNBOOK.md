@@ -130,3 +130,83 @@ running `LogLevel VERBOSE` logs that key-id on every accepted certificate. The t
 cross-correlate on the session id with **no trust in the Agent** — which is exactly what
 makes the second trail independent. To investigate a session on the node:
 `journalctl -u ssh | grep '<session_id>'`.
+
+## High Availability (Session Fifteen; Design §10.2/§10.3)
+
+The default mode is **single-instance** with an in-process signal bus and zero extra
+dependencies — single-instance operators can ignore the NATS/relay guidance below.
+Ownership, the coordination subject, and the relay token are keyed by the gateway
+**NAME** (`gateway_identity.name`), never its UUID. **Session bytes never traverse the
+coordination bus** — only the `DialBackSignal` does.
+
+### Draining a Gateway gracefully (SIGTERM ordering — FR-HA-7)
+
+On `SIGTERM`/`SIGINT` the Gateway drains in order (`ha.drain.*`):
+
+1. `/readyz` flips to **503** but the Gateway KEEPS ACCEPTING for
+   `pre_drain_grace_secs` (default 5s). Size your LB so
+   `probe_interval × unhealthy_threshold ≤` this grace, so the LB deregisters this
+   Gateway *before* it stops accepting (no window where the LB still routes a new
+   connection to a Gateway that has stopped listening).
+2. Accept loops stop; the heartbeat loop **releases presence** so a standby claims at
+   once; agent control channels close so agents fail over.
+3. Live sessions — both this Gateway's own ingress sessions AND relays it serves as an
+   owner — finish to `deadline_secs` (default 30s); they are **not** cut instantly.
+4. Any session still live at the deadline is torn down via the recorder-finalize path
+   (recordings finalize; no orphaned WORM object), then in-flight finalizes drain.
+
+Point the LB health check at `GET ha.drain.readyz_addr/readyz` (200 `ready` /
+503 `draining`); empty `readyz_addr` disables it (default).
+
+**No live migration (FR-HA-7):** a relayed session does **not** survive the death of the
+*owner* it runs on — the client reconnects (cheap, pinned-key silent reconnect) and
+re-routes to the new owner. A session whose node is owned by the *ingress itself* is
+unaffected by any other Gateway's drain.
+
+### "Not owner" / presence contention — expected behaviour
+
+Several Gateways may hold a live control channel for the same node, but only one **owns**
+it (the monotonic-nonce claim). A non-owner is a warm **standby** — it keeps the channel
+and keeps heartbeating, taking over the instant the owner goes stale (~30s TTL). The log
+`presence: standby (another gateway owns this node)` is **normal**, not an error. A
+heartbeat that fails (CP unreachable / stale-nonce reject) means the Gateway simply does
+not own the node this tick; a session routed to it fails closed and self-heals next tick.
+
+### M1 — presence-refresh flap on a large fleet
+
+**Symptom:** a HEALTHY Gateway holding many nodes intermittently marks its own nodes
+stale; new sessions fail closed; ownership flaps.
+**Cause:** the per-node heartbeat RPCs did not all complete within the staleness TTL.
+Heartbeats fan out ~16-wide, so hundreds of nodes at ~100ms/RPC stay inside the 30s TTL,
+but a slow CP or a very large fleet can still blow the budget.
+**Mitigation:** cut CP `Presence.Heartbeat` latency; add Gateways to lower owned-node count
+per Gateway; or raise `ha.presence.heartbeat_interval_secs` / `staleness_ttl_secs` in
+lockstep on BOTH the Gateway and the CP. Watch the `presence heartbeat failed` rate.
+
+### NATS coordination bus (HA only)
+
+The bundled NATS client is a minimal **core** pub/sub client connecting in **plaintext
+with an unauthenticated CONNECT** — it targets a **trusted internal network** and is
+deliberately dependency-free (supply-chain rationale).
+
+- **Production requirement:** run the bus mutually authenticated + TLS + subject-authorized
+  (only the owner may `SUB sl.dialback.<owner>`; only ingress Gateways may `PUB`). Provide
+  TLS/auth via a **co-located sidecar** (localhost TLS-terminating proxy / NATS leaf-node
+  TLS boundary), or substitute a TLS-capable `CoordinationBackend`.
+- **Fail-loud:** if the broker advertises `tls_required`/`auth_required` this plaintext
+  client cannot meet, the connection manager logs a single loud error and **stops** (no
+  reconnect loop). HA signalling is then DOWN and remote-owned sessions fail closed — fix
+  the sidecar/broker config and restart.
+- **No-owner is invisible on NATS:** a `PUB` to a subject with no subscriber succeeds
+  silently, so an absent owner is not surfaced at publish time; `ha.routing.relay_timeout_secs`
+  is the backstop (the ingress waits out the bound and fails closed).
+- **Defence-in-depth:** the owner drops a stale/replayed signal (owner_nonce older than its
+  current presence nonce) and caps concurrent relays per node — bus publish-authz is the
+  first line, these back it up.
+
+### Observability (interim)
+
+The metrics framework is deferred (Accepted-Risk, per the S8/S12/S14 precedent). Until it
+lands, use the structured logs: `event=peer_relay_serving` / `event=peer_relay_closed`
+(relay throughput as an owner), the `presence …` lines (ownership claim/standby/loss), and
+`outcome=node_unreachable reason=…` (fail-closed routing).

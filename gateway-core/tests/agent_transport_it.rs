@@ -96,6 +96,7 @@ impl Harness {
                 pending: pending.clone(),
                 signer: signer.clone(),
                 lock_set: lock_set.clone(),
+                peer_relay: None,
                 config: gateway_core::config::AgentTransportConfig {
                     listen_addr: "127.0.0.1:0".into(),
                     heartbeat_interval_secs: 1,
@@ -206,6 +207,7 @@ fn node_dial(node_name: &str, session_id: &str) -> NodeDial {
         node_name: node_name.into(),
         session_id: session_id.into(),
         principal: "deploy".into(),
+        ..Default::default()
     }
 }
 

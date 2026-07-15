@@ -7,7 +7,7 @@
 
 use crate::asyncio::IoBackend;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Gateway configuration.
@@ -39,6 +39,9 @@ pub struct GatewayConfig {
     /// Outer SSH-leg server (Session Seven). A blank `listen_addr` leaves it
     /// disabled (scaffold mode); set it to run the SSH front door.
     pub ssh: SshServerConfig,
+    /// High-availability coordination (Session Fifteen). Default is
+    /// single-instance / in-process with ZERO extra dependencies.
+    pub ha: HaConfig,
 }
 
 impl Default for GatewayConfig {
@@ -51,6 +54,226 @@ impl Default for GatewayConfig {
             bootstrap: None,
             identity: IdentityConfig::default(),
             ssh: SshServerConfig::default(),
+            ha: HaConfig::default(),
+        }
+    }
+}
+
+/// A failure loading the Gateway configuration from a file (fail-closed at
+/// startup: a misconfigured or unreadable file aborts rather than silently
+/// falling back to a possibly-insecure default).
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The config file could not be read.
+    #[error("reading gateway config {path}: {source}")]
+    Read {
+        /// The path that failed.
+        path: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The config file did not parse as JSON (a misspelled/unknown key is a parse
+    /// error via `deny_unknown_fields`, so misconfiguration fails closed).
+    #[error("parsing gateway config {path}: {source}")]
+    Parse {
+        /// The path that failed.
+        path: String,
+        /// The underlying deserialization error.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+impl GatewayConfig {
+    /// The environment variable naming the JSON config file.
+    pub const CONFIG_ENV: &'static str = "SL_GATEWAY_CONFIG";
+
+    /// Load the configuration. `explicit` (a `--config` path) wins; otherwise the
+    /// [`Self::CONFIG_ENV`] environment variable is consulted; with neither set the
+    /// built-in default is used. A named-but-unreadable/unparseable file is an error
+    /// (fail closed — never a silent fallback to the default).
+    pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
+        let from_env = std::env::var_os(Self::CONFIG_ENV).map(PathBuf::from);
+        match explicit.map(Path::to_path_buf).or(from_env) {
+            Some(path) => Self::load_from_path(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Parse a JSON config file. `deny_unknown_fields` makes an unknown key an error.
+    pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        serde_json::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.display().to_string(),
+            source,
+        })
+    }
+}
+
+/// High-availability coordination (Session Fifteen; Design §10.2/§10.3,
+/// FR-HA-2/3/4/5/8). Governs how this Gateway participates in a multi-instance
+/// deployment: how it signals a peer owner to dial back the node byte stream, how it
+/// heartbeats node ownership to the CP, and how it routes a session whose node is
+/// owned by another Gateway.
+///
+/// The default is **single-instance** with an **in-process** signal bus and ZERO
+/// extra dependencies. Single and HA modes are **mode-symmetric**: the same presence
+/// rows and the same code paths run in both — only the signal transport differs (in
+/// single mode the sole Gateway owns every node it holds a channel for, so a
+/// cross-gateway relay never fires, but the seam is still exercised).
+/// `deny_unknown_fields` fails misconfiguration closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HaConfig {
+    /// Single-instance (default) vs HA. Selects only the signal transport default and
+    /// enables the cross-gateway relay; presence + routing run identically either way.
+    pub mode: HaMode,
+    /// The coordination signal bus: in-process (default, zero deps) or NATS.
+    pub coordination: CoordinationConfig,
+    /// The `host:port` a peer owner is told to dial back to for the direct byte relay
+    /// (advertised via presence + carried in the signal). Empty ⇒ derived from the
+    /// agent transport advertise URL — the peer relay shares that one TLS server.
+    pub peer_relay_advertise_addr: String,
+    /// Presence heartbeat cadence + staleness bound.
+    pub presence: PresenceConfig,
+    /// Session-routing bounds: the relay-establish deadline + the owner-cache TTL.
+    pub routing: RoutingConfig,
+    /// Graceful-drain bound.
+    pub drain: DrainConfig,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            mode: HaMode::SingleInstance,
+            coordination: CoordinationConfig::default(),
+            peer_relay_advertise_addr: String::new(),
+            presence: PresenceConfig::default(),
+            routing: RoutingConfig::default(),
+            drain: DrainConfig::default(),
+        }
+    }
+}
+
+/// Whether this Gateway runs alone or as one of several (Session Fifteen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HaMode {
+    /// The sole Gateway: it owns every node it holds a control channel for, so a
+    /// cross-gateway relay never fires. Default. In-process signal bus, zero deps.
+    SingleInstance,
+    /// One of several Gateways behind an L4 LB: a session may land on a Gateway that
+    /// does NOT own the target node's agent channel, and is relayed to the owner.
+    Ha,
+}
+
+/// The coordination signal bus (Session Fifteen). Carries **only** the
+/// `DialBackSignal` (ids + the ingress relay address + the single-use SLGW1 token) —
+/// session bytes NEVER traverse it (the byte path is the direct Gateway↔Gateway
+/// relay). Serialized with an internal `backend` tag; `deny_unknown_fields` fails a
+/// stray key closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CoordinationConfig {
+    /// In-process broadcast keyed by gateway id (single-instance default, zero deps).
+    /// Publish delivers to the local subscriber; the seam is identical to NATS.
+    #[default]
+    InProcess,
+    /// Core NATS pub/sub (no JetStream): publish to `{subject_prefix}.dialback.{owner}`,
+    /// subscribe `{subject_prefix}.dialback.{self}`. The signal is transient; a delivery
+    /// failure just means the ingress times out and fails closed.
+    Nats {
+        /// The NATS server URL (e.g. `nats://nats.internal:4222`).
+        url: String,
+        /// Subject prefix (default `sl`).
+        #[serde(default = "default_subject_prefix")]
+        subject_prefix: String,
+    },
+}
+
+fn default_subject_prefix() -> String {
+    "sl".to_string()
+}
+
+/// Presence heartbeat + staleness bounds (Session Fifteen; §10.2 §8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PresenceConfig {
+    /// How often (seconds) this Gateway heartbeats ownership of every node it holds a
+    /// live agent control channel for (§8: 10s).
+    pub heartbeat_interval_secs: u64,
+    /// The owner staleness bound (seconds) the Gateway uses for its local owner cache /
+    /// observability. The AUTHORITATIVE staleness decision is the CP's (§8: 30s, three
+    /// missed heartbeats).
+    pub staleness_ttl_secs: u64,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 10,
+            staleness_ttl_secs: 30,
+        }
+    }
+}
+
+/// Session-routing bounds for a remote-owned node (Session Fifteen; §10.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingConfig {
+    /// How long (seconds) the ingress waits for the owner to establish the direct relay before
+    /// failing closed to "node offline". Sits ABOVE the owner's worst-case establish budget —
+    /// its local agent dial-back plus the relay handshake, each independently bounded (default
+    /// ~10s + ~10s = ~20s) — so a slow-but-HEALTHY owner is not abandoned (L1); and well BELOW
+    /// the SSH LoginGraceTime (300s) so a hung peer never hangs the handshake. The SLGW1 token
+    /// TTL is set above this in turn (main.rs).
+    pub relay_timeout_secs: u64,
+    /// The owner cache TTL (seconds); an entry older than this is stale (§8: 30s, =
+    /// presence staleness). The per-session authoritative owner is the Authorize
+    /// response; the cache feeds staleness/observability.
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            relay_timeout_secs: 25,
+            cache_ttl_secs: 30,
+        }
+    }
+}
+
+/// Graceful-drain bound (Session Fifteen; §10.3, closes S9 F-drain).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DrainConfig {
+    /// After SIGTERM, flip `/readyz` to 503 but KEEP ACCEPTING new connections for this long
+    /// (M3, FR-HA-7 order) — so the L4/L7 LB observes the unready state and deregisters this
+    /// Gateway BEFORE it stops accepting, closing the window where the LB still routes a new
+    /// connection to a Gateway that has already stopped listening. Set to a small multiple of
+    /// the LB's probe interval × unhealthy-threshold. `0` disables the grace (stop accepting at
+    /// once). Default 5s.
+    pub pre_drain_grace_secs: u64,
+    /// How long (seconds) drain waits for live sessions to finish before finalizing
+    /// recordings and exiting. Live sessions are finished-to-deadline, not dropped
+    /// instantly (§8: 30s).
+    pub deadline_secs: u64,
+    /// A `host:port` for the readiness surface (`GET /readyz`): `200` while serving, `503`
+    /// once draining, so an LB deregisters this Gateway before its sessions are torn down.
+    /// **Empty disables it** (the default).
+    pub readyz_addr: String,
+}
+
+impl Default for DrainConfig {
+    fn default() -> Self {
+        Self {
+            pre_drain_grace_secs: 5,
+            deadline_secs: 30,
+            readyz_addr: String::new(),
         }
     }
 }
@@ -692,5 +915,87 @@ mod tests {
         assert!(!cfg.ssh.recorder.strict);
         // The rest of the recorder block keeps its (strict-adjacent) defaults.
         assert!(cfg.ssh.recorder.spool_dir.is_none());
+    }
+
+    #[test]
+    fn ha_defaults_to_single_instance_in_process_zero_deps() {
+        let ha = GatewayConfig::default().ha;
+        assert_eq!(ha.mode, HaMode::SingleInstance);
+        assert_eq!(ha.coordination, CoordinationConfig::InProcess);
+        assert!(ha.peer_relay_advertise_addr.is_empty());
+        assert_eq!(ha.presence.heartbeat_interval_secs, 10);
+        assert_eq!(ha.presence.staleness_ttl_secs, 30);
+        assert_eq!(ha.routing.relay_timeout_secs, 25);
+        assert_eq!(ha.routing.cache_ttl_secs, 30);
+        assert_eq!(ha.drain.pre_drain_grace_secs, 5);
+        assert_eq!(ha.drain.deadline_secs, 30);
+        // The relay deadline must sit under the SSH login grace so a hung peer never hangs the
+        // handshake — AND above the owner's worst-case establish budget (dial-back + handshake,
+        // ~20s) so a slow-but-healthy owner is not abandoned (L1).
+        assert!((ha.routing.relay_timeout_secs) < GatewayConfig::default().ssh.login_grace_secs);
+        assert!(ha.routing.relay_timeout_secs > 20);
+    }
+
+    #[test]
+    fn ha_nats_backend_parses_with_prefix_default() {
+        let cfg: GatewayConfig = serde_json::from_str(
+            r#"{"ha":{"mode":"ha","coordination":{"backend":"nats","url":"nats://n:4222"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ha.mode, HaMode::Ha);
+        assert_eq!(
+            cfg.ha.coordination,
+            CoordinationConfig::Nats {
+                url: "nats://n:4222".into(),
+                subject_prefix: "sl".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn ha_unknown_key_fails_closed() {
+        // A stray key anywhere in the HA block is rejected, not silently ignored.
+        for bad in [
+            r#"{"ha":{"moed":"ha"}}"#,
+            r#"{"ha":{"routing":{"relay_timeout":10}}}"#,
+            r#"{"ha":{"coordination":{"backend":"nats","url":"x","extra":1}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GatewayConfig>(bad).is_err(),
+                "unknown HA key must be rejected: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_from_path_reads_json_and_denies_unknown_keys() {
+        let dir = std::env::temp_dir();
+        let good = dir.join(format!("sl-gw-cfg-good-{}.json", std::process::id()));
+        std::fs::write(&good, r#"{"io_backend":"uring","ha":{"mode":"ha"}}"#).unwrap();
+        let cfg = GatewayConfig::load_from_path(&good).unwrap();
+        assert_eq!(cfg.io_backend, IoBackend::Uring);
+        assert_eq!(cfg.ha.mode, HaMode::Ha);
+        std::fs::remove_file(&good).ok();
+
+        let bad = dir.join(format!("sl-gw-cfg-bad-{}.json", std::process::id()));
+        std::fs::write(&bad, r#"{"io_back_end":"uring"}"#).unwrap();
+        assert!(matches!(
+            GatewayConfig::load_from_path(&bad),
+            Err(ConfigError::Parse { .. })
+        ));
+        std::fs::remove_file(&bad).ok();
+
+        // A named-but-missing file is a fail-closed error, never a silent default.
+        assert!(matches!(
+            GatewayConfig::load_from_path(Path::new("/nonexistent/sl-gw.json")),
+            Err(ConfigError::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn load_without_a_path_is_the_default() {
+        // `load(None)` with the env unset yields the built-in default.
+        let cfg = GatewayConfig::load(None).unwrap();
+        assert_eq!(cfg.ha.mode, HaMode::SingleInstance);
     }
 }

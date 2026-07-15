@@ -40,6 +40,11 @@ fi
 # messages only, no gRPC service; the framed WebSocket protocol itself is
 # specified in contracts/wire/agent-gateway-v1.md), an additive node_name on
 # authz NodeConnection, and IssueGatewayServerCertificate on identity.proto.
+# Session Fifteen added presence.proto (Presence: Heartbeat / Release — the HA
+# ownership write path; the read is folded into authz NodeConnection owner
+# fields 5-8) and gateway/v1/coordination.proto (the Gateway<->Gateway
+# DialBackSignal + SLGW1 relay token + RELAY_* frame payloads; the framed
+# protocol itself is contracts/wire/gateway-relay-v1.md).
 RELS=(
   "sessionlayer/controlplane/v1/common.proto"
   "sessionlayer/controlplane/v1/handshake.proto"
@@ -49,6 +54,8 @@ RELS=(
   "sessionlayer/controlplane/v1/auth.proto"
   "sessionlayer/controlplane/v1/recording.proto"
   "sessionlayer/controlplane/v1/lock.proto"
+  "sessionlayer/controlplane/v1/presence.proto"
+  "sessionlayer/gateway/v1/coordination.proto"
   "sessionlayer/agent/v1/wire.proto"
 )
 
@@ -56,6 +63,15 @@ for rel in "${RELS[@]}"; do
   mkdir -p "proto/$(dirname "$rel")"
   cp -v "$SRC_ROOT/$rel" "proto/$rel"
 done
+
+# Session Fifteen also vendors the frozen wire-conformance golden frames (generated + self-
+# checked from the frozen codec+proto), consumed by tests/wire_conformance.rs so the Gateway CI
+# catches wire drift on its own (F-wireversion-1). Regenerate upstream only on a contract change.
+CONF_SRC="../ControlPlane-API/contracts/wire/conformance/frames.json"
+if [[ -f "$CONF_SRC" ]]; then
+  mkdir -p proto/wire-conformance
+  cp -v "$CONF_SRC" proto/wire-conformance/frames.json
+fi
 
 echo "[sync-contracts] vendored proto re-synced from $SRC_ROOT"
 echo "[sync-contracts] NOTE: contracts are FROZEN; re-sync only after a versioned change (contracts/VERSIONING.md), then rebuild."

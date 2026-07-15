@@ -172,6 +172,13 @@ impl AgentRegistry {
             .is_some_and(|h| h.agent_id == agent_id)
     }
 
+    /// The names of every node this Gateway currently holds a live control channel
+    /// for — the set the HA presence heartbeat loop claims ownership of each tick
+    /// (Session Fifteen). A node that drops out between ticks is released.
+    pub fn owned_node_names(&self) -> Vec<String> {
+        self.agents.lock().unwrap().keys().cloned().collect()
+    }
+
     /// The number of live control channels.
     pub fn len(&self) -> usize {
         self.agents.lock().unwrap().len()

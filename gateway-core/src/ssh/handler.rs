@@ -1106,6 +1106,13 @@ impl SshHandler {
                         node_name: nc.node_name,
                         session_id: self.session_id.clone(),
                         principal: target.login.clone(),
+                        // HA (Session Fifteen): the fresh presence owner the CP folded into
+                        // the decision. Empty for agentless / no-fresh-owner; the agent-model
+                        // connector routes local-vs-remote by owner==self and fails closed on
+                        // an empty owner ("node offline").
+                        owning_gateway_id: nc.owning_gateway_id,
+                        owning_gateway_addr: nc.owning_gateway_addr,
+                        owner_nonce: nc.owner_nonce,
                     },
                     trust,
                     grant: SessionGrant {

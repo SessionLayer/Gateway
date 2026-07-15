@@ -208,6 +208,7 @@ async fn start_gateway(cp: &MockCp, recorder: RecorderChoice) -> anyhow::Result<
             pending: pending.clone(),
             signer: signer.clone(),
             lock_set: deps.lock_set.clone(),
+            peer_relay: None,
             config: config.agent.clone(),
         },
         sd_rx.clone(),

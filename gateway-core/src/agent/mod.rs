@@ -37,6 +37,11 @@ pub const CONTROL_PATH: &str = "/agent/v1/control";
 /// The per-session dial-back path (contract §1).
 pub const DIALBACK_PATH: &str = "/agent/v1/dialback";
 
+/// The HA Gateway↔Gateway peer-relay path (Session Fifteen; `gateway-relay-v1.md` §2). A
+/// per-session byte relay on the same TLS server; the connecting peer is a GATEWAY, not an
+/// agent.
+pub const PEER_RELAY_PATH: &str = "/peer/v1/relay";
+
 /// Normative bound on the `heartbeat_interval_secs` we propose in `HELLO_ACK`
 /// (contract §3): below 1 is a self-inflicted DoS, above 300 a dead peer goes undetected
 /// too long.
@@ -70,8 +75,18 @@ pub fn wire_component_info() -> crate::pb::ComponentInfo {
     }
 }
 
-/// The URI SAN scheme the CP stamps into an agent's identity certificate.
+/// The URI SAN scheme the CP stamps into an agent's identity certificate. A GATEWAY
+/// identity cert instead carries `sessionlayer://gateway/<uuid>` + a dNSName = its name;
+/// the HA peer identity is the NAME (the dNSName), so the gateway-vs-agent distinction on
+/// the peer-relay path is "has no agent URI SAN".
 const AGENT_URI_PREFIX: &str = "sessionlayer://agent/";
+
+/// The URI SAN scheme the CP stamps into a GATEWAY identity certificate
+/// (`sessionlayer://gateway/<uuid>`). Its PRESENCE is the positive gateway-DiD check on the
+/// peer-relay path (F10a): a CA never issues this SAN to a non-gateway, so requiring it — not
+/// merely the ABSENCE of an agent URI SAN — closes the residual where a leaf carrying only a
+/// gateway-named dNSName could be mistaken for a gateway.
+const GATEWAY_URI_PREFIX: &str = "sessionlayer://gateway/";
 
 /// The peer an agent connection resolves to, taken **only** from its mTLS client
 /// certificate — the CP stamped both SANs, so neither is self-asserted. `AgentHello`
@@ -101,6 +116,10 @@ pub enum PeerError {
     /// Not exactly one dNSName SAN (the node name).
     #[error("certificate does not resolve to exactly one node name")]
     NotOneNode,
+    /// The certificate does not resolve to exactly one gateway identity: it carries an
+    /// agent URI SAN (so it is an agent, not a gateway), or not exactly one dNSName SAN.
+    #[error("certificate does not resolve to exactly one gateway identity")]
+    NotOneGateway,
 }
 
 /// Resolve the agent peer from its mTLS client certificate (contract §1).
@@ -142,6 +161,52 @@ pub fn peer_identity(cert_der: &[u8]) -> Result<AgentPeer, PeerError> {
         agent_id: agent_id.clone(),
         node_name: node_name.clone(),
     })
+}
+
+/// Resolve a peer **gateway** NAME from its mTLS client certificate (Session Fifteen;
+/// `gateway-relay-v1.md` §2), for the peer-relay path.
+///
+/// The HA routing key is the gateway NAME (`gateway_identity.name`), which the CP stamps as
+/// the **dNSName SAN** alongside a `sessionlayer://gateway/<uuid>` URI SAN. A gateway peer must
+/// therefore satisfy BOTH: exactly one dNSName SAN (the name we return) AND a present gateway
+/// URI SAN (the positive DiD check, F10a). A certificate carrying an *agent* URI SAN is an
+/// agent — refused on this gateway-only path. The relay token binding
+/// (`owner_gateway_id == this name`) is the second, decisive check at the call site.
+pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|_| PeerError::Parse)?;
+
+    let mut dns_names = Vec::new();
+    let mut has_gateway_uri = false;
+    for ext in cert.extensions() {
+        let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() else {
+            continue;
+        };
+        for name in &san.general_names {
+            match name {
+                // An agent identity on the gateway-only path is refused, not guessed at.
+                GeneralName::URI(uri) if uri.starts_with(AGENT_URI_PREFIX) => {
+                    return Err(PeerError::NotOneGateway);
+                }
+                GeneralName::URI(uri) if uri.starts_with(GATEWAY_URI_PREFIX) => {
+                    has_gateway_uri = true;
+                }
+                GeneralName::DNSName(dns) => dns_names.push(dns.to_string()),
+                _ => {}
+            }
+        }
+    }
+    // Positive check (F10a): a gateway MUST carry the gateway URI SAN, not merely lack an agent
+    // one — otherwise a leaf with a gateway-named dNSName but no gateway identity would pass.
+    if !has_gateway_uri {
+        return Err(PeerError::NotOneGateway);
+    }
+    let [name] = dns_names.as_slice() else {
+        return Err(PeerError::NotOneGateway);
+    };
+    if name.is_empty() {
+        return Err(PeerError::NotOneGateway);
+    }
+    Ok(name.clone())
 }
 
 /// The WebSocket bounds both roles run under.
@@ -249,6 +314,37 @@ mod tests {
     fn garbage_is_not_a_certificate() {
         assert_eq!(peer_identity(&[]), Err(PeerError::Parse));
         assert_eq!(peer_identity(b"not a cert"), Err(PeerError::Parse));
+    }
+
+    #[test]
+    fn gateway_peer_resolves_by_dns_name_and_refuses_agents() {
+        let ca = ca();
+        // Production gateway identity cert: dNSName = name + the uuid URI SAN.
+        let gw = leaf(
+            &ca,
+            vec![dns("gw-A"), uri("sessionlayer://gateway/abc-uuid")],
+        );
+        assert_eq!(gateway_peer_identity(&gw).unwrap(), "gw-A");
+        // F10a positive check: a leaf with a gateway-named dNSName but NO gateway URI SAN is
+        // NOT a gateway — a CA only issues the gateway URI SAN to a real gateway.
+        let dns_only = leaf(&ca, vec![dns("gw-B")]);
+        assert_eq!(
+            gateway_peer_identity(&dns_only),
+            Err(PeerError::NotOneGateway)
+        );
+        // An agent cert is refused on the gateway-only relay path (it is not a gateway).
+        let agent = leaf(&ca, vec![uri("sessionlayer://agent/a7"), dns("node-a")]);
+        assert_eq!(gateway_peer_identity(&agent), Err(PeerError::NotOneGateway));
+        // A gateway URI SAN but no dNSName does not resolve to a name.
+        let no_dns = leaf(&ca, vec![uri("sessionlayer://gateway/abc-uuid")]);
+        assert_eq!(
+            gateway_peer_identity(&no_dns),
+            Err(PeerError::NotOneGateway)
+        );
+        // A leaf with neither a dNSName nor a gateway URI SAN (e.g. a context-signer).
+        let none = leaf(&ca, vec![uri("sessionlayer://decision-context-signer")]);
+        assert_eq!(gateway_peer_identity(&none), Err(PeerError::NotOneGateway));
+        assert_eq!(gateway_peer_identity(b"garbage"), Err(PeerError::Parse));
     }
 
     #[test]

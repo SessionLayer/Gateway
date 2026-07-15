@@ -325,6 +325,17 @@ impl LiveSessionRegistry {
         self.sessions.lock().unwrap().remove(session_id);
     }
 
+    /// The number of live sessions (the graceful-drain wait polls this until zero or the
+    /// deadline, Session Fifteen).
+    pub fn len(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
+    /// Whether no session is live.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Tear down every live session a newly-added lock matches. Returns the count.
     pub fn apply_added_lock(&self, lock: &Lock) -> usize {
         let Some(target) = lock.target.as_ref() else {
@@ -337,6 +348,21 @@ impl LiveSessionRegistry {
                 .filter(|c| c.matches(target))
                 .cloned()
                 .collect()
+        };
+        for c in &victims {
+            c.terminate();
+        }
+        victims.len()
+    }
+
+    /// Tear down EVERY live session (the graceful-drain deadline, L4): trips each session's
+    /// abort so its recorder finalize path runs to a bounded deadline, rather than dropping the
+    /// tasks un-finalized when the process exits (which would leave un-finalized WORM objects).
+    /// Idempotent (a no-op once the registry is empty). Returns the count torn down.
+    pub fn terminate_all(&self) -> usize {
+        let victims: Vec<SessionControl> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.values().cloned().collect()
         };
         for c in &victims {
             c.terminate();

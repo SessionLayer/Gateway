@@ -32,6 +32,7 @@ use gateway_core::pb::gateway_identity_server::{GatewayIdentity, GatewayIdentity
 use gateway_core::pb::handshake_server::{Handshake, HandshakeServer};
 use gateway_core::pb::lock_feed_server::{LockFeed, LockFeedServer};
 use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
+use gateway_core::pb::presence_server::{Presence, PresenceServer};
 use gateway_core::pb::recording_server::{Recording, RecordingServer};
 use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningServer};
 use gateway_core::pb::{
@@ -41,13 +42,15 @@ use gateway_core::pb::{
     DeviceFlowStatus, EnrollGatewayRequest, EnrollGatewayResponse, FinalizeRecordingRequest,
     FinalizeRecordingResponse, Heartbeat, HostVerification, IssueGatewayServerCertificateRequest,
     IssueGatewayServerCertificateResponse, KeySealAlgorithm, Lock, LockEvent, LockRemoval,
-    LockSnapshot, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse, ProtocolVersion,
-    RenewGatewayIdentityRequest, RenewGatewayIdentityResponse, RequestUploadRequest,
-    RequestUploadResponse, ResolveBreakglassCodeRequest, ResolveBreakglassCodeResponse,
-    ResolveBreakglassKeyRequest, ResolveBreakglassKeyResponse, ResolveOtpRequest,
-    ResolveOtpResponse, ResolvePinRequest, ResolvePinResponse, ResolveUserCertRequest,
-    ResolveUserCertResponse, ResolvedIdentity, ServerHello, SignSessionCertificateRequest,
-    SignSessionCertificateResponse, StreamLocksRequest, UploadCredential, WormMode,
+    LockSnapshot, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
+    PresenceHeartbeatRequest, PresenceHeartbeatResponse, PresenceReleaseRequest,
+    PresenceReleaseResponse, ProtocolVersion, RenewGatewayIdentityRequest,
+    RenewGatewayIdentityResponse, RequestUploadRequest, RequestUploadResponse,
+    ResolveBreakglassCodeRequest, ResolveBreakglassCodeResponse, ResolveBreakglassKeyRequest,
+    ResolveBreakglassKeyResponse, ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest,
+    ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity,
+    ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
+    UploadCredential, WormMode,
 };
 use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
 use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
@@ -194,6 +197,33 @@ impl TestCa {
         Ok(csr.signed_by(&self.issuer())?.der().to_vec())
     }
 
+    /// Sign an enrollment/renewal CSR as a **gateway identity** (clientAuth) leaf whose SANs
+    /// THIS CA chooses, mirroring the real CP `EnrollGateway`/`RenewGatewayIdentity`: dNSName =
+    /// the gateway's enrolled name (the HA routing key) PLUS the `sessionlayer://gateway/<id>`
+    /// URI SAN. The CSR contributes only its public key. Stamping the URI SAN keeps the mock
+    /// faithful to production so the peer-relay positive gateway-SAN check (F10a) is exercised.
+    pub fn sign_csr_as_gateway_identity(
+        &self,
+        csr_der: &[u8],
+        gateway_name: &str,
+        gateway_id: &str,
+    ) -> Result<Vec<u8>, rcgen::Error> {
+        let mut csr = Self::parse_csr(csr_der)?;
+        csr.params.distinguished_name = rcgen::DistinguishedName::new();
+        csr.params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, gateway_name);
+        csr.params.subject_alt_names = vec![
+            rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(gateway_name).unwrap()),
+            rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("sessionlayer://gateway/{gateway_id}"))
+                    .unwrap(),
+            ),
+        ];
+        csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        Ok(csr.signed_by(&self.issuer())?.der().to_vec())
+    }
+
     /// Issue an **agent identity** leaf: a clientAuth leaf carrying the two SANs the
     /// Gateway resolves an agent peer from (contract §1) — the URI SAN
     /// `sessionlayer://agent/<agent_id>` and the dNSName SAN = the node's name.
@@ -335,6 +365,18 @@ struct BreakglassActivation {
     node_id: String,
 }
 
+/// One HA presence row (Session Fifteen): node → owner. The owner is the gateway NAME
+/// (`gateway_identity.name`, the HA routing key), never the caller's id. `nonce` is the
+/// monotonic fencing token; `last_seen` drives staleness (a stale owner is taken over).
+#[derive(Clone, Debug)]
+struct PresenceRow {
+    owner: String,
+    gateway_addr: String,
+    nonce: u64,
+    nonce_id: String,
+    last_seen: SystemTime,
+}
+
 /// Mutable + immutable mock CP state shared by the three service handlers.
 struct MockState {
     ca: TestCa,
@@ -458,6 +500,17 @@ struct MockState {
     lock_events: tokio::sync::broadcast::Sender<LockEvent>,
     /// The lock-feed epoch (monotonic per mock CP).
     feed_epoch: AtomicU64,
+
+    // ---- Session Fifteen: HA presence (node -> owner, monotonic nonce) --------
+    /// The presence table, keyed by the node NAME the Gateway heartbeats (the agent-registry
+    /// key / the agent cert's dNSName SAN); the real CP resolves the name to the node uuid and
+    /// keys `runtime.presence` by that. Authorize keys by the same name (pass-through resolver
+    /// this session). Mirrors `runtime.presence`: claim / refresh / standby with a monotonic
+    /// fencing nonce.
+    presence: Mutex<HashMap<String, PresenceRow>>,
+    /// How long an owner may go un-heartbeated before it is considered stale and taken over
+    /// (and before its owner fields stop riding on Authorize). Short in tests.
+    presence_staleness: Duration,
 }
 
 impl MockState {
@@ -580,16 +633,17 @@ impl GatewayIdentity for MockSvc {
                 return Err(Status::permission_denied("enrollment denied"));
             }
         }
-        let leaf_der = self
-            .ca
-            .sign_csr(&r.pkcs10_csr)
-            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
-
         let gateway_id = {
             let mut id = self.next_id.lock().unwrap();
             *id += 1;
             format!("gw-{id:08}")
         };
+        // Stamp the gateway URI SAN + dNSName exactly as the real CP does (F10a faithfulness).
+        let leaf_der = self
+            .ca
+            .sign_csr_as_gateway_identity(&r.pkcs10_csr, &r.gateway_name, &gateway_id)
+            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
+
         self.gateways.lock().unwrap().insert(
             gateway_id.clone(),
             GatewayRecord {
@@ -636,9 +690,10 @@ impl GatewayIdentity for MockSvc {
             return Err(Status::failed_precondition("stale generation"));
         }
 
+        let gateway_name = rec.name.clone();
         let new_leaf = self
             .ca
-            .sign_csr(&r.pkcs10_csr)
+            .sign_csr_as_gateway_identity(&r.pkcs10_csr, &gateway_name, &gid)
             .map_err(|_| Status::invalid_argument("invalid CSR"))?;
 
         let bad = {
@@ -1184,12 +1239,24 @@ impl MockState {
                 used: false,
             },
         );
+        // Fold the FRESH presence owner into the node connection (Session Fifteen HA read
+        // path): the owner fields ride only when a live Gateway heartbeated ownership, so an
+        // OUTBOUND_AGENT node with no fresh owner comes back empty ⇒ "node offline".
         let node_connection = self
             .node_connections
             .lock()
             .unwrap()
             .get(&r.node_id)
-            .cloned();
+            .cloned()
+            .map(|mut nc| {
+                if let Some(row) = self.fresh_presence(&r.node_id) {
+                    nc.owning_gateway_id = row.owner;
+                    nc.owning_gateway_addr = row.gateway_addr;
+                    nc.owner_nonce = row.nonce;
+                    nc.owner_nonce_id = row.nonce_id;
+                }
+                nc
+            });
         let (signed_context, signature, signer_certificate, signer_ca_chain) =
             self.sign_context(&context);
         AuthorizeResponse {
@@ -1321,6 +1388,128 @@ impl Authorization for MockSvc {
             &r,
             AccessModel::Standing,
         )))
+    }
+}
+
+impl MockState {
+    /// The owner NAME for a caller gateway id (the HA routing key), or `None` if unknown.
+    fn gateway_name_of(&self, gid: &str) -> Option<String> {
+        self.gateways
+            .lock()
+            .unwrap()
+            .get(gid)
+            .map(|r| r.name.clone())
+    }
+
+    /// The presence row for `node_id` iff it is FRESH (heartbeated within the staleness TTL).
+    /// This is what the Authorize read path folds into `NodeConnection` (owner fields ride
+    /// only when a fresh owner exists — else the node is offline).
+    fn fresh_presence(&self, node_id: &str) -> Option<PresenceRow> {
+        let now = SystemTime::now();
+        self.presence
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .filter(|row| {
+                now.duration_since(row.last_seen)
+                    .map(|d| d < self.presence_staleness)
+                    .unwrap_or(false)
+            })
+            .cloned()
+    }
+}
+
+#[tonic::async_trait]
+impl Presence for MockSvc {
+    async fn heartbeat(
+        &self,
+        request: Request<PresenceHeartbeatRequest>,
+    ) -> Result<Response<PresenceHeartbeatResponse>, Status> {
+        // The OWNER is the authenticated mTLS peer (its gateway_identity.name) — never a
+        // request field (the HA trust rule, exactly like the real CP).
+        let gid = require_gateway(&request, self)?;
+        let owner = self
+            .gateway_name_of(&gid)
+            .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
+        let r = request.into_inner();
+        if r.node_name.is_empty() {
+            return Err(Status::invalid_argument("node name required"));
+        }
+        if r.gateway_addr.is_empty() {
+            return Err(Status::invalid_argument("gateway address required"));
+        }
+
+        let now = SystemTime::now();
+        let mut map = self.presence.lock().unwrap();
+        let row = match map.get(&r.node_name) {
+            // Refresh: we are the owner → bump last_seen (nonce unchanged).
+            Some(existing) if existing.owner == owner => PresenceRow {
+                gateway_addr: r.gateway_addr.clone(),
+                last_seen: now,
+                ..existing.clone()
+            },
+            // Takeover: the owner is stale → claim with nonce+1 and a new nonce_id.
+            Some(existing)
+                if now
+                    .duration_since(existing.last_seen)
+                    .map(|d| d >= self.presence_staleness)
+                    .unwrap_or(true) =>
+            {
+                PresenceRow {
+                    owner: owner.clone(),
+                    gateway_addr: r.gateway_addr.clone(),
+                    nonce: existing.nonce + 1,
+                    nonce_id: random_token("nonce"),
+                    last_seen: now,
+                }
+            }
+            // Standby: a fresh owner that is not us → NO write; return the authoritative owner.
+            Some(existing) => existing.clone(),
+            // Claim a node with no current owner (nonce 1).
+            None => PresenceRow {
+                owner: owner.clone(),
+                gateway_addr: r.gateway_addr.clone(),
+                nonce: 1,
+                nonce_id: random_token("nonce"),
+                last_seen: now,
+            },
+        };
+        map.insert(r.node_name.clone(), row.clone());
+
+        Ok(Response::new(PresenceHeartbeatResponse {
+            owning_gateway_id: row.owner.clone(),
+            gateway_addr: row.gateway_addr,
+            nonce: row.nonce,
+            nonce_id: row.nonce_id,
+            last_seen_epoch_ms: epoch_ms(row.last_seen),
+            is_self_owner: row.owner == owner,
+        }))
+    }
+
+    async fn release(
+        &self,
+        request: Request<PresenceReleaseRequest>,
+    ) -> Result<Response<PresenceReleaseResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let owner = self
+            .gateway_name_of(&gid)
+            .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
+        let r = request.into_inner();
+        let mut map = self.presence.lock().unwrap();
+        let released = match map.get(&r.node_name) {
+            Some(existing) if existing.owner == owner => {
+                // Age last_seen far into the past so a standby claims immediately (the nonce
+                // chain is preserved), closing the planned-drain failover window.
+                let relinquished = PresenceRow {
+                    last_seen: UNIX_EPOCH,
+                    ..existing.clone()
+                };
+                map.insert(r.node_name.clone(), relinquished);
+                true
+            }
+            _ => false, // idempotent: not the recorded owner
+        };
+        Ok(Response::new(PresenceReleaseResponse { released }))
     }
 }
 
@@ -1511,6 +1700,12 @@ fn epoch_of(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
+fn epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 impl MockState {
     fn validity_window(&self) -> (i64, i64) {
         let now = unix_now();
@@ -1541,6 +1736,7 @@ pub struct MockCpBuilder {
     server_range: ((u32, u32), (u32, u32)),
     cert_ttl: Duration,
     server_san: String,
+    presence_staleness: Duration,
 }
 
 impl Default for MockCpBuilder {
@@ -1549,6 +1745,7 @@ impl Default for MockCpBuilder {
             server_range: ((1, 0), (1, 1)),
             cert_ttl: Duration::from_secs(3600),
             server_san: "cp.internal".to_string(),
+            presence_staleness: Duration::from_secs(30),
         }
     }
 }
@@ -1563,6 +1760,13 @@ impl MockCpBuilder {
     /// Override the issued Gateway leaf-certificate TTL (drives renew-ahead).
     pub fn cert_ttl(mut self, ttl: Duration) -> Self {
         self.cert_ttl = ttl;
+        self
+    }
+
+    /// Override the HA presence staleness TTL (an owner un-heartbeated this long is taken
+    /// over; short values let a failover test observe re-ownership quickly).
+    pub fn presence_staleness(mut self, ttl: Duration) -> Self {
+        self.presence_staleness = ttl;
         self
     }
 
@@ -1682,6 +1886,8 @@ impl MockCpBuilder {
             signed_key_ids: Mutex::new(Vec::new()),
             lock_events: tokio::sync::broadcast::channel(64).0,
             feed_epoch: AtomicU64::new(1),
+            presence: Mutex::new(HashMap::new()),
+            presence_staleness: self.presence_staleness,
         });
 
         let tls = ServerTlsConfig::new()
@@ -1710,6 +1916,7 @@ impl MockCpBuilder {
                 .add_service(AuthorizationServer::new(MockSvc(svc_state.clone())))
                 .add_service(RecordingServer::new(MockSvc(svc_state.clone())))
                 .add_service(LockFeedServer::new(MockSvc(svc_state.clone())))
+                .add_service(PresenceServer::new(MockSvc(svc_state.clone())))
                 .serve_with_incoming(incoming)
                 .await;
         });
@@ -1927,6 +2134,7 @@ impl MockCp {
                 dial_address: dial_address.to_string(),
                 host_verification: Some(host),
                 node_name: node_id.to_string(),
+                ..Default::default()
             },
         );
     }
@@ -1947,8 +2155,19 @@ impl MockCp {
                 dial_address: String::new(),
                 host_verification: Some(host),
                 node_name: node_name.to_string(),
+                ..Default::default()
             },
         );
+    }
+
+    /// The current HA presence owner NAME for `node_id` (for failover assertions), if any.
+    pub fn presence_owner(&self, node_id: &str) -> Option<String> {
+        self.state
+            .presence
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(|r| r.owner.clone())
     }
 
     /// Issue an **agent identity** leaf from this CP's internal mTLS CA: the S12
