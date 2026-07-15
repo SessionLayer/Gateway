@@ -404,16 +404,19 @@ impl CpAuthClient {
     /// authenticated mTLS peer — never a field — so this only ever claims/refreshes
     /// ownership for THIS Gateway. A contention/stale-nonce reject surfaces as an RPC
     /// error the caller treats as "not owner" (fail closed, FR-HA-5).
+    /// The node is addressed by its stable enrollment NAME (the agent-registry key / the
+    /// agent cert's dNSName SAN); the CP resolves the name to the node row keying
+    /// `runtime.presence` — the Gateway has no database and knows its owned nodes only by name.
     pub async fn presence_heartbeat(
         &self,
-        node_id: &str,
+        node_name: &str,
         gateway_addr: &str,
     ) -> Result<PresenceHeartbeatResponse, CpError> {
-        let node_id = node_id.to_string();
+        let node_name = node_name.to_string();
         let gateway_addr = gateway_addr.to_string();
         self.call(move |ch| {
             let req = PresenceHeartbeatRequest {
-                node_id,
+                node_name,
                 gateway_addr,
             };
             async move { PresenceClient::new(ch).heartbeat(req).await }
@@ -423,14 +426,14 @@ impl CpAuthClient {
 
     /// Release ownership of a node on graceful drain or control-channel loss so a
     /// standby claims immediately (Session Fifteen, §10.3). Idempotent server-side: a
-    /// no-op unless this Gateway is the recorded owner.
+    /// no-op unless this Gateway is the recorded owner. Addressed by node NAME.
     pub async fn presence_release(
         &self,
-        node_id: &str,
+        node_name: &str,
     ) -> Result<PresenceReleaseResponse, CpError> {
-        let node_id = node_id.to_string();
+        let node_name = node_name.to_string();
         self.call(move |ch| {
-            let req = PresenceReleaseRequest { node_id };
+            let req = PresenceReleaseRequest { node_name };
             async move { PresenceClient::new(ch).release(req).await }
         })
         .await

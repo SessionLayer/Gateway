@@ -128,7 +128,9 @@ async fn start_ingress(cp: &MockCp, coordination: Arc<dyn CoordinationBackend>) 
         pending_relays,
         cred.gateway_name.clone(),
         addr,
-        Duration::from_secs(3),
+        // Generous relative to in-process establishment; margin against CPU starvation when this
+        // IT runs alongside the Docker E2Es under the full gate's parallelism.
+        Duration::from_secs(5),
         Duration::from_secs(30),
     );
     Ingress {

@@ -475,9 +475,11 @@ struct MockState {
     feed_epoch: AtomicU64,
 
     // ---- Session Fifteen: HA presence (node -> owner, monotonic nonce) --------
-    /// The presence table, keyed by the `node_id` the Gateway sends (in this session the
-    /// enrollment name via the pass-through resolver, exactly as Authorize keys it). Mirrors
-    /// `runtime.presence`: claim / refresh / standby with a monotonic fencing nonce.
+    /// The presence table, keyed by the node NAME the Gateway heartbeats (the agent-registry
+    /// key / the agent cert's dNSName SAN); the real CP resolves the name to the node uuid and
+    /// keys `runtime.presence` by that. Authorize keys by the same name (pass-through resolver
+    /// this session). Mirrors `runtime.presence`: claim / refresh / standby with a monotonic
+    /// fencing nonce.
     presence: Mutex<HashMap<String, PresenceRow>>,
     /// How long an owner may go un-heartbeated before it is considered stale and taken over
     /// (and before its owner fields stop riding on Authorize). Short in tests.
@@ -1401,8 +1403,8 @@ impl Presence for MockSvc {
             .gateway_name_of(&gid)
             .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
         let r = request.into_inner();
-        if r.node_id.is_empty() {
-            return Err(Status::invalid_argument("node id required"));
+        if r.node_name.is_empty() {
+            return Err(Status::invalid_argument("node name required"));
         }
         if r.gateway_addr.is_empty() {
             return Err(Status::invalid_argument("gateway address required"));
@@ -1410,7 +1412,7 @@ impl Presence for MockSvc {
 
         let now = SystemTime::now();
         let mut map = self.presence.lock().unwrap();
-        let row = match map.get(&r.node_id) {
+        let row = match map.get(&r.node_name) {
             // Refresh: we are the owner → bump last_seen (nonce unchanged).
             Some(existing) if existing.owner == owner => PresenceRow {
                 gateway_addr: r.gateway_addr.clone(),
@@ -1443,7 +1445,7 @@ impl Presence for MockSvc {
                 last_seen: now,
             },
         };
-        map.insert(r.node_id.clone(), row.clone());
+        map.insert(r.node_name.clone(), row.clone());
 
         Ok(Response::new(PresenceHeartbeatResponse {
             owning_gateway_id: row.owner.clone(),
@@ -1465,7 +1467,7 @@ impl Presence for MockSvc {
             .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
         let r = request.into_inner();
         let mut map = self.presence.lock().unwrap();
-        let released = match map.get(&r.node_id) {
+        let released = match map.get(&r.node_name) {
             Some(existing) if existing.owner == owner => {
                 // Age last_seen far into the past so a standby claims immediately (the nonce
                 // chain is preserved), closing the planned-drain failover window.
@@ -1473,7 +1475,7 @@ impl Presence for MockSvc {
                     last_seen: UNIX_EPOCH,
                     ..existing.clone()
                 };
-                map.insert(r.node_id.clone(), relinquished);
+                map.insert(r.node_name.clone(), relinquished);
                 true
             }
             _ => false, // idempotent: not the recorded owner

@@ -68,15 +68,24 @@ enum RelayError {
     Tls,
 }
 
-/// Spawn the signal-handler loop. It subscribes to the coordination bus and serves each
-/// inbound relay on its own task, until `shutdown` flips true.
+/// Spawn the signal-handler loop. It serves each inbound relay on its own task, until
+/// `shutdown` flips true.
+///
+/// The subscription is established **synchronously here**, before this returns, so the owner is
+/// on the bus before any ingress can publish to it — closing the startup window where an early
+/// `DialBackSignal` would be dropped (core NATS / in-process broadcast deliver only to CURRENT
+/// subscribers; a message published before subscribe is lost).
 pub fn spawn(deps: PeerClientDeps, shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run(deps, shutdown))
+    let sub = deps.coordination.subscribe(&deps.self_gateway_id);
+    tracing::info!(gateway = %deps.self_gateway_id, "peer-relay signal handler subscribed");
+    tokio::spawn(run(deps, sub, shutdown))
 }
 
-async fn run(deps: PeerClientDeps, mut shutdown: watch::Receiver<bool>) {
-    let mut sub = deps.coordination.subscribe(&deps.self_gateway_id);
-    tracing::info!(gateway = %deps.self_gateway_id, "peer-relay signal handler subscribed");
+async fn run(
+    deps: PeerClientDeps,
+    mut sub: futures_util::stream::BoxStream<'static, DialBackSignal>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
         if *shutdown.borrow() {
             return;
