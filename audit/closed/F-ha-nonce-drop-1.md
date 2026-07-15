@@ -21,5 +21,13 @@ Before any costly work, `serve_relay` now:
 2. **Caps concurrent served relays per node** via `ServedRelays` (default 8/node), failing closed
    (`RelayError::PerNodeCap`) over the cap. The same registry backs the graceful-drain wait (M2).
 
-Publish-authz on the bus (§8) is the first line; these are defence-in-depth. Unit test:
-`served_relays_caps_per_node_and_counts_active_for_drain`.
+Publish-authz on the bus (§8) is the first line; these are defence-in-depth.
+
+## Tests
+
+- `served_relays_caps_per_node_and_counts_active_for_drain` — the per-node cap + drain counter.
+- `a_stale_nonce_is_dropped_while_still_owner_and_fires_no_node_dial` (protocol-ha caveat) — pins
+  the load-bearing branch: with `is_self_owner == true` AND a live agent channel, a signal whose
+  `owner_nonce` is older than the observed epoch returns `StaleNonce` and a spy `NodeConnector`
+  confirms NO `AgentDial` fires. (`ha_relay_it` covers the superseded / `is_self_owner == false`
+  path.)

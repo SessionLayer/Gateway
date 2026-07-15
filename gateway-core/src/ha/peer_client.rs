@@ -467,6 +467,90 @@ fn client_tls_config(cred: &CredentialSnapshot) -> Result<Arc<ClientConfig>, Rel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::agent::registry::AgentRegistry;
+    use crate::cpauth::CredentialSnapshot;
+    use crate::ha::coordination::InProcessBackend;
+    use crate::ha::presence::OwnerCache;
+    use crate::mtls::ClientIdentity;
+    use crate::ssh::connector::{ByteStream, ConnectFuture, NodeConnectError};
+
+    /// A local connector that records whether `connect` (the S14 AgentDial) was ever invoked.
+    struct SpyConnector(Arc<AtomicBool>);
+    impl NodeConnector for SpyConnector {
+        fn connect<'a>(&'a self, _dial: &'a NodeDial) -> ConnectFuture<'a> {
+            self.0.store(true, Ordering::SeqCst);
+            Box::pin(async move {
+                Err::<Box<dyn ByteStream>, NodeConnectError>(NodeConnectError::NoAgent)
+            })
+        }
+    }
+
+    fn dummy_credential() -> watch::Receiver<CredentialSnapshot> {
+        // Never read: `serve_relay` returns before it would build the client TLS config.
+        let (tx, rx) = watch::channel(CredentialSnapshot {
+            identity: ClientIdentity {
+                cert_pem: Vec::new(),
+                key_pem: zeroize::Zeroizing::new(String::new()),
+            },
+            ca_chain_der: Vec::new(),
+        });
+        std::mem::forget(tx);
+        rx
+    }
+
+    /// F4: even when the owner STILL believes it owns the node (`is_self_owner == true`) and holds
+    /// a live agent channel, a `DialBackSignal` whose `owner_nonce` is OLDER than the observed
+    /// ownership epoch is a stale/replay and must be dropped with `StaleNonce` — and, crucially,
+    /// WITHOUT any local node dial-back (no `AgentDial` fires).
+    #[tokio::test]
+    async fn a_stale_nonce_is_dropped_while_still_owner_and_fires_no_node_dial() {
+        let dialed = Arc::new(AtomicBool::new(false));
+
+        // We hold a live control channel for web-01 (so the live-channel guard would pass — proving
+        // the STALE-NONCE check, not the channel check, is what drops the signal).
+        let registry = Arc::new(AgentRegistry::new(4));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        std::mem::forget(rx);
+        std::mem::forget(registry.register("web-01", "agent-b", tx).unwrap());
+
+        // …and we still believe we own web-01, at ownership epoch (nonce) 5.
+        let owner_cache = Arc::new(OwnerCache::new(Duration::from_secs(30)));
+        owner_cache.observe("web-01", "gw-B", "gw-b:9444", 5);
+
+        let deps = PeerClientDeps {
+            coordination: Arc::new(InProcessBackend::new()),
+            self_gateway_id: "gw-B".into(),
+            local_connector: Arc::new(SpyConnector(dialed.clone())),
+            registry,
+            owner_cache,
+            served_relays: Arc::new(ServedRelays::default()),
+            credential: dummy_credential(),
+            max_frame_bytes: 64 * 1024,
+            handshake_timeout: Duration::from_secs(5),
+        };
+
+        // A signal addressed to us as owner but carrying an OLDER nonce (3 < observed 5).
+        let signal = DialBackSignal {
+            node_id: "node-uuid".into(),
+            node_name: "web-01".into(),
+            session_id: "sess-1".into(),
+            owner_gateway_id: "gw-B".into(),
+            owner_nonce: 3,
+            ..Default::default()
+        };
+
+        let err = serve_relay(deps, signal).await.unwrap_err();
+        assert!(
+            matches!(err, RelayError::StaleNonce),
+            "an older-nonce signal is StaleNonce, got {err:?}"
+        );
+        assert!(
+            !dialed.load(Ordering::SeqCst),
+            "a stale-nonce signal must NOT trigger a local node dial-back"
+        );
+    }
 
     #[test]
     fn served_relays_caps_per_node_and_counts_active_for_drain() {
