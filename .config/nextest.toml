@@ -1,10 +1,20 @@
 # cargo-nextest configuration. Run the full suite (no fail-fast) so CI reports
 # the complete failure picture, and surface failing-test output inline.
+#
+# `retries = 2`: the Docker/testcontainers integration tests are subject to a
+# transient rootless-Docker infra flake — under parallelism (a 2-core box runs
+# ~2 Docker tests at once, each starting MinIO + a node container) the RootlessKit
+# port manager races on ephemeral host ports and returns
+# `AddPort(): bind: address already in use`, failing container startup for a
+# random test. A retry re-attempts the container on a fresh port and passes.
+# Retries CANNOT mask a deterministic failure (it fails all attempts); a retried
+# pass is reported distinctly (`final-status-level = "flaky"`), so real
+# instability stays visible.
 [profile.default]
 fail-fast = false
 failure-output = "immediate-final"
 final-status-level = "flaky"
-retries = 0
+retries = 2
 
 [profile.ci]
 inherits = "default"
