@@ -85,7 +85,9 @@ message AuthorizeRequest {
   repeated string identity_groups = 2;
 
   // The fixed target node id (UUID). The CP resolves its labels from inventory;
-  // the decision is bound to THIS node.
+  // the decision is bound to THIS node. Optional when node_name (field 9) is set:
+  // name resolution is server-side authoritative (a client-asserted id is never
+  // trusted over the resolved name).
   string node_id = 3;
 
   // The Linux login the user is requesting (the SSH username maps to it). The
@@ -116,6 +118,17 @@ message AuthorizeRequest {
   // JIT needs NO request field: the CP resolves an ACTIVE jit_request grant for
   // {identity, node} server-side. Added in Session 13 (additive; protocol stays 1.1).
   string breakglass_token = 8;
+
+  // The target node's HUMAN NAME (the `node` half of the SSH username encoding, or
+  // the wildcard-DNS host with its configured suffix stripped, produced by the
+  // Gateway's TargetResolver). When non-empty the CP resolves it to
+  // runtime.node.id via findByName — server-side and AUTHORITATIVE (§11, §2.6;
+  // FR-ADDR-1) — and IGNORES node_id, so a client can never smuggle an id past the
+  // resolved name. An unknown name yields the SAME generic deny as any other
+  // no-match (no existence disclosure, §7.1). Empty ⇒ the CP falls back to node_id
+  // (UUID) for direct-id callers. Added in Session Sixteen (additive; protocol
+  // stays 1.1); closes F-ha-connect-nodename-1.
+  string node_name = 9;
 }
 
 // AuthorizeResponse carries the generic decision and, on ALLOW, the signed
