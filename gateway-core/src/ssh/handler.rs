@@ -1860,14 +1860,9 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn session_ids_are_distinct_hex() {
-        let a = new_session_id();
-        let b = new_session_id();
-        assert_eq!(a.len(), 32);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b);
-    }
+    // (Superseded by `session_id_is_a_canonical_uuid`, which asserts the canonical dashed-UUID
+    // shape + distinctness; the old `session_ids_are_distinct_hex` asserted the un-dashed 32-char
+    // hex form that F-ha-session-uuid-1 replaced.)
 
     /// Capability gate (FR-SESS-2): a legacy `scp` exec is gated by EXEC (never a
     /// standalone SCP), an unknown subsystem is never granted, and UNSPECIFIED is
