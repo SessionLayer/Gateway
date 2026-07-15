@@ -1751,11 +1751,20 @@ pub(crate) fn sanitize(s: &str) -> String {
 }
 
 /// A random session id for this connect (opaque; not a UUID parser dependency).
+/// Canonical RFC 4122 v4 UUID string. The contract (`authz.proto` `session_id`)
+/// is a UUID and the CP `parseUuid`s it — an un-dashed hex blob is rejected and
+/// denies the connect (fail-closed `missing_input`). Kept dependency-free (no
+/// `uuid` crate) over the existing CSPRNG.
 fn new_session_id() -> String {
     use rand_core::RngCore;
-    let mut bytes = [0u8; 16];
-    rand_core::OsRng.fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut b = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4
+    b[8] = (b[8] & 0x3F) | 0x80; // RFC 4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
 }
 
 /// The Gateway wall clock as Unix epoch seconds (for grant/lock expiry checks).
@@ -1769,6 +1778,24 @@ fn now_epoch_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_id_is_a_canonical_uuid() {
+        // The CP `parseUuid`s `AuthorizeRequest.session_id` (contract: UUID); an
+        // un-dashed blob denies the connect. Guard the canonical 8-4-4-4-12 v4 shape.
+        let id = new_session_id();
+        let groups: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(id
+            .chars()
+            .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(groups[2].as_bytes()[0], b'4'); // version 4
+        assert!(matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')); // RFC 4122 variant
+        assert_ne!(new_session_id(), new_session_id()); // fresh per call
+    }
 
     #[test]
     fn sanitize_strips_control_and_bounds_length() {
