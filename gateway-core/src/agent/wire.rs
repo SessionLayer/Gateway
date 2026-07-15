@@ -12,6 +12,9 @@ use crate::pbagent::{
     AgentHello, DialBackAccept, DialBackAuth, DialBackRequest, DialBackResult, GatewayHelloAck,
     Ping, Pong, StreamClose, StreamOpen, VersionReject, WireError, WireErrorCode,
 };
+// The HA relay payloads (0x24-0x26) live in the gateway package; the framing is the
+// shared Agent<->Gateway v1 wire (gateway-relay-v1.md §3 reuses it verbatim).
+use crate::pbgw::{RelayAccept, RelayOpen, RelayReject};
 
 /// Fixed frame header length: `VER | TYPE | LENGTH(u32 BE)`.
 pub const HEADER_LEN: usize = 6;
@@ -39,6 +42,12 @@ pub enum MsgType {
     DialBackAuth = 0x22,
     /// `DialBackAccept` — the token verified and was atomically consumed.
     DialBackAccept = 0x23,
+    /// `RelayOpen` — owner→ingress, presents the SLGW1 relay token (HA, S15).
+    RelayOpen = 0x24,
+    /// `RelayAccept` — ingress→owner, the relay token verified; bytes may flow.
+    RelayAccept = 0x25,
+    /// `RelayReject` — ingress→owner, a relay binding failed; close (fail closed).
+    RelayReject = 0x26,
     /// `StreamOpen` — the Agent's loopback splice is live.
     StreamOpen = 0x30,
     /// `StreamData` — **raw bytes** (SSH-layer ciphertext), no protobuf.
@@ -63,6 +72,9 @@ impl MsgType {
             0x21 => Self::DialBackResult,
             0x22 => Self::DialBackAuth,
             0x23 => Self::DialBackAccept,
+            0x24 => Self::RelayOpen,
+            0x25 => Self::RelayAccept,
+            0x26 => Self::RelayReject,
             0x30 => Self::StreamOpen,
             0x31 => Self::StreamData,
             0x32 => Self::StreamClose,
@@ -202,6 +214,9 @@ payload_decoder!(as_dial_back_accept, DialBackAccept);
 payload_decoder!(as_stream_open, StreamOpen);
 payload_decoder!(as_stream_close, StreamClose);
 payload_decoder!(as_wire_error, WireError);
+payload_decoder!(as_relay_open, RelayOpen);
+payload_decoder!(as_relay_accept, RelayAccept);
+payload_decoder!(as_relay_reject, RelayReject);
 
 #[cfg(test)]
 mod tests {
@@ -277,6 +292,26 @@ mod tests {
     fn wrong_version_is_rejected() {
         let bytes = Bytes::from(encode(2, MsgType::Ping, &[]));
         assert_eq!(decode(bytes, MAX, 1), Err(FrameError::BadVersion));
+    }
+
+    #[test]
+    fn ha_relay_types_are_defined_and_round_trip() {
+        // 0x24-0x26 were free slots in the shared registry; the HA relay profile
+        // (gateway-relay-v1.md §4) defines them additively without moving the version.
+        assert_eq!(MsgType::from_u8(0x24), Some(MsgType::RelayOpen));
+        assert_eq!(MsgType::from_u8(0x25), Some(MsgType::RelayAccept));
+        assert_eq!(MsgType::from_u8(0x26), Some(MsgType::RelayReject));
+        let open = RelayOpen {
+            token: "SLGW1.x.y".into(),
+        };
+        let frame = decode(
+            Bytes::from(encode_msg(1, MsgType::RelayOpen, &open)),
+            MAX,
+            1,
+        )
+        .unwrap();
+        assert_eq!(frame.msg_type, MsgType::RelayOpen);
+        assert_eq!(as_relay_open(&frame).unwrap().token, "SLGW1.x.y");
     }
 
     #[test]
