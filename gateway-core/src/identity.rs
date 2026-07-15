@@ -618,7 +618,10 @@ fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
 /// Whether a freshly-adopted certificate is **already expired at this host's clock** — a
 /// clock-skew / CP-TTL fault the caller logs loudly (the renewal proceeds, bounded).
 pub fn expired_at_issue(now: SystemTime, not_after: SystemTime) -> bool {
-    not_after.duration_since(now).unwrap_or(Duration::ZERO).is_zero()
+    not_after
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+        .is_zero()
 }
 
 /// The post-renewal delay for a certificate that is NOT the persisted identity — the
@@ -744,7 +747,10 @@ impl RenewAhead {
                         "RENEW-STORM GUARD: adopted a certificate already expired at this Gateway's clock (clock skew beyond the certificate TTL, or a CP TTL misconfiguration) — renewal continues bounded to ~1/min; fix NTP / the CP certificate TTL (operator action required)"
                     );
                 }
-                let remaining = current.not_after.duration_since(now).unwrap_or(Duration::ZERO);
+                let remaining = current
+                    .not_after
+                    .duration_since(now)
+                    .unwrap_or(Duration::ZERO);
                 floor_after_renew(base, remaining)
             } else {
                 base

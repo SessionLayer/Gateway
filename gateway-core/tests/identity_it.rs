@@ -397,6 +397,9 @@ async fn renew_ahead_loop_does_not_storm_when_the_cp_issues_an_already_expired_c
         (1..=5).contains(&gens),
         "generations={gens}: expected a bounded 1..=5 (storm would be dozens; 0 means it never renewed)"
     );
-    assert!(!loop_task.is_finished(), "the loop must keep retrying (bounded), not exit");
+    assert!(
+        !loop_task.is_finished(),
+        "the loop must keep retrying (bounded), not exit"
+    );
     loop_task.abort();
 }
