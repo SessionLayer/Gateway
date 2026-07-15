@@ -40,6 +40,11 @@ fi
 # messages only, no gRPC service; the framed WebSocket protocol itself is
 # specified in contracts/wire/agent-gateway-v1.md), an additive node_name on
 # authz NodeConnection, and IssueGatewayServerCertificate on identity.proto.
+# Session Fifteen added presence.proto (Presence: Heartbeat / Release — the HA
+# ownership write path; the read is folded into authz NodeConnection owner
+# fields 5-8) and gateway/v1/coordination.proto (the Gateway<->Gateway
+# DialBackSignal + SLGW1 relay token + RELAY_* frame payloads; the framed
+# protocol itself is contracts/wire/gateway-relay-v1.md).
 RELS=(
   "sessionlayer/controlplane/v1/common.proto"
   "sessionlayer/controlplane/v1/handshake.proto"
@@ -49,6 +54,8 @@ RELS=(
   "sessionlayer/controlplane/v1/auth.proto"
   "sessionlayer/controlplane/v1/recording.proto"
   "sessionlayer/controlplane/v1/lock.proto"
+  "sessionlayer/controlplane/v1/presence.proto"
+  "sessionlayer/gateway/v1/coordination.proto"
   "sessionlayer/agent/v1/wire.proto"
 )
 

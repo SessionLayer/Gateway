@@ -73,3 +73,13 @@ pub mod pbagent {
     #![allow(missing_docs)]
     tonic::include_proto!("sessionlayer.agent.v1");
 }
+
+/// Generated payload types for the frozen **Gateway <-> Gateway** HA coordination
+/// contract (`sessionlayer.gateway.v1`). Not gRPC: the `DialBackSignal` is the
+/// CoordinationBackend signal payload and the `RelayTokenPayload` / `RelayOpen` /
+/// `RelayAccept` / `RelayReject` are the direct peer-relay frame payloads
+/// (`contracts/wire/gateway-relay-v1.md`); the Control Plane is not a party to it.
+pub mod pbgw {
+    #![allow(missing_docs)]
+    tonic::include_proto!("sessionlayer.gateway.v1");
+}

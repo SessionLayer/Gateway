@@ -209,6 +209,37 @@ message NodeConnection {
   // whose relationship to node.name is the resolver's business, not this
   // contract's. Added in Session Fourteen (additive; protocol stays 1.1).
   string node_name = 4;
+
+  // HA presence/ownership answer for an OUTBOUND_AGENT node (Design §10.2/§10.3;
+  // FR-HA-2/4/5). The CP reads runtime.presence and populates these ONLY when a
+  // FRESH owner exists (last_seen within the presence staleness TTL). For an
+  // OUTBOUND_AGENT node these being empty means no live Gateway holds the node's
+  // agent control channel: the Gateway fails closed to "node offline". For
+  // AGENTLESS they are always empty (any Gateway dials the node directly; no
+  // ownership). Carried UNSIGNED for the same reason as the rest of this message.
+  // All added in Session Fifteen (additive; protocol stays 1.1).
+  //
+  // The gateway_id (matching gateway_identity.name) of the Gateway that currently
+  // owns this node's agent channel. If it equals the requesting Gateway's own id
+  // the session runs locally (S14 path); otherwise the ingress routes the session
+  // to this owner over a direct Gateway<->Gateway relay bootstrapped by the
+  // coordination signal (bytes never traverse the coordination bus).
+  string owning_gateway_id = 5;
+
+  // The owner's peer-relay advertise address (host:port) as last heartbeated. The
+  // ingress does NOT dial this for the byte path (the owner dials back to the
+  // ingress); it is carried for observability and future use.
+  string owning_gateway_addr = 6;
+
+  // The owner's monotonic presence nonce at decision time. The ingress binds it
+  // into the relay token and the owner re-checks it still owns with this exact
+  // nonce, so a superseded owner (nonce advanced by a failover) cannot serve a
+  // stale relay — the anti-stale-ownership primitive (FR-HA-5).
+  uint64 owner_nonce = 7;
+
+  // The owner's presence nonce_id (uuid) at decision time; disambiguates two
+  // claims that could share a nonce value across a reset. Empty when no fresh owner.
+  string owner_nonce_id = 8;
 }
 
 // HostVerification carries the trust the Gateway checks the node's presented host

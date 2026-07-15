@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package sessionlayer.gateway.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.gateway.coordination.v1";
+option java_outer_classname = "CoordinationProto";
+
+// Gateway<->Gateway HA coordination + relay payloads (Design §10.2/§10.3;
+// FR-HA-3/4/5/8). The Control Plane is NOT a party to this protocol: these
+// messages are exchanged Gateway-to-Gateway. They live here because contracts/
+// is the canonical cross-repo contract home; the CP generates (unused) Java.
+//
+// The normative protocol — the CoordinationBackend signalling contract, the
+// direct peer-relay handshake, and their security invariants — is
+// contracts/wire/gateway-relay-v1.md.
+//
+// ANTI-REQUIREMENT (Design §10.2, FR-HA-3): session bytes MUST NEVER traverse
+// the coordination bus. The bus carries ONLY the DialBackSignal below (ids +
+// the ingress address + a signed single-use token). The node byte stream flows
+// over the direct on-demand Gateway<->Gateway relay connection whose frames are
+// RAW OPAQUE BYTES, exactly as with the Agent splice.
+
+// DialBackSignal is published by an INGRESS Gateway (the one holding the client's
+// SSH connection) onto the CoordinationBackend, addressed to the Gateway that
+// currently OWNS the target node's agent control channel (subject
+// sl.dialback.<owner_gateway_id>). It asks the owner to produce the node byte
+// stream and relay it back to the ingress. It is signalling only: it carries the
+// ingress's relay address so the owner can establish the DIRECT relay connection,
+// plus a single-use relay token the owner presents on that connection.
+message DialBackSignal {
+  // The target node (runtime.node.id, uuid) and its stable enrollment name (the
+  // join key the owner matches against its agent registry).
+  string node_id = 1;
+  string node_name = 2;
+
+  // The ingress Gateway's session id (its own owned session + recording).
+  string session_id = 3;
+
+  // The ingress Gateway's id (gateway_identity.name) and the peer-relay address
+  // (host:port) the owner MUST dial back to for the direct byte relay. "the
+  // address carried in the signal" (Design §10.2).
+  string ingress_gateway_id = 4;
+  string ingress_relay_addr = 5;
+
+  // The owner this signal is addressed to (must match the subscriber's own id)
+  // and the presence nonce the ingress saw at decision time. The owner re-checks
+  // it still owns the node with this exact nonce before serving (stale-ownership
+  // reject, FR-HA-5).
+  string owner_gateway_id = 6;
+  uint64 owner_nonce = 7;
+
+  // The resolved Linux principal (for the owner's local dial-back token binding /
+  // audit correlation; the inner-leg cert is still minted at the ingress).
+  string principal = 8;
+
+  // The single-use relay token (SLGW1) minted by the ingress and presented by the
+  // owner on the direct relay connection (RELAY_OPEN). Opaque to the bus.
+  string relay_token = 9;
+
+  // Absolute expiry (unix epoch milliseconds) after which the signal is stale.
+  int64 exp_epoch_ms = 10;
+}
+
+// RelayTokenPayload is the decoded body of the SLGW1 relay token
+// (SLGW1.<b64url(payload)>.<b64url(sig)>), minted and verified by the INGRESS
+// Gateway with its per-process P-256 key (verify-then-decode over a domain-
+// separated prefix, exactly like the Agent dial-back token SLDB1). It is a
+// bearer credential for exactly one peer-relay connection: single-use, bound to
+// the ingress that minted it, and accepted only from the owner it names.
+message RelayTokenPayload {
+  string jti = 1;               // unique id; single-use ledger key at the ingress
+  string node_id = 2;
+  string node_name = 3;
+  string session_id = 4;
+  string ingress_gateway_id = 5;
+  string owner_gateway_id = 6;  // MUST equal the mTLS peer id on the relay conn
+  string principal = 7;
+  uint64 owner_nonce = 8;
+  int64 exp_epoch_ms = 9;
+  string signer_fingerprint = 10; // the ingress per-process signing key fp
+}
+
+// RELAY_OPEN (0x24, owner -> ingress) presents the SLGW1 token to bind the direct
+// relay connection to the ingress's awaiting session. See gateway-relay-v1.md §5/§6.
+message RelayOpen {
+  string token = 1;
+}
+
+// RELAY_ACCEPT (0x25, ingress -> owner): the token verified; raw STREAM_DATA may flow.
+message RelayAccept {}
+
+// RELAY_REJECT (0x26, ingress -> owner): a binding failed; the connection closes
+// (fail closed). `code` is a stable machine-readable reason; `message` is
+// operator-facing (never secret material).
+message RelayReject {
+  string code = 1;
+  string message = 2;
+}

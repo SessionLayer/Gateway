@@ -45,6 +45,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a mutually-authenticated WebSocket, and the Control Plane is not a party to
     // it (contracts/wire/agent-gateway-v1.md).
     let agent_wire = proto_root.join("sessionlayer/agent/v1/wire.proto");
+    // Session Fifteen additions (frozen upstream): the HA presence write path
+    // (Presence: Heartbeat / Release — the Gateway is a client, the server side is
+    // generated for the in-process mock CP) and the Gateway<->Gateway coordination
+    // payloads (DialBackSignal + SLGW1 relay token + RELAY_* frames — messages
+    // only, NOT gRPC; the CP is not a party; contracts/wire/gateway-relay-v1.md).
+    let presence = proto_root.join("sessionlayer/controlplane/v1/presence.proto");
+    let coordination = proto_root.join("sessionlayer/gateway/v1/coordination.proto");
 
     // Regenerate only when the vendored contract (or this script) changes.
     for p in [
@@ -56,7 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &auth,
         &recording,
         &lock,
+        &presence,
         &agent_wire,
+        &coordination,
     ] {
         println!("cargo:rerun-if-changed={}", p.display());
     }
@@ -77,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 auth,
                 recording,
                 lock,
+                presence,
                 common.clone(),
             ],
             std::slice::from_ref(&proto_root),
@@ -89,7 +99,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(false)
         .build_server(false)
         .extern_path(".sessionlayer.controlplane.v1", "crate::pb")
-        .compile_protos(&[agent_wire], &[proto_root])?;
+        .compile_protos(&[agent_wire], std::slice::from_ref(&proto_root))?;
+
+    // Gateway<->Gateway coordination payloads (messages only; no CP types, so no
+    // extern_path). Generated into its own module (crate::pbgw via lib.rs).
+    tonic_prost_build::configure()
+        .build_client(false)
+        .build_server(false)
+        .compile_protos(&[coordination], std::slice::from_ref(&proto_root))?;
 
     Ok(())
 }
