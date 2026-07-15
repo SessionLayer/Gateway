@@ -461,3 +461,102 @@ async fn unreachable_node_is_node_offline() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ── Session Sixteen addressing (Part A name-forward + Part B wildcard DNS) ────
+
+/// The human-named node these addressing cases reach (a pin + grant + pinned host key).
+const ADDR_NODE: &str = "web-01";
+
+async fn wire_named_node(cp: &MockCp, pin: &KeyMat, host_key: &KeyMat, name: &str, node_port: u16) {
+    cp.register_pin(&pin.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", name, "deploy");
+    let trust = cp.pinned_verification(host_key.public_wire.clone());
+    cp.set_node_connection(name, &format!("127.0.0.1:{node_port}"), trust);
+}
+
+/// Part A (FR-ADDR-1): `ssh deploy%web-01@gw` reaches the node addressed by its human
+/// NAME, and the Gateway forwards that NAME to `Authorize` (the CP resolves name→id
+/// server-side; closes the read half of F-ha-connect-nodename-1).
+#[tokio::test]
+async fn addressing_by_human_name_forwards_the_node_name() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_named_node(&cp, &pin, &host_key, ADDR_NODE, node_port).await;
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config())).await;
+    let client = client_container(&pin).await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(gw_port, &[], "deploy%web-01", "echo NAME_OK"),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "addressing by human name must reach the node; stderr={stderr}"
+    );
+    assert!(stdout.contains("NAME_OK"), "stdout={stdout:?}");
+
+    let req = cp
+        .last_authorize_request()
+        .expect("an AuthorizeRequest reached the CP");
+    assert_eq!(
+        req.node_name, ADDR_NODE,
+        "the parsed node NAME is forwarded for CP-side name→id resolution"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+/// Part B (FR-ADDR-1, wildcard DNS — SERVER side): a username whose node carries the
+/// operator's DNS suffix (`deploy%web-01.ssh.corp`) reaches the same node as the bare
+/// `deploy%web-01`, because the Gateway strips the configured `ssh.corp` suffix before
+/// resolution, and the BARE name is what is forwarded to `Authorize`.
+///
+/// This drives the encoded username DIRECTLY (a real deployment produces it via a
+/// client-side rewrite — see docs/addressing.md; note the stock-OpenSSH `User %r%%%h`
+/// ssh_config token does NOT work, since `User` rejects %r/%h — so the client mechanism
+/// is out of scope for this E2E, which proves the GATEWAY strip that Part B owns).
+#[tokio::test]
+async fn addressing_wildcard_dns_suffix_is_stripped() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_named_node(&cp, &pin, &host_key, ADDR_NODE, node_port).await;
+
+    // Turn on wildcard DNS: strip `ssh.corp` to recover the bare node name `web-01`.
+    let mut cfg = gw_config();
+    cfg.node_dns_suffixes = vec!["ssh.corp".to_string()];
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(cfg)).await;
+    let client = client_container(&pin).await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(gw_port, &[], "deploy%web-01.ssh.corp", "echo WILDCARD_OK"),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the suffixed node must reach the node after the strip; stderr={stderr}"
+    );
+    assert!(stdout.contains("WILDCARD_OK"), "stdout={stdout:?}");
+
+    let req = cp
+        .last_authorize_request()
+        .expect("an AuthorizeRequest reached the CP");
+    assert_eq!(
+        req.node_name, ADDR_NODE,
+        "the wildcard suffix is stripped before the name is forwarded"
+    );
+
+    drop(node);
+    Ok(())
+}

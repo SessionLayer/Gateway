@@ -511,6 +511,17 @@ struct MockState {
     /// How long an owner may go un-heartbeated before it is considered stale and taken over
     /// (and before its owner fields stop riding on Authorize). Short in tests.
     presence_staleness: Duration,
+
+    // ---- Session Sixteen: name→id resolution (Part A, FR-ADDR-1) --------------
+    /// Optional node NAME → CP id mapping. `Authorize` resolves `node_name` through
+    /// this (server-side authoritative, ignoring the client-asserted `node_id`);
+    /// an unmapped name resolves to itself (pass-through, the S7–S15 test shape). A
+    /// distinct mapping lets a test prove the Gateway forwards the NAME and the whole
+    /// downstream keys on the CP-resolved id, not the raw parsed string.
+    node_name_to_id: Mutex<HashMap<String, String>>,
+    /// Every `AuthorizeRequest` the mock received, in order — for Part A assertions
+    /// (node_name populated, name resolution authoritative).
+    authorize_requests: Mutex<Vec<AuthorizeRequest>>,
 }
 
 impl MockState {
@@ -1359,7 +1370,16 @@ impl Authorization for MockSvc {
         if *self.authorize_unavailable.lock().unwrap() {
             return Err(Status::unavailable("control plane temporarily unavailable"));
         }
-        let r = request.into_inner();
+        let mut r = request.into_inner();
+        self.authorize_requests.lock().unwrap().push(r.clone());
+        // Name resolution is server-side authoritative (§11, FR-ADDR-1): resolve
+        // node_name to the node's id/key and IGNORE the client-asserted node_id, so a
+        // client cannot smuggle an id past the resolved name. Empty node_name falls
+        // back to node_id (a direct-id caller). Everything below keys on the resolved
+        // r.node_id.
+        if !r.node_name.is_empty() {
+            r.node_id = self.resolve_node_name(&r.node_name);
+        }
 
         // Break-glass connect (Session Thirteen): a present token routes to the
         // always-available break-glass path (consume token + activation/alert + force
@@ -1392,6 +1412,18 @@ impl Authorization for MockSvc {
 }
 
 impl MockState {
+    /// Resolve a node NAME to its CP id (Session Sixteen, Part A). A mapped name
+    /// returns the mapped id; an unmapped name resolves to itself (pass-through, the
+    /// S7–S15 shape where the mock inventory is keyed by name).
+    fn resolve_node_name(&self, name: &str) -> String {
+        self.node_name_to_id
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// The owner NAME for a caller gateway id (the HA routing key), or `None` if unknown.
     fn gateway_name_of(&self, gid: &str) -> Option<String> {
         self.gateways
@@ -1888,6 +1920,8 @@ impl MockCpBuilder {
             feed_epoch: AtomicU64::new(1),
             presence: Mutex::new(HashMap::new()),
             presence_staleness: self.presence_staleness,
+            node_name_to_id: Mutex::new(HashMap::new()),
+            authorize_requests: Mutex::new(Vec::new()),
         });
 
         let tls = ServerTlsConfig::new()
@@ -2111,6 +2145,30 @@ impl MockCp {
             .lock()
             .unwrap()
             .insert(node_id.to_string());
+    }
+
+    /// Map a node NAME to a DISTINCT CP id (Session Sixteen, Part A). Without a mapping
+    /// the mock resolves a name to itself (pass-through). A distinct mapping lets a test
+    /// address by human name yet configure the inventory (`allow`, `set_node_connection`,
+    /// locks) by the id — proving the Gateway forwards the NAME and the whole downstream
+    /// keys on the CP-resolved id, not the raw parsed string.
+    pub fn map_node_name(&self, name: &str, id: &str) {
+        self.state
+            .node_name_to_id
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), id.to_string());
+    }
+
+    /// The most recent `AuthorizeRequest` the mock received (Part A assertions:
+    /// node_name populated). `None` if none arrived yet.
+    pub fn last_authorize_request(&self) -> Option<AuthorizeRequest> {
+        self.state
+            .authorize_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
     }
 
     /// Grant `{identity, node, principal}` (also registers the node as existing).
