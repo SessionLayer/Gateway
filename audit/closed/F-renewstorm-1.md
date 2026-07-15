@@ -138,24 +138,37 @@ Then:
 ## Resolution — Verified-Fixed
 
 The floor could still collapse when the freshly-issued certificate had **no remaining
-window** (`remaining == 0`): the `remaining / 2` cap drove it to zero and the loop renewed
-at RPC rate. Rethought rather than patched (`identity.rs`):
+window** (`remaining == 0`): the `remaining / 2` cap drove it to zero and the loop renewed at
+RPC rate (reliability reproduced 40 generations in 2 s). Fixed in `identity.rs`, and
+**cross-repo aligned** with the Agent's identical S12 helper (ag-engineer2):
 
-- `floor_after_renew` gains an **absolute `RENEW_SPIN_GUARD` (5 s)** the `remaining / 2` cap
-  cannot erase — the post-renewal wait can never reach zero.
-- New `PostRenew` / `schedule_after_renew`: an already-expired-at-issue certificate is a
-  **terminal, loud condition** (`PostRenew::ExpiredAtIssue`), not a schedule. Retrying
-  reissues the same expired cert (the skew persists — the RPC keeps *succeeding* against the
-  CP's clock) and burns the generation counter, a §8.2 clone-detection **security** primitive.
-  Both loops — `RenewAhead::run` and the S14 serverAuth `spawn_server_cert_renewal` — now
-  **stop with a `tracing::error!`** requiring operator action (fix NTP / the CP TTL), a
-  deliberate `RepairNeeded`-class stop over an unbounded 5 s-spaced retry (a multi-TTL skew is
-  not a transient blip; churning the security counter is worse than pausing renewal).
+- `floor_after_renew` now applies the **full `RENEW_MIN_INTERVAL` (60 s)** when
+  `remaining == 0`, and keeps the `remaining / 2` cap only for a real (positive) window so a
+  legitimately-short cert still renews before it expires. The collapse-to-zero is gone.
+- **Retry-bounded, NOT terminal** (a deliberate reversal of the first draft). An already-
+  expired *issued* certificate is a clock/CP-TTL fault whose likeliest cause is the **CP's**
+  clock or config — common to the whole fleet. A terminal `RepairNeeded`-style exit would make
+  **every Gateway and Agent stop at once** on one central misconfig: fail-deadly amplification,
+  the opposite of the platform's degrade-safe doctrine. So both loops (`RenewAhead::run` and
+  the S14 serverAuth `spawn_server_cert_renewal`) **keep renewing, bounded to ~1/min**, and log
+  a distinct `tracing::error!` (`RENEW-STORM GUARD`) naming the likely cause. The generation
+  counter (§8.2 clone-detection) stays usable — churned at ~1/min at worst, never frozen — and
+  a transient clock fault self-heals once NTP corrects, with no process restart.
 - The two unit tests that **encoded the bug** (`floor_after_renew(ZERO,ZERO)==ZERO`,
-  `reissue_delay(..)==ZERO`) are corrected.
+  `reissue_delay(..)==ZERO`) are corrected to the floored values.
+
+**Semantics match the Agent exactly** (same 60 s const, same `is_zero()` branch, same
+retry-bounded loop) so the shared helper behaves identically in both repos.
 
 **Proving tests:** `identity::tests::floor_after_renew_never_collapses_to_zero`,
-`identity::tests::schedule_after_renew_flags_an_already_expired_cert_as_terminal`, and the
-**loop-level** `identity_it::renew_ahead_loop_stops_instead_of_storming_on_an_already_expired_issued_cert`
-(`cert_ttl(0)`, asserts <=1 renewal in 2 s — was 40). Cross-repo: the Agent's identical S12
-helper is dispatched to ag-engineer2 with the same semantics (spin guard + terminal).
+`identity::tests::expired_at_issue_detects_an_already_dead_certificate`, and the loop-level
+`identity_it::renew_ahead_loop_does_not_storm_when_the_cp_issues_an_already_expired_cert`
+(`cert_ttl(0)`; asserts a **bounded** 1..=5 renewals over 3 s — the storm was dozens — AND that
+the loop is still running, i.e. not terminal).
+
+## Superseded first-draft note
+
+An earlier draft made this path **terminal** (stop the loop on an already-expired issued cert).
+The lead and ag-engineer2 corrected it to retry-bounded on the fleet-safety argument above; the
+terminal `PostRenew::ExpiredAtIssue` and the absolute `RENEW_SPIN_GUARD` were removed in favour
+of the `is_zero()`-branch floor. Recorded here so the reasoning is not lost.

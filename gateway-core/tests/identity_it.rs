@@ -347,9 +347,11 @@ async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past()
 ///
 /// This drives the real LOOP (not the helper) with `cert_ttl(0)` — `validity_window()` then
 /// returns not_after = now, i.e. "the certificate the CP issued is already expired at us".
-/// The fix makes that a terminal, loud condition: one renewal, then stop.
+/// The fix bounds the renewals to ~1/min (retry-bounded, NOT terminal — a terminal exit on a
+/// fleet-wide CP misconfig would be fail-deadly; cross-repo aligned with the Agent), so a few
+/// generations over the window instead of hundreds, and the loop keeps running.
 #[tokio::test]
-async fn renew_ahead_loop_stops_instead_of_storming_on_an_already_expired_issued_cert() {
+async fn renew_ahead_loop_does_not_storm_when_the_cp_issues_an_already_expired_cert() {
     let cp = MockCp::builder()
         .cert_ttl(Duration::from_secs(0))
         .start()
@@ -384,15 +386,17 @@ async fn renew_ahead_loop_stops_instead_of_storming_on_an_already_expired_issued
             .await;
     });
 
-    // Two seconds of wall-clock for the loop to storm in if it were going to.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Three seconds of wall-clock for the loop to storm in if it were going to.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // The loop must have STOPPED itself (terminal ExpiredAtIssue), so aborting finds a
-    // finished task — and at most one extra generation was burned.
+    // Retry-bounded: the floor caps the loop to ~1 renewal/min, so a small handful of
+    // generations over this window — NOT the ~40+ of the storm. And the loop must still be
+    // RUNNING (not terminal), so a transient clock fault self-heals once the clock is fixed.
     let gens = cp.recorded_generation(&gateway_id).unwrap_or(0);
     assert!(
-        gens <= 1,
-        "BUSY-RENEW STORM: the loop burned {gens} generations in 2s (must be <= 1)"
+        (1..=5).contains(&gens),
+        "generations={gens}: expected a bounded 1..=5 (storm would be dozens; 0 means it never renewed)"
     );
+    assert!(!loop_task.is_finished(), "the loop must keep retrying (bounded), not exit");
     loop_task.abort();
 }

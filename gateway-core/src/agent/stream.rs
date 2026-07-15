@@ -50,7 +50,17 @@ impl<S> WsByteStream<S> {
         }
     }
 
-    /// The largest `STREAM_DATA` payload that fits inside one frame.
+    /// The largest `STREAM_DATA` payload the Gateway puts in one frame.
+    ///
+    /// Deliberately `max_frame_bytes − HEADER_LEN`, whereas the Agent chunks to the full
+    /// `max_frame_bytes` (the negotiated bound is on the PAYLOAD, contract §2). The asymmetry
+    /// is safe and intentional: each side's *receive* guard bounds the payload inclusively at
+    /// `max_frame_bytes`, and each side's WebSocket message ceiling is
+    /// `max_frame_bytes + HEADER_LEN` (see [`ws_config`](super::ws_config)) — so an
+    /// Agent-sized frame (header + full payload) still clears the Gateway's receive limits.
+    /// The Gateway staying a header under the bound just means its own frames never sit
+    /// exactly on the ceiling. (Protocol-review INFO: noted rather than aligned, to avoid
+    /// churning the frozen wire behaviour for a purely cosmetic symmetry.)
     fn max_payload(&self) -> usize {
         self.max_frame_bytes.saturating_sub(HEADER_LEN).max(1)
     }

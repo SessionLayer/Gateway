@@ -336,24 +336,17 @@ fn spawn_server_cert_renewal(
     tokio::spawn(async move {
         let mut not_before = std::time::SystemTime::now();
         loop {
-            let delay = match identity::reissue_delay(
-                std::time::SystemTime::now(),
-                not_before,
-                not_after,
-            ) {
-                identity::PostRenew::After(d) => d,
-                // The CP just issued a serverAuth leaf already expired at our clock. Each
-                // reissue also generates a P-256 keypair + CSR, so a spin storms both CPU
-                // and the CP. Stop and keep the current cert (F-renewstorm-1): agents will
-                // fail to verify an expired Gateway and the node goes offline, which is the
-                // correct fail-closed outcome for a broken clock — an operator must fix it.
-                identity::PostRenew::ExpiredAtIssue => {
-                    tracing::error!(
-                        "SECURITY/OPS: the Control Plane issued an agent-facing certificate already expired at this Gateway's clock (clock skew or CP TTL misconfiguration) — stopping reissue to avoid a keygen/RPC storm; fix NTP / the CP certificate TTL (operator action required)"
-                    );
-                    return;
-                }
-            };
+            let now = std::time::SystemTime::now();
+            // An already-expired serverAuth leaf is the same clock/CP-TTL fault as the
+            // identity path. Retry BOUNDED (floored to ~1/min), not terminal: agents can't
+            // verify an expired Gateway so the node goes offline (fail-closed), but a
+            // fleet-wide CP misconfig must not stop every Gateway at once (F-renewstorm-1).
+            if identity::expired_at_issue(now, not_after) {
+                tracing::error!(
+                    "RENEW-STORM GUARD: the Control Plane issued an agent-facing certificate already expired at this Gateway's clock (clock skew or CP TTL misconfiguration) — reissue continues bounded to ~1/min; fix NTP / the CP certificate TTL (operator action required)"
+                );
+            }
+            let delay = identity::reissue_delay(now, not_before, not_after);
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|v| *v) => return,
