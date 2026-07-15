@@ -399,6 +399,14 @@ fn validate_agent_config(
             "ssh.agent.max_agents must be >= 1".to_string(),
         ));
     }
+    // At least one connection per registered node, or a full fleet could never all be
+    // connected at once (F-agentdos-1: the cap bounds sockets, not registrations).
+    if agent.max_connections < agent.max_agents {
+        return Err(SshServerError::Config(format!(
+            "ssh.agent.max_connections ({}) must be >= max_agents ({})",
+            agent.max_connections, agent.max_agents
+        )));
+    }
     Ok(())
 }
 
@@ -626,6 +634,13 @@ mod tests {
             },
             AgentTransportConfig {
                 max_agents: 0,
+                ..on.clone()
+            },
+            // Fewer connection slots than registrable nodes: a full fleet could never all
+            // be connected (F-agentdos-1).
+            AgentTransportConfig {
+                max_connections: 512,
+                max_agents: 1024,
                 ..on.clone()
             },
         ] {

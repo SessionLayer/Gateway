@@ -29,7 +29,6 @@ use crate::agent::{ws_config, CONTROL_PATH, DIALBACK_PATH};
 use crate::pbagent::{
     AgentHello, DialBackAuth, DialBackErrorCode, DialBackRequest, DialBackResult, Pong, StreamOpen,
 };
-use crate::version;
 
 /// The WebSocket a client peer speaks over.
 pub type ClientWs = WebSocketStream<TlsStream<TcpStream>>;
@@ -111,10 +110,12 @@ impl AgentClient {
     /// Send `HELLO` and consume the Gateway's `HELLO_ACK` (contract §3).
     pub async fn hello(&self, ws: &mut ClientWs) -> anyhow::Result<Negotiated> {
         let hello = AgentHello {
-            component: Some(version::component_info()),
+            // The AGENT-WIRE range (1.0), not the gRPC plane's (contract §3) — a faithful
+            // client must not advertise a wire minor that does not exist.
+            component: Some(crate::agent::wire_component_info()),
         };
-        // The preface frame carries the SENDER's protocol major.
-        let ver = version::PROTOCOL_MAX.0 as u8;
+        // The preface frame carries the SENDER's wire protocol major.
+        let ver = crate::agent::WIRE_PROTOCOL_MAX.0 as u8;
         ws.send(Message::Binary(WsBytes::from(wire::encode_msg(
             ver,
             MsgType::Hello,
@@ -300,10 +301,18 @@ impl AgentClient {
             if *shutdown.borrow() {
                 return;
             }
+            // Backoff WITH jitter (contract §7): a fleet that dropped together (a Gateway
+            // restart) must not reconnect in lockstep. `[0.5, 1.5)` of the current backoff —
+            // a test double that violated the spec would be a bad oracle (F-agentjitter-1).
+            let jittered = {
+                use rand_core::RngCore;
+                let f = 0.5 + f64::from(rand_core::OsRng.next_u32()) / f64::from(u32::MAX);
+                backoff.mul_f64(f)
+            };
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|v| *v) => return,
-                _ = tokio::time::sleep(backoff) => {}
+                _ = tokio::time::sleep(jittered) => {}
             }
             backoff = (backoff * 2).min(Duration::from_secs(5));
         }

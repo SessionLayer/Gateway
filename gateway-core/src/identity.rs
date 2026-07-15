@@ -588,35 +588,86 @@ pub fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), Id
 ///
 /// After a renewal the loop re-derives its schedule from the NEW certificate. If that
 /// certificate is already past its renew trigger — a short TTL with a clock-skew
-/// backdate (FR-BOOT-4), an inverted window, or a CP clock ahead of ours —
-/// [`compute_renew_delay`] returns `ZERO` and the loop would renew back-to-back,
-/// hammering the CP and burning generations. Flooring the *post-renewal* wait bounds
-/// that to ≈1 renewal/min. (The Agent hit this in S12; the Gateway shared the bug.)
+/// backdate (FR-BOOT-4) or a CP clock ahead of ours — [`compute_renew_delay`] returns
+/// `ZERO` and the loop would renew back-to-back, hammering the CP and burning
+/// generations. Flooring the *post-renewal* wait bounds that. (The Agent hit this in S12;
+/// the Gateway shared the bug.)
 const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Apply the post-renewal minimum-interval floor, never delaying past expiry (the
-/// floor is capped at half the remaining TTL). Pure, for unit testing.
+/// An **absolute** lower bound on the post-renewal wait that no other term can erase.
+///
+/// The `remaining / 2` cap below exists so a legitimately-short window still renews before
+/// it expires — but when the issued certificate is *nearly* expired at our clock,
+/// `remaining / 2` shrinks toward zero and, without this guard, collapses the whole floor
+/// to zero (F-renewstorm-1: the S14 floor closed the `base == 0` trigger but left this one
+/// open). Renewing 5 s later instead of 0 s later costs nothing when the certificate is
+/// about to die anyway, and it bounds the storm structurally.
+const RENEW_SPIN_GUARD: Duration = Duration::from_secs(5);
+
+/// Apply the post-renewal floor: at least [`RENEW_MIN_INTERVAL`] when the window is
+/// healthy, capped at half the remaining TTL so it never sleeps past expiry, but **never
+/// below [`RENEW_SPIN_GUARD`]** — the cap cannot drive it to zero. Pure, for unit testing.
 fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
     base.max(RENEW_MIN_INTERVAL.min(remaining / 2))
+        .max(RENEW_SPIN_GUARD)
 }
 
-/// When to re-issue a certificate that is NOT the persisted identity — the
-/// agent-facing serverAuth leaf (Session Fourteen), which is held only in memory.
-///
-/// Same renew-ahead schedule as the identity (2/3 of TTL, jittered), always floored:
-/// this is called immediately after an issue, so it is by definition the
-/// post-success case the floor exists for.
-pub fn reissue_delay(now: SystemTime, not_before: SystemTime, not_after: SystemTime) -> Duration {
+/// What to do after a successful renewal, given the freshly-adopted certificate.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PostRenew {
+    /// Sleep this long, then renew again — floored so the loop cannot spin.
+    After(Duration),
+    /// The certificate just adopted is **already expired at this host's clock**. This is a
+    /// clock or CP-TTL fault, not a schedule: retrying reissues the same expired
+    /// certificate (the skew persists — the RPC keeps *succeeding* because the CP validates
+    /// against the CP's clock) and burns the **generation counter**, which is a security
+    /// primitive (§8.2 clone detection), on every iteration. So it is terminal — stop,
+    /// keep the current credential, and require operator action (fix NTP / the CP TTL).
+    /// A `RepairNeeded`-class stop rather than an unbounded 5 s-spaced retry: a
+    /// multi-TTL clock skew is not a transient blip, and continuing to churn the security
+    /// counter is worse than pausing renewal until an operator intervenes.
+    ExpiredAtIssue,
+}
+
+/// Decide the post-renewal schedule (or that the issued certificate is already expired).
+/// Shared by the identity renew loop and the S14 serverAuth-cert reissue loop so both
+/// treat the storm condition identically.
+pub fn schedule_after_renew(
+    now: SystemTime,
+    not_before: SystemTime,
+    not_after: SystemTime,
+    fraction: f64,
+    jitter_fraction: f64,
+    jitter_sample: f64,
+) -> PostRenew {
+    let remaining = not_after.duration_since(now).unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        return PostRenew::ExpiredAtIssue;
+    }
     let base = compute_renew_delay(
+        now,
+        not_before,
+        not_after,
+        fraction,
+        jitter_fraction,
+        jitter_sample,
+    );
+    PostRenew::After(floor_after_renew(base, remaining))
+}
+
+/// The post-renewal schedule for a certificate that is NOT the persisted identity — the
+/// agent-facing serverAuth leaf (Session Fourteen), held only in memory. Same schedule +
+/// same storm guard as the identity; this is always the post-success case, so it returns
+/// [`PostRenew`] (including the terminal already-expired signal).
+pub fn reissue_delay(now: SystemTime, not_before: SystemTime, not_after: SystemTime) -> PostRenew {
+    schedule_after_renew(
         now,
         not_before,
         not_after,
         2.0 / 3.0,
         0.1,
         random_jitter_sample(),
-    );
-    let remaining = not_after.duration_since(now).unwrap_or(Duration::ZERO);
-    floor_after_renew(base, remaining)
+    )
 }
 
 /// A handle to trigger a renewal on demand and to observe the current credential.
@@ -715,11 +766,27 @@ impl RenewAhead {
             // only after a successful renewal — where a zero delay would be a hot spin
             // against the CP rather than a legitimate catch-up.
             let delay = if just_renewed {
-                let remaining = current
-                    .not_after
-                    .duration_since(SystemTime::now())
-                    .unwrap_or(Duration::ZERO);
-                floor_after_renew(base, remaining)
+                match schedule_after_renew(
+                    SystemTime::now(),
+                    current.not_before,
+                    current.not_after,
+                    self.config.renew_ahead_fraction,
+                    self.config.renew_jitter_fraction,
+                    random_jitter_sample(),
+                ) {
+                    PostRenew::After(d) => d,
+                    // The CP just issued a certificate already expired at our clock. Retrying
+                    // reproduces it and burns the generation counter (a security primitive);
+                    // stop and require operator action rather than storm (F-renewstorm-1).
+                    PostRenew::ExpiredAtIssue => {
+                        tracing::error!(
+                            gateway_id = %current.gateway_id,
+                            generation = current.generation,
+                            "SECURITY/OPS: adopted a certificate already expired at this Gateway's clock (clock skew beyond the certificate TTL, or a CP TTL misconfiguration) — stopping renew-ahead to avoid a generation storm; fix NTP / the CP certificate TTL (operator action required)"
+                        );
+                        return;
+                    }
+                }
             } else {
                 base
             };
@@ -895,9 +962,9 @@ mod tests {
     }
 
     #[test]
-    fn floor_after_renew_bounds_a_busy_renew_but_never_delays_past_expiry() {
-        // The bug: a certificate born past its own renew trigger yields a ZERO delay,
-        // so the post-renewal loop would spin on the CP.
+    fn floor_after_renew_never_collapses_to_zero() {
+        // A certificate born past its own renew trigger yields a ZERO base; the floor must
+        // not let the post-renewal loop spin on the CP.
         assert_eq!(
             floor_after_renew(Duration::ZERO, Duration::from_secs(3600)),
             RENEW_MIN_INTERVAL
@@ -907,28 +974,40 @@ mod tests {
             floor_after_renew(Duration::from_secs(600), Duration::from_secs(3600)),
             Duration::from_secs(600)
         );
-        // Near expiry the floor is capped at half the remaining TTL, so flooring can
-        // never push a renewal past the certificate's own expiry.
+        // Near expiry the `remaining/2` cap shortens the floor — but the absolute spin
+        // guard means it can NEVER reach zero (F-renewstorm-1: this is the case the old
+        // `remaining/2`-only floor collapsed).
         assert_eq!(
             floor_after_renew(Duration::ZERO, Duration::from_secs(10)),
-            Duration::from_secs(5)
+            RENEW_SPIN_GUARD // min(60, 5) = 5, then .max(SPIN_GUARD) = 5
+        );
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::from_secs(4)),
+            RENEW_SPIN_GUARD // remaining/2 = 2s, but the guard floors it at 5s
         );
         assert_eq!(
             floor_after_renew(Duration::ZERO, Duration::ZERO),
-            Duration::ZERO
+            RENEW_SPIN_GUARD // the exact collapse-to-zero case, now guarded
         );
     }
 
     #[test]
-    fn reissue_delay_is_always_floored() {
-        // The server-certificate schedule: a zero-TTL-fraction window must not spin.
+    fn schedule_after_renew_flags_an_already_expired_cert_as_terminal() {
         let now = SystemTime::now();
-        let delay = reissue_delay(now, now, now + Duration::from_secs(3600));
-        assert!(delay >= RENEW_MIN_INTERVAL, "got {delay:?}");
-        // An already-expired window yields zero remaining => no delay to floor.
+        // A healthy window schedules a floored delay.
+        assert!(matches!(
+            schedule_after_renew(now, now, now + Duration::from_secs(3600), 2.0 / 3.0, 0.1, 0.0),
+            PostRenew::After(d) if d >= RENEW_SPIN_GUARD
+        ));
+        // A certificate already expired at our clock is terminal, not a schedule — retrying
+        // reissues the same expired cert and burns the generation counter.
+        assert_eq!(
+            schedule_after_renew(now, now - Duration::from_secs(10), now, 2.0 / 3.0, 0.1, 0.0),
+            PostRenew::ExpiredAtIssue
+        );
         assert_eq!(
             reissue_delay(now, now - Duration::from_secs(10), now),
-            Duration::ZERO
+            PostRenew::ExpiredAtIssue
         );
     }
 

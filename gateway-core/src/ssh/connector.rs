@@ -116,6 +116,10 @@ pub enum NodeConnectError {
     /// The Agent declined the dial-back, or its own dial to the node's `sshd` failed.
     #[error("the agent refused or could not serve the dial-back")]
     AgentRefused,
+    /// The Agent is registered and (probably) alive, but its control-channel signal queue
+    /// stayed saturated for the whole bound — a shed under load, distinct from a dead agent.
+    #[error("the node's agent control channel is saturated")]
+    AgentBusy,
     /// The CP declared a connector model this Gateway does not implement — including
     /// `UNSPECIFIED`. Fail closed; never fall back to another model.
     #[error("unsupported connector kind {0}")]

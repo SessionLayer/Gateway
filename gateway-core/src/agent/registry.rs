@@ -15,12 +15,31 @@ use tokio::sync::mpsc;
 use crate::pbagent::DialBackRequest;
 
 /// What the Gateway sends down a live control channel.
-#[derive(Debug)]
 pub enum ControlOut {
     /// Ask the owning Agent to dial back for one session.
     DialBack(Box<DialBackRequest>),
     /// This connection has been superseded by a newer one for the same node: close.
     Superseded,
+}
+
+/// Hand-written so the dial-back **token cannot transit `Debug`** (contract §6: "never
+/// logged, never persisted, never echoed"). `DialBackRequest` is prost-generated and would
+/// otherwise derive `Debug` including its `token` field, so a single future `debug!(?out)`
+/// in the control loop would dump a live single-use capability. Mirrors S9's
+/// `SessionGrant` redaction (F-agentlog-1).
+impl std::fmt::Debug for ControlOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DialBack(req) => f
+                .debug_struct("DialBack")
+                .field("request_id", &req.request_id)
+                .field("node_name", &req.node_name)
+                .field("session_id", &req.session_id)
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::Superseded => f.write_str("Superseded"),
+        }
+    }
 }
 
 /// A live control channel to the Agent that owns one node.
@@ -33,25 +52,47 @@ pub struct ControlHandle {
 }
 
 impl ControlHandle {
-    /// Signal the Agent to dial back. `Err` means the channel is gone (the Agent
-    /// disconnected between lookup and send) — the caller fails closed to
-    /// node-offline.
-    pub fn send_dial_back(&self, req: DialBackRequest) -> Result<(), RegistryError> {
-        self.tx
-            .try_send(ControlOut::DialBack(Box::new(req)))
-            .map_err(|_| RegistryError::ChannelGone)
+    /// Signal the Agent to dial back, waiting up to `queue_timeout` for room in the control
+    /// channel's outbound queue.
+    ///
+    /// A **bounded `send`, not `try_send`** (F-agentsignal-1): a momentary burst of
+    /// concurrent sessions to a healthy agent queues and drains rather than shedding the
+    /// 17th onto the "node offline" path. Only a queue that stays full for the whole bound —
+    /// a genuinely saturated or wedged control channel — sheds, and it sheds as the distinct
+    /// [`RegistryError::Busy`], never conflated with [`RegistryError::ChannelGone`] (the
+    /// agent actually disconnected). Fail-closed either way; the two just log differently.
+    pub async fn send_dial_back(
+        &self,
+        req: DialBackRequest,
+        queue_timeout: std::time::Duration,
+    ) -> Result<(), RegistryError> {
+        match tokio::time::timeout(
+            queue_timeout,
+            self.tx.send(ControlOut::DialBack(Box::new(req))),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(RegistryError::ChannelGone),
+            Err(_) => Err(RegistryError::Busy),
+        }
     }
 }
 
-/// A registry failure. Both are fail-closed: the session becomes "node offline".
+/// A registry failure. All are fail-closed: the session becomes "node offline". They are
+/// distinguished so an operator can tell a dead agent from a saturated one (F-agentsignal-1).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RegistryError {
     /// No Agent is registered for this node (never connected, or dropped).
     #[error("no agent is registered for this node")]
     NotRegistered,
-    /// The control channel closed between lookup and send.
+    /// The control channel closed between lookup and send (the agent disconnected).
     #[error("the agent control channel is gone")]
     ChannelGone,
+    /// The control channel's outbound queue stayed full for the whole bound — the agent is
+    /// registered and (probably) alive but its signal path is saturated or wedged.
+    #[error("the agent control channel is saturated")]
+    Busy,
     /// The registry is at its configured agent cap (bounded resource use).
     #[error("agent registry is at capacity")]
     AtCapacity,
@@ -169,6 +210,7 @@ impl Drop for Registration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn chan() -> (mpsc::Sender<ControlOut>, mpsc::Receiver<ControlOut>) {
         mpsc::channel(4)
@@ -243,14 +285,70 @@ mod tests {
     }
 
     #[test]
-    fn send_after_the_agent_is_gone_fails_closed() {
+    fn control_out_debug_redacts_the_dial_back_token() {
+        // F-agentlog-1: a future debug!(?out) must never dump the single-use capability.
+        let out = ControlOut::DialBack(Box::new(DialBackRequest {
+            request_id: "req-1".into(),
+            token: "SLDB1.supersecretpayload.sig".into(),
+            ..Default::default()
+        }));
+        let shown = format!("{out:?}");
+        assert!(!shown.contains("SLDB1"), "token leaked via Debug: {shown}");
+        assert!(!shown.contains("supersecret"));
+        assert!(
+            shown.contains("request_id"),
+            "non-secret fields still shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_burst_queues_up_to_the_channel_capacity() {
+        // A momentary burst must not shed: sends within capacity succeed without draining.
+        let reg = Arc::new(AgentRegistry::new(8));
+        let (tx, _rx) = mpsc::channel(4);
+        let _g = reg.register("node-a", "agent-a", tx).unwrap();
+        let handle = reg.lookup("node-a").unwrap();
+        for _ in 0..4 {
+            assert!(handle
+                .send_dial_back(DialBackRequest::default(), Duration::from_millis(50))
+                .await
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saturated_channel_sheds_as_busy_not_channel_gone() {
+        // The receiver exists but never drains: a full queue sheds as Busy — distinct from a
+        // disconnected agent — after the bound, so an operator is not sent to chase a dead
+        // agent that is actually just overloaded (F-agentsignal-1).
+        let reg = Arc::new(AgentRegistry::new(8));
+        let (tx, _rx) = mpsc::channel(1);
+        let _g = reg.register("node-a", "agent-a", tx).unwrap();
+        let handle = reg.lookup("node-a").unwrap();
+        // Fill the single slot, then a second send has nowhere to go and times out.
+        handle
+            .send_dial_back(DialBackRequest::default(), Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .send_dial_back(DialBackRequest::default(), Duration::from_millis(50))
+                .await,
+            Err(RegistryError::Busy)
+        );
+    }
+
+    #[tokio::test]
+    async fn send_after_the_agent_is_gone_is_channel_gone_not_busy() {
         let reg = Arc::new(AgentRegistry::new(8));
         let (tx, rx) = chan();
         let _g = reg.register("node-a", "agent-a", tx).unwrap();
         let handle = reg.lookup("node-a").unwrap();
         drop(rx); // the control task ended between lookup and send
         assert_eq!(
-            handle.send_dial_back(DialBackRequest::default()),
+            handle
+                .send_dial_back(DialBackRequest::default(), Duration::from_millis(50))
+                .await,
             Err(RegistryError::ChannelGone)
         );
     }

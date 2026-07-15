@@ -46,6 +46,30 @@ pub const HEARTBEAT_INTERVAL_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300
 /// must clear the inner leg's max packet with headroom, and bound per-connection memory.
 pub const MAX_FRAME_BYTES_RANGE: std::ops::RangeInclusive<usize> = 4096..=1_048_576;
 
+/// The Agent <-> Gateway **wire** protocol range, `(major, minor)`. This is a DISTINCT
+/// protocol from the CP <-> Gateway gRPC plane (`crate::version::PROTOCOL_*`): it reuses
+/// the `ProtocolVersion`/`ComponentInfo` *concept* and the N-1 resolver, but it has its own
+/// version line, and the Control Plane is not a party to it (contract §1). Baseline **1.0**
+/// (contract §3) — do NOT couple it to the gRPC version, which is already at 1.1; advertising
+/// the gRPC max here would offer Agents a wire minor that does not exist and violate §3.
+pub const WIRE_PROTOCOL_MIN: (u32, u32) = (1, 0);
+
+/// Highest Agent <-> Gateway wire protocol this build speaks. Bump only when the framed
+/// protocol itself gains a minor — never in lockstep with the gRPC plane.
+pub const WIRE_PROTOCOL_MAX: (u32, u32) = (1, 0);
+
+/// This Gateway's [`ComponentInfo`](crate::pb::ComponentInfo) for the wire preface: the
+/// artifact identity (name + semver) with the **agent-wire** protocol range, not the gRPC
+/// one.
+pub fn wire_component_info() -> crate::pb::ComponentInfo {
+    crate::pb::ComponentInfo {
+        name: crate::version::COMPONENT_NAME.to_string(),
+        semver: crate::version::SEMVER.to_string(),
+        protocol_min: Some(crate::version::protocol_version(WIRE_PROTOCOL_MIN)),
+        protocol_max: Some(crate::version::protocol_version(WIRE_PROTOCOL_MAX)),
+    }
+}
+
 /// The URI SAN scheme the CP stamps into an agent's identity certificate.
 const AGENT_URI_PREFIX: &str = "sessionlayer://agent/";
 

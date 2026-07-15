@@ -318,6 +318,10 @@ impl PendingDialBacks {
     /// Abandon by `request_id` — the Agent reported a fast-fail (`DIAL_BACK_RESULT`
     /// with `accepted = false`), so the Gateway need not wait out the deadline.
     /// Dropping the entry drops its sender, which wakes the waiting connector.
+    ///
+    /// Test-only: the production control loop uses [`Self::fail_request_for`], which scopes
+    /// the cancel to the reporting peer (F-agentcancel-1).
+    #[cfg(test)]
     pub fn fail_request(&self, request_id: &str) {
         let jti = self
             .inner
@@ -328,6 +332,28 @@ impl PendingDialBacks {
             .cloned();
         if let Some(jti) = jti {
             self.abandon(&jti);
+        }
+    }
+
+    /// Abandon a fast-failed dial-back **only if it belongs to the reporting agent**
+    /// (F-agentcancel-1): the `request_id` is peer-supplied, and `by_request` spans the whole
+    /// pending map, so an agent that learned another session's `request_id` could otherwise
+    /// cancel it. The pending entry's signed binding names the owning `{agent_id, node_name}`;
+    /// a mismatch is ignored (and logged by the caller only for its own).
+    pub fn fail_request_for(&self, request_id: &str, agent_id: &str, node_name: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(jti) = inner.by_request.get(request_id).cloned() else {
+            return;
+        };
+        let owned = inner
+            .by_jti
+            .get(&jti)
+            .is_some_and(|e| e.binding.agent_id == agent_id && e.binding.node_name == node_name);
+        if !owned {
+            return;
+        }
+        if let Some(entry) = inner.by_jti.remove(&jti) {
+            inner.by_request.remove(&entry.request_id);
         }
     }
 
@@ -569,6 +595,36 @@ mod tests {
         assert!(
             rx.blocking_recv().is_err(),
             "sender dropped => connector errors"
+        );
+    }
+
+    #[test]
+    fn fail_request_for_only_cancels_the_reporting_agents_own_dial_back() {
+        // F-agentcancel-1: request_id is peer-supplied and by_request spans the whole map, so
+        // the fast-fail cancel MUST be scoped to the reporting agent's own binding.
+        let pending = PendingDialBacks::default();
+        // binding() is {node-a, sess-1, deploy, agent-1}.
+        pending_with(&pending, "victim", binding());
+
+        // Another agent, knowing the request_id, tries to cancel it.
+        pending.fail_request_for("req-victim", "agent-2", "node-b");
+        assert_eq!(
+            pending.len(),
+            1,
+            "a stranger cannot cancel someone else's dial-back"
+        );
+        pending.fail_request_for("req-victim", "agent-1", "node-b");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the node must match too, not just the agent"
+        );
+
+        // The rightful owner (matching agent AND node) cancels it.
+        pending.fail_request_for("req-victim", "agent-1", "node-a");
+        assert!(
+            pending.is_empty(),
+            "the owning agent may fast-fail its own dial-back"
         );
     }
 }

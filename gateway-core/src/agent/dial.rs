@@ -67,18 +67,37 @@ impl NodeConnector for AgentDial {
             if dial.node_name.is_empty() {
                 return Err(NodeConnectError::NoNodeName);
             }
-            let agent = self
-                .registry
-                .lookup(&dial.node_name)
-                .map_err(|_| NodeConnectError::NoAgent)?;
+            let agent = match self.registry.lookup(&dial.node_name) {
+                Ok(a) => a,
+                Err(_) => {
+                    tracing::info!(node = %dial.node_name, outcome = "node_unreachable", reason = "no_agent_registered", "no agent is connected for this node");
+                    return Err(NodeConnectError::NoAgent);
+                }
+            };
 
-            // Deny wins (§8.4). Re-checked again when the token is redeemed, so a lock
-            // pushed between the signal and the dial-back still refuses.
+            // Deny wins, and deny fails CLOSED (§8.4, S10 spine). An unhealthy lock feed
+            // cannot confirm the ABSENCE of a lock, so an empty deny-set is NOT evidence the
+            // agent is unlocked — refuse rather than mint a single-use dial-back capability
+            // for a peer we cannot vouch for (F-agentlock-1). The session path reaches the
+            // same conclusion from the same signal (handler.rs local_recheck).
+            if !self.lock_set.healthy() {
+                tracing::warn!(
+                    node = %dial.node_name,
+                    outcome = "node_unreachable",
+                    reason = "lock_feed_unhealthy",
+                    "lock feed cannot confirm the agent is unlocked; refusing to signal (deny fails closed)"
+                );
+                return Err(NodeConnectError::AgentLocked);
+            }
+            // Re-checked again when the token is redeemed, so a lock pushed between the
+            // signal and the dial-back still refuses.
             let bindings = LockBindings::for_agent(&agent.agent_id, &dial.node_name);
             if let Some(lock) = self.lock_set.matching(&bindings) {
                 tracing::warn!(
                     node = %dial.node_name,
                     lock_id = %lock.lock_id,
+                    outcome = "node_unreachable",
+                    reason = "agent_locked",
                     "refusing to signal a locked agent"
                 );
                 return Err(NodeConnectError::AgentLocked);
@@ -118,20 +137,38 @@ impl NodeConnector for AgentDial {
                 token,
                 not_after_epoch_seconds: not_after,
             };
-            if agent.send_dial_back(request).is_err() {
-                self.pending.abandon(&jti);
-                return Err(NodeConnectError::NoAgent);
+            // One deadline covers signalling the agent AND waiting for the splice, so the
+            // whole flow stays bounded by dial_back_timeout even when a burst queues.
+            let deadline = tokio::time::Instant::now() + self.dial_back_timeout;
+            match agent.send_dial_back(request, self.dial_back_timeout).await {
+                Ok(()) => {}
+                Err(crate::agent::registry::RegistryError::Busy) => {
+                    // A burst that could not drain: shed with a DISTINCT outcome so an
+                    // operator is not sent to chase a dead agent that is merely overloaded.
+                    self.pending.abandon(&jti);
+                    tracing::warn!(node = %dial.node_name, outcome = "node_unreachable", reason = "agent_signal_saturated", "the node's agent control channel is saturated; shedding this session");
+                    return Err(NodeConnectError::AgentBusy);
+                }
+                Err(_) => {
+                    self.pending.abandon(&jti);
+                    tracing::info!(node = %dial.node_name, outcome = "node_unreachable", reason = "agent_disconnected", "the node's agent disconnected before the signal could be sent");
+                    return Err(NodeConnectError::NoAgent);
+                }
             }
 
-            match tokio::time::timeout(self.dial_back_timeout, ready_rx).await {
+            match tokio::time::timeout_at(deadline, ready_rx).await {
                 Ok(Ok(stream)) => Ok(stream),
                 // The pending entry was dropped: the Agent reported a fast-fail, or the
                 // dial-back was refused. Either way the token is already dead.
-                Ok(Err(_)) => Err(NodeConnectError::AgentRefused),
+                Ok(Err(_)) => {
+                    tracing::info!(node = %dial.node_name, outcome = "node_unreachable", reason = "agent_refused_or_local_dial_failed", "the agent refused the dial-back or could not reach its node's sshd");
+                    Err(NodeConnectError::AgentRefused)
+                }
                 Err(_) => {
                     // The deadline elapsed: abandon the pending entry so the token stops
                     // being redeemable at once, and fail closed to node-offline.
                     self.pending.abandon(&jti);
+                    tracing::info!(node = %dial.node_name, outcome = "node_unreachable", reason = "dial_back_timeout", "the agent did not complete the dial-back within the deadline");
                     Err(NodeConnectError::Timeout(self.dial_back_timeout))
                 }
             }
@@ -182,6 +219,54 @@ mod tests {
         let set = Arc::new(LockSet::new(30, 30));
         set.replace_snapshot(Vec::new(), 1);
         set
+    }
+
+    /// A deny-set the feed has never confirmed (boot) — or, after `mark_disconnected`, one
+    /// whose stream has dropped. `matching()` returns `None` (empty), but `healthy()` is
+    /// false, so it is NOT evidence the agent is unlocked.
+    fn unhealthy_locks() -> Arc<LockSet> {
+        Arc::new(LockSet::new(30, 30))
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_lock_feed_refuses_to_signal_and_mints_no_token() {
+        // F-agentlock-1: deny fails closed. With the feed unable to confirm the absence of a
+        // lock, the connector must NOT mint a single-use dial-back capability for the agent.
+        let registry = Arc::new(AgentRegistry::new(8));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let _g = registry.register("node-a", "agent-a", tx).unwrap();
+        let pending = Arc::new(PendingDialBacks::default());
+        let dial = AgentDial::new(
+            registry,
+            pending.clone(),
+            Arc::new(DialBackSigner::generate()),
+            unhealthy_locks(),
+            GW.to_string(),
+            "wss://gw:9444".into(),
+            30,
+            Duration::from_millis(100),
+        );
+        let err = dial.connect(&node_dial("node-a")).await.unwrap_err();
+        assert!(matches!(err, NodeConnectError::AgentLocked));
+        assert!(pending.is_empty(), "no dial-back capability may be minted");
+        assert!(rx.try_recv().is_err(), "no signal may be sent");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_lock_feed_refuses_to_signal() {
+        // The feed WAS healthy, then the CP stream dropped: a lock raised at the CP during
+        // the outage never arrived, so an empty set is not "unlocked".
+        let locks = healthy_locks();
+        locks.mark_disconnected();
+        assert!(!locks.healthy());
+        let registry = Arc::new(AgentRegistry::new(8));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let _g = registry.register("node-a", "agent-a", tx).unwrap();
+        let dial = dialer(registry, locks);
+        assert!(matches!(
+            dial.connect(&node_dial("node-a")).await,
+            Err(NodeConnectError::AgentLocked)
+        ));
     }
 
     #[tokio::test]

@@ -94,6 +94,9 @@ struct Inner {
     handshake_timeout: Duration,
     heartbeat: Duration,
     max_frame_bytes: usize,
+    /// Caps concurrently-handshaking connections (sockets), so an unauthenticated peer
+    /// cannot exhaust the Gateway before presenting a certificate (F-agentdos-1).
+    connection_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// A bound, ready-to-run agent transport.
@@ -113,6 +116,23 @@ impl BoundAgentTransport {
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) {
         let inner = self.inner;
         tokio::pin!(shutdown);
+
+        // Readiness gate (F-agentlock-1): do NOT begin serving agents until the lock feed
+        // has delivered its first snapshot. This makes the boot race structurally
+        // impossible rather than merely denied — a locked agent that reconnects during boot
+        // is not even handshaked until we can evaluate the deny-set. A feed that never
+        // connects means we serve no agent nodes (they are "offline", §7.1) — the correct
+        // deny-wins trade. `refuse_if_locked` then keeps failing closed if the feed later
+        // drops mid-life.
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("agent transport shutting down before the lock feed became ready");
+                return;
+            }
+            _ = await_lock_feed_ready(&inner.deps.lock_set) => {}
+        }
+
         tracing::info!(addr = %self.local_addr, "agent transport listening");
         loop {
             tokio::select! {
@@ -124,8 +144,15 @@ impl BoundAgentTransport {
                 accepted = self.listener.accept() => {
                     match accepted {
                         Ok((tcp, peer)) => {
+                            // Cap concurrent connections BEFORE any TLS work (F-agentdos-1):
+                            // over the cap, drop at accept rather than exhaust the Gateway.
+                            let Ok(permit) = inner.connection_slots.clone().try_acquire_owned() else {
+                                tracing::warn!(peer = %peer, "agent transport at connection capacity; dropping");
+                                continue;
+                            };
                             let inner = inner.clone();
                             tokio::spawn(async move {
+                                let _permit = permit; // held for the connection lifetime
                                 if let Err(e) = accept_agent(inner, tcp).await {
                                     tracing::info!(peer = %peer, error = %e, "agent connection refused");
                                 }
@@ -160,6 +187,7 @@ pub async fn bind(
         handshake_timeout: Duration::from_secs(deps.config.handshake_timeout_secs),
         heartbeat: Duration::from_secs(deps.config.heartbeat_interval_secs),
         max_frame_bytes: deps.config.max_frame_bytes,
+        connection_slots: Arc::new(tokio::sync::Semaphore::new(deps.config.max_connections)),
         tls: tls_rx,
         deps,
     });
@@ -169,6 +197,20 @@ pub async fn bind(
         local_addr,
         inner,
     })
+}
+
+/// Resolve once the lock feed has confirmed the deny-set (its first snapshot landed and it
+/// is fresh). Polled — this runs once at startup, not on any hot path.
+async fn await_lock_feed_ready(lock_set: &LockSet) {
+    if lock_set.healthy() {
+        return;
+    }
+    tracing::info!(
+        "agent transport waiting for the lock feed before serving agents (deny fails closed)"
+    );
+    while !lock_set.healthy() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The `wss://` URL an Agent is told to dial back to. Configured explicitly in a real
@@ -294,8 +336,24 @@ fn spawn_server_cert_renewal(
     tokio::spawn(async move {
         let mut not_before = std::time::SystemTime::now();
         loop {
-            let delay =
-                identity::reissue_delay(std::time::SystemTime::now(), not_before, not_after);
+            let delay = match identity::reissue_delay(
+                std::time::SystemTime::now(),
+                not_before,
+                not_after,
+            ) {
+                identity::PostRenew::After(d) => d,
+                // The CP just issued a serverAuth leaf already expired at our clock. Each
+                // reissue also generates a P-256 keypair + CSR, so a spin storms both CPU
+                // and the CP. Stop and keep the current cert (F-renewstorm-1): agents will
+                // fail to verify an expired Gateway and the node goes offline, which is the
+                // correct fail-closed outcome for a broken clock — an operator must fix it.
+                identity::PostRenew::ExpiredAtIssue => {
+                    tracing::error!(
+                        "SECURITY/OPS: the Control Plane issued an agent-facing certificate already expired at this Gateway's clock (clock skew or CP TTL misconfiguration) — stopping reissue to avoid a keygen/RPC storm; fix NTP / the CP certificate TTL (operator action required)"
+                    );
+                    return;
+                }
+            };
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|v| *v) => return,
@@ -448,14 +506,36 @@ async fn handshake(
     let ver = match preface(&mut ws, inner).await {
         Ok(ver) => ver,
         Err(e) => {
-            let _ = send_error(&mut ws, version::PROTOCOL_MAX.0 as u8, &e).await;
+            // Pre-negotiation error: stamp it with our wire major (contract §3).
+            let _ = send_error(&mut ws, wire_reject_ver(), &e).await;
             return Err(e);
         }
     };
     Ok((ws, peer, role, ver))
 }
 
+/// The agent-surface Lock gate (contract §1/§6 check 7/§8). Used at registration, on every
+/// heartbeat tick, and at dial-back redemption.
+///
+/// **Deny fails closed (§8.4, the S10 safety spine).** An unhealthy deny-feed — before the
+/// first snapshot at boot, or after the CP stream drops — cannot confirm the ABSENCE of a
+/// lock, and an empty `LockSet` is indistinguishable from "no lock applies". So an
+/// unconfirmable deny-set is treated as a deny, exactly as the session path does
+/// (`handler.rs` local_recheck). The availability cost is deliberate: while the feed is down
+/// this Gateway serves NO agent nodes — they are simply "offline" (§7.1), the correct
+/// deny-wins trade. In practice the cost is small: a down lock stream usually means the CP is
+/// down, and `Authorize` already fails closed, so few new sessions were possible anyway.
+/// (F-agentlock-1.)
 fn refuse_if_locked(inner: &Inner, peer: &AgentPeer) -> Result<(), ConnError> {
+    if !inner.deps.lock_set.healthy() {
+        tracing::warn!(
+            agent_id = %sanitize(&peer.agent_id),
+            node = %sanitize(&peer.node_name),
+            reason = "lock_feed_unhealthy",
+            "lock feed cannot confirm the agent is unlocked; refusing (deny fails closed)"
+        );
+        return Err(ConnError::Locked);
+    }
     let bindings = LockBindings::for_agent(&peer.agent_id, &peer.node_name);
     if let Some(lock) = inner.deps.lock_set.matching(&bindings) {
         tracing::warn!(
@@ -484,14 +564,10 @@ where
 
     let Some(selected) = negotiate(&client) else {
         let reject = VersionReject {
-            gateway_min: Some(version::protocol_version(version::PROTOCOL_MIN)),
-            gateway_max: Some(version::protocol_version(version::PROTOCOL_MAX)),
+            gateway_min: Some(version::protocol_version(crate::agent::WIRE_PROTOCOL_MIN)),
+            gateway_max: Some(version::protocol_version(crate::agent::WIRE_PROTOCOL_MAX)),
         };
-        let payload = wire::encode_msg(
-            version::PROTOCOL_MAX.0 as u8,
-            MsgType::VersionReject,
-            &reject,
-        );
+        let payload = wire::encode_msg(wire_reject_ver(), MsgType::VersionReject, &reject);
         let _ = ws.send(Message::Binary(WsBytes::from(payload))).await;
         let _ = ws.close(None).await;
         return Err(ConnError::NoCommonVersion);
@@ -499,7 +575,7 @@ where
 
     let ver = selected.0 as u8;
     let ack = GatewayHelloAck {
-        component: Some(version::component_info()),
+        component: Some(crate::agent::wire_component_info()),
         selected: Some(version::protocol_version(selected)),
         heartbeat_interval_secs: inner.deps.config.heartbeat_interval_secs as u32,
         max_frame_bytes: inner.max_frame_bytes as u32,
@@ -514,15 +590,28 @@ where
     Ok(ver)
 }
 
-/// Resolve the highest common protocol version, reusing the CP-plane N-1 resolver
-/// (VERSIONING §3). No overlap ⇒ fail closed (FR-HA-9).
+/// The `VER` byte for a frame sent before a version is negotiated (a `VERSION_REJECT` or a
+/// pre-preface error): the sender's own **wire** protocol major (contract §3), NOT the gRPC
+/// plane's.
+fn wire_reject_ver() -> u8 {
+    crate::agent::WIRE_PROTOCOL_MAX.0 as u8
+}
+
+/// Resolve the highest common **wire** protocol version, reusing the pure N-1 resolver
+/// (VERSIONING §3) over the agent-wire range — which is 1.0, independent of the gRPC plane.
+/// No overlap ⇒ fail closed (FR-HA-9).
 fn negotiate(client: &ComponentInfo) -> Option<(u32, u32)> {
     let min = client.protocol_min.as_ref().map(|v| (v.major, v.minor))?;
     let max = client.protocol_max.as_ref().map(|v| (v.major, v.minor))?;
     if min.0 != max.0 {
         return None; // a range must never straddle majors (VERSIONING §3)
     }
-    version::resolve_common_version(version::PROTOCOL_MIN, version::PROTOCOL_MAX, min, max)
+    version::resolve_common_version(
+        crate::agent::WIRE_PROTOCOL_MIN,
+        crate::agent::WIRE_PROTOCOL_MAX,
+        min,
+        max,
+    )
 }
 
 // ---- control role -------------------------------------------------------------
@@ -566,15 +655,19 @@ where
     let mut ticker = tokio::time::interval(inner.heartbeat);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick is immediate
-    let mut unanswered_pings = 0u32;
-    let mut nonce = 0u64;
+    let mut next_nonce = 0u64;
+    // Pings sent but not yet answered, in send order. A PONG for an OLDER ping still proves
+    // liveness (the agent answers in order), so a slow-but-alive agent whose round-trip
+    // approaches the interval is not flapped offline (F-agentliveness-1).
+    let mut outstanding: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
 
     let outcome = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Two missed intervals ⇒ the peer is dead (contract §7).
-                if unanswered_pings >= 2 {
-                    tracing::info!(agent_id = %sanitize(&peer.agent_id), node = %sanitize(&peer.node_name), "agent missed two heartbeats; deregistering (node becomes unreachable)");
+                // Two missed intervals ⇒ the peer is dead (contract §7): a ping unanswered
+                // across two ticks, NOT merely "the latest ping is unanswered".
+                if outstanding.len() >= 2 {
+                    tracing::info!(agent_id = %sanitize(&peer.agent_id), node = %sanitize(&peer.node_name), outcome = "node_unreachable", reason = "missed_heartbeats", "agent missed two heartbeats; deregistering (node becomes unreachable)");
                     break Ok(());
                 }
                 // A lock pushed after registration must not leave the channel live.
@@ -582,12 +675,12 @@ where
                     let _ = send_error(&mut ws, ver, &ConnError::Locked).await;
                     break Err(ConnError::Locked);
                 }
-                nonce = nonce.wrapping_add(1);
-                let ping = wire::encode_msg(ver, MsgType::Ping, &Ping { nonce });
+                next_nonce = next_nonce.wrapping_add(1);
+                let ping = wire::encode_msg(ver, MsgType::Ping, &Ping { nonce: next_nonce });
                 if ws.send(Message::Binary(WsBytes::from(ping))).await.is_err() {
                     break Ok(());
                 }
-                unanswered_pings += 1;
+                outstanding.push_back(next_nonce);
             }
             out = rx.recv() => {
                 match out {
@@ -617,18 +710,31 @@ where
                 };
                 match frame.msg_type {
                     MsgType::Pong => {
-                        if wire::as_pong(&frame).map(|p| p.nonce) == Ok(nonce) {
-                            unanswered_pings = 0;
+                        let acked = wire::as_pong(&frame)?.nonce;
+                        // A PONG for ping N acks N and every still-outstanding older ping.
+                        if outstanding.contains(&acked) {
+                            while outstanding.front().is_some_and(|&n| n <= acked) {
+                                outstanding.pop_front();
+                            }
                         }
                     }
                     MsgType::DialBackResult => {
                         let result = wire::as_dial_back_result(&frame)?;
                         if !result.accepted {
-                            // Fast-fail: drop the pending entry now rather than making
-                            // the session wait out the dial-back deadline. The token
-                            // stops being redeemable at the same instant.
-                            tracing::info!(node = %sanitize(&peer.node_name), error = result.error, "agent refused a dial-back (fast-fail)");
-                            inner.deps.pending.fail_request(&result.request_id);
+                            // Fast-fail: drop the pending entry now rather than making the
+                            // session wait out the dial-back deadline. Scoped to THIS peer's
+                            // own node/agent (F-agentcancel-1): an agent must not be able to
+                            // cancel another session's dial-back by naming its request_id.
+                            // Render the error as its typed enum (a closed set), never the
+                            // raw wire value — no peer text transits this line (F-agentlog-2).
+                            let code = crate::pbagent::DialBackErrorCode::try_from(result.error)
+                                .unwrap_or(crate::pbagent::DialBackErrorCode::Unspecified);
+                            tracing::info!(node = %sanitize(&peer.node_name), error = ?code, "agent refused a dial-back (fast-fail)");
+                            inner.deps.pending.fail_request_for(
+                                &result.request_id,
+                                &peer.agent_id,
+                                &peer.node_name,
+                            );
                         }
                     }
                     MsgType::Ping => {
@@ -851,13 +957,39 @@ where
     ws.send(Message::Binary(WsBytes::from(payload))).await
 }
 
-/// Strip control/ANSI characters from untrusted peer-supplied text before it reaches
-/// a log sink (log-injection / terminal-escape guard).
+/// Strip characters that could forge or corrupt an operator log line from untrusted
+/// peer-supplied text (contract §8: "log it escaped").
+///
+/// `char::is_control()` covers only category **Cc** (C0/C1 + DEL) — it misses the four
+/// classes that actually enable log/terminal attacks, so we strip them too
+/// (F-agentlog-1): line/paragraph separators (Zl/Zp — new-line forging in JSON/log
+/// pipelines), bidi controls (reorder the rendered line to read as something else),
+/// zero-width/format characters (defeat grep and alerting), and the BOM. The inputs on
+/// this surface are short cert-derived identifiers and diagnostic strings, so dropping the
+/// (rare, non-load-bearing) format characters is harmless.
 fn sanitize(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !is_log_unsafe(c))
         .take(256)
         .collect::<String>()
+}
+
+/// Whether `c` could forge or corrupt a log line (see [`sanitize`]).
+fn is_log_unsafe(c: char) -> bool {
+    c.is_control() // Cc: C0/C1 controls incl. \n \r \t ESC and DEL
+        || matches!(c,
+            '\u{00AD}'                 // soft hyphen
+            | '\u{061C}'               // arabic letter mark (bidi)
+            | '\u{180E}'               // mongolian vowel separator
+            | '\u{200B}'..='\u{200F}'  // zero-width (space/non-joiner/joiner) + LRM/RLM
+            | '\u{2028}'               // line separator (Zl)
+            | '\u{2029}'               // paragraph separator (Zp)
+            | '\u{202A}'..='\u{202E}'  // bidi embeddings/overrides
+            | '\u{2060}'..='\u{2064}'  // word joiner + invisible operators
+            | '\u{2066}'..='\u{206F}'  // bidi isolates + deprecated format chars
+            | '\u{FEFF}'               // zero-width no-break space / BOM
+            | '\u{FFF9}'..='\u{FFFB}'  // interlinear annotation controls
+        )
 }
 
 #[cfg(test)]
@@ -881,15 +1013,26 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_picks_the_highest_common_version() {
-        // Baseline: both ship 1.0-1.1 today.
-        assert_eq!(negotiate(&info((1, 0), (1, 1))), Some((1, 1)));
-        // N-1: a 1.0-only Agent still connects.
+    fn negotiation_uses_the_wire_range_not_the_grpc_range() {
+        // The wire protocol is pinned at 1.0 (contract §3). The gRPC plane is already at
+        // 1.1 — negotiation MUST NOT leak that here: an Agent advertising [1.0, 1.1] gets
+        // 1.0, never 1.1, because 1.1 does not exist on the wire (F-wireversion-1).
+        assert_eq!(negotiate(&info((1, 0), (1, 1))), Some((1, 0)));
         assert_eq!(negotiate(&info((1, 0), (1, 0))), Some((1, 0)));
+        // Guard the decoupling explicitly: our wire max is below the gRPC max.
+        assert_eq!(crate::agent::WIRE_PROTOCOL_MAX, (1, 0));
+        assert!(crate::agent::WIRE_PROTOCOL_MAX < crate::version::PROTOCOL_MAX);
+        assert_eq!(
+            crate::agent::wire_component_info().protocol_max,
+            Some(crate::pb::ProtocolVersion { major: 1, minor: 0 })
+        );
     }
 
     #[test]
     fn no_common_version_fails_closed() {
+        // A peer offering ONLY 1.1 shares nothing with our wire [1.0, 1.0] → reject, never
+        // a silent downgrade to a wire minor we do not actually speak.
+        assert_eq!(negotiate(&info((1, 1), (1, 1))), None);
         // A different major has no overlap → VERSION_REJECT, never a guess.
         assert_eq!(negotiate(&info((2, 0), (2, 0))), None);
         // A range that straddles majors is malformed.
@@ -921,7 +1064,17 @@ mod tests {
 
     #[test]
     fn peer_error_text_is_sanitized_before_logging() {
+        // C0 control + ANSI CSI (the ESC is a C0 control).
         assert_eq!(sanitize("evil\n\u{1b}[2Jinjected"), "evil[2Jinjected");
+        // F-agentlog-1: the Cf/Zl/Zp classes char::is_control() misses are stripped too.
+        assert_eq!(sanitize("ok\u{202e}dezirohtuanu"), "okdezirohtuanu"); // RTL override
+        assert_eq!(sanitize("a\u{200b}b\u{feff}c"), "abc"); // zero-width + BOM
+        assert_eq!(
+            sanitize("line1\u{2028}line2\u{2029}line3"),
+            "line1line2line3"
+        );
+        // Ordinary non-ASCII text is preserved (this is a log guard, not ASCII-only).
+        assert_eq!(sanitize("café-node"), "café-node");
     }
 
     #[test]

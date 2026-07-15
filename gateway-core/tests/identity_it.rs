@@ -336,3 +336,63 @@ async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past()
         "the post-renewal floor must bound the loop to one renewal in this window"
     );
 }
+
+/// F-renewstorm-1 (HIGH): the S14 floor closed the `base == 0` trigger but left the
+/// `remaining == 0` one open. When the CP issues a certificate that is ALREADY EXPIRED at
+/// the Gateway's clock (clock skew beyond the TTL, or a near-zero CP TTL), the `remaining/2`
+/// cap collapsed the floor to zero and the loop renewed at RPC rate — 40 generations in 2s
+/// in the reliability repro. The RPC keeps *succeeding* (the CP validates against its own
+/// clock), so nothing self-limits, and each iteration churns the generation counter, which
+/// is the §8.2 clone-detection primitive.
+///
+/// This drives the real LOOP (not the helper) with `cert_ttl(0)` — `validity_window()` then
+/// returns not_after = now, i.e. "the certificate the CP issued is already expired at us".
+/// The fix makes that a terminal, loud condition: one renewal, then stop.
+#[tokio::test]
+async fn renew_ahead_loop_stops_instead_of_storming_on_an_already_expired_issued_cert() {
+    let cp = MockCp::builder()
+        .cert_ttl(Duration::from_secs(0))
+        .start()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = identity::IdentityStore::open(dir.path()).unwrap();
+    let params = cp.channel_params(CT, RT);
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &cp.mint_enrollment_token(),
+        "gw-storm2",
+    )
+    .await
+    .unwrap();
+    let gateway_id = cred.gateway_id.clone();
+
+    let renew_ahead = identity::RenewAhead::new(
+        store,
+        identity::RenewAheadConfig {
+            renew_ahead_fraction: 2.0 / 3.0,
+            renew_jitter_fraction: 0.1,
+            retry_backoff: Duration::from_millis(20),
+            channel: params,
+        },
+        cred,
+    );
+    let loop_task = tokio::spawn(async move {
+        renew_ahead
+            .run(Box::pin(std::future::pending::<()>()))
+            .await;
+    });
+
+    // Two seconds of wall-clock for the loop to storm in if it were going to.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The loop must have STOPPED itself (terminal ExpiredAtIssue), so aborting finds a
+    // finished task — and at most one extra generation was burned.
+    let gens = cp.recorded_generation(&gateway_id).unwrap_or(0);
+    assert!(
+        gens <= 1,
+        "BUSY-RENEW STORM: the loop burned {gens} generations in 2s (must be <= 1)"
+    );
+    loop_task.abort();
+}

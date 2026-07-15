@@ -162,6 +162,12 @@ pub struct AgentTransportConfig {
     pub handshake_timeout_secs: u64,
     /// Cap on live agent control channels (bounded resource use).
     pub max_agents: usize,
+    /// Cap on concurrently-handshaking **connections** (sockets), distinct from
+    /// [`Self::max_agents`] which caps registered nodes. A connection over the cap is
+    /// dropped at accept *before* any TLS work, so an unauthenticated peer cannot exhaust
+    /// the Gateway before it ever presents a certificate (F-agentdos-1). Sized to leave room
+    /// for one control channel plus concurrent dial-backs per agent.
+    pub max_connections: usize,
 }
 
 impl Default for AgentTransportConfig {
@@ -175,6 +181,7 @@ impl Default for AgentTransportConfig {
             dial_back_timeout_secs: 10,
             handshake_timeout_secs: 10,
             max_agents: 1024,
+            max_connections: 4096,
         }
     }
 }
@@ -657,6 +664,11 @@ mod tests {
         assert_eq!(a.dial_back_token_ttl_secs, 30);
         assert_eq!(a.dial_back_timeout_secs, 10);
         assert_eq!(a.max_agents, 1024);
+        assert_eq!(a.max_connections, 4096);
+        assert!(
+            a.max_connections >= a.max_agents,
+            "room for one socket per node"
+        );
         // The two ordering invariants validate_config enforces hold at the defaults.
         assert!((a.dial_back_timeout_secs as i64) < a.dial_back_token_ttl_secs);
         assert!(a.max_frame_bytes > InnerLegServerConfig::default().max_packet_bytes as usize);

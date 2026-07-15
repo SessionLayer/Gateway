@@ -46,6 +46,17 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Harness {
+        Harness::start_inner(true).await
+    }
+
+    /// Start with the lock feed **not yet confirmed** — the deny-set is empty AND unhealthy,
+    /// so the transport's readiness gate should refuse to serve agents until a snapshot lands
+    /// (F-agentlock-1). Call `h.lock_set.replace_snapshot(..)` to make it ready.
+    async fn start_unready() -> Harness {
+        Harness::start_inner(false).await
+    }
+
+    async fn start_inner(feed_ready: bool) -> Harness {
         let cp = MockCp::start().await;
         let dir = tempfile::tempdir().unwrap();
         let store = identity::IdentityStore::open(dir.path()).unwrap();
@@ -71,7 +82,9 @@ impl Harness {
         let pending = Arc::new(PendingDialBacks::default());
         let signer = Arc::new(DialBackSigner::generate());
         let lock_set = Arc::new(LockSet::new(30, 30));
-        lock_set.replace_snapshot(Vec::new(), 1); // healthy, empty
+        if feed_ready {
+            lock_set.replace_snapshot(Vec::new(), 1); // healthy, empty
+        }
 
         let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
         let transport = server::bind(
@@ -279,6 +292,101 @@ async fn a_locked_agent_cannot_register() {
         h.dialer().connect(&node_dial(NODE, "sess-1")).await,
         Err(NodeConnectError::NoAgent)
     ));
+}
+
+#[tokio::test]
+async fn the_transport_does_not_serve_agents_until_the_lock_feed_is_ready() {
+    // F-agentlock-1 readiness gate: a Gateway that cannot yet confirm the deny-set must not
+    // serve agents (a locked agent reconnecting during boot must not be admitted). Deny
+    // fails closed → the node is simply "offline" until the feed lands.
+    let h = Harness::start_unready().await;
+    let client = h.agent(AGENT, NODE);
+    let (_task, _sd) = h.spawn_control(&client);
+
+    // While the feed is unconfirmed the transport is not accepting: no registration.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        h.registry.is_empty(),
+        "no agent may register before the lock feed confirms the deny-set"
+    );
+
+    // Once the feed delivers its first snapshot, the transport starts accepting and the
+    // client's connection — queued in the listener backlog this whole time — completes its
+    // handshake and registers.
+    h.lock_set.replace_snapshot(Vec::new(), 1);
+    h.await_registered(NODE).await;
+}
+
+#[tokio::test]
+async fn a_dropped_lock_feed_refuses_new_registration_and_dial_back_redemption() {
+    // The feed WAS healthy (so the transport is serving), then the CP stream drops mid-life:
+    // a lock raised at the CP during the outage never arrives, so an empty set is not
+    // evidence the agent is unlocked. Both a new registration and a dial-back redemption of
+    // a token issued while healthy must fail closed.
+    let h = Harness::start().await;
+    let client = h.agent(AGENT, NODE);
+
+    // A live token, captured while the feed is healthy.
+    let req = capture_dial_back(&h, &client, "sess-drop").await;
+
+    // The CP lock stream drops.
+    h.lock_set.mark_disconnected();
+    assert!(!h.lock_set.healthy());
+
+    // (a) Redeeming the already-issued token is refused (the exploitable half).
+    assert_unauthorized(&redeem(&h, &client, &req).await);
+    assert_eq!(
+        h.pending.len(),
+        1,
+        "an unconfirmable redemption does not consume it"
+    );
+
+    // (b) A brand-new registration is refused too.
+    let other = h.agent("agent-b", "node-b");
+    let mut ws = other.connect(&h.endpoint, CONTROL_PATH).await.unwrap();
+    let negotiated = other.hello(&mut ws).await.unwrap();
+    let frame = other.next_frame(&mut ws, negotiated.ver).await.unwrap();
+    assert_eq!(frame.msg_type, MsgType::Error);
+    assert_eq!(
+        wire::as_wire_error(&frame).unwrap().code,
+        WireErrorCode::Unauthorized as i32
+    );
+    assert!(
+        h.registry.lookup("node-b").is_err(),
+        "no registration while the feed is down"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_that_stops_answering_heartbeats_is_deregistered() {
+    // F-agentliveness-1(a): the "two missed heartbeats => dead" path had no coverage. Register
+    // an agent, then stop answering PINGs (drain but never PONG) — the node must go
+    // unreachable within a bounded time (heartbeat is 1s in the harness).
+    let h = Harness::start().await;
+    let client = h.agent(AGENT, NODE);
+    let mut ws = client.connect(&h.endpoint, CONTROL_PATH).await.unwrap();
+    let _n = client.hello(&mut ws).await.unwrap();
+    h.await_registered(NODE).await;
+
+    // Drain incoming frames (incl. PINGs) so the socket does not back up, but never answer.
+    let drain = tokio::spawn(async move {
+        use futures_util::StreamExt;
+        while ws.next().await.transpose().ok().flatten().is_some() {}
+    });
+
+    let mut dead = false;
+    for _ in 0..100 {
+        if h.registry.is_empty() {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        dead,
+        "an agent that stops answering heartbeats must be deregistered"
+    );
+    drain.abort();
 }
 
 #[tokio::test]
