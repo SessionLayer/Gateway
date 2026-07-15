@@ -421,7 +421,8 @@ mod tests {
     }
 
     fn registry_with(nodes: &[&str]) -> Arc<AgentRegistry> {
-        let reg = Arc::new(AgentRegistry::new(16));
+        // Size the registry to the node count (the M1 fleet test registers 100).
+        let reg = Arc::new(AgentRegistry::new(nodes.len().max(16)));
         // Leak the receivers so the registrations stay live for the test's lifetime.
         for n in nodes {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
