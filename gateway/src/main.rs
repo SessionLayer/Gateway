@@ -174,6 +174,15 @@ fn run() -> anyhow::Result<()> {
             let remaining = outer.live_sessions.terminate_all();
             if remaining > 0 {
                 tracing::warn!(remaining, "tearing down sessions still live at the drain deadline via the recorder-finalize path (L4)");
+                // Wait (bounded) for the forced teardowns to fully DROP before draining the
+                // finalize tracker (L4 race). `terminate_all` only SPAWNS the disconnects; each
+                // session's recorder finalize is registered (`FinalizeTracker::spawn`, count++) in
+                // `SshHandler::drop`'s BODY, which runs BEFORE the `live_guard` field deregisters
+                // (`len--`). So `live_sessions.len() == 0` guarantees every over-deadline session's
+                // finalize is already counted. Without this wait, `finalize_tracker.drain` could
+                // sample `count == 0` on its first poll and return before the finalize is even
+                // registered — truncating that session's WORM object.
+                drain_live_sessions(&outer.live_sessions, None, TEARDOWN_SETTLE_BOUND).await;
             }
             let grace = Duration::from_secs(cfg.ssh.recorder.upload_timeout_secs.saturating_add(10));
             tracing::info!(grace_secs = grace.as_secs(), "draining in-flight recording finalizes");
@@ -354,6 +363,11 @@ struct OuterLeg {
     /// pure owner/relay Gateway would cut its live relayed sessions the instant it exits.
     served_relays: Option<Arc<ha::peer_client::ServedRelays>>,
 }
+
+/// Bound on waiting for force-terminated sessions to fully DROP (so their recorder finalizes are
+/// registered) before draining the finalize tracker (L4). A force-disconnected session drops
+/// sub-second; this is a generous safety cap, well within the drain deadline.
+const TEARDOWN_SETTLE_BOUND: Duration = Duration::from_secs(5);
 
 /// Wait for both this Gateway's own live sessions AND the relays it serves as an owner to
 /// finish, bounded by `deadline` (the S9 F-drain fix + M2: sessions are finished-to-deadline,
@@ -761,5 +775,42 @@ mod tests {
         // The default (un-enrolled) config must not attempt enrollment.
         let cfg = GatewayConfig::default();
         assert!(cfg.bootstrap.is_none());
+    }
+
+    /// The bounded drain wait (used by both the M2 relay drain and the L4 teardown-settle wait)
+    /// must actually BLOCK until the tracked in-flight count reaches zero, and then return
+    /// PROMPTLY — not sit until the deadline. This is the load-bearing property of the L4 fix:
+    /// waiting for `live_sessions.len() == 0` after `terminate_all()` is only safe if the wait
+    /// genuinely observes the count draining. (A faithful live-session variant needs a real russh
+    /// `Handle` in `SessionControl`, which only the Docker E2E provides.)
+    #[tokio::test]
+    async fn drain_blocks_until_in_flight_reaches_zero_then_returns_promptly() {
+        let live = ssh::locks::LiveSessionRegistry::default();
+        let relays = Arc::new(ha::peer_client::ServedRelays::default());
+
+        // Nothing in flight ⇒ return at once (well under the deadline).
+        let t0 = std::time::Instant::now();
+        drain_live_sessions(&live, Some(&relays), Duration::from_secs(30)).await;
+        assert!(t0.elapsed() < Duration::from_secs(1));
+
+        // One in-flight relay held for 400ms; the drain must wait for it and then return, NOT
+        // block to the deadline.
+        let slot = relays.begin("web-01").expect("slot");
+        assert_eq!(relays.active(), 1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            drop(slot); // releases ⇒ active() == 0
+        });
+        let t1 = std::time::Instant::now();
+        drain_live_sessions(&live, Some(&relays), Duration::from_secs(30)).await;
+        let waited = t1.elapsed();
+        assert!(
+            waited >= Duration::from_millis(350),
+            "it waited for the relay to finish"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "and returned once drained, not at the 30s deadline"
+        );
     }
 }
