@@ -325,6 +325,17 @@ impl LiveSessionRegistry {
         self.sessions.lock().unwrap().remove(session_id);
     }
 
+    /// The number of live sessions (the graceful-drain wait polls this until zero or the
+    /// deadline, Session Fifteen).
+    pub fn len(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
+    /// Whether no session is live.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Tear down every live session a newly-added lock matches. Returns the count.
     pub fn apply_added_lock(&self, lock: &Lock) -> usize {
         let Some(target) = lock.target.as_ref() else {

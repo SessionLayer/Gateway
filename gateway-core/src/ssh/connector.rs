@@ -43,7 +43,7 @@ pub struct NodeTarget {
 
 /// How to reach the node — the CP-resolved connector kind + whatever that kind needs
 /// (Design §9.2). Selection is per-node (FR-CONN-3): a fleet mixes both models.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NodeDial {
     /// The CP node identifier (for correlation/logging).
     pub node_id: String,
@@ -61,6 +61,18 @@ pub struct NodeDial {
     /// The resolved Linux principal (bound into the dial-back token; enforcement lives
     /// in the inner-leg certificate, never in the Agent).
     pub principal: String,
+    /// HA (Session Fifteen): the Gateway NAME that currently OWNS this node's agent
+    /// control channel (Authorize `owning_gateway_id`). Empty for agentless nodes and
+    /// for an agent node with no fresh presence owner (⇒ "node offline", fail closed).
+    /// `== self` routes locally (the S14 agent dial); `!= self` routes to the owner over
+    /// a direct Gateway↔Gateway relay.
+    pub owning_gateway_id: String,
+    /// The owner's peer-relay advertise address (observability; the ingress does NOT dial
+    /// it — the owner dials back to the ingress).
+    pub owning_gateway_addr: String,
+    /// The owner's monotonic presence nonce at decision time — bound into the relay token
+    /// so a superseded owner (nonce advanced by a failover) cannot serve a stale relay.
+    pub owner_nonce: u64,
 }
 
 /// What a successful outer leg hands the inner leg: the CP's signed decision
@@ -127,6 +139,11 @@ pub enum NodeConnectError {
     /// The node is outbound-agent but this Gateway has no agent transport configured.
     #[error("the agent transport is not enabled on this Gateway")]
     AgentTransportDisabled,
+    /// HA (Session Fifteen): a remote-owned node could not be reached — the coordination
+    /// signal could not be delivered to the owner, or the owner did not establish the
+    /// direct relay within the bound. Fail closed to "node offline" (FR-HA-5).
+    #[error("the owning gateway could not be reached for the relay")]
+    RelayUnavailable,
 }
 
 /// The boxed future returned by [`NodeConnector::connect`].
@@ -234,6 +251,7 @@ mod tests {
             node_name: "node-1".into(),
             session_id: "sess-1".into(),
             principal: "deploy".into(),
+            ..Default::default()
         }
     }
 

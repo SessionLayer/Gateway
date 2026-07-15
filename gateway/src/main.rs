@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gateway_core::{
     agent,
     asyncio::{self, IoBackend},
-    config::GatewayConfig,
-    cpauth, handshake, health, identity, mtls, ssh, tls,
+    config::{CoordinationConfig, GatewayConfig, HaConfig},
+    cpauth, ha, handshake, health, identity, mtls, ssh, tls,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,22 +130,36 @@ fn run() -> anyhow::Result<()> {
 
         // Outer SSH leg (Session Seven): started only when configured AND the
         // Gateway holds a CP mTLS identity to delegate auth to (fail closed).
-        let finalize_tracker =
-            start_outer_leg(&cfg, renew.as_ref(), shutdown_rx.clone()).await?;
+        let outer = start_outer_leg(&cfg, renew.as_ref(), shutdown_rx.clone()).await?;
+
+        // Readiness surface (Session Fifteen): `ready` until we start draining. A
+        // separate `readyz_stop` keeps the /readyz listener alive THROUGH the drain (so
+        // the LB keeps seeing 503 while sessions finish), stopping only at the very end.
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        let (readyz_stop_tx, readyz_stop_rx) = tokio::sync::watch::channel(false);
+        if !cfg.ha.drain.readyz_addr.is_empty() {
+            ha::readiness::spawn(cfg.ha.drain.readyz_addr.clone(), ready_rx, readyz_stop_rx);
+        }
 
         tracing::info!("awaiting shutdown signal (SIGTERM / Ctrl-C)");
         let mut sd = shutdown_rx;
         let _ = sd.wait_for(|v| *v).await;
         tracing::info!("shutdown signal received; Gateway stopping");
 
-        // Graceful shutdown: the accept loop has stopped; give live sessions'
-        // recordings a bounded grace to finalize + upload before we exit, so they
-        // are not lost (#3). In-flight connection preservation is S14 (F-drain).
-        if let Some(tracker) = finalize_tracker {
+        // Graceful drain (Session Fifteen, §10.3 — closes S9 F-drain). (1) Flip unready so
+        // the LB deregisters us and stops sending NEW connections; (2) the accept loops have
+        // already stopped, and the heartbeat loop releases presence so a standby claims;
+        // (3) FINISH live sessions to a bounded deadline (they are not dropped instantly —
+        // that is the F-drain fix); (4) finalize + upload their recordings.
+        let _ = ready_tx.send(false);
+        if let Some(outer) = outer {
+            let deadline = Duration::from_secs(cfg.ha.drain.deadline_secs);
+            drain_live_sessions(&outer.live_sessions, deadline).await;
             let grace = Duration::from_secs(cfg.ssh.recorder.upload_timeout_secs.saturating_add(10));
             tracing::info!(grace_secs = grace.as_secs(), "draining in-flight recording finalizes");
-            tracker.drain(grace).await;
+            outer.finalize_tracker.drain(grace).await;
         }
+        let _ = readyz_stop_tx.send(true);
         Ok::<(), anyhow::Error>(())
     })
 }
@@ -310,11 +324,38 @@ async fn bootstrap_identity(cfg: &GatewayConfig) -> anyhow::Result<Option<identi
 /// (fail closed: never an SSH front door that can't reach the decision authority).
 /// The CP auth client tracks the renewing credential so a rotated identity is
 /// picked up without a restart.
+/// The running outer leg's drain handles (Session Fifteen): the recording finalize tracker
+/// and the live-session registry the graceful drain waits on.
+struct OuterLeg {
+    finalize_tracker: ssh::recorder::FinalizeTracker,
+    live_sessions: Arc<ssh::locks::LiveSessionRegistry>,
+}
+
+/// Wait for live sessions to finish, bounded by `deadline` (the S9 F-drain fix: live
+/// sessions are finished-to-deadline, not dropped instantly).
+async fn drain_live_sessions(live: &ssh::locks::LiveSessionRegistry, deadline: Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        let n = live.len();
+        if n == 0 {
+            return;
+        }
+        if start.elapsed() >= deadline {
+            tracing::warn!(
+                remaining = n,
+                "drain deadline reached with live sessions still open; finalizing and exiting"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn start_outer_leg(
     cfg: &GatewayConfig,
     renew: Option<&identity::RenewHandle>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<Option<ssh::recorder::FinalizeTracker>> {
+) -> anyhow::Result<Option<OuterLeg>> {
     if cfg.ssh.listen_addr.is_empty() {
         return Ok(None);
     }
@@ -346,7 +387,10 @@ async fn start_outer_leg(
         }
     });
 
-    let factory = Arc::new(cpauth::CpChannelFactory::from_watch(params, snap_rx));
+    let factory = Arc::new(cpauth::CpChannelFactory::from_watch(
+        params,
+        snap_rx.clone(),
+    ));
     let cpauth = Arc::new(cpauth::CpAuthClient::new(
         factory.clone(),
         Duration::from_secs(cfg.ssh.cp_rpc_timeout_secs),
@@ -385,6 +429,7 @@ async fn start_outer_leg(
         &renew.current(),
         cpauth.clone(),
         lock_set.clone(),
+        snap_rx,
         shutdown.clone(),
     )
     .await?;
@@ -402,7 +447,7 @@ async fn start_outer_leg(
         recorder_factory,
         finalize_tracker: finalize_tracker.clone(),
         lock_set,
-        live_sessions,
+        live_sessions: live_sessions.clone(),
         config: ssh_cfg.clone(),
     };
 
@@ -416,7 +461,10 @@ async fn start_outer_leg(
             })
             .await;
     });
-    Ok(Some(finalize_tracker))
+    Ok(Some(OuterLeg {
+        finalize_tracker,
+        live_sessions,
+    }))
 }
 
 /// Start the outbound-agent WSS transport if `ssh.agent.listen_addr` is configured,
@@ -426,11 +474,13 @@ async fn start_outer_leg(
 /// issue the agent-facing serverAuth leaf, the port is taken), startup **aborts** —
 /// running the SSH front door while every agent node is silently unreachable would be
 /// a worse failure than not starting.
+#[allow(clippy::too_many_arguments)]
 async fn start_agent_transport(
     cfg: &GatewayConfig,
     cred: &identity::Credential,
     cpauth: Arc<cpauth::CpAuthClient>,
     lock_set: Arc<ssh::locks::LockSet>,
+    cred_watch: tokio::sync::watch::Receiver<cpauth::CredentialSnapshot>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<Option<Arc<dyn ssh::connector::NodeConnector>>> {
     let acfg = &cfg.ssh.agent;
@@ -444,15 +494,31 @@ async fn start_agent_transport(
     // Gateway cannot be redeemed here (contract §6).
     let signer = Arc::new(agent::token::DialBackSigner::generate());
 
+    // HA (Session Fifteen): the coordination bus + relay-token machinery, always wired
+    // (single mode is mode-symmetric — the remote path is dormant because the owner is always
+    // self). The relay signer + pending ledger are shared between the ingress-side
+    // RemoteGatewayConnector and the peer-relay server that redeems its tokens.
+    let coordination = build_coordination(&cfg.ha)?;
+    let relay_signer = Arc::new(ha::relay_token::RelaySigner::generate());
+    let pending_relays = Arc::new(ha::relay_token::PendingRelays::default());
+    let owner_cache = Arc::new(ha::presence::OwnerCache::new(Duration::from_secs(
+        cfg.ha.routing.cache_ttl_secs,
+    )));
+    let self_name = cred.gateway_name.clone();
+
     let transport = agent::server::bind(
         agent::server::AgentTransportDeps {
-            cpauth,
+            cpauth: cpauth.clone(),
             gateway_id: cred.gateway_id.clone(),
-            gateway_name: cred.gateway_name.clone(),
+            gateway_name: self_name.clone(),
             registry: registry.clone(),
             pending: pending.clone(),
             signer: signer.clone(),
             lock_set: lock_set.clone(),
+            peer_relay: Some(agent::server::PeerRelayServerDeps {
+                relay_signer: relay_signer.clone(),
+                pending_relays: pending_relays.clone(),
+            }),
             config: acfg.clone(),
         },
         shutdown.clone(),
@@ -469,9 +535,12 @@ async fn start_agent_transport(
             "ssh.agent.listen_addr binds a wildcard address ({local_addr}); set ssh.agent.advertise_url to the wss:// URL agents should dial back to"
         );
     }
-    tracing::info!(addr = %local_addr, advertise = %advertise, "outbound-agent transport started");
+    // The host:port a peer owner dials back to for the direct relay (the SAME TLS server as
+    // the agent transport). Configured explicitly, else derived from the agent advertise URL.
+    let peer_relay_addr = derive_peer_relay_addr(&cfg.ha, &advertise)?;
+    tracing::info!(addr = %local_addr, advertise = %advertise, peer_relay_addr = %peer_relay_addr, mode = ?cfg.ha.mode, "outbound-agent transport + HA peer relay started");
 
-    let mut sd = shutdown;
+    let mut sd = shutdown.clone();
     tokio::spawn(async move {
         transport
             .run(async move {
@@ -480,8 +549,10 @@ async fn start_agent_transport(
             .await;
     });
 
-    Ok(Some(Arc::new(agent::dial::AgentDial::new(
-        registry,
+    // The LOCAL agent connector (S14): shared by the router (local route) and the peer client
+    // (the owner-side node dial-back that produces the byte stream to relay).
+    let agent_dial: Arc<dyn ssh::connector::NodeConnector> = Arc::new(agent::dial::AgentDial::new(
+        registry.clone(),
         pending,
         signer,
         lock_set,
@@ -489,7 +560,93 @@ async fn start_agent_transport(
         advertise,
         acfg.dial_back_token_ttl_secs,
         Duration::from_secs(acfg.dial_back_timeout_secs),
+    ));
+
+    // Claim presence for every node this Gateway holds a channel for (runs in both modes).
+    let store = Arc::new(ha::presence::CpPresenceStore::new(cpauth));
+    ha::presence::HeartbeatLoop::new(
+        store,
+        registry.clone(),
+        owner_cache.clone(),
+        peer_relay_addr.clone(),
+        Duration::from_secs(cfg.ha.presence.heartbeat_interval_secs),
+    )
+    .spawn(shutdown.clone());
+
+    // The owner-side signal handler: serve a peer ingress a relay to a node we own.
+    ha::peer_client::spawn(
+        ha::peer_client::PeerClientDeps {
+            coordination: coordination.clone(),
+            self_gateway_id: self_name.clone(),
+            local_connector: agent_dial.clone(),
+            registry,
+            owner_cache: owner_cache.clone(),
+            credential: cred_watch,
+            max_frame_bytes: acfg.max_frame_bytes,
+            handshake_timeout: Duration::from_secs(acfg.handshake_timeout_secs),
+        },
+        shutdown,
+    );
+
+    // The ingress-side remote connector + the router that decides local-vs-remote by owner.
+    // The relay token must outlive the relay-establish window, so its TTL exceeds
+    // relay_timeout by a comfortable margin.
+    let remote: Arc<dyn ssh::connector::NodeConnector> =
+        Arc::new(ha::connector::RemoteGatewayConnector::new(
+            coordination,
+            relay_signer,
+            pending_relays,
+            self_name.clone(),
+            peer_relay_addr,
+            Duration::from_secs(cfg.ha.routing.relay_timeout_secs),
+            Duration::from_secs(cfg.ha.routing.relay_timeout_secs + 20),
+        ));
+    Ok(Some(Arc::new(ha::connector::AgentRouter::new(
+        self_name,
+        agent_dial,
+        remote,
+        owner_cache,
     ))))
+}
+
+/// Build the coordination signal bus from the HA config (Session Fifteen). In-process by
+/// default (zero deps); the NATS backend lands behind the `nats` feature.
+fn build_coordination(
+    ha: &HaConfig,
+) -> anyhow::Result<Arc<dyn ha::coordination::CoordinationBackend>> {
+    match &ha.coordination {
+        CoordinationConfig::InProcess => Ok(Arc::new(ha::coordination::InProcessBackend::new())),
+        CoordinationConfig::Nats {
+            url,
+            subject_prefix,
+        } => {
+            tracing::info!(url = %url, subject_prefix = %subject_prefix, "using the NATS coordination backend (core pub/sub; run NATS on a trusted network or NATS-over-TLS)");
+            let backend = ha::nats::NatsBackend::connect(url, subject_prefix)
+                .map_err(|e| anyhow::anyhow!("NATS coordination backend: {e}"))?;
+            Ok(Arc::new(backend))
+        }
+    }
+}
+
+/// Resolve the peer-relay advertise address (`host:port`) a peer owner dials back to. Uses
+/// `ha.peer_relay_advertise_addr` when set, else derives it from the agent advertise URL —
+/// the peer relay shares that TLS server.
+fn derive_peer_relay_addr(ha: &HaConfig, agent_advertise_url: &str) -> anyhow::Result<String> {
+    if !ha.peer_relay_advertise_addr.is_empty() {
+        return Ok(ha.peer_relay_advertise_addr.clone());
+    }
+    let addr = agent_advertise_url
+        .strip_prefix("wss://")
+        .unwrap_or(agent_advertise_url)
+        .split('/')
+        .next()
+        .unwrap_or(agent_advertise_url);
+    if addr.is_empty() {
+        anyhow::bail!(
+            "cannot derive ha.peer_relay_advertise_addr from the agent advertise URL {agent_advertise_url:?}; set ha.peer_relay_advertise_addr"
+        );
+    }
+    Ok(addr.to_string())
 }
 
 /// Snapshot a credential for the CP channel factory (leaf/key + trust anchors).

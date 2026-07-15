@@ -22,15 +22,17 @@ use crate::mtls::{self, ChannelParams, ClientIdentity, MtlsError};
 use crate::pb::authorization_client::AuthorizationClient;
 use crate::pb::gateway_identity_client::GatewayIdentityClient;
 use crate::pb::outer_leg_auth_client::OuterLegAuthClient;
+use crate::pb::presence_client::PresenceClient;
 use crate::pb::recording_client::RecordingClient;
 use crate::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
     BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution, FinalizeRecordingRequest,
     FinalizeRecordingResponse, IssueGatewayServerCertificateRequest,
     IssueGatewayServerCertificateResponse, PollDeviceFlowRequest, PollDeviceFlowResponse,
-    RequestUploadRequest, RequestUploadResponse, ResolveBreakglassCodeRequest,
-    ResolveBreakglassKeyRequest, ResolveOtpRequest, ResolvePinRequest, ResolveUserCertRequest,
-    ResolvedIdentity,
+    PresenceHeartbeatRequest, PresenceHeartbeatResponse, PresenceReleaseRequest,
+    PresenceReleaseResponse, RequestUploadRequest, RequestUploadResponse,
+    ResolveBreakglassCodeRequest, ResolveBreakglassKeyRequest, ResolveOtpRequest,
+    ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity,
 };
 
 /// A failure calling the CP. Fail-closed at every variant.
@@ -395,6 +397,43 @@ impl CpAuthClient {
     /// is picked up.
     pub fn current_ca_chain(&self) -> Vec<Vec<u8>> {
         self.factory.current_ca_chain()
+    }
+
+    /// Heartbeat ownership of a node this Gateway holds a live agent control channel
+    /// for (Session Fifteen HA write path, §10.2/§10.3, FR-HA-2). The OWNER is the
+    /// authenticated mTLS peer — never a field — so this only ever claims/refreshes
+    /// ownership for THIS Gateway. A contention/stale-nonce reject surfaces as an RPC
+    /// error the caller treats as "not owner" (fail closed, FR-HA-5).
+    pub async fn presence_heartbeat(
+        &self,
+        node_id: &str,
+        gateway_addr: &str,
+    ) -> Result<PresenceHeartbeatResponse, CpError> {
+        let node_id = node_id.to_string();
+        let gateway_addr = gateway_addr.to_string();
+        self.call(move |ch| {
+            let req = PresenceHeartbeatRequest {
+                node_id,
+                gateway_addr,
+            };
+            async move { PresenceClient::new(ch).heartbeat(req).await }
+        })
+        .await
+    }
+
+    /// Release ownership of a node on graceful drain or control-channel loss so a
+    /// standby claims immediately (Session Fifteen, §10.3). Idempotent server-side: a
+    /// no-op unless this Gateway is the recorded owner.
+    pub async fn presence_release(
+        &self,
+        node_id: &str,
+    ) -> Result<PresenceReleaseResponse, CpError> {
+        let node_id = node_id.to_string();
+        self.call(move |ch| {
+            let req = PresenceReleaseRequest { node_id };
+            async move { PresenceClient::new(ch).release(req).await }
+        })
+        .await
     }
 
     /// Obtain the **serverAuth** leaf for the agent-facing WSS listener (Session

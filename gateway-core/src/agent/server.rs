@@ -34,12 +34,17 @@ use crate::agent::registry::{AgentRegistry, ControlOut, RegistryError};
 use crate::agent::stream::WsByteStream;
 use crate::agent::token::{now_epoch_secs, DialBackSigner, PendingDialBacks, TokenError};
 use crate::agent::wire::{self, Frame, FrameError, MsgType};
-use crate::agent::{peer_identity, AgentPeer, PeerError, CONTROL_PATH, DIALBACK_PATH};
+use crate::agent::{
+    gateway_peer_identity, peer_identity, AgentPeer, PeerError, CONTROL_PATH, DIALBACK_PATH,
+    PEER_RELAY_PATH,
+};
 use crate::config::AgentTransportConfig;
 use crate::cpauth::CpAuthClient;
+use crate::ha::relay_token::{now_epoch_ms, PendingRelays, RelaySigner, RelayTokenError};
 use crate::identity;
 use crate::pb::ComponentInfo;
 use crate::pbagent::{GatewayHelloAck, Ping, StreamOpen, VersionReject, WireErrorCode};
+use crate::pbgw::{RelayAccept, RelayReject};
 use crate::ssh::locks::{LockBindings, LockSet};
 use crate::version;
 
@@ -48,6 +53,16 @@ use crate::version;
 enum Role {
     Control,
     DialBack,
+    /// HA Gateway↔Gateway byte relay (Session Fifteen; `/peer/v1/relay`).
+    PeerRelay,
+}
+
+/// The authenticated peer, resolved from its mTLS client certificate by role: an agent
+/// (control/dial-back) or a peer gateway (relay).
+enum Peer {
+    Agent(AgentPeer),
+    /// A peer gateway's NAME (the HA routing key), from its dNSName SAN.
+    Gateway(String),
 }
 
 /// A failure standing up the agent transport (fail-closed at startup).
@@ -84,8 +99,23 @@ pub struct AgentTransportDeps {
     /// The actively-pushed lock deny-set (§8.4) — consulted at registration and at
     /// every dial-back.
     pub lock_set: Arc<LockSet>,
+    /// HA peer-relay machinery (Session Fifteen). `Some` enables the `/peer/v1/relay`
+    /// path — the ingress side that verifies an SLGW1 token and hands the relay byte
+    /// stream to the awaiting session. `None` leaves the path refused (fail closed).
+    pub peer_relay: Option<PeerRelayServerDeps>,
     /// Transport bounds.
     pub config: AgentTransportConfig,
+}
+
+/// The ingress-side peer-relay dependencies (Session Fifteen). Shared with the
+/// `RemoteGatewayConnector`: the same per-process signer minted the token an owner now
+/// presents, and the same ledger holds the awaiting session's oneshot.
+#[derive(Clone)]
+pub struct PeerRelayServerDeps {
+    /// The ingress per-process SLGW1 signer (verifies a presented relay token).
+    pub relay_signer: Arc<RelaySigner>,
+    /// The single-use relay ledger; consuming an entry resolves the session's oneshot.
+    pub pending_relays: Arc<PendingRelays>,
 }
 
 struct Inner {
@@ -178,6 +208,10 @@ pub async fn bind(
     let issued = issue_server_config(&deps).await?;
     let (tls_tx, tls_rx) = watch::channel(issued.config);
     spawn_server_cert_renewal(deps.clone(), tls_tx, issued.not_after, shutdown.clone());
+    // R5: sweep signalled-but-never-redeemed relay tokens so the (bounded) ledger drains.
+    if let Some(pr) = &deps.peer_relay {
+        spawn_relay_pending_gc(pr.pending_relays.clone(), shutdown.clone());
+    }
     spawn_pending_gc(deps.pending.clone(), shutdown);
 
     let listener = TcpListener::bind(&deps.config.listen_addr).await?;
@@ -389,6 +423,23 @@ fn spawn_pending_gc(
     });
 }
 
+/// Drop HA relay tokens whose signalled owner never dialled the relay back (R5), so the bounded
+/// [`PendingRelays`] ledger cannot fill with abandoned entries.
+fn spawn_relay_pending_gc(
+    pending: Arc<PendingRelays>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|v| *v) => return,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => pending.gc(now_epoch_ms()),
+            }
+        }
+    });
+}
+
 // ---- connection handling ------------------------------------------------------
 
 /// Why an agent connection was refused. Reported to the peer as a coarse code only
@@ -417,6 +468,10 @@ enum ConnError {
     Token(#[from] TokenError),
     #[error("agent is covered by a lock")]
     Locked,
+    #[error("relay token: {0}")]
+    Relay(#[from] RelayTokenError),
+    #[error("peer relay is not configured on this gateway")]
+    RelayNotConfigured,
 }
 
 impl ConnError {
@@ -424,10 +479,10 @@ impl ConnError {
     /// identity exists.
     fn code(&self) -> WireErrorCode {
         match self {
-            ConnError::Token(_) | ConnError::Locked | ConnError::Peer(_) => {
+            ConnError::Token(_) | ConnError::Relay(_) | ConnError::Locked | ConnError::Peer(_) => {
                 WireErrorCode::Unauthorized
             }
-            ConnError::Registry(_) => WireErrorCode::Unavailable,
+            ConnError::Registry(_) | ConnError::RelayNotConfigured => WireErrorCode::Unavailable,
             _ => WireErrorCode::Protocol,
         }
     }
@@ -442,9 +497,12 @@ async fn accept_agent(inner: Arc<Inner>, tcp: TcpStream) -> Result<(), ConnError
             Ok(result) => result?,
             Err(_) => return Err(ConnError::HandshakeTimeout),
         };
-    match role {
-        Role::Control => run_control(ws, inner, peer, ver).await,
-        Role::DialBack => run_dial_back(ws, inner, peer, ver).await,
+    match (role, peer) {
+        (Role::Control, Peer::Agent(p)) => run_control(ws, inner, p, ver).await,
+        (Role::DialBack, Peer::Agent(p)) => run_dial_back(ws, inner, p, ver).await,
+        (Role::PeerRelay, Peer::Gateway(name)) => run_peer_relay(ws, inner, name, ver).await,
+        // The role fixes the identity kind in `handshake`; a mismatch is impossible.
+        _ => Err(ConnError::UnknownPath),
     }
 }
 
@@ -458,7 +516,7 @@ async fn handshake(
 ) -> Result<
     (
         WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>,
-        AgentPeer,
+        Peer,
         Role,
         u8,
     ),
@@ -468,16 +526,20 @@ async fn handshake(
     let acceptor = TlsAcceptor::from(inner.tls.borrow().clone());
     let tls = acceptor.accept(tcp).await.map_err(ConnError::Tls)?;
 
-    // The verifier already required a client certificate; resolve the peer from its
-    // CP-stamped SANs (nothing on the wire can assert an identity).
-    let peer = {
+    // The verifier already required a client certificate; keep the leaf DER and resolve the
+    // peer identity AFTER the role (path) is known — an agent and a peer gateway resolve
+    // from different SANs. Nothing on the wire can assert an identity.
+    let leaf_der = {
         let (_, conn) = tls.get_ref();
         let certs = conn.peer_certificates().ok_or(PeerError::NoCertificate)?;
-        let leaf = certs.first().ok_or(PeerError::NoCertificate)?;
-        peer_identity(leaf.as_ref())?
+        certs
+            .first()
+            .ok_or(PeerError::NoCertificate)?
+            .as_ref()
+            .to_vec()
     };
 
-    // Only the two contracted paths exist; anything else is refused at the upgrade.
+    // Only the contracted paths exist; anything else is refused at the upgrade.
     let mut role = None;
     let ws = accept_hdr_async_with_config(
         tls,
@@ -485,6 +547,7 @@ async fn handshake(
             role = match req.uri().path() {
                 CONTROL_PATH => Some(Role::Control),
                 DIALBACK_PATH => Some(Role::DialBack),
+                PEER_RELAY_PATH => Some(Role::PeerRelay),
                 _ => return Err(ErrorResponse::new(None)),
             };
             Ok(resp)
@@ -494,6 +557,11 @@ async fn handshake(
     .await
     .map_err(ConnError::Handshake)?;
     let role = role.ok_or(ConnError::UnknownPath)?;
+
+    let peer = match role {
+        Role::Control | Role::DialBack => Peer::Agent(peer_identity(&leaf_der)?),
+        Role::PeerRelay => Peer::Gateway(gateway_peer_identity(&leaf_der)?),
+    };
 
     let mut ws = ws;
     let ver = match preface(&mut ws, inner).await {
@@ -870,6 +938,128 @@ where
     .await
     .map_err(ConnError::Handshake)?;
     Ok(ready)
+}
+
+// ---- peer-relay role (HA, Session Fifteen) ------------------------------------
+
+/// Serve one Gateway↔Gateway byte relay (`gateway-relay-v1.md` §5). The peer is the OWNER
+/// (gw-B) dialling this ingress (gw-A) back; on a verified SLGW1 token the WS becomes the
+/// session byte stream handed to the awaiting `RemoteGatewayConnector::connect`. gw-A owns
+/// the session + recording; the owner is a dumb relay.
+async fn run_peer_relay<S>(
+    mut ws: WebSocketStream<S>,
+    inner: Arc<Inner>,
+    gateway_name: String,
+    ver: u8,
+) -> Result<(), ConnError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(deps) = inner.deps.peer_relay.clone() else {
+        // No HA routing wired on this Gateway: the path exists but is refused (fail closed).
+        let _ = send_relay_reject(&mut ws, ver).await;
+        let _ = ws.close(None).await;
+        return Err(ConnError::RelayNotConfigured);
+    };
+
+    // Every pre-splice round-trip is bounded (the S8 lesson): a peer that opens the relay
+    // and then stalls must not hold the pending session open.
+    let authorized = tokio::time::timeout(
+        inner.handshake_timeout,
+        authorize_relay(&mut ws, &inner, &deps, &gateway_name, ver),
+    )
+    .await
+    .unwrap_or(Err(ConnError::HandshakeTimeout));
+
+    let ready = match authorized {
+        Ok(ready) => ready,
+        Err(e) => {
+            // Any failure ⇒ RELAY_REJECT + close (fail closed). The specific reason goes to
+            // the operator log ONLY; the token is never echoed.
+            tracing::warn!(
+                peer_gateway = %sanitize(&gateway_name),
+                reason = %e,
+                "peer relay refused (fail closed)"
+            );
+            let _ = send_relay_reject(&mut ws, ver).await;
+            let _ = ws.close(None).await;
+            return Err(e);
+        }
+    };
+
+    // The WS is the session byte stream now — hand it to the inner leg. gw-B frames the node
+    // bytes as STREAM_DATA; this ingress unwraps them via the same `WsByteStream`.
+    let stream = WsByteStream::new(ws, ver, inner.max_frame_bytes);
+    if ready.send(Box::new(stream)).is_err() {
+        tracing::info!(peer_gateway = %sanitize(&gateway_name), "peer relay arrived after the ingress gave up; dropping");
+    }
+    Ok(())
+}
+
+/// Verify a presented SLGW1 relay token and consume the awaiting session (`gateway-relay-v1.md`
+/// §5/§6): all bindings, the mTLS peer == the token's owner, single-use consume. On success the
+/// ingress sends RELAY_ACCEPT and returns the session's oneshot sender.
+async fn authorize_relay<S>(
+    ws: &mut WebSocketStream<S>,
+    inner: &Inner,
+    deps: &PeerRelayServerDeps,
+    gateway_name: &str,
+    ver: u8,
+) -> Result<tokio::sync::oneshot::Sender<Box<dyn crate::ssh::connector::ByteStream>>, ConnError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = next_frame(ws, inner.max_frame_bytes, ver).await?;
+    if frame.msg_type != MsgType::RelayOpen {
+        return Err(ConnError::Frame(FrameError::UnknownType));
+    }
+    let open = wire::as_relay_open(&frame)?;
+
+    // Envelope + signature over the transmitted bytes + this ingress + the validity window
+    // (verify-then-decode). The signer fingerprint pins it to this process's key.
+    let payload =
+        deps.relay_signer
+            .verify(&open.token, &inner.deps.gateway_name, now_epoch_ms())?;
+
+    // The authenticated mTLS peer IS the owner the token names — a token captured by a
+    // different, even valid, gateway is worthless to it (`gateway-relay-v1.md` §6/§7).
+    if payload.owner_gateway_id != gateway_name {
+        return Err(ConnError::Relay(RelayTokenError::WrongOwner));
+    }
+
+    // Single-use: consuming the pending entry IS the token's redemption, and the entry's
+    // bindings must equal the payload's. Consumed LAST so a rogue presentation cannot burn a
+    // legitimate session's token.
+    let ready = deps.pending_relays.consume(&payload)?;
+
+    ws.send(Message::Binary(WsBytes::from(wire::encode_msg(
+        ver,
+        MsgType::RelayAccept,
+        &RelayAccept {},
+    ))))
+    .await
+    .map_err(ConnError::Handshake)?;
+    Ok(ready)
+}
+
+/// Send a coarse RELAY_REJECT (§7.1 non-disclosure: the peer learns only that the relay was
+/// refused, never which binding failed).
+async fn send_relay_reject<S>(
+    ws: &mut WebSocketStream<S>,
+    ver: u8,
+) -> Result<(), tokio_tungstenite::tungstenite::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let payload = wire::encode_msg(
+        ver,
+        MsgType::RelayReject,
+        &RelayReject {
+            code: "unauthorized".to_string(),
+            message: "relay refused".to_string(),
+        },
+    );
+    ws.send(Message::Binary(WsBytes::from(payload))).await
 }
 
 // ---- frame plumbing -----------------------------------------------------------

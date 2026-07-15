@@ -64,5 +64,14 @@ for rel in "${RELS[@]}"; do
   cp -v "$SRC_ROOT/$rel" "proto/$rel"
 done
 
+# Session Fifteen also vendors the frozen wire-conformance golden frames (generated + self-
+# checked from the frozen codec+proto), consumed by tests/wire_conformance.rs so the Gateway CI
+# catches wire drift on its own (F-wireversion-1). Regenerate upstream only on a contract change.
+CONF_SRC="../ControlPlane-API/contracts/wire/conformance/frames.json"
+if [[ -f "$CONF_SRC" ]]; then
+  mkdir -p proto/wire-conformance
+  cp -v "$CONF_SRC" proto/wire-conformance/frames.json
+fi
+
 echo "[sync-contracts] vendored proto re-synced from $SRC_ROOT"
 echo "[sync-contracts] NOTE: contracts are FROZEN; re-sync only after a versioned change (contracts/VERSIONING.md), then rebuild."

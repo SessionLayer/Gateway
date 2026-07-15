@@ -44,6 +44,7 @@ pub mod asyncio;
 pub mod config;
 pub mod cpauth;
 pub mod decisionctx;
+pub mod ha;
 pub mod handshake;
 pub mod health;
 pub mod identity;
@@ -61,6 +62,9 @@ pub mod version;
 /// come from the `.proto` comments.
 pub mod pb {
     #![allow(missing_docs)]
+    // Generated from the FROZEN protos, whose bullet-list doc comments trip clippy's
+    // doc_lazy_continuation on this generated code; the contract is not ours to reflow.
+    #![allow(clippy::doc_lazy_continuation)]
     tonic::include_proto!("sessionlayer.controlplane.v1");
 }
 
@@ -71,6 +75,9 @@ pub mod pb {
 /// Cross-package types (`ComponentInfo`, `ProtocolVersion`) resolve to [`pb`].
 pub mod pbagent {
     #![allow(missing_docs)]
+    // Generated from the FROZEN protos, whose bullet-list doc comments trip clippy's
+    // doc_lazy_continuation on this generated code; the contract is not ours to reflow.
+    #![allow(clippy::doc_lazy_continuation)]
     tonic::include_proto!("sessionlayer.agent.v1");
 }
 
@@ -81,5 +88,8 @@ pub mod pbagent {
 /// (`contracts/wire/gateway-relay-v1.md`); the Control Plane is not a party to it.
 pub mod pbgw {
     #![allow(missing_docs)]
+    // Generated from the FROZEN protos, whose bullet-list doc comments trip clippy's
+    // doc_lazy_continuation on this generated code; the contract is not ours to reflow.
+    #![allow(clippy::doc_lazy_continuation)]
     tonic::include_proto!("sessionlayer.gateway.v1");
 }
