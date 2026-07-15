@@ -16,6 +16,7 @@ use gateway_core::{
     config::{CoordinationConfig, GatewayConfig, HaConfig},
     cpauth, ha, handshake, health, identity, mtls, ssh, tls,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +33,11 @@ const VERSION: &str = concat!(
     about = "SessionLayer Gateway daemon (Session One scaffold)"
 )]
 struct Cli {
+    /// Path to a JSON configuration file. Overrides the `SL_GATEWAY_CONFIG`
+    /// environment variable; with neither set, the built-in defaults are used. A
+    /// named-but-unreadable/unparseable file aborts startup (fail closed).
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -69,7 +75,8 @@ impl From<BackendArg> for IoBackend {
 fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    match cli.command {
         Some(Command::Health) => {
             println!("{}", serde_json::to_string_pretty(&health::report())?);
             Ok(())
@@ -80,7 +87,7 @@ fn main() -> anyhow::Result<()> {
             println!("requested {requested:?} -> resolved {resolved:?}");
             Ok(())
         }
-        None => run(),
+        None => run(cli.config),
     }
 }
 
@@ -92,13 +99,16 @@ fn main() -> anyhow::Result<()> {
 /// load failure aborts startup (the process exits non-zero) rather than running
 /// without an authenticated CP identity; the SSH server is not started without
 /// a CP identity to delegate to.
-fn run() -> anyhow::Result<()> {
+fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    // Load the config (explicit `--config` wins, then `$SL_GATEWAY_CONFIG`, then the built-in
+    // default). Fail closed on a named-but-bad file rather than silently running the default.
+    let cfg = GatewayConfig::load(config_path.as_deref())?;
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     runtime.block_on(async {
-        let cfg = GatewayConfig::default();
         let io = asyncio::select_io(cfg.io_backend);
         let report = health::report();
 

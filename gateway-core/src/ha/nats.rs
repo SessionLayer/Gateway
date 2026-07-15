@@ -419,6 +419,14 @@ fn classify_line(line: &str) -> LineKind {
 fn info_requires_unsupported(info: &str) -> Option<&'static str> {
     // NATS INFO is compact JSON; a required capability appears as `"tls_required":true` /
     // `"auth_required":true`. The plaintext reference client can meet neither.
+    //
+    // NOTE (robustness bound, F8): this is a SUBSTRING match on nats-server's canonical compact
+    // INFO. A broker that emitted a reformatted INFO (whitespace inside the object, e.g.
+    // `"tls_required" : true`) would NOT match here and the client would degrade to the reconnect
+    // loop instead of the loud fatal. That is a fail-safe direction (availability, not security):
+    // TLS/auth is a defense-in-depth deployment requirement, not what protects the relay token
+    // (which is single-use + bound to the owner mTLS cert). Real nats-server never reformats INFO,
+    // so the loud path fires in practice; a full JSON parse is deliberately avoided (zero-dep).
     if info.contains("\"tls_required\":true") {
         return Some("broker advertises tls_required, but the reference NATS client is plaintext");
     }
