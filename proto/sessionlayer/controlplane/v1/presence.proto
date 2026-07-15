@@ -41,8 +41,14 @@ service Presence {
 }
 
 message PresenceHeartbeatRequest {
-  // The node whose ownership is being claimed/refreshed (runtime.node.id, uuid).
-  string node_id = 1;
+  // The node whose ownership is being claimed/refreshed, identified by its stable
+  // enrollment NAME (runtime.node.name) — NOT its UUID. The Gateway has no database
+  // and knows its owned nodes only by the name it reads from each agent's mTLS
+  // dNSName SAN (the agent registry is keyed by name), so it can only address a node
+  // by name. The CP resolves the name to the node row and keys runtime.presence by
+  // the resolved runtime.node.id; an unknown name is refused (fail closed). Node
+  // names are unique (runtime.node.name UNIQUE). Field number stable since S15.
+  string node_name = 1;
 
   // The caller's peer-relay advertise address (host:port) that a peer ingress
   // Gateway would be told to expect the relay dial-back from. Stored as
@@ -65,7 +71,9 @@ message PresenceHeartbeatResponse {
 }
 
 message PresenceReleaseRequest {
-  string node_id = 1;
+  // The node's stable enrollment NAME (see PresenceHeartbeatRequest.node_name);
+  // the CP resolves it to the runtime.node.id keying runtime.presence.
+  string node_name = 1;
 }
 
 message PresenceReleaseResponse {
