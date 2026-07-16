@@ -53,7 +53,7 @@ use crate::ssh::innerleg::{
 };
 use crate::ssh::locks::{LiveSessionRegistry, LockBindings, LockSet, SessionControl, SessionGuard};
 use crate::ssh::outcome::{SshOutcome, DEVICE_FLOW_TIMEOUT, SERVICE_UNAVAILABLE};
-use crate::ssh::target::{parse_username, strip_dns_suffix, TargetResolver};
+use crate::ssh::target::{parse_username, strip_dns_suffix, Target, TargetResolver};
 use crate::version;
 
 /// Per-connection state shared with the accept loop: whether authentication
@@ -139,6 +139,10 @@ pub struct HandlerDeps {
     /// SSH server configuration (target separator, device-flow timing, inner-leg
     /// bounds, recorder policy, …).
     pub config: Arc<SshServerConfig>,
+    /// ProxyJump host-cert MITM state (Session Sixteen, Part C): the Gateway's outer
+    /// host key + per-node host-cert cache. `Some` only when `ssh.proxy_jump.enabled`;
+    /// `None` ⇒ a `direct-tcpip` forward is refused (the pre-S16 behaviour).
+    pub proxy_jump: Option<Arc<crate::ssh::proxyjump::ProxyJumpState>>,
 }
 
 /// A single SSH connection's handler. Not `Clone`: it owns per-connection state.
@@ -151,6 +155,11 @@ pub struct SshHandler {
     /// The SSH username (client-supplied; parsed as `login%node`, never trusted
     /// as a principal, sanitized before logging).
     username: Option<String>,
+    /// Set on the INNER hop of a ProxyJump connection (Session Sixteen, Part C):
+    /// the target node comes from the `direct-tcpip` request (already wildcard-DNS
+    /// normalized), not the username, and the whole username is the login (no `%`
+    /// parse). `None` on the normal outer leg (username-encoding / wildcard DNS).
+    proxyjump_node: Option<String>,
     authenticated: Option<Authenticated>,
     /// True once a break-glass credential (FIDO2 key / offline code) authenticated
     /// this connection (Session Thirteen). Drives the break-glass Authorize + forced
@@ -237,11 +246,33 @@ struct Authorized {
 impl SshHandler {
     /// Construct a handler for a freshly-accepted, gate-passed connection.
     pub fn new(deps: HandlerDeps, source_ip: IpAddr, conn: Arc<ConnState>) -> Self {
+        Self::with_proxyjump_node(deps, source_ip, conn, None)
+    }
+
+    /// Construct the handler for the INNER hop of a ProxyJump connection (Part C):
+    /// the node is fixed by the `direct-tcpip` target, and the source IP + a fresh
+    /// `ConnState` are inherited from the terminated outer jump connection.
+    pub fn new_proxyjump(
+        deps: HandlerDeps,
+        source_ip: IpAddr,
+        conn: Arc<ConnState>,
+        node: String,
+    ) -> Self {
+        Self::with_proxyjump_node(deps, source_ip, conn, Some(node))
+    }
+
+    fn with_proxyjump_node(
+        deps: HandlerDeps,
+        source_ip: IpAddr,
+        conn: Arc<ConnState>,
+        proxyjump_node: Option<String>,
+    ) -> Self {
         Self {
             deps,
             source_ip,
             session_id: new_session_id(),
             username: None,
+            proxyjump_node,
             authenticated: None,
             break_glass: false,
             breakglass_token: None,
@@ -995,16 +1026,26 @@ impl SshHandler {
             return Err(SshOutcome::AuthFailed);
         };
         let username = self.username.as_deref().unwrap_or_default();
-        let Ok(mut target) = parse_username(username, self.deps.config.target_separator) else {
-            tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), outcome = "policy_denied", reason = "malformed_target", "generic denial");
-            return Err(SshOutcome::PolicyDenied);
+        let target = if let Some(node) = &self.proxyjump_node {
+            // ProxyJump inner hop (Session Sixteen, Part C): the node is fixed by the
+            // `direct-tcpip` target (already wildcard-DNS normalized when the inner
+            // server was spun up), and the whole username IS the login — no `%` parse.
+            Target {
+                login: username.to_string(),
+                node: node.clone(),
+            }
+        } else {
+            let Ok(mut target) = parse_username(username, self.deps.config.target_separator) else {
+                tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), outcome = "policy_denied", reason = "malformed_target", "generic denial");
+                return Err(SshOutcome::PolicyDenied);
+            };
+            // Wildcard DNS (Part B): fold `web-01.ssh.corp` back to the bare node name
+            // before resolution so it reaches the same node as a plain `login%web-01`
+            // (the DNS suffix is a client convenience; see docs/addressing.md). A no-op
+            // when no configured `ssh.node_dns_suffixes` matches (default).
+            target.node = strip_dns_suffix(&target.node, &self.deps.config.node_dns_suffixes);
+            target
         };
-        // Wildcard DNS (Session Sixteen, Part B): fold `web-01.ssh.corp` (from the ssh_config
-        // `Host *.ssh.corp` → `User %r%%%h` convenience) back to the bare node name before
-        // resolution, so it reaches the same node as a plain `login%web-01`. A no-op when no
-        // configured `ssh.node_dns_suffixes` matches (default), so the baseline encoding is
-        // untouched.
-        target.node = strip_dns_suffix(&target.node, &self.deps.config.node_dns_suffixes);
 
         // Credential-principal reducer (deny-only): a login-scoped credential may
         // only be used for a login it is scoped to (FR-AUTH-15 spirit, §5.4/§5.5).
@@ -1112,13 +1153,20 @@ impl SshHandler {
                     session_id = %self.session_id,
                     "authorized; establishing inner leg"
                 );
+                // Session Sixteen Part A (F-ha-connect-nodename-1 read half): downstream
+                // keys on the CP-RESOLVED node id from the SIGNED context, NOT the parsed
+                // name. With a real inventory where name != uuid the two differ, and the
+                // session token minted by Authorize is bound to the resolved id — so the
+                // inner-leg SignContext.node_id MUST be context.node_id or
+                // SignSessionCertificate fails closed (advisory ctx != token). The parsed
+                // `node_id` local remains only for pre-verification logging.
                 Ok(Authorized {
                     node: NodeTarget {
-                        node_id: node_id.clone(),
+                        node_id: context.node_id.clone(),
                         principal: target.login.clone(),
                     },
                     dial: NodeDial {
-                        node_id,
+                        node_id: context.node_id.clone(),
                         dial_address: nc.dial_address,
                         connector_kind: nc.connector_kind,
                         node_name: nc.node_name,
@@ -1600,20 +1648,53 @@ impl Handler for SshHandler {
         Ok(false)
     }
 
-    /// Local port forwarding is refused this session (the capability gate; the
-    /// forwarded-channel bridge is a clean follow-up seam). Dropping the reply
-    /// handle rejects the channel.
+    /// A `direct-tcpip` channel open. Two cases:
+    ///
+    /// - **ProxyJump host-cert MITM** (Session Sixteen, Part C): when
+    ///   `ssh.proxy_jump.enabled` and this is the OUTER jump connection, the request
+    ///   is `ssh -J gw login@node` opening a forward to the node. We DO NOT proxy TCP
+    ///   — we accept the channel and terminate the inner hop ourselves, presenting a
+    ///   host-CA host cert for the node (no TOFU) and running the full recorded
+    ///   session seam (see [`crate::ssh::proxyjump`]).
+    /// - Otherwise it is a plain **local port-forward**, which is refused (the
+    ///   capability gate; agent/port forwarding are default-deny). Dropping the reply
+    ///   handle rejects the channel. Nested ProxyJump (a forward from an already-MITM
+    ///   inner hop) is likewise refused.
     async fn channel_open_direct_tcpip(
         &mut self,
-        _channel: Channel<russh::server::Msg>,
-        _host_to_connect: &str,
+        channel: Channel<russh::server::Msg>,
+        host_to_connect: &str,
         _port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
-        _reply: russh::server::ChannelOpenHandle,
+        reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", "direct-tcpip (local port-forward) refused");
+        // Nested ProxyJump (forward from an already-terminated inner hop) is refused:
+        // one MITM hop only, never a forward chain.
+        let proxy_jump = if self.proxyjump_node.is_some() {
+            None
+        } else {
+            self.deps.proxy_jump.clone()
+        };
+        let Some(pj) = proxy_jump else {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", "direct-tcpip (local port-forward) refused");
+            return Ok(());
+        };
+        // Accept the forwarded channel and hand it to an inner SSH server that
+        // presents the node's host cert. Spawned so the outer connection keeps
+        // pumping this channel's bytes to the inner server's stream.
+        reply.accept().await;
+        let stream = channel.into_stream();
+        let deps = self.deps.clone();
+        let source_ip = self.source_ip;
+        let host = host_to_connect.to_string();
+        let login_grace = Duration::from_secs(self.deps.config.login_grace_secs);
+        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "proxyjump_inner", "ProxyJump: terminating inner hop with a host-CA host cert (no TOFU)");
+        tokio::spawn(async move {
+            crate::ssh::proxyjump::serve_inner_hop(deps, pj, source_ip, host, stream, login_grace)
+                .await;
+        });
         Ok(())
     }
 }

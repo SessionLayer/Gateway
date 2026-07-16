@@ -560,3 +560,269 @@ async fn addressing_wildcard_dns_suffix_is_stripped() -> anyhow::Result<()> {
     drop(node);
     Ok(())
 }
+
+/// Read half of F-ha-connect-nodename-1, name≠uuid: the client addresses the node by its
+/// HUMAN NAME (`web-01`), the CP resolves it to a DISTINCT id, and the whole downstream keys
+/// on that CP-resolved id (dial + inner-cert). Proves the Gateway forwards the NAME and does
+/// NOT leak the raw parsed string past resolution — the regression guard for the Part A
+/// downstream fix (NodeTarget/NodeDial.node_id -> context.node_id): without it,
+/// SignContext.node_id is the parsed name "web-01" while the session token is bound to the
+/// resolved id, so SignSessionCertificate rejects (ctx.node_id != token.node_id) and the
+/// session fails closed. With the fix the end-to-end session succeeds.
+#[tokio::test]
+async fn addressing_by_name_resolves_to_a_distinct_cp_id() -> anyhow::Result<()> {
+    const NODE_UUID: &str = "11111111-1111-4111-8111-111111111111";
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+
+    // Client addresses by NAME; the CP inventory (allow, connection) is keyed by the distinct id.
+    cp.map_node_name("web-01", NODE_UUID);
+    cp.register_pin(&pin.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", NODE_UUID, "deploy");
+    let trust = cp.pinned_verification(host_key.public_wire.clone());
+    cp.set_node_connection(NODE_UUID, &format!("127.0.0.1:{node_port}"), trust);
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config())).await;
+    let client = client_container(&pin).await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(gw_port, &[], "deploy%web-01", "echo DISTINCT_OK"),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "name-addressed session must succeed when the CP resolves name->a distinct id; stderr={stderr}"
+    );
+    assert!(stdout.contains("DISTINCT_OK"), "stdout={stdout:?}");
+
+    // The Gateway forwarded the NAME (not the id) for CP-side resolution.
+    let req = cp
+        .last_authorize_request()
+        .expect("an AuthorizeRequest reached the CP");
+    assert_eq!(req.node_name, "web-01", "the human NAME is forwarded");
+
+    drop(node);
+    Ok(())
+}
+
+// ── ProxyJump host-cert MITM (Session Sixteen, Part C; §9.3/§11, FR-ADDR-1) ──────
+//
+// `ssh -J gw deploy@web-01` opens a direct-tcpip forward to the node through the
+// (authenticated) jump connection; the Gateway TERMINATES that inner hop, presenting
+// a host-CA-signed host cert for `web-01`. A stock client with one `@cert-authority`
+// line verifies it with NO TOFU, then the full session seam runs on the node.
+
+/// Write `content` to `path` inside the client container (small config/known_hosts
+/// files). `content` must contain no single quotes (ssh_config / base64 keys don't).
+async fn write_client_file(container: &ContainerAsync<GenericImage>, path: &str, content: &str) {
+    let (code, _o, e) = ssh_exec(
+        container,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("printf '%s' '{content}' > {path}"),
+        ],
+    )
+    .await;
+    assert_eq!(code, Some(0), "write {path} failed: {e}");
+}
+
+/// The `@cert-authority * <host-CA>` known_hosts line the client installs once so it
+/// trusts the Gateway's outer host cert for the node namespace (the consensual MITM).
+fn cert_authority_line(cp: &MockCp) -> String {
+    let ca = ssh_key::PublicKey::from_bytes(&cp.host_ca_public_wire())
+        .unwrap()
+        .to_openssh()
+        .unwrap();
+    format!("@cert-authority * {ca}")
+}
+
+/// A client ssh_config: the `jump` host is the Gateway (its own host key is not the
+/// no-TOFU boundary → no host-key check); the `web-01` host is reached via ProxyJump
+/// and verified STRICTLY against `known_hosts` (the `@cert-authority` line). This
+/// separation is what proves the *node* is cert-verified with no TOFU.
+fn proxyjump_ssh_config(gw_port: u16, known_hosts: &str) -> String {
+    format!(
+        "Host jump\n\
+         \tHostName 127.0.0.1\n\
+         \tPort {gw_port}\n\
+         \tUser deploy\n\
+         \tIdentityFile /root/pin_key\n\
+         \tIdentitiesOnly yes\n\
+         \tPreferredAuthentications publickey\n\
+         \tStrictHostKeyChecking no\n\
+         \tUserKnownHostsFile /dev/null\n\
+         \tBatchMode yes\n\
+         \n\
+         Host web-01\n\
+         \tProxyJump jump\n\
+         \tUser deploy\n\
+         \tIdentityFile /root/pin_key\n\
+         \tIdentitiesOnly yes\n\
+         \tPreferredAuthentications publickey\n\
+         \tUserKnownHostsFile {known_hosts}\n\
+         \tStrictHostKeyChecking yes\n\
+         \tBatchMode yes\n\
+         \tConnectTimeout 30\n"
+    )
+}
+
+async fn start_proxyjump_gateway(cp: &MockCp) -> (u16, tokio::sync::oneshot::Sender<()>) {
+    let mut cfg = gw_config();
+    cfg.proxy_jump = gateway_core::config::ProxyJumpConfig { enabled: true };
+    start_gateway(cp, Arc::new(cfg)).await
+}
+
+#[tokio::test]
+async fn proxyjump_host_cert_mitm_runs_on_node() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_named_node(&cp, &pin, &host_key, ADDR_NODE, node_port).await;
+
+    let (gw_port, _sd) = start_proxyjump_gateway(&cp).await;
+    let client = client_container(&pin).await;
+    write_client_file(&client, "/root/known_hosts_ca", &cert_authority_line(&cp)).await;
+    write_client_file(
+        &client,
+        "/root/ssh_config",
+        &proxyjump_ssh_config(gw_port, "/root/known_hosts_ca"),
+    )
+    .await;
+
+    // ssh -J gw deploy@web-01 — the host cert is verified via `@cert-authority`.
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        vec![
+            "ssh".into(),
+            "-F".into(),
+            "/root/ssh_config".into(),
+            "web-01".into(),
+            "echo PROXYJUMP_OK; id -un".into(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "ProxyJump host-cert MITM must run on the node; stderr={stderr}"
+    );
+    assert!(stdout.contains("PROXYJUMP_OK"), "stdout={stdout:?}");
+    assert!(
+        stdout.contains("deploy"),
+        "ran as the granted login; stdout={stdout:?}"
+    );
+
+    // The node was addressed by human NAME through the inner hop's direct-tcpip target.
+    let req = cp
+        .last_authorize_request()
+        .expect("an AuthorizeRequest reached the CP");
+    assert_eq!(
+        req.node_name, ADDR_NODE,
+        "the direct-tcpip node name is authorized"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxyjump_without_cert_authority_is_refused_no_tofu() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_named_node(&cp, &pin, &host_key, ADDR_NODE, node_port).await;
+
+    let (gw_port, _sd) = start_proxyjump_gateway(&cp).await;
+    let client = client_container(&pin).await;
+    // Empty known_hosts (NO @cert-authority) + strict checking: the presented host
+    // cert cannot be verified and must be REJECTED — never trust-on-first-use.
+    write_client_file(&client, "/root/known_hosts_empty", "").await;
+    write_client_file(
+        &client,
+        "/root/ssh_config",
+        &proxyjump_ssh_config(gw_port, "/root/known_hosts_empty"),
+    )
+    .await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        vec![
+            "ssh".into(),
+            "-F".into(),
+            "/root/ssh_config".into(),
+            "web-01".into(),
+            "echo SHOULD_NOT_RUN".into(),
+        ],
+    )
+    .await;
+    assert_ne!(
+        code,
+        Some(0),
+        "an unverifiable host cert must be refused (no TOFU)"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_RUN"),
+        "the session must NOT run without @cert-authority; stdout={stdout:?}"
+    );
+    assert!(
+        stderr
+            .to_lowercase()
+            .contains("host key verification failed"),
+        "the client rejected the host (no TOFU); stderr={stderr}"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxyjump_refuses_agent_forwarding() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_named_node(&cp, &pin, &host_key, ADDR_NODE, node_port).await;
+
+    let (gw_port, _sd) = start_proxyjump_gateway(&cp).await;
+    let client = client_container(&pin).await;
+    write_client_file(&client, "/root/known_hosts_ca", &cert_authority_line(&cp)).await;
+    write_client_file(
+        &client,
+        "/root/ssh_config",
+        &proxyjump_ssh_config(gw_port, "/root/known_hosts_ca"),
+    )
+    .await;
+
+    // Run a real agent locally and request forwarding (-A). The Gateway refuses the
+    // auth-agent channel (FR-SESS-2), so the NODE sees no forwarded agent socket.
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "eval \"$(ssh-agent -s)\" >/dev/null 2>&1; ssh-add /root/pin_key >/dev/null 2>&1; \
+             ssh -A -F /root/ssh_config web-01 'echo AGENT=${SSH_AUTH_SOCK:-none}'"
+                .into(),
+        ],
+    )
+    .await;
+    assert_eq!(code, Some(0), "the session still runs; stderr={stderr}");
+    assert!(
+        stdout.contains("AGENT=none"),
+        "agent forwarding must be refused on the ProxyJump path (no forwarded socket on the node); stdout={stdout:?}"
+    );
+
+    drop(node);
+    Ok(())
+}

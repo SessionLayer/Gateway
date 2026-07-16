@@ -30,6 +30,7 @@ use gateway_core::identity;
 use gateway_core::pb::authorization_server::{Authorization, AuthorizationServer};
 use gateway_core::pb::gateway_identity_server::{GatewayIdentity, GatewayIdentityServer};
 use gateway_core::pb::handshake_server::{Handshake, HandshakeServer};
+use gateway_core::pb::host_cert_signing_server::{HostCertSigning, HostCertSigningServer};
 use gateway_core::pb::lock_feed_server::{LockFeed, LockFeedServer};
 use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
 use gateway_core::pb::presence_server::{Presence, PresenceServer};
@@ -49,7 +50,8 @@ use gateway_core::pb::{
     ResolveBreakglassCodeRequest, ResolveBreakglassCodeResponse, ResolveBreakglassKeyRequest,
     ResolveBreakglassKeyResponse, ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest,
     ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity,
-    ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
+    ServerHello, SignGatewayHostCertificateRequest, SignGatewayHostCertificateResponse,
+    SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
     UploadCredential, WormMode,
 };
 use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
@@ -957,6 +959,63 @@ fn resolve_down(state: &MockState) -> Result<(), Status> {
         return Err(Status::unavailable("control plane temporarily unavailable"));
     }
     Ok(())
+}
+
+#[tonic::async_trait]
+impl HostCertSigning for MockSvc {
+    async fn sign_gateway_host_certificate(
+        &self,
+        request: Request<SignGatewayHostCertificateRequest>,
+    ) -> Result<Response<SignGatewayHostCertificateResponse>, Status> {
+        // mTLS-required tier: resolve the caller and refuse a locked one (mirrors the
+        // real HostCertSigningService; generic denial, no leak).
+        let peer = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = peer
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+            .as_ref()
+            .to_vec();
+        let gid = self.resolve_gateway_id(&leaf)?;
+        {
+            let gws = self.gateways.lock().unwrap();
+            if gws.get(&gid).map(|r| r.locked).unwrap_or(true) {
+                return Err(Status::permission_denied("access denied by policy"));
+            }
+        }
+        let r = request.into_inner();
+        if r.host_principals.is_empty() {
+            return Err(Status::invalid_argument("host_principals required"));
+        }
+        let pubkey = ssh_key::PublicKey::from_bytes(&r.host_public_key)
+            .map_err(|_| Status::invalid_argument("bad host public key"))?;
+        let ca = ssh_key::PrivateKey::from_openssh(&self.host_ca_pem).unwrap();
+        let now = unix_now();
+        let valid_secs = 3600u64;
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            now.saturating_sub(60),
+            now + valid_secs,
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .unwrap();
+        for p in &r.host_principals {
+            builder.valid_principal(p).unwrap();
+        }
+        builder.key_id("sessionlayer-gateway-host-cert").unwrap();
+        let cert = builder.sign(&ca).unwrap();
+        Ok(Response::new(SignGatewayHostCertificateResponse {
+            certificate_line: cert.to_openssh().unwrap(),
+            certificate_blob: cert.to_bytes().unwrap(),
+            valid_after_epoch_seconds: now.saturating_sub(60) as i64,
+            valid_before_epoch_seconds: (now + valid_secs) as i64,
+        }))
+    }
 }
 
 #[tonic::async_trait]
@@ -1946,6 +2005,7 @@ impl MockCpBuilder {
                 .add_service(HandshakeServer::new(MockSvc(svc_state.clone())))
                 .add_service(GatewayIdentityServer::new(MockSvc(svc_state.clone())))
                 .add_service(SessionSigningServer::new(MockSvc(svc_state.clone())))
+                .add_service(HostCertSigningServer::new(MockSvc(svc_state.clone())))
                 .add_service(OuterLegAuthServer::new(MockSvc(svc_state.clone())))
                 .add_service(AuthorizationServer::new(MockSvc(svc_state.clone())))
                 .add_service(RecordingServer::new(MockSvc(svc_state.clone())))
@@ -2680,6 +2740,14 @@ pub async fn outer_leg_deps_named(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    // ProxyJump host-cert MITM (Part C): build the state only when the test enabled
+    // it in config (the mock CP then serves HostCertSigning); None otherwise, so
+    // every existing test keeps a direct-tcpip refusal.
+    let proxy_jump = config.proxy_jump.enabled.then(|| {
+        Arc::new(
+            gateway_core::ssh::proxyjump::ProxyJumpState::new().expect("build proxyjump state"),
+        )
+    });
     (
         HandlerDeps {
             cpauth,
@@ -2690,6 +2758,7 @@ pub async fn outer_leg_deps_named(
             lock_set,
             live_sessions,
             config,
+            proxy_jump,
         },
         credential,
     )

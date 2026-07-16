@@ -499,6 +499,23 @@ async fn start_outer_leg(
         ))),
         agent_connector,
     ));
+    // ProxyJump host-cert MITM state (Session Sixteen, Part C): generate the outer
+    // host key once at startup when enabled. If keygen fails, disable ProxyJump
+    // (direct-tcpip stays refused — fail closed) rather than block the other modes.
+    let proxy_jump = if ssh_cfg.proxy_jump.enabled {
+        match ssh::proxyjump::ProxyJumpState::new() {
+            Ok(state) => {
+                tracing::info!("ProxyJump host-cert MITM enabled (Part C)");
+                Some(Arc::new(state))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ProxyJump enabled but outer host key generation failed; ProxyJump DISABLED (direct-tcpip refused)");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let deps = ssh::handler::HandlerDeps {
         cpauth,
         connector,
@@ -508,6 +525,7 @@ async fn start_outer_leg(
         lock_set,
         live_sessions: live_sessions.clone(),
         config: ssh_cfg.clone(),
+        proxy_jump,
     };
 
     let server = ssh::bind(ssh_cfg, deps).await?;

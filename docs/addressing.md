@@ -6,8 +6,8 @@ The Gateway is a single SSH front door; the *target node* is carried in the conn
 | Mode | What the user types | How the node is carried |
 |---|---|---|
 | Username-encoding | `ssh login%node@gw` | the `%`-separated username (`login` + node) |
-| **Wildcard DNS** (Session Sixteen, Part B) | `ssh login@node.ssh.corp` | an ssh_config convenience rewrites it to the username-encoding form |
-| ProxyJump + host-cert | `ssh -J gw node` (Session Sixteen, Part C) | — |
+| **Wildcard DNS** (Session Sixteen, Part B) | `ssh login%node.ssh.corp@<any *.ssh.corp>` (or a wrapper/alias) | the node is in the username; the Gateway strips the DNS suffix |
+| **ProxyJump + host-cert** (Session Sixteen, Part C) | `ssh -J gw login@node` | the node is the ProxyJump forward target; the Gateway presents a host-CA host cert (no TOFU) |
 
 In every mode the Gateway ends up with a **login** and a **node name**; the node name is resolved
 to a node id **server-side by the Control Plane** (`Authorize.node_name` → `findByName`, Session
@@ -21,22 +21,28 @@ The Gateway never decides node existence or access.
 
 ## Wildcard DNS (Part B)
 
-Lets a user type a natural `ssh user@node.<your-domain>` while a small **client-side ssh_config**
-convenience folds it into the username-encoding form the Gateway already understands — no Gateway
-DNS server, no client plugin.
+Wildcard DNS points `*.ssh.corp` at the Gateway so a fleet's node hostnames resolve to the single
+front door with no per-node config. The **node is still conveyed in the SSH username** — that is the
+only channel a stock `ssh` sends to the server (SSH has no host header / SNI). Part B's server-side
+feature is a **wildcard-suffix strip**: it lets the username's node half be a fully-qualified DNS
+name, which the Gateway normalizes to the bare node before name→id resolution. So
+`ssh deploy%web-01.ssh.corp@anything.ssh.corp` reaches `web-01`.
 
-### Client `~/.ssh/config`
+### Client convenience (choose one)
 
-```
-Host *.ssh.corp
-    HostName gw.example.com          # the Gateway's real address
-    User %r%%%h                      # encode: <original-user> % <original-host>
-    # (optional) pin the Gateway host key / set Port as needed
-```
+There is **no pure `~/.ssh/config` rewrite** that turns a natural `ssh user@node.ssh.corp` into the
+username encoding: OpenSSH's `User` directive does not expand `%h`/`%r` (`vdollar_percent_expand:
+unknown key`), and a command-line `user@` overrides any config `User`. The username is the only thing
+`ssh` sends the server, so the node must be in it. Realistic ergonomics:
 
-`ssh deploy@web-01.ssh.corp` then dials the **Gateway** with the username `deploy%web-01.ssh.corp`:
-`%r` expands to the login the user asked for (`deploy`), `%%` is a literal `%` (the target
-separator), and `%h` is the original host (`web-01.ssh.corp`).
+- **Type the encoding** (the DNS suffix is fine — it is stripped): `ssh deploy%web-01.ssh.corp@gw`.
+- **A distributed wrapper/alias** — a one-line shell function or `sl-ssh` script config-mgmt ships:
+  ```sh
+  sl-ssh() { local u=${1%@*} h=${1#*@}; shift; ssh "${u}%${h}@gw.example.com" "$@"; }
+  # sl-ssh deploy@web-01.ssh.corp  →  ssh deploy%web-01.ssh.corp@gw  (Gateway strips .ssh.corp)
+  ```
+- For a **fully natural `ssh user@node.ssh.corp`** with nothing typed or wrapped, use **ProxyJump
+  (mode C, below)** — there the node travels as the SSH forward target, not the username.
 
 ### Gateway side
 
@@ -62,9 +68,8 @@ matches is denied generically at the CP (no existence disclosure).
 ### End to end
 
 ```
-user: ssh deploy@web-01.ssh.corp
-  → ssh_config (Host *.ssh.corp): HostName gw, User %r%%%h
-  → gateway receives username "deploy%web-01.ssh.corp"
+user: sl-ssh deploy@web-01.ssh.corp        (or: ssh deploy%web-01.ssh.corp@gw)
+  → gateway receives username "deploy%web-01.ssh.corp"   (*.ssh.corp resolves to the Gateway)
   → % split: login=deploy, node="web-01.ssh.corp"
   → strip suffix "ssh.corp": node="web-01"
   → Authorize(node_name="web-01") → CP findByName → node id

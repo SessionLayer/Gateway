@@ -321,17 +321,24 @@ pub struct SshServerConfig {
     /// The username-encoding target separator (`login%node`, Design §11). `%` by
     /// default; wildcard-DNS and ProxyJump host-cert modes are Session Sixteen.
     pub target_separator: char,
-    /// Wildcard-DNS node domains (Session Sixteen, Part B, Design §11, FR-ADDR-2).
-    /// Under the ssh_config convenience `Host *.ssh.corp` → `Hostname gw`,
-    /// `User %r%%%h`, an `ssh user@web-01.ssh.corp` arrives as the username
-    /// `user%web-01.ssh.corp`; after the `%` split the Gateway strips a matching
-    /// suffix here to recover the bare node name (`web-01`) for the name→id lookup.
-    /// Each entry is a domain suffix, with or without a leading dot
-    /// (e.g. `"ssh.corp"` or `".ssh.corp"`); matching is case-insensitive and the
-    /// most-specific (longest) match wins. **Empty (default) disables wildcard DNS**
+    /// Wildcard-DNS node domains (Session Sixteen, Part B, Design §11, FR-ADDR-1).
+    /// The node name is carried in the SSH username (the only channel a stock `ssh`
+    /// sends the server); wildcard DNS just points `*.ssh.corp` at the Gateway. This
+    /// lets the username's node half be a fully-qualified DNS name: after the `%`
+    /// split the Gateway strips a matching suffix here to recover the bare node name
+    /// (`user%web-01.ssh.corp` → `web-01`) for the name→id lookup (see
+    /// `docs/addressing.md`). Each entry is a domain suffix, with or without a
+    /// leading dot (`"ssh.corp"` == `".ssh.corp"`); matching is case-insensitive and
+    /// the most-specific (longest) match wins. **Empty (default) disables the strip**
     /// — a target with no matching suffix is passed through unchanged, so the plain
     /// `login%node` encoding is unaffected.
     pub node_dns_suffixes: Vec<String>,
+    /// ProxyJump host-cert MITM (Session Sixteen, Part C, Design §9.3/§11,
+    /// FR-ADDR-1). When enabled the Gateway terminates the inner hop of
+    /// `ssh -J gw login@node`, presenting a host-CA-signed host certificate for the
+    /// node so a stock client with one `@cert-authority` line verifies it with no
+    /// TOFU. Off by default (a `direct-tcpip` forward is then refused, as before).
+    pub proxy_jump: ProxyJumpConfig,
     /// OIDC device-flow presentation + polling knobs (FR-AUTH-4).
     pub device_flow: DeviceFlowConfig,
     /// Bound (seconds) on establishing the CP mTLS transport for an auth/authorize
@@ -639,6 +646,7 @@ impl Default for SshServerConfig {
             source_ip_allowlist: Vec::new(),
             target_separator: '%',
             node_dns_suffixes: Vec::new(),
+            proxy_jump: ProxyJumpConfig::default(),
             device_flow: DeviceFlowConfig::default(),
             cp_connect_timeout_secs: 5,
             cp_rpc_timeout_secs: 10,
@@ -666,6 +674,21 @@ impl Default for SshServerConfig {
 pub struct ProxyProtocolConfig {
     /// Trusted load-balancer CIDRs. See the type docs for the fail-closed matrix.
     pub lb_cidrs: Vec<String>,
+}
+
+/// ProxyJump host-cert MITM (Session Sixteen, Part C, Design §9.3/§11, FR-ADDR-1).
+/// When `enabled`, a `direct-tcpip` forward (`ssh -J gw login@node`) is terminated
+/// at the Gateway: it runs an inner SSH server over the forwarded channel that
+/// presents a host-CA-signed host certificate for the requested node, so a stock
+/// client with one `@cert-authority` line verifies it with **no TOFU**. Agent
+/// forwarding is refused on this path (FR-SESS-2). Off by default — a `direct-tcpip`
+/// is then refused (the pre-S16 behaviour).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyJumpConfig {
+    /// Enable ProxyJump host-cert termination. Requires the CP `HostCertSigning`
+    /// service (S16) to mint the outer host cert from the host CA.
+    pub enabled: bool,
 }
 
 /// OIDC device-flow presentation + polling (FR-AUTH-4, Design §5.2).
