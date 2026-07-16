@@ -125,3 +125,16 @@ clap = { version = "4", features = ["derive"] }
 # Tier-0 data plane: keep integer-overflow checks on even in release. A
 # byte-shoveling proxy must not silently wrap a length/offset. Cheap insurance.
 overflow-checks = true
+
+# Session Sixteen, Part C (ProxyJump host-cert MITM, §9.3/§11): russh 0.62 cannot
+# present an SSH host CERTIFICATE as a server (`server::Config` has only plain
+# `keys`), yet the ProxyJump path requires the Gateway to present a host-CA host
+# cert so a stock client with one `@cert-authority` line verifies it with no TOFU.
+# We vendor russh 0.62.2 verbatim with a minimal, gated patch (4 touch-points:
+# `Config.host_certificates`, the KEXINIT host-key-alg advertise, the KEX host-key
+# lookup, and the K_S emission) so a `*-cert-v01@openssh.com` host key can be
+# presented; the plain-key path is byte-identical when `host_certificates` is empty
+# (every existing outer-leg mode is unaffected). See `third_party/russh` and the
+# `[SessionLayer patch]` markers in its source.
+[patch.crates-io]
+russh = { path = "third_party/russh" }
