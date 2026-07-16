@@ -1681,6 +1681,16 @@ impl Handler for SshHandler {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", "direct-tcpip (local port-forward) refused");
             return Ok(());
         };
+        // Tier-0 per-connection channel cap (shared with channel_open_session): a
+        // ProxyJump inner hop spawns a russh server + a login-grace watchdog, and the
+        // host-cert fetch mints a host-CA cert — all before the inner authorize. Cap
+        // the direct-tcpip opens so an authenticated-but-ungranted jump connection
+        // cannot flood inner-server spawns / host-CA signing / memory (S16 F-proxyjump-dos).
+        self.channels_opened += 1;
+        if self.channels_opened > self.deps.config.inner.max_channels_per_connection {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection channel cap exceeded; refusing ProxyJump direct-tcpip");
+            return Ok(());
+        }
         // Accept the forwarded channel and hand it to an inner SSH server that
         // presents the node's host cert. Spawned so the outer connection keeps
         // pumping this channel's bytes to the inner server's stream.

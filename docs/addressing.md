@@ -75,3 +75,42 @@ user: sl-ssh deploy@web-01.ssh.corp        (or: ssh deploy%web-01.ssh.corp@gw)
   → Authorize(node_name="web-01") → CP findByName → node id
   → session established on web-01
 ```
+
+## ProxyJump + host-cert MITM (Part C)
+
+`ssh -J gw deploy@web-01` gives the **natural** `user@node` form with nothing typed
+or wrapped: the node travels as the SSH forward target. Stock `ssh -J` opens a
+`direct-tcpip` forward to `web-01:22` through the (authenticated) jump connection,
+then runs a fresh SSH handshake to `web-01` over it. The Gateway **terminates** that
+inner hop and presents a **host certificate for `web-01` signed by the host CA**, so
+the client verifies the Gateway *as* the node — a cryptographically explicit,
+consensual MITM (Design §9.3/§11). Enable it with `ssh.proxy_jump.enabled`.
+
+### Client setup — one `@cert-authority` line (MANDATORY, no TOFU)
+
+The operator installs the host CA once in the client's known_hosts:
+
+```
+@cert-authority *.ssh.corp <host-ca-public-key>
+```
+
+- **`@cert-authority` is REQUIRED and `StrictHostKeyChecking` MUST be `yes`** (or
+  `accept-new` only for the *jump* host, never the target). Without the
+  `@cert-authority` line the client cannot verify the presented host cert and — in
+  strict mode — **refuses the connection** (the no-TOFU guarantee; a lenient client
+  that disables host-key checking would trust-on-first-use, which is the operator's
+  misconfiguration to avoid). The Gateway never prompts for or silently accepts a
+  first-use key.
+- The cert's principal is the exact hostname you dial (`web-01`), so scope the
+  `@cert-authority` pattern to your node namespace.
+
+### Properties
+
+- The inner hop runs the **full session seam** (auth → authorize → inner leg →
+  recorder → bridge) reused verbatim — recording, RBAC, and locks apply exactly as
+  the other modes. Only the target node comes from the `direct-tcpip` request.
+- **Agent forwarding is refused** on this path (FR-SESS-2); nested ProxyJump (a
+  forward from an already-terminated inner hop) is refused — one MITM hop only.
+- The Gateway's outer host cert is short-lived (CP-set TTL, ~1h) and re-fetched
+  before expiry; the outer host **private key never leaves** the Gateway (the CP
+  signs only the presented public key).

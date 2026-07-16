@@ -36,6 +36,13 @@ use crate::ssh::target::strip_dns_suffix;
 /// Refetch a host cert this many seconds before `valid_before` (skew + reuse).
 const CERT_REFRESH_SKEW_SECS: u64 = 60;
 
+/// Hard cap on the per-principal host-cert cache. The principal is the fully
+/// client-controlled `direct-tcpip` host, so the cache is bounded (evicting expired
+/// entries first, then the soonest-to-expire) to deny a memory-exhaustion path — a
+/// jump connection cannot grow it without limit (S16 F-proxyjump-dos, defence in
+/// depth with the per-connection channel cap that bounds the mint rate).
+const MAX_CACHED_HOST_CERTS: usize = 256;
+
 /// A ProxyJump setup failure. Coarse on purpose: any failure fails the inner hop
 /// closed (the channel is dropped → the client sees a connection failure), never a
 /// TOFU fallback.
@@ -128,6 +135,20 @@ impl ProxyJumpState {
         let cert = Certificate::from_bytes(&resp.certificate_blob)
             .map_err(|_| ProxyJumpError::HostCertUnavailable)?;
         let mut cache = self.certs.lock().await;
+        // Bound the cache (the key is attacker-controlled): drop expired entries, then
+        // if still at the cap, evict the soonest-to-expire before inserting.
+        if cache.len() >= MAX_CACHED_HOST_CERTS && !cache.contains_key(principal) {
+            cache.retain(|_, c| c.valid_before > now);
+            if cache.len() >= MAX_CACHED_HOST_CERTS {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, c)| c.valid_before)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+        }
         cache.insert(
             principal.to_string(),
             CachedCert {
