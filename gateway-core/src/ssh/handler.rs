@@ -1700,7 +1700,7 @@ impl Handler for SshHandler {
         let source_ip = self.source_ip;
         let host = host_to_connect.to_string();
         let login_grace = Duration::from_secs(self.deps.config.login_grace_secs);
-        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "proxyjump_inner", "ProxyJump: terminating inner hop with a host-CA host cert (no TOFU)");
+        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, node = %sanitize(host_to_connect), outcome = "proxyjump_inner", "ProxyJump: terminating inner hop with a host-CA host cert (no TOFU)");
         tokio::spawn(async move {
             crate::ssh::proxyjump::serve_inner_hop(deps, pj, source_ip, host, stream, login_grace)
                 .await;

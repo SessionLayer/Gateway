@@ -203,6 +203,11 @@ pub async fn serve_inner_hop<S>(
         ..Default::default()
     });
 
+    // The inner hop runs the SAME SshHandler, so it registers in the shared
+    // LiveSessionRegistry (via ensure_registered on its first authorized channel) with
+    // LockBindings from the CP-resolved context.node_id — a mid-session S10 lock (e.g.
+    // a node quarantine) therefore tears the ProxyJump inner session down exactly like
+    // a direct session (verified in the S10 lock-teardown path).
     let conn = Arc::new(ConnState::default());
     let handler = SshHandler::new_proxyjump(deps, source_ip, conn.clone(), node);
 

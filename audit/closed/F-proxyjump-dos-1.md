@@ -44,6 +44,17 @@ deliberate; only the resource bound is the defect.
   zeroization, Debug-redacted key, no lock-across-await, fail-closed on missing cert /
   no TOFU, CpError renders only the gRPC code, no unwrap/panic on hostile input).
 
+## Retest notes (redteam, post-fix — both bounded/low, no further action)
+
+- F1a caps CONCURRENCY, not lifetime mint count: one connection can serially
+  open→mint→close→reopen to mint fresh principals. Fine — F1b bounds memory and the
+  signing rate is throttled by how fast a channel can cycle; do not expect F1a alone
+  to bound total distinct mints.
+- Cache-thrash: an attacker minting >256 distinct principals evicts
+  legitimately-cached node certs (soonest-to-expire eviction), forcing re-mints for
+  real traffic. Bounded and low (a re-mint still fails closed on CP failure); a mild
+  amplification, noted.
+
 ## Residual (Accepted, with controls)
 
 A Tier-0 Gateway can still request a host cert for an arbitrary (well-formed) principal
