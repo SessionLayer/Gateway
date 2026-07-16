@@ -321,6 +321,24 @@ pub struct SshServerConfig {
     /// The username-encoding target separator (`login%node`, Design §11). `%` by
     /// default; wildcard-DNS and ProxyJump host-cert modes are Session Sixteen.
     pub target_separator: char,
+    /// Wildcard-DNS node domains (Session Sixteen, Part B, Design §11, FR-ADDR-1).
+    /// The node name is carried in the SSH username (the only channel a stock `ssh`
+    /// sends the server); wildcard DNS just points `*.ssh.corp` at the Gateway. This
+    /// lets the username's node half be a fully-qualified DNS name: after the `%`
+    /// split the Gateway strips a matching suffix here to recover the bare node name
+    /// (`user%web-01.ssh.corp` → `web-01`) for the name→id lookup (see
+    /// `docs/addressing.md`). Each entry is a domain suffix, with or without a
+    /// leading dot (`"ssh.corp"` == `".ssh.corp"`); matching is case-insensitive and
+    /// the most-specific (longest) match wins. **Empty (default) disables the strip**
+    /// — a target with no matching suffix is passed through unchanged, so the plain
+    /// `login%node` encoding is unaffected.
+    pub node_dns_suffixes: Vec<String>,
+    /// ProxyJump host-cert MITM (Session Sixteen, Part C, Design §9.3/§11,
+    /// FR-ADDR-1). When enabled the Gateway terminates the inner hop of
+    /// `ssh -J gw login@node`, presenting a host-CA-signed host certificate for the
+    /// node so a stock client with one `@cert-authority` line verifies it with no
+    /// TOFU. Off by default (a `direct-tcpip` forward is then refused, as before).
+    pub proxy_jump: ProxyJumpConfig,
     /// OIDC device-flow presentation + polling knobs (FR-AUTH-4).
     pub device_flow: DeviceFlowConfig,
     /// Bound (seconds) on establishing the CP mTLS transport for an auth/authorize
@@ -627,6 +645,8 @@ impl Default for SshServerConfig {
             proxy: ProxyProtocolConfig::default(),
             source_ip_allowlist: Vec::new(),
             target_separator: '%',
+            node_dns_suffixes: Vec::new(),
+            proxy_jump: ProxyJumpConfig::default(),
             device_flow: DeviceFlowConfig::default(),
             cp_connect_timeout_secs: 5,
             cp_rpc_timeout_secs: 10,
@@ -654,6 +674,21 @@ impl Default for SshServerConfig {
 pub struct ProxyProtocolConfig {
     /// Trusted load-balancer CIDRs. See the type docs for the fail-closed matrix.
     pub lb_cidrs: Vec<String>,
+}
+
+/// ProxyJump host-cert MITM (Session Sixteen, Part C, Design §9.3/§11, FR-ADDR-1).
+/// When `enabled`, a `direct-tcpip` forward (`ssh -J gw login@node`) is terminated
+/// at the Gateway: it runs an inner SSH server over the forwarded channel that
+/// presents a host-CA-signed host certificate for the requested node, so a stock
+/// client with one `@cert-authority` line verifies it with **no TOFU**. Agent
+/// forwarding is refused on this path (FR-SESS-2). Off by default — a `direct-tcpip`
+/// is then refused (the pre-S16 behaviour).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyJumpConfig {
+    /// Enable ProxyJump host-cert termination. Requires the CP `HostCertSigning`
+    /// service (S16) to mint the outer host cert from the host CA.
+    pub enabled: bool,
 }
 
 /// OIDC device-flow presentation + polling (FR-AUTH-4, Design §5.2).
@@ -823,6 +858,10 @@ mod tests {
         let cfg = GatewayConfig::default();
         assert!(cfg.ssh.listen_addr.is_empty(), "SSH server off by default");
         assert_eq!(cfg.ssh.target_separator, '%');
+        assert!(
+            cfg.ssh.node_dns_suffixes.is_empty(),
+            "wildcard DNS off by default"
+        );
         assert!(cfg.ssh.proxy.lb_cidrs.is_empty(), "PROXY off by default");
         assert!(
             cfg.ssh.source_ip_allowlist.is_empty(),
@@ -831,6 +870,23 @@ mod tests {
         // The device flow must fit inside the login grace window.
         assert!(cfg.ssh.device_flow.poll_timeout_secs < cfg.ssh.login_grace_secs);
         assert_eq!(cfg.ssh.device_flow.heartbeat_interval_secs, 10);
+    }
+
+    #[test]
+    fn wildcard_dns_suffixes_parse_and_deny_unknown_keys() {
+        // Session Sixteen Part B: the wildcard-DNS node domains parse from config.
+        let cfg: GatewayConfig =
+            serde_json::from_str(r#"{"ssh":{"node_dns_suffixes":["ssh.corp",".db.internal"]}}"#)
+                .unwrap();
+        assert_eq!(
+            cfg.ssh.node_dns_suffixes,
+            vec!["ssh.corp".to_string(), ".db.internal".to_string()]
+        );
+        // A misspelled key still fails closed (deny_unknown_fields).
+        assert!(serde_json::from_str::<GatewayConfig>(
+            r#"{"ssh":{"node_dns_suffix":["ssh.corp"]}}"#
+        )
+        .is_err());
     }
 
     #[test]

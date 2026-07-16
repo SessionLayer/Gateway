@@ -30,6 +30,7 @@ use gateway_core::identity;
 use gateway_core::pb::authorization_server::{Authorization, AuthorizationServer};
 use gateway_core::pb::gateway_identity_server::{GatewayIdentity, GatewayIdentityServer};
 use gateway_core::pb::handshake_server::{Handshake, HandshakeServer};
+use gateway_core::pb::host_cert_signing_server::{HostCertSigning, HostCertSigningServer};
 use gateway_core::pb::lock_feed_server::{LockFeed, LockFeedServer};
 use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
 use gateway_core::pb::presence_server::{Presence, PresenceServer};
@@ -49,7 +50,8 @@ use gateway_core::pb::{
     ResolveBreakglassCodeRequest, ResolveBreakglassCodeResponse, ResolveBreakglassKeyRequest,
     ResolveBreakglassKeyResponse, ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest,
     ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity,
-    ServerHello, SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
+    ServerHello, SignGatewayHostCertificateRequest, SignGatewayHostCertificateResponse,
+    SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
     UploadCredential, WormMode,
 };
 use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
@@ -511,6 +513,17 @@ struct MockState {
     /// How long an owner may go un-heartbeated before it is considered stale and taken over
     /// (and before its owner fields stop riding on Authorize). Short in tests.
     presence_staleness: Duration,
+
+    // ---- Session Sixteen: name→id resolution (Part A, FR-ADDR-1) --------------
+    /// Optional node NAME → CP id mapping. `Authorize` resolves `node_name` through
+    /// this (server-side authoritative, ignoring the client-asserted `node_id`);
+    /// an unmapped name resolves to itself (pass-through, the S7–S15 test shape). A
+    /// distinct mapping lets a test prove the Gateway forwards the NAME and the whole
+    /// downstream keys on the CP-resolved id, not the raw parsed string.
+    node_name_to_id: Mutex<HashMap<String, String>>,
+    /// Every `AuthorizeRequest` the mock received, in order — for Part A assertions
+    /// (node_name populated, name resolution authoritative).
+    authorize_requests: Mutex<Vec<AuthorizeRequest>>,
 }
 
 impl MockState {
@@ -949,6 +962,63 @@ fn resolve_down(state: &MockState) -> Result<(), Status> {
 }
 
 #[tonic::async_trait]
+impl HostCertSigning for MockSvc {
+    async fn sign_gateway_host_certificate(
+        &self,
+        request: Request<SignGatewayHostCertificateRequest>,
+    ) -> Result<Response<SignGatewayHostCertificateResponse>, Status> {
+        // mTLS-required tier: resolve the caller and refuse a locked one (mirrors the
+        // real HostCertSigningService; generic denial, no leak).
+        let peer = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = peer
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+            .as_ref()
+            .to_vec();
+        let gid = self.resolve_gateway_id(&leaf)?;
+        {
+            let gws = self.gateways.lock().unwrap();
+            if gws.get(&gid).map(|r| r.locked).unwrap_or(true) {
+                return Err(Status::permission_denied("access denied by policy"));
+            }
+        }
+        let r = request.into_inner();
+        if r.host_principals.is_empty() {
+            return Err(Status::invalid_argument("host_principals required"));
+        }
+        let pubkey = ssh_key::PublicKey::from_bytes(&r.host_public_key)
+            .map_err(|_| Status::invalid_argument("bad host public key"))?;
+        let ca = ssh_key::PrivateKey::from_openssh(&self.host_ca_pem).unwrap();
+        let now = unix_now();
+        let valid_secs = 3600u64;
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            now.saturating_sub(60),
+            now + valid_secs,
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .unwrap();
+        for p in &r.host_principals {
+            builder.valid_principal(p).unwrap();
+        }
+        builder.key_id("sessionlayer-gateway-host-cert").unwrap();
+        let cert = builder.sign(&ca).unwrap();
+        Ok(Response::new(SignGatewayHostCertificateResponse {
+            certificate_line: cert.to_openssh().unwrap(),
+            certificate_blob: cert.to_bytes().unwrap(),
+            valid_after_epoch_seconds: now.saturating_sub(60) as i64,
+            valid_before_epoch_seconds: (now + valid_secs) as i64,
+        }))
+    }
+}
+
+#[tonic::async_trait]
 impl OuterLegAuth for MockSvc {
     async fn resolve_user_cert(
         &self,
@@ -1359,7 +1429,16 @@ impl Authorization for MockSvc {
         if *self.authorize_unavailable.lock().unwrap() {
             return Err(Status::unavailable("control plane temporarily unavailable"));
         }
-        let r = request.into_inner();
+        let mut r = request.into_inner();
+        self.authorize_requests.lock().unwrap().push(r.clone());
+        // Name resolution is server-side authoritative (§11, FR-ADDR-1): resolve
+        // node_name to the node's id/key and IGNORE the client-asserted node_id, so a
+        // client cannot smuggle an id past the resolved name. Empty node_name falls
+        // back to node_id (a direct-id caller). Everything below keys on the resolved
+        // r.node_id.
+        if !r.node_name.is_empty() {
+            r.node_id = self.resolve_node_name(&r.node_name);
+        }
 
         // Break-glass connect (Session Thirteen): a present token routes to the
         // always-available break-glass path (consume token + activation/alert + force
@@ -1392,6 +1471,18 @@ impl Authorization for MockSvc {
 }
 
 impl MockState {
+    /// Resolve a node NAME to its CP id (Session Sixteen, Part A). A mapped name
+    /// returns the mapped id; an unmapped name resolves to itself (pass-through, the
+    /// S7–S15 shape where the mock inventory is keyed by name).
+    fn resolve_node_name(&self, name: &str) -> String {
+        self.node_name_to_id
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// The owner NAME for a caller gateway id (the HA routing key), or `None` if unknown.
     fn gateway_name_of(&self, gid: &str) -> Option<String> {
         self.gateways
@@ -1888,6 +1979,8 @@ impl MockCpBuilder {
             feed_epoch: AtomicU64::new(1),
             presence: Mutex::new(HashMap::new()),
             presence_staleness: self.presence_staleness,
+            node_name_to_id: Mutex::new(HashMap::new()),
+            authorize_requests: Mutex::new(Vec::new()),
         });
 
         let tls = ServerTlsConfig::new()
@@ -1912,6 +2005,7 @@ impl MockCpBuilder {
                 .add_service(HandshakeServer::new(MockSvc(svc_state.clone())))
                 .add_service(GatewayIdentityServer::new(MockSvc(svc_state.clone())))
                 .add_service(SessionSigningServer::new(MockSvc(svc_state.clone())))
+                .add_service(HostCertSigningServer::new(MockSvc(svc_state.clone())))
                 .add_service(OuterLegAuthServer::new(MockSvc(svc_state.clone())))
                 .add_service(AuthorizationServer::new(MockSvc(svc_state.clone())))
                 .add_service(RecordingServer::new(MockSvc(svc_state.clone())))
@@ -2111,6 +2205,30 @@ impl MockCp {
             .lock()
             .unwrap()
             .insert(node_id.to_string());
+    }
+
+    /// Map a node NAME to a DISTINCT CP id (Session Sixteen, Part A). Without a mapping
+    /// the mock resolves a name to itself (pass-through). A distinct mapping lets a test
+    /// address by human name yet configure the inventory (`allow`, `set_node_connection`,
+    /// locks) by the id — proving the Gateway forwards the NAME and the whole downstream
+    /// keys on the CP-resolved id, not the raw parsed string.
+    pub fn map_node_name(&self, name: &str, id: &str) {
+        self.state
+            .node_name_to_id
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), id.to_string());
+    }
+
+    /// The most recent `AuthorizeRequest` the mock received (Part A assertions:
+    /// node_name populated). `None` if none arrived yet.
+    pub fn last_authorize_request(&self) -> Option<AuthorizeRequest> {
+        self.state
+            .authorize_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
     }
 
     /// Grant `{identity, node, principal}` (also registers the node as existing).
@@ -2622,6 +2740,14 @@ pub async fn outer_leg_deps_named(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    // ProxyJump host-cert MITM (Part C): build the state only when the test enabled
+    // it in config (the mock CP then serves HostCertSigning); None otherwise, so
+    // every existing test keeps a direct-tcpip refusal.
+    let proxy_jump = config.proxy_jump.enabled.then(|| {
+        Arc::new(
+            gateway_core::ssh::proxyjump::ProxyJumpState::new().expect("build proxyjump state"),
+        )
+    });
     (
         HandlerDeps {
             cpauth,
@@ -2632,6 +2758,7 @@ pub async fn outer_leg_deps_named(
             lock_set,
             live_sessions,
             config,
+            proxy_jump,
         },
         credential,
     )

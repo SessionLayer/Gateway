@@ -57,6 +57,63 @@ message SignContext {
   string requested_principal = 3;
 }
 
+// HostCertSigning issues the Gateway's OUTER SSH host certificate for the
+// ProxyJump host-cert MITM path (Design §9.3, §11; FR-ADDR-1). On that path the
+// Gateway terminates the client's inner SSH hop and must present a host
+// certificate signed by the HOST CA so a stock OpenSSH client that installed one
+// `@cert-authority` line accepts the Gateway as the target node with NO TOFU.
+// Added in Session Sixteen.
+//
+// AUTHORIZATION. Unlike SessionSigning this RPC is NOT session-bound (a host cert
+// is presented before the inner hop authenticates, so there is no session token
+// yet). It is authorized purely by the caller's Gateway mTLS identity, which the
+// interceptor resolves to an ACTIVE, UNLOCKED gateway_identity (a locked/revoked
+// Gateway is refused — the lock is the revocation). The host CA is the
+// operator-consented MITM trust anchor; the CP TTL-bounds and audits issuance.
+//
+// KEY CUSTODY (D2). The Gateway generates the outer host keypair locally and
+// sends ONLY the public key; the CP returns a certificate only.
+service HostCertSigning {
+  // SignGatewayHostCertificate signs the Gateway's presented host public key into
+  // a short-lived HOST certificate (host CA) whose principals are the exact
+  // client-facing hostname(s) the Gateway will be addressed as on the ProxyJump
+  // inner hop. The Gateway re-fetches on expiry (rotation).
+  rpc SignGatewayHostCertificate(SignGatewayHostCertificateRequest) returns (SignGatewayHostCertificateResponse);
+}
+
+// SignGatewayHostCertificateRequest is the Gateway-identity-authorized host-cert
+// request (not session-bound).
+message SignGatewayHostCertificateRequest {
+  // The Gateway-generated OUTER host PUBLIC key, OpenSSH wire-encoded (an
+  // `ecdsa-sha2-nistp256` public-key blob, matching the P-256 host CA / D6). The
+  // private key never leaves the Gateway (D2).
+  bytes host_public_key = 1;
+
+  // The host principal(s) to certify — the exact hostname(s) the client dials on
+  // the ProxyJump inner hop (the `direct-tcpip` host_to_connect, e.g. "web-01" or
+  // the wildcard-DNS "web-01.ssh.corp"). OpenSSH verifies the presented cert's
+  // principals against the hostname it connected to (§11). Non-empty; each is
+  // length/charset-bounded by the CP.
+  repeated string host_principals = 2;
+}
+
+// SignGatewayHostCertificateResponse returns the signed host certificate — cert
+// only, never a private key.
+message SignGatewayHostCertificateResponse {
+  // The signed OpenSSH host certificate as an authorized-keys-style line
+  // (`ecdsa-sha2-nistp256-cert-v01@openssh.com AAAA... <key-id>`).
+  string certificate_line = 1;
+
+  // The same certificate as the raw OpenSSH wire blob (base64 body decoded), for
+  // the Gateway to present directly on the inner-hop host-key negotiation.
+  bytes certificate_blob = 2;
+
+  // Certificate validity as Unix epoch seconds (UTC). valid_after is backdated for
+  // skew (FR-CA-5); the Gateway re-fetches before valid_before to rotate.
+  int64 valid_after_epoch_seconds = 3;
+  int64 valid_before_epoch_seconds = 4;
+}
+
 // SignSessionCertificateResponse returns the signed certificate — cert only.
 message SignSessionCertificateResponse {
   // The signed OpenSSH inner-leg certificate as an authorized-keys line

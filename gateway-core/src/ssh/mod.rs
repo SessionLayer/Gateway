@@ -22,6 +22,7 @@ pub mod lockfeed;
 pub mod locks;
 pub mod outcome;
 pub mod proxy;
+pub mod proxyjump;
 pub mod recorder;
 pub mod target;
 

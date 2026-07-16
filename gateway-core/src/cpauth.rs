@@ -21,6 +21,7 @@ use tonic::transport::Channel;
 use crate::mtls::{self, ChannelParams, ClientIdentity, MtlsError};
 use crate::pb::authorization_client::AuthorizationClient;
 use crate::pb::gateway_identity_client::GatewayIdentityClient;
+use crate::pb::host_cert_signing_client::HostCertSigningClient;
 use crate::pb::outer_leg_auth_client::OuterLegAuthClient;
 use crate::pb::presence_client::PresenceClient;
 use crate::pb::recording_client::RecordingClient;
@@ -32,7 +33,8 @@ use crate::pb::{
     PresenceHeartbeatRequest, PresenceHeartbeatResponse, PresenceReleaseRequest,
     PresenceReleaseResponse, RequestUploadRequest, RequestUploadResponse,
     ResolveBreakglassCodeRequest, ResolveBreakglassKeyRequest, ResolveOtpRequest,
-    ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity,
+    ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity, SignGatewayHostCertificateRequest,
+    SignGatewayHostCertificateResponse,
 };
 
 /// A failure calling the CP. Fail-closed at every variant.
@@ -529,6 +531,31 @@ impl CpAuthClient {
             self.invalidate().await;
         }
         result
+    }
+
+    /// Obtain the Gateway's OUTER SSH host certificate for the ProxyJump host-cert
+    /// MITM path (Session Sixteen, §9.3/§11; FR-ADDR-1). Authenticated purely by
+    /// the Gateway's mTLS client certificate (NOT session-bound); the CP signs the
+    /// presented host public key with the host CA and returns a cert only — the
+    /// host private key never leaves the Gateway (D2). `host_principals` are the
+    /// exact client-facing hostname(s) the Gateway will be addressed as.
+    pub async fn sign_gateway_host_certificate(
+        &self,
+        host_public_key: Vec<u8>,
+        host_principals: Vec<String>,
+    ) -> Result<SignGatewayHostCertificateResponse, CpError> {
+        self.call(move |ch| {
+            let req = SignGatewayHostCertificateRequest {
+                host_public_key,
+                host_principals,
+            };
+            async move {
+                HostCertSigningClient::new(ch)
+                    .sign_gateway_host_certificate(req)
+                    .await
+            }
+        })
+        .await
     }
 }
 
