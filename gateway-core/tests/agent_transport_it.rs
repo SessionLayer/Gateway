@@ -271,6 +271,7 @@ async fn a_locked_agent_cannot_register() {
         expires_at_epoch_seconds: 0,
         created_at_epoch_seconds: 0,
         reason: "clone detected".into(),
+        ..Default::default()
     });
 
     let client = h.agent(AGENT, NODE);
@@ -610,6 +611,7 @@ async fn a_locked_agent_cannot_redeem_a_dial_back_issued_before_the_lock() {
         expires_at_epoch_seconds: 0,
         created_at_epoch_seconds: 0,
         reason: "locked mid-flight".into(),
+        ..Default::default()
     });
 
     assert_unauthorized(&redeem(&h, &client, &req).await);
