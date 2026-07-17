@@ -55,6 +55,10 @@ WORM_BUCKET="sessionlayer-recordings"
 MINIO_USER="sessionlayer"
 MINIO_PASS="sessionlayer-dev-secret"
 
+CP_REST="http://localhost:${FS_CP_REST_PORT}"
+ADMIN_ID="e2e-admin"                                  # machine service account for the admin REST API
+ADMIN_SECRET="fs-admin-$$-$(date +%s)"                # client_secret (dev-only, per-run)
+
 NODE_IMAGE="sessionlayer-gw-fullstack-node:s20"
 CLIENT_IMAGE="sessionlayer-gw-fullstack-client:s20"
 MINIO_IMAGE="minio/minio:RELEASE.2025-04-08T15-41-24Z"
@@ -231,8 +235,36 @@ SQL
   local ck; ck="$(PSQL -tAc "SELECT length(recording_customer_public_key) FROM config.operator_settings WHERE singleton=true")"
   [[ "${ck:-0}" -gt 0 ]] || die "customer recording key was not stored"
 
+  log "seed 7/7: admin machine service account (client_secret) + platform role (audit:read, node:enroll)"
+  # No REST to provision a service account, so seed it (mirrors AbstractConfigApiIT.tokenWith):
+  # secret_hash = lowercase-hex SHA-256 of the client_secret (Secrets.sha256Hex).
+  local sh; sh="$(sl_sha "$ADMIN_SECRET")"
+  PSQL <<SQL
+INSERT INTO config.service_account(id,name,description,auth_method,origin)
+VALUES (gen_random_uuid(),'$ADMIN_ID','fullstack e2e admin','client_secret','default') ON CONFLICT (name) DO NOTHING;
+INSERT INTO runtime.service_account_credential(id,service_account_id,service_account_name,credential_type,secret_hash,status,issued_at)
+SELECT gen_random_uuid(), sa.id, sa.name, 'client_secret','$sh','active',now() FROM config.service_account sa WHERE sa.name='$ADMIN_ID'
+  AND NOT EXISTS (SELECT 1 FROM runtime.service_account_credential c WHERE c.service_account_name='$ADMIN_ID');
+INSERT INTO config.platform_role(id,name,permissions,description,origin)
+VALUES (gen_random_uuid(),'e2e-superadmin',ARRAY['audit:read','node:enroll','lock:write','lock:read']::text[],'e2e','default') ON CONFLICT (name) DO NOTHING;
+INSERT INTO config.role_binding(id,role_id,subject_kind,subject,origin)
+SELECT gen_random_uuid(), r.id,'user','$ADMIN_ID','default' FROM config.platform_role r WHERE r.name='e2e-superadmin'
+ON CONFLICT DO NOTHING;
+SQL
+
   export GW_ENROLL_TOKEN SESSION_CA_LINE
-  ok "seed_cp done (mTLS CA + session CA + gw token + dp_rule + pin + customer key)"
+  ok "seed_cp done (mTLS CA + session CA + gw token + dp_rule + pin + customer key + admin SA)"
+}
+
+# Mint a CP machine bearer via the public /v1/oauth2/token (client-credentials). The token +
+# body are OAuth2 snake_case; the CP self-signs (RS256) + self-verifies (key regenerated per
+# boot, so re-mint after any CP restart). Sets $ADMIN_TOKEN.
+mint_admin_token() {
+  local resp; resp="$(curl -s "$CP_REST/v1/oauth2/token" -H 'Content-Type: application/json' \
+    -d "{\"grant_type\":\"client_credentials\",\"client_id\":\"$ADMIN_ID\",\"client_secret\":\"$ADMIN_SECRET\"}")"
+  ADMIN_TOKEN="$(printf %s "$resp" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)"
+  [[ -n "$ADMIN_TOKEN" ]] || die "could not mint admin machine token (oauth2/token): $resp"
+  ok "admin machine bearer minted (client-credentials)"
 }
 
 # Generate the node's host key, start the node container with it + the session-CA
@@ -275,20 +307,25 @@ start_node() {
   ok "node up: $NODE_NAME sshd on 127.0.0.1:$NODE_PORT (pinned fp $NODE_HOSTKEY_FP)"
 }
 
-# Register the node in inventory as agentless with its dial address + pinned host key.
-seed_node_inventory() {
-  log "seed 7/7: node inventory ($NODE_NAME -> agentless 127.0.0.1:$NODE_PORT, pinned host key)"
-  # Upsert then SELECT the id separately: psql prints an "INSERT 0 1" command tag on
-  # stdout even under -tA, which would corrupt a RETURNING-captured id.
-  PSQL -c "INSERT INTO runtime.node(id,name,connector_kind,status,resolved_labels,address)
-    VALUES (gen_random_uuid(),'$NODE_NAME','agentless','active','{\"env\":\"fullstack\"}'::jsonb,'127.0.0.1:$NODE_PORT')
-    ON CONFLICT (name) DO UPDATE SET address=EXCLUDED.address, status='active', connector_kind='agentless';" >/dev/null
-  NODE_ID="$(PSQL -tAc "SELECT id FROM runtime.node WHERE name='$NODE_NAME'" | tr -d '[:space:]')"
-  [[ -n "$NODE_ID" ]] || die "node insert returned no id"
-  PSQL -c "INSERT INTO runtime.node_host_key(id,node_id,key_type,public_key,fingerprint,source,verified_at)
-    VALUES (gen_random_uuid(),'$NODE_ID','ssh-ed25519','$NODE_HOSTKEY_LINE','$NODE_HOSTKEY_FP','pinned_key',now())
-    ON CONFLICT (node_id,fingerprint) DO NOTHING;" >/dev/null
-  ok "node inventory seeded (id=$NODE_ID)"
+# Register the agentless node via the S16 REST API (POST /v1/nodes), proving the real admin
+# API end-to-end. The CP creates the node (connector_kind=agentless, status=active) AND the
+# pinned host anchor (runtime.node_host_key source='pinned_key') from pinnedHostKey — no SQL.
+register_node() {
+  log "registering $NODE_NAME via POST /v1/nodes (agentless 127.0.0.1:$NODE_PORT, pinned host key)"
+  local body resp code
+  # Build the JSON with python reading the host-key line from the env (it has spaces + base64
+  # chars); never interpolate it into a shell-built JSON string.
+  body="$(NODE_NAME="$NODE_NAME" NODE_PORT="$NODE_PORT" HK="$NODE_HOSTKEY_LINE" python3 -c '
+import json, os
+print(json.dumps({"name": os.environ["NODE_NAME"], "address": "127.0.0.1:" + os.environ["NODE_PORT"],
+                  "labels": {"env": "fullstack"}, "pinnedHostKey": os.environ["HK"]}))')"
+  resp="$(curl -s -w $'\n%{http_code}' -X POST "$CP_REST/v1/nodes" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d "$body")"
+  code="$(printf %s "$resp" | tail -1)"
+  [[ "$code" == 201 || "$code" == 200 ]] || die "POST /v1/nodes failed ($code): $(printf %s "$resp" | head -1)"
+  NODE_ID="$(printf %s "$resp" | head -1 | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])' 2>/dev/null)"
+  [[ -n "$NODE_ID" ]] || die "POST /v1/nodes returned no node id: $resp"
+  ok "node registered via REST (id=$NODE_ID, agentless, active)"
 }
 
 launch_gateway() {
@@ -379,6 +416,55 @@ assert_recording() {
   ok "WORM object is opaque SLREC1 (magic ok, size+digest match, no plaintext), COMPLIANCE-locked"
 }
 
+# ── Part B: the connect/authorize audit event carries + is searchable by all 5 dims ──
+# The substantive FR-AUD-8/9 proof is SEARCHABILITY (an auditor finds the event by each
+# dimension) + the single-correlationId correlated chain. The AuditEventResource response
+# projects source_ip + correlation_id (top-level) and access_model (in `detail`); capabilities
+# and node_labels are searchable but not projected (the schema omits them — by design).
+assert_audit_dimensions() {
+  log "asserting the connect/authorize audit event is searchable by all 5 dimensions + the correlated chain"
+  mint_admin_token
+  local sid; sid="$(PSQL -tAc "SELECT id FROM runtime.ssh_session ORDER BY created_at DESC LIMIT 1" | tr -d '[:space:]')"
+  [[ -n "$sid" ]] || die "no ssh_session row to correlate against"
+
+  # (1) the authorize event carries the projected dims populated.
+  curl -s "$CP_REST/v1/audit-events?correlationId=$sid&action=authz.decision" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" > "$WORKDIR/audit-authz.json"
+  SID="$sid" python3 - "$WORKDIR/audit-authz.json" <<'PY' || die "authorize audit event missing a projected dimension (see audit-authz.json)"
+import sys, json, os
+d = json.load(open(sys.argv[1]))
+items = d.get("items") or []
+assert items, "no authz.decision event returned"
+e = items[0]
+assert e.get("sourceIp") == "127.0.0.1", f"sourceIp not populated: {e.get('sourceIp')}"
+assert e.get("correlationId") == os.environ["SID"], f"correlationId mismatch: {e.get('correlationId')}"
+assert (e.get("detail") or {}).get("access_model") == "standing", f"access_model not standing: {e.get('detail')}"
+print("authorize event carries sourceIp=%s access_model=%s correlationId(ok)" % (e["sourceIp"], e["detail"]["access_model"]))
+PY
+  ok "the authorize audit event carries source_ip + access_model + correlation_id"
+
+  # (2) a search filtered by EACH of the 5 dimensions returns at least the session's event.
+  local q n
+  for q in "sourceIp=127.0.0.1" "accessModel=standing" "capability=exec" "nodeLabel=env=fullstack" "correlationId=$sid"; do
+    n="$(curl -s "$CP_REST/v1/audit-events?$q" -H "Authorization: Bearer $ADMIN_TOKEN" \
+      | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("items") or []))' 2>/dev/null)"
+    [[ "${n:-0}" -ge 1 ]] || die "audit search by dimension returned nothing: ?$q"
+    log "  search ?$q -> $n event(s)"
+  done
+  ok "each of source_ip / access_model / capabilities / node_labels / correlation_id is independently searchable"
+
+  # (3) the correlated path: one correlationId reconstructs the session chain
+  # (authz.decision + recording begin/upload/finalize).
+  local chain
+  chain="$(curl -s "$CP_REST/v1/audit-events?correlationId=$sid" -H "Authorization: Bearer $ADMIN_TOKEN" \
+    | python3 -c 'import sys,json
+d=json.load(sys.stdin); acts=[e.get("action") for e in (d.get("items") or [])]
+assert any(a=="authz.decision" for a in acts), "chain missing authz.decision: "+str(acts)
+assert any(a and a.startswith("recording.") for a in acts), "chain missing recording.*: "+str(acts)
+print(",".join(acts))')" || die "correlated-path chain incomplete for correlationId=$sid"
+  ok "correlated path: correlationId=$sid returns the chain [$chain]"
+}
+
 report() {
   cat <<EOF
 
@@ -400,11 +486,13 @@ main() {
   start_infra
   start_cp
   seed_cp
-  start_node
-  seed_node_inventory
+  mint_admin_token           # machine bearer for the S16 admin REST API
+  start_node                 # generate the pinned host key + launch the node
+  register_node              # POST /v1/nodes (agentless + pinned host anchor)
   launch_gateway
-  run_session
-  assert_recording
+  run_session                # ssh through the REAL CP Authorize -> real node
+  assert_recording           # customer-sealed SLREC1 WORM object, finalized
+  assert_audit_dimensions    # 5 dims searchable + correlated chain (Part B)
   report
 }
 main "$@"

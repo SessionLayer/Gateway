@@ -56,8 +56,13 @@ subtler than ha-e2e.sh:
   no session can start at all. The MinIO WORM store needs only
   `SESSIONLAYER_RECORDING_WORM_ENDPOINT`; the CP auto-creates the object-lock bucket.
 
-The node is registered agentless (`connector_kind='agentless'`, dial address =
-`127.0.0.1:<node_port>`) with its host key **pinned** in `runtime.node_host_key` (no TOFU).
+The node is registered agentless via the **S16 REST API** (`POST /v1/nodes` with the dial
+address + `pinnedHostKey`), which also proves that admin surface end-to-end; the CP creates
+the node (`connector_kind='agentless'`, `status=active`) and the pinned host anchor (no TOFU).
+Admin REST calls (`/v1/nodes`, `/v1/join-tokens`, `/v1/audit-events`) authenticate with a CP
+**machine bearer** minted from the public `POST /v1/oauth2/token` (client-credentials) for a
+SQL-seeded service account granted `audit:read`/`node:enroll` — no browser/OIDC needed. The
+OAuth2 request and response are snake_case (`grant_type`/`access_token`).
 
 ## Scenario matrix — live here vs referenced per-repo
 
@@ -69,7 +74,7 @@ that does prove it is named.
 |---|----------|--------|
 | 1 | **CORE**: `ssh deploy%web-01@gw` runs on the real node through the real CP `Authorize` | **LIVE (core)** |
 | 2 | **Recording integrity**: finalized SLREC1 WORM object, COMPLIANCE-locked, opaque (no plaintext), size+digest match | **LIVE (core)** |
-| 3 | **Audit dimensions** (Part B): the connect/authorize event carries + is searchable by source_ip / access_model / capabilities / node_labels / correlation_id | _pending Part B jar_ |
+| 3 | **Audit dimensions** (Part B): the connect/authorize event is searchable by each of source_ip / access_model / capability / node_label / correlation_id, and one correlationId returns the connect→recording chain | **LIVE (core)** |
 | 4 | **Outbound-agent** connector: a second node reached via the real Agent (dial-out WSS → dial-back splice) | _pending (`TOPOLOGY=agent`)_ |
 | 5 | JIT self-approval refused | referenced: `breakglass_it.rs` / CP JIT ITs |
 | 6 | Lock mid-session teardown of a live recorded session | referenced: `recorder_it.rs` (real binaries) |
