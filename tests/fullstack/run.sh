@@ -56,6 +56,8 @@ FS_NODE_NETMODE="${FS_NODE_NETMODE:-}"
 if [[ -z "$FS_NODE_NETMODE" ]]; then
   [[ "$TOPOLOGY" == all ]] && FS_NODE_NETMODE=bridge || FS_NODE_NETMODE=loopback
 fi
+DENY_LOGIN="${DENY_LOGIN:-dba}"          # a node login the CP never grants (deny-path negative)
+DECRYPT_BIN="${DECRYPT_BIN:-$GW_REPO/target/debug/examples/decrypt_recording}"  # SEC-LOW-1/2 prover
 CLIENT_IDENTITY="${CLIENT_IDENTITY:-fullstack-user}"
 MARKER="FULLSTACK_OK_$$"
 KEEP_UP="${KEEP_UP:-}"
@@ -123,6 +125,15 @@ build_artifacts() {
   fi
   [[ -x "$GATEWAY_BIN" ]] || die "GATEWAY_BIN not executable: $GATEWAY_BIN"
 
+  # The recording decrypt-prover (SEC-LOW-1/2): reuses the production seal:: code to ECIES-open
+  # the WORM object with the customer PRIVATE key. Built from the workspace unless supplied.
+  if [[ ! -x "$DECRYPT_BIN" ]]; then
+    log "building the recording decrypt-prover (cargo build -p gateway-core --example decrypt_recording)"
+    ( cd "$GW_REPO" && CARGO_INCREMENTAL=0 cargo build -p gateway-core --example decrypt_recording >/dev/null 2>&1 ) \
+      || die "decrypt_recording example build failed (run 'cargo build -p gateway-core --example decrypt_recording')"
+  fi
+  [[ -x "$DECRYPT_BIN" ]] || die "DECRYPT_BIN not executable: $DECRYPT_BIN"
+
   # Build the fixture images. The ssh-client image compiles OpenSSH (minutes), so
   # reuse an already-built image on a re-run unless FS_FORCE_BUILD is set. CI starts
   # clean (no image) and builds once.
@@ -157,7 +168,7 @@ start_cp() {
   SPRING_FLYWAY_URL="jdbc:postgresql://localhost:${FS_PG_PORT}/sessionlayer" \
   SPRING_FLYWAY_USER="sessionlayer" SPRING_FLYWAY_PASSWORD="sessionlayer" \
     java -jar "$CP_JAR" > "$WORKDIR/cp.log" 2>&1 &
-  PIDS+=($!)
+  CP_PID=$!; PIDS+=("$CP_PID")   # CP_PID: the NFR-2 CP-down case kills it explicitly
   local deadline=$((SECONDS + WAIT_SECS))
   until curl -sf "http://localhost:${FS_CP_REST_PORT}/v1/healthz" >/dev/null 2>&1; do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { tail -60 "$WORKDIR/cp.log" >&2; die "CP process exited during startup"; }
@@ -377,6 +388,16 @@ launch_gateway() {
   ok "Gateway enrolled + outer SSH leg on 127.0.0.1:$FS_GW_SSH_PORT (log: $WORKDIR/gateway.log)"
 }
 
+# Run one stock-ssh attempt `<login>%<node>` through the Gateway and echo its combined output;
+# the caller inspects the exit code + output (used by the deny-path + CP-down negatives).
+ssh_attempt() {  # $1=login $2=node $3=remote-command
+  docker run --rm --network host -v "$WORKDIR/client_key:/mnt/client_key:ro" --entrypoint sh \
+    "$CLIENT_IMAGE" -c "cp /mnt/client_key /root/k && chmod 600 /root/k && \
+      ssh -p $FS_GW_SSH_PORT -i /root/k -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+        -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=25 \
+        '$1%$2@127.0.0.1' '$3'" 2>&1
+}
+
 # The headline: a stock ssh client runs a command on the REAL node, THROUGH the
 # REAL CP Authorize decision. Returns the session output in $SESSION_OUT.
 run_session() {
@@ -435,11 +456,27 @@ assert_recording() {
   [[ "$osize" == "$size_bytes" ]] || die "object size $osize != recording_ref.size_bytes $size_bytes"
   local osha; osha="sha256:$(sha256sum "$WORKDIR/obj.bin" | cut -d' ' -f1)"
   [[ "$osha" == "$digest" ]] || die "object sha256 $osha != recording_ref.content_digest $digest"
-  # Platform holds only the customer PUBLIC key: the sealed object must not carry
-  # the session plaintext (full ECIES decrypt-proof is per-repo recorder_it.rs).
+  # Platform holds only the customer PUBLIC key: the sealed object must not carry the session
+  # plaintext (negative check).
   grep -qa "$MARKER" "$WORKDIR/obj.bin" && die "SESSION PLAINTEXT MARKER found in the WORM object — sealing failed"
   grep -qi "COMPLIANCE" "$WORKDIR/retention.txt" || die "WORM object is not COMPLIANCE object-locked; mc stat:\n$(cat "$WORKDIR/retention.txt")"
   ok "WORM object is opaque SLREC1 (magic ok, size+digest match, no plaintext), COMPLIANCE-locked"
+
+  # SEC-LOW-1/2 — the POSITIVE crown-jewel proof: the WORM object DECRYPTS (customer private key,
+  # which never left the harness — the CP only ever got the public half) back to the original
+  # session bytes (marker PRESENT), and the hash-chain recomputes to the finalized head. Without
+  # this, an empty/header-only SLREC1 finalize would pass every check above. Uses decrypt_recording
+  # (reuses the exact production seal:: code).
+  log "decrypt-proving the recording with the customer private key: session bytes present + hash-chain recomputes"
+  openssl pkcs8 -topk8 -nocrypt -in "$WORKDIR/customer_key.pem" -outform DER -out "$WORKDIR/customer_key.pkcs8.der" 2>/dev/null \
+    || die "could not convert the customer key to PKCS8 DER"
+  local dec; dec="$("$DECRYPT_BIN" "$WORKDIR/customer_key.pkcs8.der" "$WORKDIR/obj.bin" 2>"$WORKDIR/decrypt.err")" \
+    || die "decrypt_recording failed (customer key cannot open the object?): $(cat "$WORKDIR/decrypt.err")"
+  grep -q "$MARKER" <<<"$dec" \
+    || die "the session marker is NOT in the DECRYPTED recording — capture+seal produced no recoverable session bytes (empty/header-only finalize?)"
+  local rechain; rechain="$(sed -n 's/^CHAIN_HEAD=//p' <<<"$dec" | head -1)"
+  [[ "$rechain" == "$chain" ]] || die "recomputed hash-chain head ($rechain) != finalized head ($chain)"
+  ok "recording decrypts to the original session (marker present) + hash-chain recomputes to the finalized head"
 }
 
 # ── Part B: the connect/authorize audit event carries + is searchable by all 5 dims ──
@@ -491,6 +528,32 @@ print(",".join(acts))')" || die "correlated-path chain incomplete for correlatio
   ok "correlated path: correlationId=$sid returns the chain [$chain]"
 }
 
+# ── SEC-LOW-3: deny-wins at the REAL-CP integration layer (not just the MockCp double). ──
+# An ungranted login must be refused by the real CP Authorize — fail closed, generic §7.1.
+assert_deny_closed() {
+  log "deny-path: an UNGRANTED login ($DENY_LOGIN%$NODE_NAME) must be refused by the real CP (fail closed)"
+  local out rc=0
+  out="$(ssh_attempt "$DENY_LOGIN" "$NODE_NAME" 'echo DENIED_SHOULD_NOT_RUN')" || rc=$?
+  [[ $rc -ne 0 ]] || die "an ungranted login was NOT refused (fail-OPEN): $out"
+  grep -q DENIED_SHOULD_NOT_RUN <<<"$out" && die "the command RAN on an ungranted login — deny bypassed: $out"
+  ok "deny-path: the ungranted login was refused by the real CP (rc=$rc, generic §7.1, no command ran)"
+}
+
+# ── NFR-2: with the real CP DOWN, a new session must fail CLOSED — never fail-open. LAST case
+# (it kills the CP). The full-stack proves this in a way MockCp cannot: a real dead decision plane.
+assert_cp_down() {
+  log "NFR-2: killing the real CP; a NEW session MUST fail closed (never fail-open)"
+  kill "$CP_PID" 2>/dev/null || true
+  local d=$((SECONDS + 25))
+  while kill -0 "$CP_PID" 2>/dev/null && [[ $SECONDS -lt $d ]]; do sleep 1; done
+  ! curl -sf "http://localhost:${FS_CP_REST_PORT}/v1/healthz" >/dev/null 2>&1 || die "CP still healthy after kill; cannot prove CP-down"
+  local out rc=0
+  out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo CPDOWN_SHOULD_NOT_RUN')" || rc=$?
+  [[ $rc -ne 0 ]] || die "a session SUCCEEDED with the CP DOWN (fail-OPEN — NFR-2 violated): $out"
+  grep -q CPDOWN_SHOULD_NOT_RUN <<<"$out" && die "the command RAN with the CP down — fail-open: $out"
+  ok "NFR-2: with the real CP down, the new session failed closed (rc=$rc); the Gateway never fails open"
+}
+
 report() {
   cat <<EOF
 
@@ -517,8 +580,10 @@ main() {
   register_node              # POST /v1/nodes (agentless + pinned host anchor)
   launch_gateway
   run_session                # ssh through the REAL CP Authorize -> real node
-  assert_recording           # customer-sealed SLREC1 WORM object, finalized
+  assert_recording           # SLREC1 WORM object + decrypt-proof (SEC-LOW-1/2)
   assert_audit_dimensions    # 5 dims searchable + correlated chain (Part B)
+  assert_deny_closed         # deny-wins at the real CP (SEC-LOW-3)
+  assert_cp_down             # NFR-2 fail-closed — LAST (kills the CP)
   report
 }
 main "$@"
