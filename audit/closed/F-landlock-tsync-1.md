@@ -36,13 +36,24 @@ socket layer (it surfaces as an EACCES on a file, not a connect failure).
 the allow-set is denied; the allowed dir is writable).
 
 **Load-bearing evidence — VERIFIED** via the full-stack harness under
-`FS_HARDENING=full` (real CP jar + real Debian-13 node + the real gateway binary):
-the gateway log shows `Landlock filesystem confinement fully enforced read_only=6
-read_write=1` and `seccomp allow-list enforced … allowed=154 hard_denied=42
-io_uring=false`, and under that profile the whole session ran green — `command ran
-on the REAL node via the REAL CP Authorize` (the per-worker-confined workers carry
-the shell/exec/sftp bridge I/O), recording SLREC1 + hash-chain + decrypt, audit
-5-dim + correlated chain, deny-path rc=1, CP-down rc=255 fail-closed. So the
-per-worker confinement both confines AND does not break the data path; the
-154-syscall allow-list is complete for enroll + accept + inner-dial + bridge +
-recorder crypto + WORM upload + CP mTLS.
+`FS_HARDENING=full` (real CP jar + real Debian-13 node + the real gateway binary).
+Gateway log, verbatim:
+
+```
+INFO outer SSH leg started addr=127.0.0.1:12201
+INFO Landlock filesystem confinement fully enforced read_only=6 read_write=1
+INFO seccomp allow-list enforced (unlisted → EPERM; exploitation set → KILL) allowed=154 hard_denied=42 io_uring=false
+```
+
+Under that profile the whole session ran green — `command ran on the REAL node via
+the REAL CP Authorize` (the per-worker-confined workers carry the shell/exec/sftp
+bridge I/O), recording SLREC1 + hash-chain + decrypt, audit 5-dim + correlated
+chain, deny-path rc=1, CP-down rc=255 fail-closed. So the per-worker confinement
+both confines AND does not break the data path; the 154-syscall allow-list is
+complete for enroll + accept + inner-dial + bridge + recorder crypto + WORM upload
++ CP mTLS. The CP endpoint was a **hostname** (`cp_mtls_endpoint:
+https://localhost:19443`, `server_name: localhost`), so glibc `getaddrinfo` ran
+under the filter and resolved — `ioctl` (allow-listed unconditionally) + the socket
+syscalls cover the resolver path (the nameserver-DNS path is not exercised by
+`localhost`/`/etc/hosts`, but `ioctl` being present covers it; a possible T3
+refinement is arg-restricting `ioctl` to the request codes actually used).
