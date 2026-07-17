@@ -114,6 +114,17 @@ base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# OpenTelemetry (Session Twenty-One, §14). ONE distributed trace client -> GW ->
+# CP -> node, carrying correlation IDs, NEVER plaintext (OTEL-CONTRACT §5). The
+# OTLP exporter is compiled in but INERT unless `OTEL_EXPORTER_OTLP_ENDPOINT` is
+# set (telemetry.rs); local `tracing`/fmt logging is otherwise unchanged. The
+# exporter's gRPC transport is **tonic/ring** (`grpc-tonic`, no `openssl` — the
+# deny.toml supply-chain policy); `reqwest`/http export is deliberately excluded.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33"
+
 # Ser/de, errors, CLI.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -170,9 +170,27 @@ async fn handle_connection(inner: Arc<ServerInner>, mut stream: TcpStream, peer:
         return;
     }
 
-    // (3) SSH transport + auth handshake.
+    // (3) SSH transport + auth handshake. The whole connection future runs inside
+    // the handler's `gateway.session` trace root (OTEL-CONTRACT §3), so every
+    // callback + CP RPC injects its context and joins the one trace.
+    use tracing::Instrument;
     let conn = Arc::new(ConnState::default());
     let handler = SshHandler::new(inner.deps.clone(), real_ip, conn.clone());
+    let session_span = handler.trace_span();
+    run_ssh_connection(inner, stream, handler, conn, real_ip)
+        .instrument(session_span)
+        .await;
+}
+
+/// The instrumented body of one SSH connection (extracted so the accept path can
+/// wrap it in the `gateway.session` span without a giant inline `.instrument()`).
+async fn run_ssh_connection(
+    inner: Arc<ServerInner>,
+    stream: TcpStream,
+    handler: SshHandler,
+    conn: Arc<ConnState>,
+    real_ip: IpAddr,
+) {
     match russh::server::run_stream(inner.russh_config.clone(), stream, handler).await {
         Ok(running) => {
             // Absolute pre-auth deadline: drop the connection if authentication

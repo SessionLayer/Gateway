@@ -182,7 +182,8 @@ pub async fn sign_session_certificate(
     timeout: Duration,
 ) -> Result<SignedInnerCert, SigningError> {
     let request = build_request(session_token, inner.public_key_openssh_wire(), context);
-    let mut client = SessionSigningClient::new(channel);
+    // Inject the current span's W3C trace context into this RPC (OTEL-CONTRACT §2.1).
+    let mut client = SessionSigningClient::new(crate::telemetry::trace_channel(channel));
     let call = client.sign_session_certificate(tonic::Request::new(request));
     let resp = match tokio::time::timeout(timeout, call).await {
         Ok(result) => result?.into_inner(),

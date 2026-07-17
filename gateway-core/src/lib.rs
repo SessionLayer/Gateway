@@ -53,6 +53,7 @@ pub mod netmatch;
 mod secret;
 pub mod signing;
 pub mod ssh;
+pub mod telemetry;
 pub mod tls;
 pub mod version;
 

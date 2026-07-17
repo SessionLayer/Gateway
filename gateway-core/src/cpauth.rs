@@ -224,12 +224,16 @@ impl CpAuthClient {
 
     /// Run `f` (an RPC future factory over a fresh channel) with the fail-closed
     /// deadline; drop the cached channel on any failure so the next call rebuilds.
+    ///
+    /// The channel is wrapped so every RPC injects the current span's W3C trace
+    /// context into the outbound gRPC metadata (OTEL-CONTRACT §2.1) — inert unless
+    /// tracing is active.
     async fn call<T, F, Fut>(&self, f: F) -> Result<T, CpError>
     where
-        F: FnOnce(Channel) -> Fut,
+        F: FnOnce(crate::telemetry::TracedChannel) -> Fut,
         Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
-        let channel = self.channel().await?;
+        let channel = crate::telemetry::trace_channel(self.channel().await?);
         let result = match tokio::time::timeout(self.rpc_timeout, f(channel)).await {
             Ok(Ok(resp)) => Ok(resp.into_inner()),
             Ok(Err(status)) => Err(CpError::Rpc(status)),
