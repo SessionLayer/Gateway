@@ -14,9 +14,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write # gh release upload
       id-token: write # keyless OIDC for cosign + provenance
@@ -42,20 +47,19 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
 
+      # SOURCE_DATE_EPOCH (tagged commit) + remapping BOTH the workspace (incl. the
+      # vendored third_party/russh) and the cargo registry out of the binary make
+      # it byte-reproducible for an independent rebuilder. (Residual: the std
+      # sysroot path — bounded by pinning the exact toolchain, documented.)
       - name: Compute deterministic build env
-        id: env
-        run: echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix=$PWD=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry=/registry" >> "$GITHUB_ENV"
 
       - name: Reproducible release build
-        env:
-          SOURCE_DATE_EPOCH: ${{ steps.env.outputs.epoch }}
-          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
         run: cargo build --release --locked --bin "$BIN"
 
       - name: Verify reproducibility (double-build digest match)
-        env:
-          SOURCE_DATE_EPOCH: ${{ steps.env.outputs.epoch }}
-          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
         run: |
           d1=$(sha256sum "target/release/$BIN" | awk '{print $1}')
           CARGO_TARGET_DIR="$RUNNER_TEMP/repro" cargo build --release --locked --bin "$BIN"
@@ -64,10 +68,13 @@ jobs:
           if [ "$d1" != "$d2" ]; then echo "::error::release binary is not reproducible"; exit 1; fi
           rm -rf "$RUNNER_TEMP/repro"
 
-      - name: Generate SBOM (CycloneDX 1.5)
+      - name: Generate SBOM (CycloneDX 1.5, reproducible)
         run: |
           cargo cyclonedx -f json --spec-version 1.5 --all --describe binaries
-          mv "gateway/${BIN}_bin.cdx.json" "${BIN}.cdx.json"
+          # Strip the nondeterministic metadata.timestamp + random serialNumber so
+          # the SBOM is byte-reproducible (cargo-cyclonedx has no reproducible flag;
+          # 0.5.9 also caps at spec 1.5). The workspace emits per-package SBOMs.
+          jq -S 'del(.metadata.timestamp) | del(.serialNumber)' "gateway/${BIN}_bin.cdx.json" > "${BIN}.cdx.json"
           jq -e '.bomFormat=="CycloneDX" and .specVersion=="1.5" and (.components|length>0)' "${BIN}.cdx.json" >/dev/null
 
       - name: Attest build provenance (SLSA)
@@ -94,12 +101,13 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }} # via env — never interpolate a ref into the shell
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "Gateway ${{ github.ref_name }}" \
+          gh release create "$TAG" \
+            --title "Gateway $TAG" \
             --notes "Signed, provenanced, reproducible release. Verify with cosign / gh attestation verify (NFR-7)." \
             || echo "release already exists — uploading assets"
-          gh release upload "${{ github.ref_name }}" --clobber \
+          gh release upload "$TAG" --clobber \
             "$BIN" \
             "${BIN}.cdx.json" \
             "${BIN}.cosign.sigstore.json" \
