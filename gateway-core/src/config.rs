@@ -42,6 +42,13 @@ pub struct GatewayConfig {
     /// High-availability coordination (Session Fifteen). Default is
     /// single-instance / in-process with ZERO extra dependencies.
     pub ha: HaConfig,
+    /// Tier-0 runtime self-hardening (Session Twenty-One, NFR-5): privilege drop
+    /// after bind, Landlock filesystem confinement, and a seccomp syscall filter.
+    /// Every step is OFF by default — hardening is a production posture engaged via
+    /// config, applied by the `gateway` binary AFTER its listeners are bound. It is
+    /// deliberately NOT part of `gateway-core`, so the in-process integration tests
+    /// (which drive the library directly) never sandbox their own test runner.
+    pub hardening: HardeningConfig,
 }
 
 impl Default for GatewayConfig {
@@ -55,6 +62,7 @@ impl Default for GatewayConfig {
             identity: IdentityConfig::default(),
             ssh: SshServerConfig::default(),
             ha: HaConfig::default(),
+            hardening: HardeningConfig::default(),
         }
     }
 }
@@ -805,6 +813,125 @@ impl Default for IdentityConfig {
     }
 }
 
+/// Tier-0 runtime self-hardening (Session Twenty-One; Design NFR-5,
+/// [[audit/closed/F-dos-accept-1.md]]). These are the in-process restrictions the
+/// `gateway` binary imposes on ITSELF at startup, after binding its listeners: a
+/// privilege drop, a Landlock filesystem confinement, and a seccomp-bpf syscall
+/// filter. They compose with — and do not replace — the outer container /
+/// Kubernetes `securityContext` in `deploy/` (read-only rootfs, dropped
+/// capabilities, `no_new_privs`, an egress NetworkPolicy). Every step is OFF by
+/// default and independently toggled, because the enforcement lives in the binary
+/// and the in-process integration tests must never sandbox their own runner.
+///
+/// **Fail-closed contract.** A step that is REQUESTED but cannot be applied for a
+/// reason under operator control (privilege drop asked for while not root, an
+/// unknown user, a Landlock/seccomp rule the kernel supports but rejects) ABORTS
+/// startup with a clear diagnostic. The single exception is a *kernel-capability
+/// gap* — the running kernel does not implement the mechanism at all (no Landlock
+/// LSM, no seccomp) — which DEGRADES with a loud warning (a documented
+/// Accepted-Risk), so the Gateway still starts on an older kernel rather than
+/// wedging. See `SeccompConfig::mode` / `LandlockConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HardeningConfig {
+    /// User to drop to (setgid + supplementary groups + setuid) AFTER the
+    /// listeners are bound, so the process may bind a privileged port (`:22`) as
+    /// root and then run unprivileged. **Empty disables the privilege drop.**
+    /// A name (resolved via NSS) or a bare numeric uid. Requested-but-not-root, or
+    /// an unknown user, fails closed.
+    pub run_as_user: String,
+    /// Group to drop to. Empty falls back to the resolved user's primary group.
+    pub run_as_group: String,
+    /// Landlock filesystem confinement.
+    pub landlock: LandlockConfig,
+    /// seccomp-bpf syscall filter.
+    pub seccomp: SeccompConfig,
+}
+
+impl Default for HardeningConfig {
+    fn default() -> Self {
+        Self {
+            run_as_user: String::new(),
+            run_as_group: String::new(),
+            landlock: LandlockConfig::default(),
+            seccomp: SeccompConfig::default(),
+        }
+    }
+}
+
+/// Landlock (LSM) filesystem confinement (kernel ≥ 5.13; full rule coverage
+/// ≥ 6.x). When enabled, the process is restricted to the configured path sets
+/// and NOTHING else — any file outside them is inaccessible regardless of DAC
+/// permissions, so a code-exec bug cannot read `/etc/shadow` or write outside the
+/// data dir. Landlock is unprivileged and additive-only (a sandbox can never
+/// re-grant access), so it composes cleanly with the privilege drop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LandlockConfig {
+    /// Master switch. Off by default.
+    pub enabled: bool,
+    /// Absolute paths the Gateway may READ (config, the CA/trust bundle, host key,
+    /// `/etc/resolv.conf` + `/etc/ssl` for TLS/DNS). Missing paths are skipped with
+    /// a warning (a rule over a non-existent path is not fatal).
+    pub read_only_paths: Vec<PathBuf>,
+    /// Absolute paths the Gateway may READ and WRITE (the credential data-dir, any
+    /// recording spool). Kept as tight as possible.
+    pub read_write_paths: Vec<PathBuf>,
+}
+
+impl Default for LandlockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            read_only_paths: Vec::new(),
+            read_write_paths: Vec::new(),
+        }
+    }
+}
+
+/// seccomp-bpf syscall filtering posture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SeccompConfig {
+    /// Filter mode (see [`SeccompMode`]).
+    pub mode: SeccompMode,
+}
+
+impl Default for SeccompConfig {
+    fn default() -> Self {
+        Self {
+            mode: SeccompMode::Off,
+        }
+    }
+}
+
+/// How the seccomp allow-list is applied.
+///
+/// The allow-list itself is fixed in code (the exact syscall set tokio + rustls
+/// + russh + tonic need); only the *posture* is configurable:
+/// - `Off` — no filter installed.
+/// - `Log` — the filter is installed but an unlisted syscall is only LOGGED
+///   (`SECCOMP_RET_LOG`, visible in `dmesg`/auditd) and then allowed. This is the
+///   discovery/roll-out mode: run a full session, confirm nothing unexpected is
+///   logged, then flip to `Enforce`. It provides NO protection.
+/// - `Enforce` — an unlisted syscall is BLOCKED with `EPERM` (`SECCOMP_RET_ERRNO`),
+///   which is robust to libc drift (a new syscall degrades that one operation
+///   rather than crashing the Tier-0 daemon and dropping every live session),
+///   while a small hard-deny set of unambiguously-exploitation syscalls
+///   (`execve`/`ptrace`/`kexec`/module-load/namespace-escape/…) instead KILLS the
+///   process — those must never occur, and if they do it is a compromise to
+///   surface loudly, not to paper over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeccompMode {
+    /// No seccomp filter is installed.
+    Off,
+    /// Install the filter but only log (do not block) unlisted syscalls.
+    Log,
+    /// Install and enforce the filter (EPERM unlisted; kill the hard-deny set).
+    Enforce,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +971,33 @@ mod tests {
         // A misspelled key must error, not be silently dropped.
         let result: Result<GatewayConfig, _> = serde_json::from_str(r#"{"io_back_end":"uring"}"#);
         assert!(result.is_err(), "unknown config key must be rejected");
+    }
+
+    #[test]
+    fn hardening_is_fully_disabled_by_default() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.hardening.run_as_user.is_empty(), "no privilege drop");
+        assert!(!cfg.hardening.landlock.enabled, "landlock off");
+        assert_eq!(cfg.hardening.seccomp.mode, SeccompMode::Off, "seccomp off");
+    }
+
+    #[test]
+    fn hardening_parses_and_rejects_unknown_nested_key() {
+        let cfg: GatewayConfig = serde_json::from_str(
+            r#"{"hardening":{"run_as_user":"sessionlayer","landlock":{"enabled":true,"read_write_paths":["/var/lib/sessionlayer-gateway"]},"seccomp":{"mode":"enforce"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.hardening.run_as_user, "sessionlayer");
+        assert!(cfg.hardening.landlock.enabled);
+        assert_eq!(
+            cfg.hardening.landlock.read_write_paths,
+            vec![PathBuf::from("/var/lib/sessionlayer-gateway")]
+        );
+        assert_eq!(cfg.hardening.seccomp.mode, SeccompMode::Enforce);
+
+        let bad: Result<GatewayConfig, _> =
+            serde_json::from_str(r#"{"hardening":{"seccomp":{"level":"enforce"}}}"#);
+        assert!(bad.is_err(), "unknown hardening key must fail closed");
     }
 
     #[test]

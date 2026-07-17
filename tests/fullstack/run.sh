@@ -372,8 +372,24 @@ print(json.dumps({"name": os.environ["NODE_NAME"], "address": "127.0.0.1:" + os.
   ok "node registered via REST (id=$NODE_ID, agentless, active)"
 }
 
+# Tier-0 hardening profile for the real-binary run (Session Twenty-One, NFR-5).
+# FS_HARDENING: off (default — the S20 baseline, unchanged) | log | seccomp | full.
+# The Gateway runs here as an unprivileged user on a high port, so the privilege
+# drop is naturally a no-op; seccomp + Landlock are the live-exercised layers,
+# proving the enforced profile does NOT break the real SSH data path.
+gw_hardening_json() {
+  case "${FS_HARDENING:-off}" in
+    off)     printf '{}' ;;
+    log)     printf '{"seccomp":{"mode":"log"}}' ;;
+    seccomp) printf '{"seccomp":{"mode":"enforce"}}' ;;
+    full)    printf '{"seccomp":{"mode":"enforce"},"landlock":{"enabled":true,"read_only_paths":["/usr","/lib","/lib64","/etc","/dev","/proc"],"read_write_paths":["%s"]}}' "$WORKDIR" ;;
+    *)       die "unknown FS_HARDENING=${FS_HARDENING} (want: off|log|seccomp|full)" ;;
+  esac
+}
+
 launch_gateway() {
-  log "rendering + launching the real Gateway (agentless, single-instance)"
+  local prof="${FS_HARDENING:-off}"
+  log "rendering + launching the real Gateway (agentless, single-instance; hardening=$prof)"
   CP_MTLS_ENDPOINT="https://localhost:${FS_CP_MTLS_PORT}" \
   CP_SERVER_NAME="localhost" \
   GW_DATA_DIR="$WORKDIR/gw-data" \
@@ -381,7 +397,8 @@ launch_gateway() {
   GW_CA_PEM="$WORKDIR/ca.pem" \
   GW_NAME="$GW_NAME" \
   GW_SSH_ADDR="127.0.0.1:${FS_GW_SSH_PORT}" \
-    envsubst '${CP_MTLS_ENDPOINT} ${CP_SERVER_NAME} ${GW_DATA_DIR} ${GW_ENROLL_TOKEN} ${GW_CA_PEM} ${GW_NAME} ${GW_SSH_ADDR}' \
+  GW_HARDENING="$(gw_hardening_json)" \
+    envsubst '${CP_MTLS_ENDPOINT} ${CP_SERVER_NAME} ${GW_DATA_DIR} ${GW_ENROLL_TOKEN} ${GW_CA_PEM} ${GW_NAME} ${GW_SSH_ADDR} ${GW_HARDENING}' \
     < "$SCRIPT_DIR/config/gateway-core.json.tmpl" > "$WORKDIR/gateway.json"
   rm -rf "$WORKDIR/gw-data"; mkdir -p "$WORKDIR/gw-data"
   RUST_LOG="${GW_RUST_LOG:-info}" "$GATEWAY_BIN" --config "$WORKDIR/gateway.json" > "$WORKDIR/gateway.log" 2>&1 &

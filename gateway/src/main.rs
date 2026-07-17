@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod hardening;
+
 /// `--version` output: SemVer plus the supported CP <-> Gateway protocol range.
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -156,6 +158,14 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         if !cfg.ha.drain.readyz_addr.is_empty() {
             ha::readiness::spawn(cfg.ha.drain.readyz_addr.clone(), ready_rx, readyz_stop_rx);
         }
+
+        // Tier-0 self-hardening (Session Twenty-One, NFR-5): every listener is now
+        // bound, so drop privileges, confine the filesystem (Landlock), and install
+        // the seccomp filter. Fail-closed — a requested step that cannot be applied
+        // aborts startup (a kernel-capability gap degrades with a warning inside the
+        // step). Applied here rather than in `gateway-core` so the library's
+        // in-process integration tests never sandbox their own runner.
+        hardening::apply(&cfg.hardening)?;
 
         tracing::info!("awaiting shutdown signal (SIGTERM / Ctrl-C)");
         let mut sd = shutdown_rx;

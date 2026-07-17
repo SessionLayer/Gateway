@@ -1,0 +1,107 @@
+# SessionLayer Gateway — hardened Kubernetes deployment (Session Twenty-One, NFR-5).
+#
+# The security-context here is the OUTER layer; the binary applies its own
+# in-process seccomp + Landlock at startup (hardening.* in the ConfigMap below).
+# Together: a non-root, read-only-rootfs, all-capabilities-dropped, no-privilege-
+# escalation, seccomp-confined process whose egress is restricted by the
+# NetworkPolicy in networkpolicy.yaml.
+#
+# This uses the cloud-native port model: the container listens on a high port and
+# a Service maps :22 -> :2222, so no privileged bind (and therefore no in-process
+# privilege drop) is needed. For a bind-:22 host deployment use deploy/systemd/,
+# which exercises the in-process privilege-drop-after-bind instead.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sessionlayer-gateway-config
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+data:
+  gateway.json: |
+    {
+      "cp_mtls_endpoint": "https://controlplane.sessionlayer.svc:9443",
+      "data_dir": "/var/lib/sessionlayer-gateway",
+      "ssh": {
+        "listen_addr": "0.0.0.0:2222",
+        "host_key_path": "/var/lib/sessionlayer-gateway/host_ed25519",
+        "source_ip_allowlist": ["10.0.0.0/8"]
+      },
+      "hardening": {
+        "landlock": {
+          "enabled": true,
+          "read_only_paths": [
+            "/etc/sessionlayer",
+            "/etc/ssl/certs",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/usr/local/bin/gateway",
+            "/lib", "/lib64", "/usr/lib"
+          ],
+          "read_write_paths": ["/var/lib/sessionlayer-gateway"]
+        },
+        "seccomp": { "mode": "enforce" }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sessionlayer-gateway
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: sessionlayer-gateway }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: sessionlayer-gateway }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: ghcr.io/sessionlayer/gateway:latest # pin by digest in production
+          args: ["--config", "/etc/sessionlayer/gateway.json"]
+          ports:
+            - { name: ssh, containerPort: 2222 }
+            - { name: agent, containerPort: 9444 }
+          securityContext:
+            allowPrivilegeEscalation: false # sets no_new_privs
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/sessionlayer-gateway }
+            - { name: config, mountPath: /etc/sessionlayer, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            periodSeconds: 5
+      volumes:
+        # The credential data-dir. An emptyDir re-enrolls on every restart; use a
+        # PVC (or a StatefulSet) to persist the enrolled identity + generation.
+        - name: data
+          emptyDir: {}
+        - name: config
+          configMap: { name: sessionlayer-gateway-config }
+        - name: tmp
+          emptyDir: { medium: Memory }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sessionlayer-gateway
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+spec:
+  type: LoadBalancer
+  selector: { app.kubernetes.io/name: sessionlayer-gateway }
+  ports:
+    - { name: ssh, port: 22, targetPort: 2222 }
+    - { name: agent, port: 9444, targetPort: 9444 }
