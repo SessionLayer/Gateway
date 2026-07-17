@@ -846,6 +846,12 @@ pub struct HardeningConfig {
     pub landlock: LandlockConfig,
     /// seccomp-bpf syscall filter.
     pub seccomp: SeccompConfig,
+    /// Disable coredumps for the process (Part B, NFR-5): `PR_SET_DUMPABLE=0` +
+    /// `RLIMIT_CORE=0`, so a crash while the Gateway holds SSH plaintext or an
+    /// inner private key cannot spill it to a core file. **On by default** — it is
+    /// low-risk and directly protects secrets (unlike the sandbox steps). Set
+    /// false only to capture a core for debugging a non-production build.
+    pub disable_coredumps: bool,
 }
 
 impl Default for HardeningConfig {
@@ -855,6 +861,7 @@ impl Default for HardeningConfig {
             run_as_group: String::new(),
             landlock: LandlockConfig::default(),
             seccomp: SeccompConfig::default(),
+            disable_coredumps: true,
         }
     }
 }
@@ -865,7 +872,7 @@ impl Default for HardeningConfig {
 /// permissions, so a code-exec bug cannot read `/etc/shadow` or write outside the
 /// data dir. Landlock is unprivileged and additive-only (a sandbox can never
 /// re-grant access), so it composes cleanly with the privilege drop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LandlockConfig {
     /// Master switch. Off by default.
@@ -877,16 +884,6 @@ pub struct LandlockConfig {
     /// Absolute paths the Gateway may READ and WRITE (the credential data-dir, any
     /// recording spool). Kept as tight as possible.
     pub read_write_paths: Vec<PathBuf>,
-}
-
-impl Default for LandlockConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            read_only_paths: Vec::new(),
-            read_write_paths: Vec::new(),
-        }
-    }
 }
 
 /// seccomp-bpf syscall filtering posture.
@@ -974,11 +971,17 @@ mod tests {
     }
 
     #[test]
-    fn hardening_is_fully_disabled_by_default() {
+    fn hardening_sandbox_off_but_coredumps_disabled_by_default() {
         let cfg = GatewayConfig::default();
+        // The sandbox steps are opt-in...
         assert!(cfg.hardening.run_as_user.is_empty(), "no privilege drop");
         assert!(!cfg.hardening.landlock.enabled, "landlock off");
         assert_eq!(cfg.hardening.seccomp.mode, SeccompMode::Off, "seccomp off");
+        // ...but coredump-disable (low-risk, directly protects secrets) is ON.
+        assert!(
+            cfg.hardening.disable_coredumps,
+            "coredumps disabled by default"
+        );
     }
 
     #[test]

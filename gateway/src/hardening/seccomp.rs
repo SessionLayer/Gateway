@@ -25,14 +25,19 @@ use gateway_core::config::SeccompMode;
 use seccompiler::{apply_filter_all_threads, BpfProgram, SeccompAction, SeccompFilter};
 use std::collections::BTreeMap;
 
-pub fn install(mode: SeccompMode) -> anyhow::Result<()> {
+/// Install the filter. `io_uring_active` gates the `io_uring_*` syscalls: they are
+/// a favourite sandbox-escape primitive, so unless the io_uring reactor is actually
+/// selected at runtime (it is opt-in; epoll is the default) they are hard-denied
+/// (KILL), not merely EPERM'd.
+pub fn install(mode: SeccompMode, io_uring_active: bool) -> anyhow::Result<()> {
     match mode {
         SeccompMode::Off => {
             tracing::debug!("seccomp filter disabled by config");
             Ok(())
         }
         SeccompMode::Log => {
-            let filter = build_filter(SeccompAction::Log).context("building seccomp log filter")?;
+            let filter = build_filter(SeccompAction::Log, io_uring_active)
+                .context("building seccomp log filter")?;
             apply(filter).context("installing seccomp log filter")?;
             tracing::warn!(
                 "seccomp installed in LOG mode: unlisted syscalls are recorded (dmesg/auditd) but NOT blocked — no protection; flip hardening.seccomp.mode to \"enforce\" once the log is clean"
@@ -43,16 +48,18 @@ pub fn install(mode: SeccompMode) -> anyhow::Result<()> {
             // Order does not matter for action precedence (the kernel runs all
             // filters), but install the KILL filter first so that if anything goes
             // wrong we still fail closed.
-            let kill = build_kill_filter().context("building seccomp hard-deny filter")?;
+            let kill =
+                build_kill_filter(io_uring_active).context("building seccomp hard-deny filter")?;
             apply(kill).context("installing seccomp hard-deny filter")?;
 
-            let allow = build_filter(SeccompAction::Errno(libc::EPERM as u32))
+            let allow = build_filter(SeccompAction::Errno(libc::EPERM as u32), io_uring_active)
                 .context("building seccomp allow-list filter")?;
             apply(allow).context("installing seccomp allow-list filter")?;
 
             tracing::info!(
-                allowed = allowed_syscalls().len(),
-                hard_denied = dangerous_syscalls().len(),
+                allowed = allowed_syscalls(io_uring_active).len(),
+                hard_denied = dangerous_syscalls(io_uring_active).len(),
+                io_uring = io_uring_active,
                 "seccomp allow-list enforced (unlisted → EPERM; exploitation set → KILL)"
             );
             Ok(())
@@ -67,14 +74,15 @@ fn apply(filter: SeccompFilter) -> anyhow::Result<()> {
     let program: BpfProgram = filter
         .try_into()
         .map_err(|e| anyhow::anyhow!("compiling seccomp BPF: {e}"))?;
-    apply_filter_all_threads(&program).map_err(|e| anyhow::anyhow!("applying seccomp filter: {e}"))?;
+    apply_filter_all_threads(&program)
+        .map_err(|e| anyhow::anyhow!("applying seccomp filter: {e}"))?;
     Ok(())
 }
 
 /// The allow-list filter: listed syscalls → ALLOW, everything else → `mismatch`
 /// (EPERM in enforce, LOG in log mode).
-fn build_filter(mismatch: SeccompAction) -> anyhow::Result<SeccompFilter> {
-    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = allowed_syscalls()
+fn build_filter(mismatch: SeccompAction, io_uring_active: bool) -> anyhow::Result<SeccompFilter> {
+    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = allowed_syscalls(io_uring_active)
         .into_iter()
         .map(|nr| (nr, Vec::new()))
         .collect();
@@ -84,8 +92,8 @@ fn build_filter(mismatch: SeccompAction) -> anyhow::Result<SeccompFilter> {
 
 /// The hard-deny filter: the exploitation set → KILL_PROCESS, everything else →
 /// ALLOW (so this filter only ever escalates the dangerous syscalls).
-fn build_kill_filter() -> anyhow::Result<SeccompFilter> {
-    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = dangerous_syscalls()
+fn build_kill_filter(io_uring_active: bool) -> anyhow::Result<SeccompFilter> {
+    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = dangerous_syscalls(io_uring_active)
         .into_iter()
         .map(|nr| (nr, Vec::new()))
         .collect();
@@ -112,7 +120,7 @@ fn target_arch() -> seccompiler::TargetArch {
 /// the Gateway correct. Arch-specific legacy syscalls (present only on x86_64) are
 /// cfg-gated; aarch64 reaches the same behaviour through the `*at`/`*2` variants,
 /// which are in the common set.
-fn allowed_syscalls() -> Vec<libc::c_long> {
+fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
     let mut v = vec![
         // ---- byte I/O + file descriptors ----
         libc::SYS_read,
@@ -289,6 +297,16 @@ fn allowed_syscalls() -> Vec<libc::c_long> {
         libc::SYS_setrlimit,
     ]);
 
+    // io_uring is a known sandbox-escape primitive; only allow it when the reactor
+    // is actually selected (otherwise it is in the hard-deny set).
+    if io_uring_active {
+        v.extend_from_slice(&[
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ]);
+    }
+
     v
 }
 
@@ -297,13 +315,16 @@ fn allowed_syscalls() -> Vec<libc::c_long> {
 /// via `clone`/`clone3` flags is left to the capability drop + `no_new_privs`
 /// (which make it impossible without CAP_SYS_ADMIN) rather than argument-filtering
 /// the thread-spawn path the runtime depends on.
-fn dangerous_syscalls() -> Vec<libc::c_long> {
+fn dangerous_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
     let mut v = vec![
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
+        // Cross-process memory manipulation the Gateway never does.
+        libc::SYS_process_madvise,
+        libc::SYS_move_pages,
         libc::SYS_kexec_load,
         libc::SYS_kexec_file_load,
         libc::SYS_init_module,
@@ -342,6 +363,16 @@ fn dangerous_syscalls() -> Vec<libc::c_long> {
         libc::SYS_uselib,
     ]);
 
+    // Hard-deny io_uring unless the reactor is actually selected (a favourite
+    // exploit/sandbox-escape primitive). When active it moves to the allow-list.
+    if !io_uring_active {
+        v.extend_from_slice(&[
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ]);
+    }
+
     v
 }
 
@@ -351,28 +382,42 @@ mod tests {
 
     #[test]
     fn allow_and_deny_sets_are_disjoint() {
-        let allow = allowed_syscalls();
-        for d in dangerous_syscalls() {
-            assert!(
-                !allow.contains(&d),
-                "syscall {d} is in BOTH the allow-list and the hard-deny set"
-            );
+        for io_uring in [false, true] {
+            let allow = allowed_syscalls(io_uring);
+            for d in dangerous_syscalls(io_uring) {
+                assert!(
+                    !allow.contains(&d),
+                    "syscall {d} is in BOTH the allow-list and the hard-deny set (io_uring={io_uring})"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn io_uring_syscalls_are_gated_on_the_backend() {
+        // Off (default): io_uring is hard-denied, not allowed.
+        assert!(dangerous_syscalls(false).contains(&libc::SYS_io_uring_setup));
+        assert!(!allowed_syscalls(false).contains(&libc::SYS_io_uring_enter));
+        // On: it moves to the allow-list and out of the kill set.
+        assert!(allowed_syscalls(true).contains(&libc::SYS_io_uring_enter));
+        assert!(!dangerous_syscalls(true).contains(&libc::SYS_io_uring_setup));
     }
 
     #[test]
     fn filters_compile() {
         // The BPF must assemble for the host arch (catches a bad syscall number or
         // an oversized program) without installing anything.
-        let allow = build_filter(SeccompAction::Errno(libc::EPERM as u32)).unwrap();
-        let _: BpfProgram = allow.try_into().unwrap();
-        let kill = build_kill_filter().unwrap();
-        let _: BpfProgram = kill.try_into().unwrap();
+        for io_uring in [false, true] {
+            let allow = build_filter(SeccompAction::Errno(libc::EPERM as u32), io_uring).unwrap();
+            let _: BpfProgram = allow.try_into().unwrap();
+            let kill = build_kill_filter(io_uring).unwrap();
+            let _: BpfProgram = kill.try_into().unwrap();
+        }
     }
 
     #[test]
     fn essential_syscalls_present() {
-        let allow = allowed_syscalls();
+        let allow = allowed_syscalls(false);
         for nr in [
             libc::SYS_read,
             libc::SYS_write,

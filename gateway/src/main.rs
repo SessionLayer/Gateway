@@ -10,6 +10,7 @@
 //! `ssh.listen_addr` is set **and** the Gateway holds a CP identity (fail closed).
 
 use clap::{Parser, Subcommand, ValueEnum};
+use gateway::hardening;
 use gateway_core::{
     agent,
     asyncio::{self, IoBackend},
@@ -19,8 +20,6 @@ use gateway_core::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-
-mod hardening;
 
 /// `--version` output: SemVer plus the supported CP <-> Gateway protocol range.
 const VERSION: &str = concat!(
@@ -75,15 +74,18 @@ impl From<BackendArg> for IoBackend {
 }
 
 fn main() -> anyhow::Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
     match cli.command {
+        // The daemon path installs its subscriber (with the optional OTel layer)
+        // inside the runtime via `telemetry::init`; the print-and-exit subcommands
+        // just need plain fmt logging.
         Some(Command::Health) => {
+            init_tracing();
             println!("{}", serde_json::to_string_pretty(&health::report())?);
             Ok(())
         }
         Some(Command::IoBackend { request }) => {
+            init_tracing();
             let requested = IoBackend::from(request);
             let resolved = asyncio::select_io(requested).backend();
             println!("requested {requested:?} -> resolved {resolved:?}");
@@ -106,11 +108,37 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     // default). Fail closed on a named-but-bad file rather than silently running the default.
     let cfg = GatewayConfig::load(config_path.as_deref())?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    // Part B (NFR-5): disable coredumps FIRST — before a listener binds or any
+    // secret is handled — so a crash can never spill SSH plaintext / the inner
+    // key to a core file, and every later thread inherits it.
+    hardening::disable_coredumps(&cfg.hardening)?;
+
+    // Resolve the reactor before building the runtime: it gates the seccomp
+    // io_uring syscalls (allowed only when actually selected) and it is cheap +
+    // side-effect-free to resolve twice (again inside for logging).
+    let io_uring_active = matches!(
+        asyncio::select_io(cfg.io_backend).backend(),
+        IoBackend::Uring
+    );
+
+    // Landlock's `restrict_self` has no TSYNC, so a worker is only confined if the
+    // domain is set on ITS thread — apply it per worker at spawn. Privilege drop
+    // (setxid) + seccomp (TSYNC) instead reach every thread later from `apply`.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if cfg.hardening.landlock.enabled {
+        let ll = cfg.hardening.landlock.clone();
+        builder.on_thread_start(move || hardening::confine_thread_for_landlock(&ll));
+    }
+    let runtime = builder.build()?;
 
     runtime.block_on(async {
+        // Install the tracing subscriber + optional OTLP export layer (Session
+        // Twenty-One, §14). Held for the runtime lifetime; its drop flushes and
+        // shuts the exporter so a clean exit does not lose the last spans. Must be
+        // inside the runtime (the batch exporter spawns on tokio).
+        let _telemetry = gateway_core::telemetry::init();
+
         let io = asyncio::select_io(cfg.io_backend);
         let report = health::report();
 
@@ -165,7 +193,7 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         // aborts startup (a kernel-capability gap degrades with a warning inside the
         // step). Applied here rather than in `gateway-core` so the library's
         // in-process integration tests never sandbox their own runner.
-        hardening::apply(&cfg.hardening)?;
+        hardening::apply(&cfg.hardening, io_uring_active)?;
 
         tracing::info!("awaiting shutdown signal (SIGTERM / Ctrl-C)");
         let mut sd = shutdown_rx;

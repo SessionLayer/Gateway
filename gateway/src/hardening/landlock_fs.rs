@@ -27,7 +27,10 @@ use std::path::Path;
 /// BestEffort mode, degrade cleanly on older kernels.
 const LANDLOCK_ABI: ABI = ABI::V1;
 
-pub fn confine(cfg: &LandlockConfig) -> anyhow::Result<()> {
+/// Confine the calling thread. `log_status` is set only for the one main-thread
+/// call; the per-worker `on_thread_start` calls pass `false` to avoid N identical
+/// status lines (one per runtime thread).
+pub fn confine(cfg: &LandlockConfig, log_status: bool) -> anyhow::Result<()> {
     let read_access = AccessFs::from_read(LANDLOCK_ABI);
     let all_access = AccessFs::from_all(LANDLOCK_ABI);
 
@@ -60,24 +63,26 @@ pub fn confine(cfg: &LandlockConfig) -> anyhow::Result<()> {
     }
 
     let status = created.restrict_self().context("landlock: restrict_self")?;
-    match status.ruleset {
-        RulesetStatus::FullyEnforced => {
-            tracing::info!(
-                read_only = cfg.read_only_paths.len(),
-                read_write = cfg.read_write_paths.len(),
-                "Landlock filesystem confinement fully enforced"
-            );
-        }
-        RulesetStatus::PartiallyEnforced => {
-            tracing::warn!(
-                "Landlock partially enforced (older kernel ABI subset); filesystem confinement is active"
-            );
-        }
-        RulesetStatus::NotEnforced => {
-            // Kernel-capability gap — documented Accepted-Risk degrade.
-            tracing::warn!(
-                "Landlock is unavailable on this kernel (no LSM support); filesystem confinement DISABLED (Accepted-Risk) — rely on the container read-only rootfs + dropped capabilities"
-            );
+    if log_status {
+        match status.ruleset {
+            RulesetStatus::FullyEnforced => {
+                tracing::info!(
+                    read_only = cfg.read_only_paths.len(),
+                    read_write = cfg.read_write_paths.len(),
+                    "Landlock filesystem confinement fully enforced"
+                );
+            }
+            RulesetStatus::PartiallyEnforced => {
+                tracing::warn!(
+                    "Landlock partially enforced (older kernel ABI subset); filesystem confinement is active"
+                );
+            }
+            RulesetStatus::NotEnforced => {
+                // Kernel-capability gap — documented Accepted-Risk degrade.
+                tracing::warn!(
+                    "Landlock is unavailable on this kernel (no LSM support); filesystem confinement DISABLED (Accepted-Risk) — rely on the container read-only rootfs + dropped capabilities"
+                );
+            }
         }
     }
     Ok(())

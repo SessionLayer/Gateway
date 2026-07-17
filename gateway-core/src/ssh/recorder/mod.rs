@@ -133,8 +133,10 @@ struct Capture<K: Eq + std::hash::Hash + Copy> {
     frame_size: usize,
     /// Plaintext (asciicast bytes) staged before the next frame is sealed. Held in
     /// a scrub-on-drop buffer so it never lingers in freed heap (Tier-0, §15); the
-    /// data-key cipher schedule is likewise zeroized (aes-gcm `zeroize`). Transient
-    /// per-event JSON copies are a documented coredump/swap-only residual (S18).
+    /// data-key cipher schedule is likewise zeroized (aes-gcm `zeroize`). The
+    /// per-event line + chunker carry buffers are now scrub-on-drop too (S21,
+    /// F-recorder-plaintext-zeroize — see [`asciicast`]); the only residual is
+    /// library growth scratch (serde_json), covered by the process coredump-disable.
     pending_pt: Zeroizing<Vec<u8>>,
     channels: HashMap<K, ChannelRec>,
     sftp_audit: Vec<FileTransferAudit>,
@@ -199,7 +201,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
         self.header_written = true;
         let w = if cols == 0 { 80 } else { cols };
         let h = if rows == 0 { 24 } else { rows };
-        self.push_asciicast(asciicast::header_line(w, h, self.started_unix))
+        self.push_asciicast(&asciicast::header_line(w, h, self.started_unix))
     }
 
     fn open_channel(&mut self, channel: K, kind: RecChannelKind) -> Result<(), String> {
@@ -221,10 +223,11 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                 );
                 if let Some(cmd) = command {
                     // Record the exec command line as an input event (ALWAYS — even
-                    // for a legacy scp-over-exec, whose content is ALSO captured).
-                    let text = String::from_utf8_lossy(&cmd).into_owned();
+                    // for a legacy scp-over-exec, whose content is ALSO captured). The
+                    // command may itself be sensitive, so the transient copy scrubs.
+                    let text = Zeroizing::new(String::from_utf8_lossy(&cmd).into_owned());
                     let line = asciicast::event_line(self.elapsed(), EventCode::Input, &text);
-                    self.push_asciicast(line)?;
+                    self.push_asciicast(&line)?;
                 }
             }
             RecChannelKind::Sftp => {
@@ -257,8 +260,9 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                 if !text.is_empty() {
                     lines.push(asciicast::event_line(elapsed, code, &text));
                 }
-                // ADDITIVELY decode a legacy scp-over-exec transfer — only the
-                // PRIMARY data stream (never stderr; #6) is protocol bytes.
+                drop(text); // scrub the transient chunk plaintext promptly
+                            // ADDITIVELY decode a legacy scp-over-exec transfer — only the
+                            // PRIMARY data stream (never stderr; #6) is protocol bytes.
                 let audits = match scp {
                     Some(d) if ext.is_none() => d.feed(direction, data),
                     _ => Vec::new(),
@@ -278,7 +282,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
             None => (Vec::new(), Vec::new()),
         };
         for l in lines {
-            self.push_asciicast(l)?;
+            self.push_asciicast(&l)?;
         }
         for a in audits {
             self.push_audit(a)?;
@@ -293,7 +297,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
         ) {
             let data = format!("{cols}x{rows}");
             let line = asciicast::event_line(self.elapsed(), EventCode::Resize, &data);
-            self.push_asciicast(line)?;
+            self.push_asciicast(&line)?;
         }
         Ok(())
     }
@@ -311,12 +315,12 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
             } => {
                 if let Some(t) = out.flush() {
                     let r =
-                        self.push_asciicast(asciicast::event_line(elapsed, EventCode::Output, &t));
+                        self.push_asciicast(&asciicast::event_line(elapsed, EventCode::Output, &t));
                     self.note_push(r);
                 }
                 if let Some(t) = inp.flush() {
                     let r =
-                        self.push_asciicast(asciicast::event_line(elapsed, EventCode::Input, &t));
+                        self.push_asciicast(&asciicast::event_line(elapsed, EventCode::Input, &t));
                     self.note_push(r);
                 }
                 if let Some(mut d) = scp {
@@ -363,9 +367,9 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
         }
     }
 
-    fn push_asciicast(&mut self, line: Vec<u8>) -> Result<(), String> {
-        self.chain.extend(&line);
-        self.pending_pt.extend_from_slice(&line);
+    fn push_asciicast(&mut self, line: &[u8]) -> Result<(), String> {
+        self.chain.extend(line);
+        self.pending_pt.extend_from_slice(line);
         self.seal_ready_frames()
     }
 
@@ -383,7 +387,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
     fn push_audit(&mut self, a: FileTransferAudit) -> Result<(), String> {
         let label = audit_marker_label(&a);
         let line = asciicast::event_line(self.elapsed(), EventCode::Marker, &label);
-        self.push_asciicast(line)?;
+        self.push_asciicast(&line)?;
         self.sftp_audit.push(a);
         Ok(())
     }
@@ -424,16 +428,20 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
 /// The canonical marker label for a file-transfer audit (an asciicast `m` event
 /// payload). A replay verifier reconstructs the file-transfer records from these,
 /// and the hash-chain (over the sealed stream) commits to them.
-fn audit_marker_label(a: &FileTransferAudit) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "type": "file-transfer",
-        "operation": a.operation,
-        "path": a.path,
-        "direction": a.direction,
-        "size": a.size,
-        "sha256": a.sha256,
-    }))
-    .expect("audit marker serializes")
+fn audit_marker_label(a: &FileTransferAudit) -> Zeroizing<String> {
+    // The label carries the transferred path — treat as sensitive; scrub the
+    // transient copy once folded into the sealed marker stream.
+    Zeroizing::new(
+        serde_json::to_string(&serde_json::json!({
+            "type": "file-transfer",
+            "operation": a.operation,
+            "path": a.path,
+            "direction": a.direction,
+            "size": a.size,
+            "sha256": a.sha256,
+        }))
+        .expect("audit marker serializes"),
+    )
 }
 
 /// The per-session recorder handed to the SSH handler and (upcast) to the bridge.

@@ -1,7 +1,23 @@
 # F-innerkey-zeroize-1: inner private key survives in un-zeroized transient copies (PEM round-trip + Arc move)
 - Severity: low
-- Status: Accepted-Risk
+- Status: Verified-Fixed
 - Area: crypto
+
+## S21 resolution (Verified-Fixed) — compensating control delivered
+The S18 disposition was **Accepted-Risk pending the S18 Tier-0 memory hardening**
+named below as the compensating control. **Session Twenty-One delivers it**, so the
+finding closes as Verified-Fixed:
+- The load-bearing scalar **is** scrubbed on drop — verified against the crate:
+  `ssh-key` 0.6.7 **and** 0.7.0-rc.11 `EcdsaPrivateKey::drop` calls `self.bytes.zeroize()`.
+  The `innerleg.rs` comment has been corrected to state this accurately (it had
+  wrongly claimed no scrub).
+- The residual (un-scrubbed `serde_json`/`ssh_key` encode-decode scratch + moved-from
+  stack slot across the 0.6↔0.7 hand-off, [[F-sshkey-dup-1]]) is now covered by
+  `hardening::coredump` (`PR_SET_DUMPABLE=0` + `RLIMIT_CORE=0`, default-on), **proven**
+  by `tests/hardening_e2e.rs` (`coredumps_disabled_rlimit_zero` +
+  `forced_crash_produces_no_core_with_secret`). Swap remains an operational residual
+  (disable/encrypt swap on sensitive fleets — RUNBOOK/`deploy/`); the coredump vector
+  that made this finding actionable is closed. See [[F-coredump-1]].
 
 ## Summary (T3: security-reviewer — inner-key custody, Tier-0 zeroization)
 Custody of the inner-leg private key is **provably correct at the trust boundary**:

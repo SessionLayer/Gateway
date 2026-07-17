@@ -16,6 +16,9 @@ workspace = true
 default = []
 # Propagate the io_uring reactor selection to the core library.
 io-uring = ["gateway-core/io-uring"]
+# Gates the test-only hardening canary binary out of release builds. The gate's
+# `--all-features` enables it, so the per-PR nextest builds + spawns it.
+hardening-canary = []
 
 [dependencies]
 gateway-core = { workspace = true }
@@ -55,27 +58,21 @@ path = "src/main.rs"
 name = "handshake-smoke"
 path = "src/bin/handshake-smoke.rs"
 
-# The hardened real-binary E2E (tests/hardening_e2e.rs) spawns THIS binary with
-# the full hardening profile active and drives shell/exec/sftp through it against
-# a real Docker node, proving the seccomp/Landlock/egress/coredump profiles do not
-# break the SSH data path. It reuses gateway-core's MockCp + node fixture via a
-# `#[path]` include, so it needs gateway-core's test-support dependency set.
+# Test-only: applies the REAL hardening profile to ITSELF, then exercises the
+# data path / attempts a forbidden syscall / forces a crash — so the per-PR
+# nextest (tests/hardening_e2e.rs) can prove the seccomp/Landlock/coredump
+# profile is correct in a subprocess without sandboxing the test runner. Kept out
+# of release builds via `required-features`.
+[[bin]]
+name = "hardening-canary"
+path = "src/bin/hardening-canary.rs"
+required-features = ["hardening-canary"]
+
+# The per-PR hardened proof (tests/hardening_e2e.rs) spawns `hardening-canary`
+# (the REAL seccomp/Landlock/coredump profile) and asserts the data-path syscalls
+# succeed, an execve is KILLed, and a forced crash yields no core with secrets.
+# The authoritative full-session proof (real CP+node+binary under the profile) is
+# the full-stack harness under FS_HARDENING=full.
 [dev-dependencies]
-gateway-core = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
-tokio-stream = { workspace = true }
-tonic = { workspace = true }
-anyhow = { workspace = true }
-serde_json = { workspace = true }
-rcgen = { workspace = true, features = ["x509-parser"] }
-ssh-key = { workspace = true }
-rand_core = { workspace = true }
-rustls = { workspace = true }
-p256 = { workspace = true }
-hkdf = { workspace = true }
-sha2 = { workspace = true }
-aes-gcm = { workspace = true }
-hmac = "0.13"
-zeroize = { workspace = true }
+libc = "0.2"
 tempfile = "3"
-testcontainers = "0.27"

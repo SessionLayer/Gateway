@@ -147,7 +147,16 @@ impl InnerClient {
             Ok(r) => r.map_err(|e| InnerLegError::Handshake(e.to_string())),
             Err(_) => Err(InnerLegError::HandshakeTimeout),
         };
-        drop(key); // zeroize the inner private key immediately after the handshake
+        // Drop the inner private key the instant the handshake no longer needs it,
+        // minimizing its residency (F-innerkey-zeroize). This is the last `Arc`
+        // ref (the auth future's clone is already released), so the drop runs
+        // `ssh_key::EcdsaPrivateKey`'s zeroizing `Drop`, scrubbing the P-256
+        // scalar; the source PEM is `Zeroizing`. The residual — un-scrubbed
+        // transient encode/decode scratch across the ssh_key 0.6↔0.7 PEM hand-off
+        // ([[F-sshkey-dup-1]]) — is library-internal, reachable only via a
+        // coredump/swap, and now covered by the S21 process hardening
+        // (PR_SET_DUMPABLE=0 + RLIMIT_CORE=0, `hardening::coredump`, NFR-5).
+        drop(key);
         if !auth?.success() {
             return Err(InnerLegError::AuthRejected);
         }
