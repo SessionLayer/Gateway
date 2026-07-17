@@ -415,7 +415,9 @@ launch_gateway() {
   RUST_LOG="${GW_RUST_LOG:-info}" "$GATEWAY_BIN" --config "$WORKDIR/gateway.json" > "$WORKDIR/gateway.log" 2>&1 &
   GW_PID=$!; PIDS+=("$GW_PID")
   local deadline=$((SECONDS + 180))
-  until grep -q "outer SSH leg started" "$WORKDIR/gateway.log" 2>/dev/null; do
+  # Wait for the accept loop to be up — which, post-R3, is AFTER hardening is
+  # applied (bind→apply→serve), so this proves a session runs under the profile.
+  until grep -q "outer SSH leg listening" "$WORKDIR/gateway.log" 2>/dev/null; do
     kill -0 "$GW_PID" 2>/dev/null || { tail -40 "$WORKDIR/gateway.log" >&2; die "Gateway exited during startup (enrollment?)"; }
     [[ $SECONDS -lt $deadline ]] || { tail -40 "$WORKDIR/gateway.log" >&2; die "Gateway outer leg never started"; }
     sleep 1
