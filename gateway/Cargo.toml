@@ -16,6 +16,9 @@ workspace = true
 default = []
 # Propagate the io_uring reactor selection to the core library.
 io-uring = ["gateway-core/io-uring"]
+# Gates the test-only hardening canary binary out of release builds. The gate's
+# `--all-features` enables it, so the per-PR nextest builds + spawns it.
+hardening-canary = []
 
 [dependencies]
 gateway-core = { workspace = true }
@@ -26,6 +29,26 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 
+# Tier-0 runtime self-hardening (Session Twenty-One, NFR-5). Linux-only and
+# confined to the BINARY: the enforcement never enters `gateway-core`, so the
+# in-process integration tests never sandbox their own runner. Each crate
+# encapsulates its own `unsafe` FFI, so the workspace `forbid(unsafe_code)` lint
+# is upheld in our code.
+#   * nix        — the privilege drop (setgroups/setgid/setuid via the glibc/musl
+#                  all-threads `setxid` wrappers, correct under multi-thread tokio).
+#   * seccompiler — a PURE-Rust seccomp-bpf assembler (no libseccomp C toolchain).
+#   * landlock   — the official Rust bindings for the Landlock LSM (best-effort ABI).
+#   * libc       — arch-correct `SYS_*` syscall numbers for the seccomp allow-list.
+[target.'cfg(target_os = "linux")'.dependencies]
+#   * user      — setgroups/setgid/setuid (the glibc/musl all-threads setxid).
+#   * process   — prctl(PR_SET_DUMPABLE/PR_SET_NO_NEW_PRIVS/PR_SET_NAME) hardening.
+#   * resource  — setrlimit(RLIMIT_CORE, 0) to disable coredumps.
+#   * mman      — mlockall/MADV_DONTDUMP for key-buffer swap/dump hygiene (best-effort).
+nix = { version = "0.31", default-features = false, features = ["user", "process", "resource", "mman"] }
+seccompiler = "0.5"
+landlock = "0.4"
+libc = "0.2"
+
 [[bin]]
 name = "gateway"
 path = "src/main.rs"
@@ -34,3 +57,22 @@ path = "src/main.rs"
 [[bin]]
 name = "handshake-smoke"
 path = "src/bin/handshake-smoke.rs"
+
+# Test-only: applies the REAL hardening profile to ITSELF, then exercises the
+# data path / attempts a forbidden syscall / forces a crash — so the per-PR
+# nextest (tests/hardening_e2e.rs) can prove the seccomp/Landlock/coredump
+# profile is correct in a subprocess without sandboxing the test runner. Kept out
+# of release builds via `required-features`.
+[[bin]]
+name = "hardening-canary"
+path = "src/bin/hardening-canary.rs"
+required-features = ["hardening-canary"]
+
+# The per-PR hardened proof (tests/hardening_e2e.rs) spawns `hardening-canary`
+# (the REAL seccomp/Landlock/coredump profile) and asserts the data-path syscalls
+# succeed, an execve is KILLed, and a forced crash yields no core with secrets.
+# The authoritative full-session proof (real CP+node+binary under the profile) is
+# the full-stack harness under FS_HARDENING=full.
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"

@@ -87,7 +87,7 @@ impl LockFeedClientTask {
             .map_err(|_| "connect timeout".to_string())?
             .map_err(|e| e.to_string())?;
 
-        let mut client = LockFeedClient::new(channel);
+        let mut client = LockFeedClient::new(crate::telemetry::trace_channel(channel));
         let req = StreamLocksRequest {
             client: Some(version::component_info()),
         };

@@ -27,9 +27,22 @@ on:
         default: main
       topology:
         description: "core | agent | all"
-        default: all
+        default: core
+      fs_hardening:
+        description: "off | log | seccomp | full (the real-data-path under the Tier-0 profile)"
+        default: full
+  # Run the hardened profile on PRs that touch the data plane / hardening / harness,
+  # so the seccomp/Landlock allow-list is verified against the REAL data path (russh,
+  # rustls-ring, tonic mTLS, hyper WORM, splice) continuously — not only in the
+  # subprocess canary (F-2). Repo-relative paths (CI checks this repo out into Gateway/).
+  pull_request:
+    paths:
+      - "gateway/**"
+      - "gateway-core/**"
+      - "tests/fullstack/**"
+      - "deploy/**"
   schedule:
-    - cron: "0 6 * * *" # nightly integration on the merged main
+    - cron: "0 6 * * *" # nightly integration on the merged main (FS_HARDENING=full)
 
 permissions:
   contents: read
@@ -108,7 +121,10 @@ jobs:
       - name: Run the full-stack cross-repo E2E
         working-directory: Gateway
         env:
-          TOPOLOGY: ${{ github.event.inputs.topology || 'all' }}
+          TOPOLOGY: ${{ github.event.inputs.topology || 'core' }}
+          # The load-bearing Part A gate: the real session runs UNDER seccomp=enforce
+          # + Landlock (F-2). Non-dispatch runs (PR/nightly) default to full.
+          FS_HARDENING: ${{ github.event.inputs.fs_hardening || 'full' }}
         run: |
           set -euo pipefail
           CP_JAR="$(ls "$GITHUB_WORKSPACE"/ControlPlane-API/target/*.jar | grep -vE 'sources|javadoc' | head -1)"

@@ -20,10 +20,12 @@
       "handshake_timeout_secs": 10
     },
     "recorder": {
-      "require_https": false
+      "require_https": false,
+      "spool_memory_threshold_bytes": ${GW_SPOOL_THRESHOLD}
     }
   },
   "ha": {
     "mode": "single_instance"
-  }
+  },
+  "hardening": ${GW_HARDENING}
 }

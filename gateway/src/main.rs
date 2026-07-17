@@ -10,6 +10,7 @@
 //! `ssh.listen_addr` is set **and** the Gateway holds a CP identity (fail closed).
 
 use clap::{Parser, Subcommand, ValueEnum};
+use gateway::hardening;
 use gateway_core::{
     agent,
     asyncio::{self, IoBackend},
@@ -73,15 +74,18 @@ impl From<BackendArg> for IoBackend {
 }
 
 fn main() -> anyhow::Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
     match cli.command {
+        // The daemon path installs its subscriber (with the optional OTel layer)
+        // inside the runtime via `telemetry::init`; the print-and-exit subcommands
+        // just need plain fmt logging.
         Some(Command::Health) => {
+            init_tracing();
             println!("{}", serde_json::to_string_pretty(&health::report())?);
             Ok(())
         }
         Some(Command::IoBackend { request }) => {
+            init_tracing();
             let requested = IoBackend::from(request);
             let resolved = asyncio::select_io(requested).backend();
             println!("requested {requested:?} -> resolved {resolved:?}");
@@ -104,11 +108,37 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     // default). Fail closed on a named-but-bad file rather than silently running the default.
     let cfg = GatewayConfig::load(config_path.as_deref())?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    // Part B (NFR-5): disable coredumps FIRST — before a listener binds or any
+    // secret is handled — so a crash can never spill SSH plaintext / the inner
+    // key to a core file, and every later thread inherits it.
+    hardening::disable_coredumps(&cfg.hardening)?;
+
+    // Resolve the reactor before building the runtime: it gates the seccomp
+    // io_uring syscalls (allowed only when actually selected) and it is cheap +
+    // side-effect-free to resolve twice (again inside for logging).
+    let io_uring_active = matches!(
+        asyncio::select_io(cfg.io_backend).backend(),
+        IoBackend::Uring
+    );
+
+    // Landlock's `restrict_self` has no TSYNC, so a worker is only confined if the
+    // domain is set on ITS thread — apply it per worker at spawn. Privilege drop
+    // (setxid) + seccomp (TSYNC) instead reach every thread later from `apply`.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if cfg.hardening.landlock.enabled {
+        let ll = cfg.hardening.landlock.clone();
+        builder.on_thread_start(move || hardening::confine_thread_for_landlock(&ll));
+    }
+    let runtime = builder.build()?;
 
     runtime.block_on(async {
+        // Install the tracing subscriber + optional OTLP export layer (Session
+        // Twenty-One, §14). Held for the runtime lifetime; its drop flushes and
+        // shuts the exporter so a clean exit does not lose the last spans. Must be
+        // inside the runtime (the batch exporter spawns on tokio).
+        let _telemetry = gateway_core::telemetry::init();
+
         let io = asyncio::select_io(cfg.io_backend);
         let report = health::report();
 
@@ -144,9 +174,17 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         });
         let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
 
+        // Listeners are BOUND here but their accept loops are NOT spawned yet — each
+        // `start_*` pushes a deferred "serve" closure so that no connection is served
+        // until AFTER hardening is applied (bind → drop → harden → serve, R3): on the
+        // multi-thread runtime an accept loop spawned before `apply()` could take a
+        // connection while still un-seccomp'd / un-Landlock'd (and, on the systemd :22
+        // path, still root).
+        let mut serves: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+
         // Outer SSH leg (Session Seven): started only when configured AND the
         // Gateway holds a CP mTLS identity to delegate auth to (fail closed).
-        let outer = start_outer_leg(&cfg, renew.as_ref(), drain_rx.clone()).await?;
+        let outer = start_outer_leg(&cfg, renew.as_ref(), drain_rx.clone(), &mut serves).await?;
 
         // Readiness surface (Session Fifteen): `ready` until we start draining. A
         // separate `readyz_stop` keeps the /readyz listener alive THROUGH the drain (so
@@ -154,7 +192,23 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(true);
         let (readyz_stop_tx, readyz_stop_rx) = tokio::sync::watch::channel(false);
         if !cfg.ha.drain.readyz_addr.is_empty() {
-            ha::readiness::spawn(cfg.ha.drain.readyz_addr.clone(), ready_rx, readyz_stop_rx);
+            let addr = cfg.ha.drain.readyz_addr.clone();
+            serves.push(Box::new(move || {
+                ha::readiness::spawn(addr, ready_rx, readyz_stop_rx);
+            }));
+        }
+
+        // Tier-0 self-hardening (Session Twenty-One, NFR-5): every listener is now
+        // bound, so drop privileges, confine the filesystem (Landlock), and install
+        // the seccomp filter. Fail-closed — a requested step that cannot be applied
+        // aborts startup (a kernel-capability gap degrades with a warning inside the
+        // step). Applied here rather than in `gateway-core` so the library's
+        // in-process integration tests never sandbox their own runner.
+        hardening::apply(&cfg.hardening, io_uring_active)?;
+
+        // Sandbox is in place — NOW start serving (R3).
+        for serve in serves {
+            serve();
         }
 
         tracing::info!("awaiting shutdown signal (SIGTERM / Ctrl-C)");
@@ -410,6 +464,7 @@ async fn start_outer_leg(
     cfg: &GatewayConfig,
     renew: Option<&identity::RenewHandle>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    serves: &mut Vec<Box<dyn FnOnce() + Send>>,
 ) -> anyhow::Result<Option<OuterLeg>> {
     if cfg.ssh.listen_addr.is_empty() {
         return Ok(None);
@@ -470,9 +525,21 @@ async fn start_outer_leg(
     // Session Nine: the real session recorder (asciicast v2 + SFTP/SCP decode +
     // customer-key encryption + hash-chained WORM upload). Reuses the one CP
     // client; reads the optional upload-CA up front (fail closed on misconfig).
+    let mut recorder_cfg = cfg.ssh.recorder.clone();
+    if recorder_cfg.spool_dir.is_none() {
+        // Default the ciphertext spool into the data-dir (which IS in the Landlock
+        // read-write set), never `/tmp` — otherwise a large recording that spills
+        // over `spool_memory_threshold_bytes` hits EACCES under the hardened profile
+        // and tears the (strict-mode) session down mid-flight (F-1). Create it now.
+        let spool = cfg.data_dir.join("recording-spool");
+        std::fs::create_dir_all(&spool).map_err(|e| {
+            anyhow::anyhow!("creating recording spool dir {}: {e}", spool.display())
+        })?;
+        recorder_cfg.spool_dir = Some(spool);
+    }
     let recorder_factory = Arc::new(ssh::recorder::RecorderFactoryImpl::new(
         cpauth.clone(),
-        cfg.ssh.recorder.clone(),
+        recorder_cfg,
     )?);
     let finalize_tracker = ssh::recorder::FinalizeTracker::default();
 
@@ -486,6 +553,7 @@ async fn start_outer_leg(
         lock_set.clone(),
         snap_rx,
         shutdown.clone(),
+        serves,
     )
     .await?
     {
@@ -529,15 +597,18 @@ async fn start_outer_leg(
     };
 
     let server = ssh::bind(ssh_cfg, deps).await?;
-    tracing::info!(addr = %server.local_addr(), "outer SSH leg started");
+    tracing::info!(addr = %server.local_addr(), "outer SSH leg bound (serving after hardening)");
     let mut shutdown = shutdown;
-    tokio::spawn(async move {
-        server
-            .run(async move {
-                let _ = shutdown.wait_for(|v| *v).await;
-            })
-            .await;
-    });
+    // Defer the accept loop until after `hardening::apply()` (R3).
+    serves.push(Box::new(move || {
+        tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = shutdown.wait_for(|v| *v).await;
+                })
+                .await;
+        });
+    }));
     Ok(Some(OuterLeg {
         finalize_tracker,
         live_sessions,
@@ -560,6 +631,7 @@ async fn start_agent_transport(
     lock_set: Arc<ssh::locks::LockSet>,
     cred_watch: tokio::sync::watch::Receiver<cpauth::CredentialSnapshot>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    serves: &mut Vec<Box<dyn FnOnce() + Send>>,
 ) -> anyhow::Result<
     Option<(
         Arc<dyn ssh::connector::NodeConnector>,
@@ -627,13 +699,16 @@ async fn start_agent_transport(
     tracing::info!(addr = %local_addr, advertise = %advertise, peer_relay_addr = %peer_relay_addr, mode = ?cfg.ha.mode, "outbound-agent transport + HA peer relay started");
 
     let mut sd = shutdown.clone();
-    tokio::spawn(async move {
-        transport
-            .run(async move {
-                let _ = sd.wait_for(|v| *v).await;
-            })
-            .await;
-    });
+    // Defer the accept loop until after `hardening::apply()` (R3).
+    serves.push(Box::new(move || {
+        tokio::spawn(async move {
+            transport
+                .run(async move {
+                    let _ = sd.wait_for(|v| *v).await;
+                })
+                .await;
+        });
+    }));
 
     // The LOCAL agent connector (S14): shared by the router (local route) and the peer client
     // (the owner-side node dial-back that produces the byte stream to relay).

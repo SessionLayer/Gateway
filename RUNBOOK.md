@@ -210,3 +210,41 @@ The metrics framework is deferred (Accepted-Risk, per the S8/S12/S14 precedent).
 lands, use the structured logs: `event=peer_relay_serving` / `event=peer_relay_closed`
 (relay throughput as an owner), the `presence …` lines (ownership claim/standby/loss), and
 `outcome=node_unreachable reason=…` (fail-closed routing).
+
+## Tier-0 runtime hardening (Session Twenty-One; Design NFR-5)
+
+The Gateway hardens **itself** at startup — after binding its listeners it drops
+privileges, confines the filesystem with Landlock, and installs a seccomp syscall filter —
+and ships with a container / OS security-context layer that composes with it. All of it is
+OFF by default and enabled via the `hardening` config block; the deployment artifacts and
+the full config reference live in **[`deploy/README.md`](deploy/README.md)** (hardened
+Dockerfile, Kubernetes `securityContext` + egress NetworkPolicy, systemd unit).
+
+Operational notes:
+- **Roll out seccomp in stages.** Set `hardening.seccomp.mode` to `log` first, run a full
+  session, and confirm `dmesg`/auditd shows no unexpected `SECCOMP` audit line before
+  flipping to `enforce`. In `enforce`, an unlisted syscall returns `EPERM` (the op fails,
+  the process does not crash); the exploitation set (`execve`/`ptrace`/module-load/…) is
+  `KILL_PROCESS` — a `gateway` process that dies on one of those has attempted something it
+  never legitimately does (treat as a compromise signal, not a flake).
+- **Fail-closed vs degrade.** A requested step that cannot apply for an operator-controlled
+  reason (privilege drop while not root, unknown user, a rule the kernel rejects) **aborts
+  startup**. Only a kernel that lacks Landlock/seccomp entirely **degrades** with a loud
+  warning (Accepted-Risk) — on such a host, lean on the container read-only rootfs +
+  dropped capabilities.
+- **Landlock allow-set.** If you enable `hardening.landlock`, remember it confines *all*
+  filesystem access: a dynamically-linked binary must be allowed the library dirs
+  (`/lib`,`/lib64`,`/usr/lib` — `getaddrinfo`/`getpwnam` load `libnss_*.so` at runtime),
+  `/etc/resolv.conf`+`/etc/nsswitch.conf`+`/etc/hosts`, `/dev`, `/proc`, and the
+  CA/config/data paths. The recorder's ciphertext spool lives under the **data-dir**
+  (`data_dir/recording-spool`, in the read-write set) — a large session spills there,
+  never `/tmp`. A missing path denies that access (see the `deploy/` reference set).
+- **Coredumps are OFF by default** (`hardening.disable_coredumps`, `PR_SET_DUMPABLE=0`
+  + `RLIMIT_CORE=0`, re-asserted after the privilege drop) — so a crash leaves **no
+  core file** for post-mortem. Only a Rust `panic` (unwinding) leaves a backtrace in
+  the structured log; an `abort`/SIGSEGV/SIGSYS leaves nothing. To capture a core for a
+  **non-production** repro, set `hardening.disable_coredumps=false`. Belt-and-suspenders
+  for a paranoid host: `sysctl fs.suid_dumpable=0` and systemd-coredump `Storage=none`
+  (pipe `core_pattern` handlers ignore `RLIMIT_CORE`, so `PR_SET_DUMPABLE=0` is the real
+  gate). Swap is a separate exposure — disable or encrypt swap on the most sensitive
+  fleets.

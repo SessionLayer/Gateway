@@ -152,6 +152,11 @@ pub struct SshHandler {
     source_ip: IpAddr,
     /// The SessionLayer session id allocated for this connect.
     session_id: String,
+    /// The root OTel span for this connection (`gateway.session`, OTEL-CONTRACT §3).
+    /// Every CP RPC on this connection injects its W3C context; child spans
+    /// (`gateway.node.connect`/`host_verify`/`bridge_setup`) parent to it. Carries
+    /// IDs/enums/outcomes only — never plaintext/keys/tokens (OTEL-CONTRACT §5).
+    session_span: tracing::Span,
     /// The SSH username (client-supplied; parsed as `login%node`, never trusted
     /// as a principal, sanitized before logging).
     username: Option<String>,
@@ -267,10 +272,23 @@ impl SshHandler {
         conn: Arc<ConnState>,
         proxyjump_node: Option<String>,
     ) -> Self {
+        let session_id = new_session_id();
+        // The trace root. `correlation_id` defaults to `session_id` (OTEL-CONTRACT
+        // §1: the jit/break-glass ids that refine it are CP-side); `node_id`,
+        // `access_model` and `outcome` are recorded once known. NO secret fields.
+        let session_span = tracing::info_span!(
+            "gateway.session",
+            sessionlayer.session_id = %session_id,
+            sessionlayer.correlation_id = %session_id,
+            sessionlayer.node_id = tracing::field::Empty,
+            sessionlayer.access_model = tracing::field::Empty,
+            sessionlayer.outcome = tracing::field::Empty,
+        );
         Self {
             deps,
             source_ip,
-            session_id: new_session_id(),
+            session_id,
+            session_span,
             username: None,
             proxyjump_node,
             authenticated: None,
@@ -299,6 +317,13 @@ impl SshHandler {
 
     fn remember_user(&mut self, user: &str) {
         self.username = Some(user.to_string());
+    }
+
+    /// The `gateway.session` trace root (OTEL-CONTRACT §3), so the accept loop can
+    /// instrument the whole connection future with it — every callback + CP RPC then
+    /// runs inside this span and joins the one trace.
+    pub fn trace_span(&self) -> tracing::Span {
+        self.session_span.clone()
     }
 
     fn source_ip(&self) -> String {
@@ -815,6 +840,8 @@ impl SshHandler {
 
         // (5) Bridge: outer data → inner (via the write half, in `data`); inner →
         // outer via the pump task. The per-session recorder taps both directions.
+        let _bridge_setup =
+            tracing::info_span!(parent: &self.session_span, "gateway.bridge_setup").entered();
         let (read, write) = crate::ssh::innerleg::split_channel(inner_chan);
         self.writers.insert(channel, write);
         // Drive node→client through the outer channel's WRITE half (backpressured);
@@ -839,6 +866,7 @@ impl SshHandler {
             tap,
         ));
         self.pumps.insert(channel, pump);
+        self.session_span.record("sessionlayer.outcome", "allow");
         tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "bridged", "inner leg bridged; session flowing");
     }
 
@@ -1212,9 +1240,24 @@ impl SshHandler {
     /// no TOFU), and authenticate. Fail-closed with the §7.1 outcome at every step;
     /// a host-verification abort is generic to the user, specific in the log.
     async fn establish_inner(&self, authz: &Authorized) -> Result<InnerClient, SshOutcome> {
+        use tracing::Instrument;
+        // Stamp the trace root with the (non-secret) decision facts now that they
+        // are known (OTEL-CONTRACT §4).
+        self.session_span
+            .record("sessionlayer.node_id", sanitize(&authz.node.node_id));
+        self.session_span.record(
+            "sessionlayer.access_model",
+            access_model_label(authz.context.access_model),
+        );
         // The connector is selected per node (agentless dial vs outbound-agent
         // dial-back); everything below this line is identical either way (D21/D23).
-        let stream = match self.deps.connector.connect(&authz.dial).await {
+        let stream = match self
+            .deps
+            .connector
+            .connect(&authz.dial)
+            .instrument(tracing::info_span!(parent: &self.session_span, "gateway.node.connect", connector_kind = authz.dial.connector_kind))
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, connector_kind = authz.dial.connector_kind, error = %e, outcome = "node_unreachable", "node connect failed");
@@ -1274,7 +1317,9 @@ impl SshHandler {
 
         let verifier = HostVerifier::new(authz.trust.clone());
         let cfg = self.inner_leg_config();
-        match InnerClient::establish(stream, verifier, &authz.node.principal, cert, key, &cfg).await
+        match InnerClient::establish(stream, verifier, &authz.node.principal, cert, key, &cfg)
+            .instrument(tracing::info_span!(parent: &self.session_span, "gateway.host_verify"))
+            .await
         {
             Ok(inner) => {
                 tracing::info!(outcome = "host_verified", source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&authz.node.node_id), host_verified = ?inner.verified(), key_id = %sanitize(&signed.key_id), "inner leg established; node host identity verified (no TOFU)");
@@ -1337,6 +1382,8 @@ impl Handler for SshHandler {
         Ok(Auth::Accept)
     }
 
+    // `skip_all`: the public key + username never enter the span (OTEL-CONTRACT §5).
+    #[tracing::instrument(name = "gateway.outer_leg.auth", parent = &self.session_span, skip_all)]
     async fn auth_publickey(
         &mut self,
         user: &str,
@@ -1447,6 +1494,9 @@ impl Handler for SshHandler {
         }
     }
 
+    // `skip_all`: the KI response (which may carry an OTP / device code) never
+    // enters the span (OTEL-CONTRACT §5).
+    #[tracing::instrument(name = "gateway.outer_leg.auth", parent = &self.session_span, skip_all)]
     async fn auth_keyboard_interactive(
         &mut self,
         user: &str,
@@ -1857,6 +1907,17 @@ pub(crate) fn sanitize(s: &str) -> String {
         .filter(|c| !is_unsafe_display(*c))
         .take(256)
         .collect()
+}
+
+/// The `sessionlayer.access_model` span-attribute label (OTEL-CONTRACT §4). A safe,
+/// closed enum — never free-form CP text. UNSPECIFIED maps to `standing` (the N-1
+/// safe default, matching the mid-session-expiry handling).
+fn access_model_label(access_model: i32) -> &'static str {
+    match AccessModel::try_from(access_model) {
+        Ok(AccessModel::Jit) => "jit",
+        Ok(AccessModel::Breakglass) => "break_glass",
+        _ => "standing",
+    }
 }
 
 /// A random session id for this connect (opaque; not a UUID parser dependency).

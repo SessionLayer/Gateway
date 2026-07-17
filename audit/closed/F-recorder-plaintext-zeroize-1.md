@@ -1,7 +1,19 @@
 # F-recorder-plaintext-zeroize-1: transient per-event plaintext copies in the recorder are not zeroized
 - Severity: low
-- Status: Accepted-Risk
+- Status: Verified-Fixed
 - Area: crypto
+
+## S21 resolution (Verified-Fixed) — named residuals scrubbed + compensating control delivered
+Session Twenty-One closes both named residuals and delivers the compensating control:
+- **Residual (1) asciicast event strings** — `asciicast::event_line` now returns
+  `Zeroizing<Vec<u8>>` and `Utf8Chunker::push`/`flush` return `Zeroizing<String>`, so
+  the per-event plaintext copies are scrubbed on drop.
+- **Residual (2) `Utf8Chunker.pending`** — the incomplete-UTF-8 carry buffer is now
+  `Zeroizing<Vec<u8>>`.
+- The only remaining residual is `serde_json`'s own internal growth scratch (the
+  accepted [[F-zeroize-1]] class, genuinely unfixable without a custom serializer),
+  now covered by the delivered coredump suppression (`hardening::coredump`), **proven**
+  by `tests/hardening_e2e.rs`. See [[F-coredump-1]].
 
 ## Summary (Session Nine — recorder Tier-0 plaintext hygiene, §3/§15)
 The session recorder (`ssh/recorder/`) copies SSH session plaintext into a few
