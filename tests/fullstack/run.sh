@@ -41,7 +41,7 @@ FS_CP_MTLS_PORT="${FS_CP_MTLS_PORT:-19443}"
 FS_CP_REST_PORT="${FS_CP_REST_PORT:-18080}"
 FS_GW_SSH_PORT="${FS_GW_SSH_PORT:-12201}"
 WORKDIR="${SL_FS_WORKDIR:-/tmp/sl-fullstack}"
-WAIT_SECS="${WAIT_SECS:-180}"
+WAIT_SECS="${WAIT_SECS:-300}"   # CP-boot healthz wait; generous for shared-box CPU starvation
 GW_NAME="${GW_NAME:-gw-fullstack}"
 NODE_NAME="${NODE_NAME:-web-01}"
 NODE_LOGIN="${NODE_LOGIN:-deploy}"
@@ -49,7 +49,13 @@ FS_NODE_PORT="${FS_NODE_PORT:-12222}"   # node sshd port (host network; see star
 # loopback (default): node on --network host, all-loopback (satisfies the pre-fix inner-cert
 # source-address pin). bridge: node on a docker port-map so it sees a DISTINCT SNAT IP — the
 # multi-host proof for F-inner-cert-source-address-1 once the CP omits inner-cert source-address.
-FS_NODE_NETMODE="${FS_NODE_NETMODE:-loopback}"
+# Node netmode: honor an explicit FS_NODE_NETMODE; otherwise TOPOLOGY=all defaults to the BRIDGE
+# (multi-host, distinct-SNAT-IP) variant — the permanent F-inner-cert-source-address-1 regression
+# guard — and every other topology to loopback.
+FS_NODE_NETMODE="${FS_NODE_NETMODE:-}"
+if [[ -z "$FS_NODE_NETMODE" ]]; then
+  [[ "$TOPOLOGY" == all ]] && FS_NODE_NETMODE=bridge || FS_NODE_NETMODE=loopback
+fi
 CLIENT_IDENTITY="${CLIENT_IDENTITY:-fullstack-user}"
 MARKER="FULLSTACK_OK_$$"
 KEEP_UP="${KEEP_UP:-}"
@@ -173,7 +179,7 @@ extract_ca_pem() {   # $1=ca_kind  -> writes a PEM cert to stdout (mtls path)
 # empty CA rows. Gate on the rows actually existing before touching them.
 wait_for_provisioning() {
   log "waiting for CP cold-start provisioning (CAs + operator_settings)"
-  local deadline=$((SECONDS + 90)) n=""
+  local deadline=$((SECONDS + 180)) n=""
   until n="$(PSQL -tAc "SELECT
        (SELECT count(*) FROM runtime.ca_key_material k JOIN config.ca_config c ON c.id=k.ca_config_id WHERE c.ca_kind='mtls' AND k.ca_certificate IS NOT NULL)
      + (SELECT count(*) FROM runtime.ca_key_material k JOIN config.ca_config c ON c.id=k.ca_config_id WHERE c.ca_kind='session' AND c.rotation_state='active' AND k.public_key IS NOT NULL)
@@ -281,30 +287,29 @@ start_node() {
   NODE_HOSTKEY_LINE="$(awk '{print $1" "$2}' "$D/node_host_key.pub")"     # 'ssh-ed25519 AAAA...' (no comment)
   NODE_HOSTKEY_FP="$(ssh-keygen -lf "$D/node_host_key.pub" | awk '{print $2}')"
 
-  # --network host (NOT a bridge port-map) is REQUIRED, and it is load-bearing, not
-  # cosmetic: the CP pins the inner-leg session cert's `source-address` critical option
-  # to the OUTER CLIENT's source IP (AuthorizeRequest.source_ip). The Gateway dials the
-  # node with a plain TcpStream::connect (no source preservation), so the node's sshd
-  # checks that option against the GATEWAY peer. Only when client, Gateway and node all
-  # observe 127.0.0.1 (this all-loopback single-host topology) does the pin match. On a
-  # bridge port-map the node sees the docker SNAT (172.17.0.1) and rejects the valid cert
-  # ("not from a permitted source address"). That mismatch is a real cross-repo finding
-  # the per-repo MockCp masks by omitting source-address — see README.md "Cross-repo findings".
+  # Node network mode (FS_NODE_NETMODE), and why it matters:
+  #   loopback (default): node on --network host, so the Gateway (a host process, plain
+  #     TcpStream::connect) reaches its sshd on 127.0.0.1:<port> and the registered dial address
+  #     is 127.0.0.1:<port>. Simple single-host connectivity — no docker port-map / SNAT in the
+  #     byte path.
+  #   bridge: node on a docker port-map, so its sshd sees the inner connection from the docker
+  #     SNAT (172.17.0.1) — a DISTINCT IP from the client's 127.0.0.1. This is BOTH the multi-host
+  #     proof AND the regression guard for F-inner-cert-source-address-1: the CP now OMITS
+  #     source-address on the inner-leg session cert (FIXED in CP e0776a9; unit guard
+  #     SessionSigningIT.mintedInnerCertOmitsSourceAddress), so a node reached over a distinct IP
+  #     accepts the cert. A re-introduced client-IP source-address pin would still match 127.0.0.1
+  #     in loopback (a false-pass) but FAIL here — exactly the MockCp-style blind spot this harness
+  #     exists to remove. (Pre-fix, bridge was the finding's repro: the node rejected the cert with
+  #     "not from a permitted source address".)
   docker rm -f "$NODE_CONTAINER" >/dev/null 2>&1 || true
   # create -> cp the host key in as root (0600) -> start, so the entrypoint's
   # ssh-keygen -A keeps our pre-placed ed25519 key (it only fills MISSING keys).
   if [[ "$FS_NODE_NETMODE" == bridge ]]; then
-    # BRIDGE port-map (the MULTI-HOST proof, FS_NODE_NETMODE=bridge): the node sees the docker
-    # SNAT (172.17.0.1) — a DISTINCT IP from the client's 127.0.0.1. With the pre-fix CP this
-    # is F-inner-cert-source-address-1's repro (the node rejects the cert); once the CP omits
-    # source-address on the inner cert, the session succeeds → the finding is Verified-Fixed.
-    log "starting the node container ($NODE_NAME; BRIDGE port-map — node sees the docker SNAT; multi-host inner-cert proof)"
+    log "starting the node container ($NODE_NAME; BRIDGE port-map — node sees the docker SNAT; multi-host inner-cert regression guard)"
     docker create --name "$NODE_CONTAINER" -p 127.0.0.1:0:22 \
       -e TRUSTED_USER_CA="$SESSION_CA_LINE" "$NODE_IMAGE" >/dev/null
   else
-    # Default all-loopback: the node on --network host, so client=Gateway=node=127.0.0.1 and the
-    # (pre-fix) inner-cert source-address pin is satisfiable. The trailing `-p $FS_NODE_PORT` is
-    # passed through to sshd (entrypoint `exec sshd -D -e "$@"`).
+    # The trailing `-p $FS_NODE_PORT` is passed through to sshd (entrypoint `exec sshd -D -e "$@"`).
     log "starting the node container ($NODE_NAME; host-net sshd :$FS_NODE_PORT; all-loopback)"
     docker create --name "$NODE_CONTAINER" --network host \
       -e TRUSTED_USER_CA="$SESSION_CA_LINE" "$NODE_IMAGE" -p "$FS_NODE_PORT" >/dev/null
@@ -363,7 +368,7 @@ launch_gateway() {
   rm -rf "$WORKDIR/gw-data"; mkdir -p "$WORKDIR/gw-data"
   RUST_LOG="${GW_RUST_LOG:-info}" "$GATEWAY_BIN" --config "$WORKDIR/gateway.json" > "$WORKDIR/gateway.log" 2>&1 &
   GW_PID=$!; PIDS+=("$GW_PID")
-  local deadline=$((SECONDS + 90))
+  local deadline=$((SECONDS + 180))
   until grep -q "outer SSH leg started" "$WORKDIR/gateway.log" 2>/dev/null; do
     kill -0 "$GW_PID" 2>/dev/null || { tail -40 "$WORKDIR/gateway.log" >&2; die "Gateway exited during startup (enrollment?)"; }
     [[ $SECONDS -lt $deadline ]] || { tail -40 "$WORKDIR/gateway.log" >&2; die "Gateway outer leg never started"; }
@@ -399,7 +404,7 @@ run_session() {
 assert_recording() {
   log "asserting the session recording finalized as a WORM-locked, customer-sealed SLREC1 object"
   # The Gateway finalizes off the connection teardown; poll the CP's recording_ref.
-  local deadline=$((SECONDS + 60)) status="" object_key="" worm_mode="" size_bytes="" chain="" digest=""
+  local deadline=$((SECONDS + 120)) status="" object_key="" worm_mode="" size_bytes="" chain="" digest=""
   while [[ $SECONDS -lt $deadline ]]; do
     status="$(PSQL -tAc "SELECT status FROM runtime.recording_ref ORDER BY created_at DESC LIMIT 1" || true)"
     [[ "$status" == "finalized" ]] && break

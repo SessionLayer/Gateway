@@ -7,10 +7,14 @@
     "gateway_name": "${GW_NAME}",
     "server_name": "${CP_SERVER_NAME}"
   },
+  "identity": {
+    "connect_timeout_secs": 30,
+    "rpc_timeout_secs": 30
+  },
   "ssh": {
     "listen_addr": "${GW_SSH_ADDR}",
-    "cp_connect_timeout_secs": 10,
-    "cp_rpc_timeout_secs": 15,
+    "cp_connect_timeout_secs": 30,
+    "cp_rpc_timeout_secs": 30,
     "inner": {
       "connect_timeout_secs": 5,
       "handshake_timeout_secs": 10

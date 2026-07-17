@@ -90,37 +90,32 @@ unless `run.sh` asserts it.
 Finding a real cross-repo bug that the per-repo MockCp suites cannot is the whole point
 of this harness (the S14/S15 lesson). Surfaced so far:
 
-### F-inner-cert-source-address-1 (owner: ControlPlane-API) — HIGH
+### F-inner-cert-source-address-1 (owner: ControlPlane-API) — HIGH, **Verified-Fixed (CP e0776a9)**
 
-The real CP mints the **inner-leg session certificate** with a `source-address` critical
-option pinned to the **outer client's** source IP (`AuthorizeRequest.source_ip`, via
-`SessionSigningToken.sourceAddress()` → `CertificateProfiles.innerLegSessionCert`,
-`ca/cert/CertificateProfiles.java:63`). But that cert is presented **by the Gateway** to
-the node, and the Gateway dials the node with a plain `TcpStream::connect`
-(`gateway-core/src/ssh/connector.rs:186`, no source preservation) — so the node's sshd
-checks `source-address` against the **Gateway's** peer IP, not the client's. They only
-coincide in a single-host all-loopback topology (client, Gateway, node all `127.0.0.1`).
-In any multi-host / NAT deployment (and on a docker bridge port-map, where the node sees
-the SNAT `172.17.0.1`) the node **rejects the otherwise-valid, CA-trusted cert** with
-`Authentication tried for deploy with valid certificate but not from a permitted source
-address … Refused by certificate options`, and the Gateway surfaces the generic "node
-offline". Every per-repo real-node test (`docker_e2e.rs`, `recorder_it.rs`, …) passed
-because **MockCp omits `source-address`**, so the real CP's value had never been checked
-against a real node until this harness.
+Originally, the real CP minted the **inner-leg session certificate** with a `source-address`
+critical option pinned to the **outer client's** source IP (`AuthorizeRequest.source_ip`, via
+`SessionSigningToken.sourceAddress()` → `CertificateProfiles.innerLegSessionCert`). But that
+cert is presented **by the Gateway** to the node, and the Gateway dials the node with a plain
+`TcpStream::connect` (`gateway-core/src/ssh/connector.rs:186`, no source preservation) — so the
+node's sshd checked `source-address` against the **Gateway's** peer IP, not the client's. They
+only coincide in a single-host all-loopback topology. In any multi-host / NAT deployment (and
+on a docker bridge port-map, where the node sees the SNAT `172.17.0.1`) the node **rejected the
+otherwise-valid, CA-trusted cert** with `Authentication tried for deploy with valid certificate
+but not from a permitted source address … Refused by certificate options`, and the Gateway
+surfaced the generic "node offline". Every per-repo real-node test (`docker_e2e.rs`,
+`recorder_it.rs`, …) passed because **MockCp omits `source-address`**, so the real CP's value had
+never been checked against a real node until this harness — the whole point of the harness.
 
-Reproduced end-to-end: seed everything, register the node on a **bridge** port-map, and
-the inner leg fails with the sshd message above; move the node to `--network host` (all
-loopback) and the same session succeeds. `run.sh` therefore defaults to the node on the host
-network (`FS_NODE_NETMODE=loopback`) so client=Gateway=node=`127.0.0.1` and the pin is
-satisfiable — this both makes the headline path green AND is the minimal reproduction of the
-constraint. **Verified-Fixed proof:** once the CP omits `source-address` on the inner cert,
-re-run with `FS_NODE_NETMODE=bridge` (node on a docker port-map → it observes the SNAT
-`172.17.0.1`, a distinct IP from the client) and the session must now succeed — proving the
-multi-host case (this run FAILS against the pre-fix CP, which is the finding).
+**Fix (landed, CP e0776a9):** the inner (node-facing) cert now **omits `source-address`** — it
+is already session-bound, short-TTL, single-use, node-host-verified, and its key never leaves the
+Gateway (D2); source-IP enforcement stays on the outer leg + `Authorize` (Design §5.6, unaffected).
+Unit guard: CP `SessionSigningIT.mintedInnerCertOmitsSourceAddress`. (This is a deliberate
+deviation from the letter of Design §3.3 line 98 "source-address pinned" — the pin is
+unimplementable as written; flagged in RESULT with a recommendation to amend §3.3.)
 
-Proposed fix (CP team's call): the inner (node-facing) cert should not pin
-`source-address` to the client IP the node can never observe — either omit it on the inner
-cert (it is already session-bound, short-TTL, node-host-verified, and the key never leaves
-the Gateway), or pin it to the Gateway's egress identity. The outer-leg credential
-`source-address` (pin/OTP/cert, Design §5) is unaffected. Until fixed, agentless nodes are
-only reachable where they observe the client's exact source IP.
+**Live multi-host proof (this harness):** `FS_NODE_NETMODE=bridge` runs the node on a docker
+port-map so its sshd observes the SNAT `172.17.0.1` — a distinct IP from the client. Against the
+pre-fix CP this run **failed** (the finding's repro); against CP e0776a9 it **succeeds**, proving
+the fix for the multi-host case. This bridge variant is also the **regression guard**: a
+re-introduced client-IP `source-address` pin would still match `127.0.0.1` under the default
+`FS_NODE_NETMODE=loopback` (a false-pass, the MockCp-style blind spot) but fail here.
