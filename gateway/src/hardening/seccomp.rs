@@ -184,6 +184,12 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_utimensat,
         libc::SYS_fadvise64,
         libc::SYS_fchdir,
+        // Landlock self-confinement: a blocking-pool thread spawned AFTER seccomp is
+        // installed re-confines itself via `on_thread_start` — allow these so that
+        // self-confine actually runs (not merely inherits the parent's domain).
+        libc::SYS_landlock_create_ruleset,
+        libc::SYS_landlock_add_rule,
+        libc::SYS_landlock_restrict_self,
         // ---- memory ----
         libc::SYS_mmap,
         libc::SYS_munmap,

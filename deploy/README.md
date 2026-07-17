@@ -45,9 +45,13 @@ in-process privilege-drop-after-bind.
     // skipped with a warning.
     "read_only_paths": [
       "/etc/sessionlayer", "/etc/ssl/certs", "/etc/resolv.conf",
-      "/etc/hosts", "/etc/nsswitch.conf",
-      "/lib", "/lib64", "/usr/lib", "/usr/local/bin/gateway"
+      "/etc/hosts", "/etc/nsswitch.conf", "/run/systemd/resolve",
+      "/lib", "/lib64", "/usr/lib", "/usr/local/bin/gateway",
+      "/dev", "/proc"
     ],
+    // The data-dir must be read-write: it holds the credential AND the recorder's
+    // ciphertext spool (`data_dir/recording-spool`, where the daemon spills a large
+    // recording — a /tmp spool would be denied here and tear the session down).
     "read_write_paths": ["/var/lib/sessionlayer-gateway"]
   },
 

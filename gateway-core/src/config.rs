@@ -550,8 +550,11 @@ pub struct RecorderConfig {
     /// [`SshOutcome::RecordingUnavailable`]: crate::ssh::outcome::SshOutcome::RecordingUnavailable
     pub strict: bool,
     /// Directory for the **ciphertext** spool file (used once a recording exceeds
-    /// [`Self::spool_memory_threshold_bytes`]). `None` uses the system temp dir.
-    /// Plaintext is NEVER written here — only sealed frames (§3/§15).
+    /// [`Self::spool_memory_threshold_bytes`]). Plaintext is NEVER written here —
+    /// only sealed frames (§3/§15). `None` at the library level falls back to the
+    /// system temp dir, but the **daemon defaults it into a `data_dir` subpath** so
+    /// the spool lives inside the Landlock read-write set (a `/tmp` spool would be
+    /// denied under the hardened profile and tear the session down — F-1).
     pub spool_dir: Option<PathBuf>,
     /// Ciphertext bytes held in memory before spilling to a temp file. Enforced
     /// ALWAYS (a large recording spills even with no `spool_dir`), bounding Gateway

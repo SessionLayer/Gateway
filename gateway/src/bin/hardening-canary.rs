@@ -66,7 +66,9 @@ fn main() {
             let (soft, hard) =
                 nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
                     .unwrap_or_else(|e| fail(&format!("GETRLIMIT_FAIL: {e}")));
-            println!("RLIMIT_CORE soft={soft} hard={hard}");
+            let dumpable = nix::sys::prctl::get_dumpable()
+                .unwrap_or_else(|e| fail(&format!("GETDUMPABLE_FAIL: {e}")));
+            println!("RLIMIT_CORE soft={soft} hard={hard} DUMPABLE={dumpable}");
         }
         // Coredump proof: enable core dumps, put a secret in memory, disable
         // coredumps via the REAL code, then crash. The parent greps for the secret.

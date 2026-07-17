@@ -387,6 +387,16 @@ gw_hardening_json() {
   esac
 }
 
+# Under a hardened profile use a SMALL ciphertext-spool threshold so a large
+# session spills to disk — exercising that the spool lands in the Landlock-allowed
+# data-dir, not /tmp (F-1). Default is the 8 MiB production value.
+gw_spool_threshold() {
+  case "${FS_HARDENING:-off}" in
+    full | seccomp) printf '65536' ;;
+    *) printf '8388608' ;;
+  esac
+}
+
 launch_gateway() {
   local prof="${FS_HARDENING:-off}"
   log "rendering + launching the real Gateway (agentless, single-instance; hardening=$prof)"
@@ -398,7 +408,8 @@ launch_gateway() {
   GW_NAME="$GW_NAME" \
   GW_SSH_ADDR="127.0.0.1:${FS_GW_SSH_PORT}" \
   GW_HARDENING="$(gw_hardening_json)" \
-    envsubst '${CP_MTLS_ENDPOINT} ${CP_SERVER_NAME} ${GW_DATA_DIR} ${GW_ENROLL_TOKEN} ${GW_CA_PEM} ${GW_NAME} ${GW_SSH_ADDR} ${GW_HARDENING}' \
+  GW_SPOOL_THRESHOLD="$(gw_spool_threshold)" \
+    envsubst '${CP_MTLS_ENDPOINT} ${CP_SERVER_NAME} ${GW_DATA_DIR} ${GW_ENROLL_TOKEN} ${GW_CA_PEM} ${GW_NAME} ${GW_SSH_ADDR} ${GW_HARDENING} ${GW_SPOOL_THRESHOLD}' \
     < "$SCRIPT_DIR/config/gateway-core.json.tmpl" > "$WORKDIR/gateway.json"
   rm -rf "$WORKDIR/gw-data"; mkdir -p "$WORKDIR/gw-data"
   RUST_LOG="${GW_RUST_LOG:-info}" "$GATEWAY_BIN" --config "$WORKDIR/gateway.json" > "$WORKDIR/gateway.log" 2>&1 &
@@ -593,6 +604,27 @@ $(printf '\033[32m========================================================\033[0
 EOF
 }
 
+# F-1: under a hardened profile the recorder spills ciphertext to disk once a
+# session exceeds the (deliberately small) spool threshold. That spool MUST land in
+# a Landlock-allowed path (the data-dir), not /tmp — a /tmp spool would EACCES and,
+# in strict mode, tear the session down mid-flight. Force a spill with a large-output
+# session and assert it still succeeds; every non-hardened run skips this.
+assert_spill() {
+  case "${FS_HARDENING:-off}" in
+    full | seccomp) : ;;
+    *) return 0 ;;
+  esac
+  log "F-1: forcing a recorder spill (>64KiB output) under hardening=$FS_HARDENING — must NOT tear down"
+  local out rc=0
+  out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'head -c 300000 /dev/zero | base64; echo SPILL_OK')" || rc=$?
+  { [[ $rc -eq 0 ]] && grep -q SPILL_OK <<<"$out"; } \
+    || die "large-output session failed under hardening — the ciphertext spool was likely EACCES'd (e.g. /tmp not in the Landlock set):\n$(tail -40 "$WORKDIR/gateway.log")"
+  # Spool file lives under the data-dir (created + removed there), never /tmp.
+  [[ -d "$WORKDIR/gw-data/recording-spool" ]] \
+    || die "expected the spool dir under the data-dir (gw-data/recording-spool)"
+  ok "recorder spill under hardening=$FS_HARDENING succeeded — spool in the data-dir, strict session intact (F-1)"
+}
+
 main() {
   preflight
   build_artifacts
@@ -606,6 +638,7 @@ main() {
   run_session                # ssh through the REAL CP Authorize -> real node
   assert_recording           # SLREC1 WORM object + decrypt-proof (SEC-LOW-1/2)
   assert_audit_dimensions    # 5 dims searchable + correlated chain (Part B)
+  assert_spill               # F-1: recorder spill lands in the Landlock-allowed data-dir
   assert_deny_closed         # deny-wins at the real CP (SEC-LOW-3)
   assert_cp_down             # NFR-2 fail-closed — LAST (kills the CP)
   report

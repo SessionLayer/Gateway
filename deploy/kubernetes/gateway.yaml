@@ -26,6 +26,9 @@ data:
         "host_key_path": "/var/lib/sessionlayer-gateway/host_ed25519",
         "source_ip_allowlist": ["10.0.0.0/8"]
       },
+      "ha": {
+        "drain": { "readyz_addr": "0.0.0.0:8081" }
+      },
       "hardening": {
         "landlock": {
           "enabled": true,
@@ -35,8 +38,10 @@ data:
             "/etc/resolv.conf",
             "/etc/hosts",
             "/etc/nsswitch.conf",
+            "/run/systemd/resolve",
             "/usr/local/bin/gateway",
-            "/lib", "/lib64", "/usr/lib"
+            "/lib", "/lib64", "/usr/lib",
+            "/dev", "/proc"
           ],
           "read_write_paths": ["/var/lib/sessionlayer-gateway"]
         },
@@ -84,6 +89,16 @@ spec:
           readinessProbe:
             httpGet: { path: /readyz, port: 8081 }
             periodSeconds: 5
+          # Liveness on the SSH port: restart a wedged (accepting-nothing) Gateway.
+          livenessProbe:
+            tcpSocket: { port: 2222 }
+            periodSeconds: 15
+            failureThreshold: 3
+          # Startup slack for enrollment (mTLS bootstrap can take a while).
+          startupProbe:
+            tcpSocket: { port: 2222 }
+            periodSeconds: 5
+            failureThreshold: 30
       volumes:
         # The credential data-dir. An emptyDir re-enrolls on every restart; use a
         # PVC (or a StatefulSet) to persist the enrolled identity + generation.

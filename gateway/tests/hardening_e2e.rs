@@ -81,13 +81,17 @@ fn landlock_confines_to_allowed_paths() {
     );
 }
 
-/// Coredump-disable is verifiable directly: after it, `RLIMIT_CORE` is 0.
+/// Coredump-disable is verifiable directly: after it, BOTH controls read back
+/// disabled — `RLIMIT_CORE`==0 AND `PR_GET_DUMPABLE`==0. The dumpable=0 assert is
+/// what makes the crash-grep non-vacuous under a piped `core_pattern`.
 #[test]
-fn coredumps_disabled_rlimit_zero() {
+fn coredumps_disabled_rlimit_zero_and_not_dumpable() {
     let r = run(&["coredump-check"], &std::env::temp_dir());
     assert!(
-        r.status.success() && r.stdout.contains("RLIMIT_CORE soft=0"),
-        "RLIMIT_CORE not zeroed (stdout={:?})",
+        r.status.success()
+            && r.stdout.contains("RLIMIT_CORE soft=0")
+            && r.stdout.contains("DUMPABLE=false"),
+        "coredump controls not fully disabled (stdout={:?})",
         r.stdout
     );
 }

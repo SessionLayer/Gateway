@@ -235,5 +235,16 @@ Operational notes:
 - **Landlock allow-set.** If you enable `hardening.landlock`, remember it confines *all*
   filesystem access: a dynamically-linked binary must be allowed the library dirs
   (`/lib`,`/lib64`,`/usr/lib` — `getaddrinfo`/`getpwnam` load `libnss_*.so` at runtime),
-  `/etc/resolv.conf`+`/etc/nsswitch.conf`+`/etc/hosts`, `/dev`, and the CA/config/data
-  paths. A missing path denies that access (see the `deploy/` reference set).
+  `/etc/resolv.conf`+`/etc/nsswitch.conf`+`/etc/hosts`, `/dev`, `/proc`, and the
+  CA/config/data paths. The recorder's ciphertext spool lives under the **data-dir**
+  (`data_dir/recording-spool`, in the read-write set) — a large session spills there,
+  never `/tmp`. A missing path denies that access (see the `deploy/` reference set).
+- **Coredumps are OFF by default** (`hardening.disable_coredumps`, `PR_SET_DUMPABLE=0`
+  + `RLIMIT_CORE=0`, re-asserted after the privilege drop) — so a crash leaves **no
+  core file** for post-mortem. Only a Rust `panic` (unwinding) leaves a backtrace in
+  the structured log; an `abort`/SIGSEGV/SIGSYS leaves nothing. To capture a core for a
+  **non-production** repro, set `hardening.disable_coredumps=false`. Belt-and-suspenders
+  for a paranoid host: `sysctl fs.suid_dumpable=0` and systemd-coredump `Storage=none`
+  (pipe `core_pattern` handlers ignore `RLIMIT_CORE`, so `PR_SET_DUMPABLE=0` is the real
+  gate). Swap is a separate exposure — disable or encrypt swap on the most sensitive
+  fleets.

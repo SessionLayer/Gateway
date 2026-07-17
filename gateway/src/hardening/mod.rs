@@ -6,8 +6,10 @@
 //! defence: after the listeners are bound it drops privileges, confines the
 //! filesystem with Landlock, and installs a seccomp syscall filter, so that a
 //! hypothetical code-execution bug in the SSH/TLS stack is boxed into a process
-//! that cannot exec a shell, escape its namespace, read `/etc/shadow`, or reach
-//! the network beyond the sockets it already holds.
+//! that cannot exec a shell, escape its namespace, or read `/etc/shadow`.
+//! (seccomp does NOT restrict egress by destination — `socket`/`connect`/`sendto`
+//! are allow-listed — so egress confinement is the deploy layer's default-deny
+//! NetworkPolicy, `deploy/kubernetes/networkpolicy.yaml`, not this filter.)
 //!
 //! **It lives in the binary, never in `gateway-core`.** The library's integration
 //! tests drive the SSH server in-process; applying a sandbox from library code

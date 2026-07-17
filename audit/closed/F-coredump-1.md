@@ -16,8 +16,13 @@ named "S18 Tier-0 memory hardening" as their compensating control.
 process lifetime and is inherited by every thread:
 - `PR_SET_DUMPABLE = 0` (via `nix::sys::prctl::set_dumpable`) — the kernel
   produces no core for the process at all, regardless of `core_pattern` (so even a
-  `core_pattern` pipe to systemd-coredump/apport receives nothing), and a non-root
-  `ptrace`/`/proc/pid/mem` attach is refused as a bonus;
+  `core_pattern` pipe to systemd-coredump/apport receives nothing — pipe handlers
+  ignore `RLIMIT_CORE`, so this is the ONLY effective gate for them), and a non-root
+  `ptrace`/`/proc/pid/mem` attach is refused as a bonus. **NB:** `setuid` in the
+  privilege drop RESETS this flag (kernel `commit_creds`), so it is **re-asserted +
+  verified fail-closed inside `privdrop::drop_to`** after the drop — see
+  [[F-coredump-privdrop-reset-1]] (CWE-528); without that re-assert the whole
+  guarantee is void on a bind-`:22`-then-drop deployment;
 - `RLIMIT_CORE = 0` (via `nix::sys::resource::setrlimit`) — belt-and-suspenders.
 
 Config: `hardening.disable_coredumps`, **default on** (low-risk, directly protects

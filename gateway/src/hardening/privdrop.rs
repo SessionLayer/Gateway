@@ -77,6 +77,21 @@ pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
         bail!("privilege drop is reversible (regained root after setuid); aborting");
     }
 
+    // CWE-528: `setuid` RESETS the process dumpable flag to
+    // `/proc/sys/fs/suid_dumpable` (kernel `commit_creds` on any euid/egid change),
+    // re-enabling the coredumps `hardening::coredump` disabled at startup. Pipe
+    // `core_pattern` handlers (systemd-coredump / apport) ignore `RLIMIT_CORE`, so
+    // `PR_SET_DUMPABLE=0` is the ONLY effective gate — re-assert it after the drop,
+    // and verify fail-closed (a dumpable Tier-0 process could spill SSH plaintext /
+    // the inner key to a core on crash).
+    nix::sys::prctl::set_dumpable(false)
+        .context("re-asserting PR_SET_DUMPABLE=0 after privilege drop")?;
+    if nix::sys::prctl::get_dumpable().context("reading PR_GET_DUMPABLE")? {
+        bail!(
+            "process still dumpable after privilege drop (setuid re-enabled coredumps); aborting"
+        );
+    }
+
     Ok(DropReport {
         uid: uid.as_raw(),
         gid: gid.as_raw(),
