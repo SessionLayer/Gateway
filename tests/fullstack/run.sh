@@ -46,6 +46,10 @@ GW_NAME="${GW_NAME:-gw-fullstack}"
 NODE_NAME="${NODE_NAME:-web-01}"
 NODE_LOGIN="${NODE_LOGIN:-deploy}"
 FS_NODE_PORT="${FS_NODE_PORT:-12222}"   # node sshd port (host network; see start_node WHY)
+# loopback (default): node on --network host, all-loopback (satisfies the pre-fix inner-cert
+# source-address pin). bridge: node on a docker port-map so it sees a DISTINCT SNAT IP — the
+# multi-host proof for F-inner-cert-source-address-1 once the CP omits inner-cert source-address.
+FS_NODE_NETMODE="${FS_NODE_NETMODE:-loopback}"
 CLIENT_IDENTITY="${CLIENT_IDENTITY:-fullstack-user}"
 MARKER="FULLSTACK_OK_$$"
 KEEP_UP="${KEEP_UP:-}"
@@ -286,13 +290,25 @@ start_node() {
   # bridge port-map the node sees the docker SNAT (172.17.0.1) and rejects the valid cert
   # ("not from a permitted source address"). That mismatch is a real cross-repo finding
   # the per-repo MockCp masks by omitting source-address — see README.md "Cross-repo findings".
-  log "starting the node container ($NODE_NAME; host-net sshd :$FS_NODE_PORT; trusts the session CA)"
   docker rm -f "$NODE_CONTAINER" >/dev/null 2>&1 || true
   # create -> cp the host key in as root (0600) -> start, so the entrypoint's
-  # ssh-keygen -A keeps our pre-placed ed25519 key (it only fills MISSING keys). The
-  # trailing `-p $FS_NODE_PORT` is passed through to sshd (entrypoint `exec sshd -D -e "$@"`).
-  docker create --name "$NODE_CONTAINER" --network host \
-    -e TRUSTED_USER_CA="$SESSION_CA_LINE" "$NODE_IMAGE" -p "$FS_NODE_PORT" >/dev/null
+  # ssh-keygen -A keeps our pre-placed ed25519 key (it only fills MISSING keys).
+  if [[ "$FS_NODE_NETMODE" == bridge ]]; then
+    # BRIDGE port-map (the MULTI-HOST proof, FS_NODE_NETMODE=bridge): the node sees the docker
+    # SNAT (172.17.0.1) — a DISTINCT IP from the client's 127.0.0.1. With the pre-fix CP this
+    # is F-inner-cert-source-address-1's repro (the node rejects the cert); once the CP omits
+    # source-address on the inner cert, the session succeeds → the finding is Verified-Fixed.
+    log "starting the node container ($NODE_NAME; BRIDGE port-map — node sees the docker SNAT; multi-host inner-cert proof)"
+    docker create --name "$NODE_CONTAINER" -p 127.0.0.1:0:22 \
+      -e TRUSTED_USER_CA="$SESSION_CA_LINE" "$NODE_IMAGE" >/dev/null
+  else
+    # Default all-loopback: the node on --network host, so client=Gateway=node=127.0.0.1 and the
+    # (pre-fix) inner-cert source-address pin is satisfiable. The trailing `-p $FS_NODE_PORT` is
+    # passed through to sshd (entrypoint `exec sshd -D -e "$@"`).
+    log "starting the node container ($NODE_NAME; host-net sshd :$FS_NODE_PORT; all-loopback)"
+    docker create --name "$NODE_CONTAINER" --network host \
+      -e TRUSTED_USER_CA="$SESSION_CA_LINE" "$NODE_IMAGE" -p "$FS_NODE_PORT" >/dev/null
+  fi
   docker cp "$D/node_host_key"     "$NODE_CONTAINER:/etc/ssh/ssh_host_ed25519_key"
   docker cp "$D/node_host_key.pub" "$NODE_CONTAINER:/etc/ssh/ssh_host_ed25519_key.pub"
   docker start "$NODE_CONTAINER" >/dev/null
@@ -303,8 +319,13 @@ start_node() {
     [[ $SECONDS -lt $deadline ]] || { docker logs "$NODE_CONTAINER" >&2; die "node sshd never listened"; }
     sleep 1
   done
-  NODE_PORT="$FS_NODE_PORT"
-  ok "node up: $NODE_NAME sshd on 127.0.0.1:$NODE_PORT (pinned fp $NODE_HOSTKEY_FP)"
+  if [[ "$FS_NODE_NETMODE" == bridge ]]; then
+    NODE_PORT="$(docker port "$NODE_CONTAINER" 22/tcp | head -1 | sed 's/.*://')"
+    [[ -n "$NODE_PORT" ]] || die "could not resolve node mapped port (bridge mode)"
+  else
+    NODE_PORT="$FS_NODE_PORT"
+  fi
+  ok "node up: $NODE_NAME sshd on 127.0.0.1:$NODE_PORT (netmode=$FS_NODE_NETMODE, pinned fp $NODE_HOSTKEY_FP)"
 }
 
 # Register the agentless node via the S16 REST API (POST /v1/nodes), proving the real admin

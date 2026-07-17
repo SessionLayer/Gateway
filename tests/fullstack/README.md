@@ -110,9 +110,13 @@ against a real node until this harness.
 
 Reproduced end-to-end: seed everything, register the node on a **bridge** port-map, and
 the inner leg fails with the sshd message above; move the node to `--network host` (all
-loopback) and the same session succeeds. `run.sh` therefore runs the node on the host
-network so client=Gateway=node=`127.0.0.1` and the pin is satisfiable — this both makes
-the headline path green AND is the minimal reproduction of the constraint.
+loopback) and the same session succeeds. `run.sh` therefore defaults to the node on the host
+network (`FS_NODE_NETMODE=loopback`) so client=Gateway=node=`127.0.0.1` and the pin is
+satisfiable — this both makes the headline path green AND is the minimal reproduction of the
+constraint. **Verified-Fixed proof:** once the CP omits `source-address` on the inner cert,
+re-run with `FS_NODE_NETMODE=bridge` (node on a docker port-map → it observes the SNAT
+`172.17.0.1`, a distinct IP from the client) and the session must now succeed — proving the
+multi-host case (this run FAILS against the pre-fix CP, which is the finding).
 
 Proposed fix (CP team's call): the inner (node-facing) cert should not pin
 `source-address` to the client IP the node can never observe — either omit it on the inner
