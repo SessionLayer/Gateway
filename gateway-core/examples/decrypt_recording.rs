@@ -33,9 +33,9 @@ fn recompute_chain(plaintext: &[u8]) -> String {
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let key_path = args
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("usage: decrypt_recording <customer_key.pkcs8.der> <object.bin>"))?;
+    let key_path = args.next().ok_or_else(|| {
+        anyhow::anyhow!("usage: decrypt_recording <customer_key.pkcs8.der> <object.bin>")
+    })?;
     let obj_path = args
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing <object.bin>"))?;
@@ -44,7 +44,8 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("parse customer key {key_path}: {e}"))?;
     let object = std::fs::read(&obj_path)?;
 
-    let header = seal::parse_header(&object).map_err(|e| anyhow::anyhow!("parse SLREC1 header: {e:?}"))?;
+    let header =
+        seal::parse_header(&object).map_err(|e| anyhow::anyhow!("parse SLREC1 header: {e:?}"))?;
     let data_key = seal::unseal_data_key(&header, &secret)
         .map_err(|e| anyhow::anyhow!("unseal data key (wrong customer key?): {e:?}"))?;
     let plaintext = seal::decrypt_frames(&object, &header, &data_key)
