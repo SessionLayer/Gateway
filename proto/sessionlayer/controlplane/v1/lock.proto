@@ -82,6 +82,22 @@ message Heartbeat {
   int64 sent_at_epoch_seconds = 1;
 }
 
+// Lock enforcement mode (Design §8.3). Added S20 (additive; the wire previously
+// carried no mode so the Gateway treated every pushed lock as a teardown).
+enum LockMode {
+  // Unset — an older CP that predates this field. The Gateway MUST treat this as
+  // STRICT (fail safe): the pre-S20 wire had no mode and every lock tore down, so
+  // absence keeps that stronger behaviour rather than silently weakening a lock.
+  LOCK_MODE_UNSPECIFIED = 0;
+
+  // Blocks new issuance AND tears down matching live sessions.
+  LOCK_MODE_STRICT = 1;
+
+  // Blocks new issuance but does NOT forcibly tear down an already-established
+  // session (a softer deny used where an abrupt teardown is undesirable).
+  LOCK_MODE_BEST_EFFORT = 2;
+}
+
 // A Lock is an incident-response deny (Design §8.3; FR-LOCK-1): it blocks new
 // issuance / session start AND tears down existing matching sessions, INDEPENDENT
 // of TTL and CA rotation. The Gateway matches `target` against a live session's
@@ -106,6 +122,10 @@ message Lock {
   // produces the SAME generic denial as any authorization failure); it may
   // appear only in the Gateway's OPERATOR-facing log.
   string reason = 5;
+
+  // The enforcement mode. UNSPECIFIED (a pre-S20 CP) MUST be treated as STRICT by
+  // the Gateway.
+  LockMode mode = 6;
 }
 
 // LockTarget mirrors the runtime.access_lock target_selector facets (S5

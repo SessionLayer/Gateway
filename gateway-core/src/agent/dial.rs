@@ -302,6 +302,7 @@ mod tests {
             expires_at_epoch_seconds: 0,
             created_at_epoch_seconds: 0,
             reason: "clone detected".into(),
+            ..Default::default()
         });
 
         let dial = dialer(registry, locks);

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::pb::{DecisionContext, Lock, LockTarget};
+use crate::pb::{DecisionContext, Lock, LockMode, LockTarget};
 
 /// The trusted, per-session facts a lock is matched against — taken from the
 /// SIGNED decision context (so a Gateway can never dodge a lock by lying about
@@ -105,6 +105,17 @@ pub fn target_matches(target: &LockTarget, b: &LockBindings) -> bool {
         return true;
     }
     false
+}
+
+/// Whether a pushed lock tears down already-ESTABLISHED live sessions (Design §8.3,
+/// FR-LOCK-2). `STRICT` — and `UNSPECIFIED`, a pre-S20 CP that carried no mode — tear
+/// down; `BEST_EFFORT` blocks new sessions/channels (via [`LockSet::matching`]) but lets a
+/// live session run to completion. Fail-safe by construction: only the explicit
+/// `BEST_EFFORT` value skips teardown, so an unknown/garbled mode still tears down (deny
+/// wins). This governs ONLY teardown; new-session denial ([`LockSet::matching`]) is
+/// mode-agnostic — every mode blocks new access.
+fn tears_down_live_sessions(lock: &Lock) -> bool {
+    lock.mode != LockMode::BestEffort as i32
 }
 
 /// A DENY expires conservatively (LATE): the lock keeps denying until clearly past
@@ -338,6 +349,12 @@ impl LiveSessionRegistry {
 
     /// Tear down every live session a newly-added lock matches. Returns the count.
     pub fn apply_added_lock(&self, lock: &Lock) -> usize {
+        // BEST_EFFORT blocks NEW sessions/channels (via LockSet::matching) but does not tear
+        // a live session down (§8.3, FR-LOCK-2); STRICT / UNSPECIFIED do. The lock is already
+        // in the LockSet before this call, so new access is denied regardless of mode.
+        if !tears_down_live_sessions(lock) {
+            return 0;
+        }
         let Some(target) = lock.target.as_ref() else {
             return 0;
         };
@@ -382,8 +399,11 @@ impl LiveSessionRegistry {
             sessions
                 .values()
                 .filter(|c| {
+                    // Only teardown-mode (STRICT / UNSPECIFIED) locks tear a live session down
+                    // on resync; a BEST_EFFORT lock still denies new access via `matching`.
                     active
                         .iter()
+                        .filter(|l| tears_down_live_sessions(l))
                         .any(|l| l.target.as_ref().map(|t| c.matches(t)).unwrap_or(false))
                 })
                 .cloned()
@@ -552,13 +572,70 @@ mod tests {
     }
 
     fn lock(id: &str, target: LockTarget, expires: i64) -> Lock {
+        lock_with_mode(id, target, expires, LockMode::Strict)
+    }
+
+    fn lock_with_mode(id: &str, target: LockTarget, expires: i64, mode: LockMode) -> Lock {
         Lock {
             lock_id: id.into(),
             target: Some(target),
             expires_at_epoch_seconds: expires,
             created_at_epoch_seconds: 0,
             reason: "test".into(),
+            mode: mode as i32,
         }
+    }
+
+    #[test]
+    fn teardown_mode_spares_only_best_effort() {
+        // STRICT and UNSPECIFIED (a pre-S20 CP that sent no mode) tear down; only the explicit
+        // BEST_EFFORT is spared; a garbled value fails safe to teardown (deny wins).
+        assert!(tears_down_live_sessions(&lock_with_mode(
+            "s",
+            tgt(),
+            0,
+            LockMode::Strict
+        )));
+        assert!(tears_down_live_sessions(&lock_with_mode(
+            "u",
+            tgt(),
+            0,
+            LockMode::Unspecified
+        )));
+        assert!(!tears_down_live_sessions(&lock_with_mode(
+            "b",
+            tgt(),
+            0,
+            LockMode::BestEffort
+        )));
+        let mut garbled = lock_with_mode("g", tgt(), 0, LockMode::Strict);
+        garbled.mode = 99;
+        assert!(tears_down_live_sessions(&garbled));
+    }
+
+    #[test]
+    fn best_effort_lock_still_denies_new_access() {
+        // New-access denial is mode-agnostic: a BEST_EFFORT lock is returned by `matching`
+        // (so it blocks new sessions/channels) exactly like STRICT — only teardown differs.
+        let set = LockSet::new(30, 30);
+        let b = bindings();
+        set.replace_snapshot(
+            vec![lock_with_mode(
+                "be",
+                LockTarget {
+                    identities: vec!["alice".into()],
+                    ..tgt()
+                },
+                0,
+                LockMode::BestEffort,
+            )],
+            1,
+        );
+        assert_eq!(
+            set.matching(&b).map(|l| l.lock_id),
+            Some("be".into()),
+            "a best_effort lock must still deny new access"
+        );
     }
 
     #[test]

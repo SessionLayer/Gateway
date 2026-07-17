@@ -766,6 +766,7 @@ async fn a_lock_tears_down_a_live_recorded_session_and_finalizes_the_recording(
         expires_at_epoch_seconds: 0,
         created_at_epoch_seconds: 0,
         reason: "incident response".into(),
+        ..Default::default()
     });
 
     // A long-lived command: without a teardown this blocks ~60s; the lock cuts it
@@ -814,6 +815,92 @@ async fn a_lock_tears_down_a_live_recorded_session_and_finalizes_the_recording(
     Ok(())
 }
 
+// ── best_effort mode (Session 20): a matching lock pushed mid-session does NOT tear the
+//    live session down (§8.3, FR-LOCK-2) — it runs to completion — yet a NEW session is
+//    still denied. The STRICT teardown counterpart is proven directly above. ──────────────
+
+#[tokio::test]
+async fn a_best_effort_lock_leaves_a_live_session_running_but_denies_new() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let (minio, s3) = start_minio().await?;
+    cp.set_s3_target(s3.clone());
+    let (cust_pub_der, _s) = customer_keypair();
+    cp.set_customer_key(
+        "ck",
+        cust_pub_der,
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    grant(&cp, &pin);
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
+    let client = client_container(&pin).await;
+
+    // Once the session is live, push a BEST_EFFORT lock matching the node. Unlike STRICT it
+    // must NOT tear the live session down — the command runs to completion.
+    cp.push_lock_after_recording_begins(gateway_core::pb::Lock {
+        lock_id: "lock-best-effort-1".into(),
+        target: Some(gateway_core::pb::LockTarget {
+            node_ids: vec![NODE_ID.to_string()],
+            ..Default::default()
+        }),
+        expires_at_epoch_seconds: 0,
+        created_at_epoch_seconds: 0,
+        reason: "soft quarantine".into(),
+        mode: gateway_core::pb::LockMode::BestEffort as i32,
+    });
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(
+            gw_port,
+            &[],
+            "deploy%node-e2e",
+            "sh -c 'echo LIVE_UP; sleep 3; echo LIVE_DONE'",
+        ),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "a best_effort lock must NOT tear the live session down; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("LIVE_DONE"),
+        "the live session ran to completion despite the best_effort lock; stdout={stdout}"
+    );
+
+    // The recording still finalizes (the session ended naturally, not via teardown).
+    let fin = await_finalized(&cp).await;
+    assert_eq!(fin.status, RecordingStatus::Finalized as i32);
+
+    // deny-new is mode-agnostic: a NEW session to the best_effort-locked node is still refused.
+    let (code2, stdout2, _e2) = ssh_exec(
+        &client,
+        ssh_cmd(gw_port, &[], "deploy%node-e2e", "echo SHOULD_NOT_RUN"),
+    )
+    .await;
+    assert_ne!(
+        code2,
+        Some(0),
+        "a best_effort lock must still DENY a new session"
+    );
+    assert!(
+        !stdout2.contains("SHOULD_NOT_RUN"),
+        "a new session on a best_effort-locked node must not run"
+    );
+
+    drop(client);
+    drop(node);
+    drop(minio);
+    Ok(())
+}
+
 // ── A pushed lock refuses a NEW session (generic denial), before any node dial. ─
 
 #[tokio::test]
@@ -845,6 +932,7 @@ async fn a_pushed_lock_denies_a_new_session() -> anyhow::Result<()> {
         expires_at_epoch_seconds: 0,
         created_at_epoch_seconds: 0,
         reason: "quarantined".into(),
+        ..Default::default()
     });
 
     let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;

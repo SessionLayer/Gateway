@@ -1060,6 +1060,7 @@ async fn locked_target_refuses_break_glass() -> anyhow::Result<()> {
         expires_at_epoch_seconds: 0,
         created_at_epoch_seconds: 0,
         reason: "incident".into(),
+        ..Default::default()
     });
 
     let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
@@ -1123,6 +1124,7 @@ async fn revoke_tears_down_a_live_break_glass_session() -> anyhow::Result<()> {
         expires_at_epoch_seconds: 0,
         created_at_epoch_seconds: 0,
         reason: "revoked".into(),
+        ..Default::default()
     });
 
     let (code, _stdout, _stderr) = ssh_exec(
