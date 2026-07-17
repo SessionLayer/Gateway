@@ -1,0 +1,108 @@
+# SessionLayer Gateway — release supply chain (Session 22 / NFR-7).
+#
+# On a `v*` tag: build the `gateway` binary REPRODUCIBLY, emit a CycloneDX SBOM,
+# a SLSA build-provenance attestation, and keyless (OIDC) cosign signatures —
+# no long-lived signing key. All third-party actions are SHA-pinned; the trailing
+# `# vX.Y.Z` is the human tag. Owner rule (S1/S2): inventory + integrity, NEVER
+# an NVD/OWASP scanner.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release upload
+      id-token: write # keyless OIDC for cosign + provenance
+      attestations: write # build-provenance attestation
+    env:
+      BIN: gateway
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # pinned commit
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install cargo-cyclonedx (SBOM)
+        run: cargo install --locked --version 0.5.9 cargo-cyclonedx
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+
+      - name: Compute deterministic build env
+        id: env
+        run: echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+
+      - name: Reproducible release build
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.env.outputs.epoch }}
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
+        run: cargo build --release --locked --bin "$BIN"
+
+      - name: Verify reproducibility (double-build digest match)
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.env.outputs.epoch }}
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
+        run: |
+          d1=$(sha256sum "target/release/$BIN" | awk '{print $1}')
+          CARGO_TARGET_DIR="$RUNNER_TEMP/repro" cargo build --release --locked --bin "$BIN"
+          d2=$(sha256sum "$RUNNER_TEMP/repro/release/$BIN" | awk '{print $1}')
+          echo "digest #1: $d1"; echo "digest #2: $d2"
+          if [ "$d1" != "$d2" ]; then echo "::error::release binary is not reproducible"; exit 1; fi
+          rm -rf "$RUNNER_TEMP/repro"
+
+      - name: Generate SBOM (CycloneDX 1.5)
+        run: |
+          cargo cyclonedx -f json --spec-version 1.5 --all --describe binaries
+          mv "gateway/${BIN}_bin.cdx.json" "${BIN}.cdx.json"
+          jq -e '.bomFormat=="CycloneDX" and .specVersion=="1.5" and (.components|length>0)' "${BIN}.cdx.json" >/dev/null
+
+      - name: Attest build provenance (SLSA)
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            target/release/gateway
+            gateway.cdx.json
+
+      - name: Keyless cosign signatures (binary + SBOM)
+        run: |
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle "${BIN}.cosign.sigstore.json" "target/release/$BIN"
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle "${BIN}.cdx.json.cosign.sigstore.json" "${BIN}.cdx.json"
+
+      - name: Assemble release artifacts
+        run: |
+          cp "target/release/$BIN" "$BIN"
+          cp "${{ steps.attest.outputs.bundle-path }}" "${BIN}.provenance.sigstore.json"
+          sha256sum "$BIN" "${BIN}.cdx.json" > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Gateway ${{ github.ref_name }}" \
+            --notes "Signed, provenanced, reproducible release. Verify with cosign / gh attestation verify (NFR-7)." \
+            || echo "release already exists — uploading assets"
+          gh release upload "${{ github.ref_name }}" --clobber \
+            "$BIN" \
+            "${BIN}.cdx.json" \
+            "${BIN}.cosign.sigstore.json" \
+            "${BIN}.cdx.json.cosign.sigstore.json" \
+            "${BIN}.provenance.sigstore.json" \
+            SHA256SUMS
