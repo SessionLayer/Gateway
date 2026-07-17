@@ -73,14 +73,17 @@ that does prove it is named.
 | # | scenario | status |
 |---|----------|--------|
 | 1 | **CORE**: `ssh deploy%web-01@gw` runs on the real node through the real CP `Authorize` | **LIVE (core)** |
-| 2 | **Recording integrity**: finalized SLREC1 WORM object, COMPLIANCE-locked, opaque (no plaintext), size+digest match | **LIVE (core)** |
+| 2 | **Recording integrity + decrypt-proof** (SEC-LOW-1/2): finalized SLREC1 WORM object, COMPLIANCE-locked, opaque (no plaintext), size+digest match, AND it ECIES-opens with the customer private key to the original session (marker present) + the hash-chain recomputes to the finalized head | **LIVE (core)** |
 | 3 | **Audit dimensions** (Part B): the connect/authorize event is searchable by each of source_ip / access_model / capability / node_label / correlation_id, and one correlationId returns the connect→recording chain | **LIVE (core)** |
-| 4 | **Outbound-agent** connector: a second node reached via the real Agent (dial-out WSS → dial-back splice) | _pending (`TOPOLOGY=agent`)_ |
-| 5 | JIT self-approval refused | referenced: `breakglass_it.rs` / CP JIT ITs |
-| 6 | Lock mid-session teardown of a live recorded session | referenced: `recorder_it.rs` (real binaries) |
-| 7 | HA owner-kill fail-closed (NFR-1) | referenced: `scripts/ha-e2e.sh` + `ha_e2e.rs` |
-| 8 | CP-down fail-closed (NFR-2) | referenced: outer-leg fail-closed ITs |
-| 9 | Wrong host key rejected (no TOFU) | referenced: `hostverify` + `inner_leg_it.rs` |
+| 4 | **Bridge multi-host inner-cert** Verified-Fixed (F-inner-cert-source-address-1 regression guard): node on a distinct SNAT IP → session succeeds post-fix (failed pre-fix) | **LIVE (`TOPOLOGY=all` / `FS_NODE_NETMODE=bridge`)** |
+| 5 | **Deny-path** fail-closed (SEC-LOW-3, deny-wins): an ungranted login is refused by the real CP (§7.1 generic) | **LIVE (core)** |
+| 6 | **CP-down** fail-closed (NFR-2): the real CP is killed → a new session fails closed, never fail-open | **LIVE (core)** |
+| 7 | **Outbound-agent** connector: a node reached via the real Agent (dial-out WSS → dial-back splice) | referenced: `agent_e2e.rs` + `splice_e2e.rs` (real Agent binaries); full-stack flow scaffolded (`tests/fullstack/agent-node/` + `gateway-agent.json.tmpl` + `AGENT_BIN`), not yet a live assertion |
+| 8 | Lock mid-session teardown of a live recorded session | referenced: `recorder_it.rs` (real binaries, both strict + best_effort) |
+| 9 | JIT self-approval refused | referenced: `breakglass_it.rs` / CP JIT ITs |
+| 10 | Break-glass can't override a Lock / FIDO2 | referenced: `breakglass_it.rs` (real `sk-dummy`) |
+| 11 | HA owner-kill fail-closed (NFR-1) | referenced: `scripts/ha-e2e.sh` + `ha_e2e.rs` |
+| 12 | Wrong host key rejected (no TOFU) | referenced: `hostverify` + `inner_leg_it.rs` |
 
 This table is the source of truth for the RESULT write-up; do not claim a row is LIVE
 unless `run.sh` asserts it.

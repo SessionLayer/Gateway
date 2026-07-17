@@ -107,10 +107,17 @@ preflight() {
   command -v ssh-keygen >/dev/null || die "ssh-keygen is required"
   [[ -n "${CP_JAR:-}" ]] || die "CP_JAR must point at the real controlplane boot jar"
   [[ -f "$CP_JAR" ]]     || die "CP_JAR does not exist: $CP_JAR"
-  if [[ "$TOPOLOGY" == "agent" || "$TOPOLOGY" == "all" ]]; then
-    [[ -n "${AGENT_BIN:-}" && -x "${AGENT_BIN:-/nonexistent}" ]] \
-      || die "TOPOLOGY=$TOPOLOGY needs AGENT_BIN pointing at an executable agent binary"
-  fi
+  case "$TOPOLOGY" in
+    core|all) : ;;  # live: loopback (core) / bridge multi-host guard (all)
+    agent)
+      # The outbound-agent connector is proven per-repo with REAL Agent binaries in
+      # gateway-core/tests/agent_e2e.rs + splice_e2e.rs (dial-out WSS + dial-back splice to the
+      # node's own 127.0.0.1:22). The full-stack agent flow (real-CP OUTBOUND_AGENT Authorize +
+      # presence + real agent enroll) is scaffolded here — tests/fullstack/agent-node/ +
+      # config/gateway-agent.json.tmpl + AGENT_BIN — but is NOT yet wired as a live assertion.
+      die "TOPOLOGY=agent is scaffolded, not live — the outbound-agent path is proven per-repo (agent_e2e.rs/splice_e2e.rs, real binaries); see README 'Scenario matrix'. Use core|all." ;;
+    *) die "unknown TOPOLOGY '$TOPOLOGY' (core|all)" ;;
+  esac
   rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
   ok "preflight: CP_JAR=$CP_JAR TOPOLOGY=$TOPOLOGY workdir=$WORKDIR"
 }
