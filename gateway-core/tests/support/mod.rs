@@ -2154,6 +2154,28 @@ impl MockCp {
         );
     }
 
+    /// Register a pin **bound to a source IP** (the pin's `{fingerprint, identity,
+    /// source-cidr, …}` binding, FR-AUTH-10). It resolves ONLY when the connection's
+    /// source matches; from any other source it does not resolve, so the outer leg
+    /// falls through to the next method (the source-change fallback).
+    pub fn register_pin_source_bound(
+        &self,
+        fingerprint: &str,
+        identity: &str,
+        principals: &[&str],
+        source_ip: &str,
+    ) {
+        self.state.pins.lock().unwrap().insert(
+            fingerprint.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: Some(source_ip.to_string()),
+            },
+        );
+    }
+
     /// Register a single-use OTP resolving to `{identity, principals}`.
     pub fn register_otp(&self, otp: &str, identity: &str, principals: &[&str]) {
         self.state.otps.lock().unwrap().insert(
@@ -2346,6 +2368,26 @@ impl MockCp {
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            {
+                let mut locks = state.locks.lock().unwrap();
+                locks.retain(|l| l.lock_id != lock.lock_id);
+                locks.push(lock.clone());
+            }
+            state.feed_epoch.fetch_add(1, Ordering::SeqCst);
+            let _ = state.lock_events.send(LockEvent {
+                event: Some(lock_event::Event::Added(lock)),
+            });
+        });
+    }
+
+    /// Like [`Self::push_lock_after_recording_begins`], but delivers the lock after a
+    /// fixed delay — for E2Es that run with the Null recorder (no BeginRecording
+    /// signal to key off), so the test can call a blocking `ssh_exec` and still push
+    /// the lock while the session is live.
+    pub fn push_lock_after_delay(&self, lock: Lock, delay: Duration) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
             {
                 let mut locks = state.locks.lock().unwrap();
                 locks.retain(|l| l.lock_id != lock.lock_id);

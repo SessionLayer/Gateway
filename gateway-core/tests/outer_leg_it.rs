@@ -617,3 +617,225 @@ async fn cp_down_during_resolution_e2e() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── FR-AUTH-3 (GW seam): the device-flow user-code + verification URI are rendered
+//    into the SSH keyboard-interactive `instruction` field (handler.rs device-flow
+//    path). Isolated from the omnibus KI test so the matrix row has its own proof. ──
+#[tokio::test]
+async fn device_flow_instruction_carries_user_code_and_verification_uri() -> anyhow::Result<()> {
+    build_client_image().await?;
+
+    let cp = MockCp::start().await;
+    let pin_key = generate_key();
+    let cert_key = generate_key();
+    let cert_line = cp.sign_user_cert(&cert_key.public_line, "unused", &["x"], 300);
+    // A device flow approving `dave`; RBAC grants dave on app-1.
+    cp.set_device_flow("WDJB-MJHT", "https://cp.example/device/verify", "dave", 1);
+    cp.allow("dave", "app-1", "ops");
+
+    let (port, _shutdown) = start_server(&cp, Arc::new(base_config())).await;
+    let container = client_container(&pin_key, &cert_key, &cert_line).await;
+
+    // Empty OTP → the outer leg begins the device flow and, on the FIRST
+    // num-prompts=0 info-request, renders the verification URL + user code into the
+    // keyboard-interactive `instruction` field (the stock ssh client prints it to
+    // stderr). The session then reaches the (offline) inner leg.
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        ssh_args(
+            port,
+            &[
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "PreferredAuthentications=keyboard-interactive",
+            ],
+            "ops%app-1",
+            "true",
+        ),
+        vec![
+            ("SSH_ASKPASS".to_string(), "/askpass.sh".to_string()),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+            ("SL_OTP".to_string(), String::new()),
+        ],
+    )
+    .await;
+    assert_ne!(code, Some(0), "device-flow login: authz ok, node offline; stderr={stderr}");
+    assert!(
+        stderr.contains("WDJB-MJHT"),
+        "the device user-code must be surfaced in the KI instruction field; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("cp.example/device/verify"),
+        "the verification URI must be surfaced in the KI instruction field; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(NODE_OFFLINE),
+        "device-flow auth+authz succeeded and reached the inner leg; stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+// ── FR-AUTH-10 (GW seam): a pin re-authenticates SILENTLY on reconnect within its
+//    TTL (no re-prompt), and a SOURCE change makes the pin no longer resolve so the
+//    outer leg falls back to the next method instead of hard-failing. ──────────────
+#[tokio::test]
+async fn pin_silently_reconnects_within_ttl_and_falls_back_on_source_change() -> anyhow::Result<()>
+{
+    build_client_image().await?;
+
+    let cp = MockCp::start().await;
+    let pin_key = generate_key();
+    let cert_key = generate_key();
+    let cert_line = cp.sign_user_cert(&cert_key.public_line, "unused", &["x"], 300);
+    // The pin (source-unbound) resolves alice→[deploy]; alice is granted on app-1.
+    cp.register_pin(&pin_key.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", "app-1", "deploy");
+
+    let (port, _shutdown) = start_server(&cp, Arc::new(base_config())).await;
+    let container = client_container(&pin_key, &cert_key, &cert_line).await;
+
+    // Silent reconnect within TTL: TWO back-to-back publickey-only connections with
+    // the SAME pin key, BatchMode + no askpass (so any prompt would fail). Both must
+    // authenticate silently and reach the (offline) inner leg — the pin path
+    // re-resolves without a fresh interactive credential.
+    for attempt in 0..2 {
+        let (code, _stdout, stderr) = ssh_exec(
+            &container,
+            ssh_args(
+                port,
+                &[
+                    "-i",
+                    "/root/pin_key",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
+                    "BatchMode=yes",
+                ],
+                "deploy%app-1",
+                "true",
+            ),
+            vec![],
+        )
+        .await;
+        assert_ne!(code, Some(0), "reconnect {attempt}: authz ok, node offline");
+        assert!(
+            stderr.contains(NODE_OFFLINE),
+            "silent pin reconnect {attempt} must authenticate with no prompt and reach the inner leg; stderr={stderr:?}"
+        );
+    }
+
+    // Source-change fallback: re-register the SAME pin bound to a DIFFERENT source
+    // (10.0.0.1 ≠ the client's loopback), and register an OTP fallback for the same
+    // identity. The pin no longer resolves from this source, so the outer leg must
+    // fall THROUGH to keyboard-interactive (OTP) rather than hard-failing.
+    cp.register_pin_source_bound(&pin_key.fingerprint, "alice", &["deploy"], "10.0.0.1");
+    cp.register_otp("otp-fallback-77", "alice", &["deploy"]);
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        ssh_args(
+            port,
+            &[
+                "-i",
+                "/root/pin_key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=publickey,keyboard-interactive",
+            ],
+            "deploy%app-1",
+            "true",
+        ),
+        vec![
+            ("SSH_ASKPASS".to_string(), "/askpass.sh".to_string()),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+            ("SL_OTP".to_string(), "otp-fallback-77".to_string()),
+        ],
+    )
+    .await;
+    assert_ne!(code, Some(0), "source-change fallback: authz ok, node offline");
+    assert!(
+        stderr.contains(NODE_OFFLINE),
+        "a source-mismatched pin must fall back to the next method (OTP), not hard-fail; stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+// ── §1.1 anti-req #1 (negative): a long-lived key offered as a *standing* auth path
+//    is REFUSED. A key authenticates ONLY through an active short-TTL pin, never as a
+//    persistent authorized_keys-style entry — the key alone is worthless. ──────────
+#[tokio::test]
+async fn a_long_lived_key_offered_as_a_standing_path_is_refused() -> anyhow::Result<()> {
+    build_client_image().await?;
+
+    let cp = MockCp::start().await;
+    let pin_key = generate_key();
+    let cert_key = generate_key();
+    let cert_line = cp.sign_user_cert(&cert_key.public_line, "unused", &["x"], 300);
+    cp.allow("alice", "app-1", "deploy");
+
+    let (port, _shutdown) = start_server(&cp, Arc::new(base_config())).await;
+    let container = client_container(&pin_key, &cert_key, &cert_line).await;
+
+    // (1) NO pin registered for the key → offered publickey-only, it is REFUSED with
+    // a standard SSH auth failure. There is no authorized_keys-style standing store
+    // the Gateway consults: a long-lived key is not, on its own, an access path.
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        ssh_args(
+            port,
+            &[
+                "-i",
+                "/root/pin_key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=publickey",
+                "-o",
+                "BatchMode=yes",
+            ],
+            "deploy%app-1",
+            "true",
+        ),
+        vec![],
+    )
+    .await;
+    assert_ne!(code, Some(0), "a standing long-lived key must not authenticate");
+    assert!(
+        stderr.to_lowercase().contains("permission denied"),
+        "a long-lived key with no active pin must be refused (no standing key store); stderr={stderr:?}"
+    );
+
+    // (2) The SAME key, once bound to an active short-TTL pin, DOES authenticate —
+    // proving the key is only ever accepted via the ephemeral pin, never as a
+    // standing credential.
+    cp.register_pin(&pin_key.fingerprint, "alice", &["deploy"]);
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        ssh_args(
+            port,
+            &[
+                "-i",
+                "/root/pin_key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=publickey",
+                "-o",
+                "BatchMode=yes",
+            ],
+            "deploy%app-1",
+            "true",
+        ),
+        vec![],
+    )
+    .await;
+    assert_ne!(code, Some(0), "pinned: authz ok, node offline");
+    assert!(
+        stderr.contains(NODE_OFFLINE),
+        "the same key WITH an active pin authenticates (short-TTL, not standing); stderr={stderr:?}"
+    );
+    Ok(())
+}
