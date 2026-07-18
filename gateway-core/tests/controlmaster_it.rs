@@ -90,6 +90,10 @@ async fn controlmaster_multiplex_per_channel_gate_and_lock_teardown() -> anyhow:
     // Grant shell+exec but WITHHOLD sftp — the per-channel gate must admit exec and
     // refuse the sftp subsystem on the SAME multiplexed connection.
     cp.set_capabilities(NODE_ID, &[Capability::Shell, Capability::Exec]);
+    // decision_ttl=0 so each channel-open re-authorizes (FR-CHAN-2): the positive
+    // control below (grant Sftp mid-connection → same-master sftp succeeds) needs the
+    // fresh capability picked up on the next channel-open.
+    cp.set_decision_ttl(0);
 
     // Real node trusting the session CA.
     let node = GenericImage::new(
@@ -198,24 +202,47 @@ async fn controlmaster_multiplex_per_channel_gate_and_lock_teardown() -> anyhow:
         "exec channel output; stdout={stdout:?}"
     );
 
-    // (3) Channel B — sftp is WITHHELD: a second channel on the SAME connection, gated
-    // independently, must be refused (per-channel capability gate).
-    let (code, _o, _e) = exec(
-        &client,
-        &[
-            "sftp",
-            "-b",
-            "/dev/null",
-            "-o",
-            &format!("ControlPath={SOCK}"),
-            TARGET,
-        ],
-    )
-    .await;
+    // (3) Channel B — sftp is WITHHELD: a second channel on the SAME authenticated
+    // master, gated independently, must be refused at the per-channel capability
+    // gate — a MULTIPLEXED subsystem/channel refusal, NOT a fresh connect/auth
+    // failure (which would evidence the multiplex didn't happen at all).
+    let sftp_cmd = [
+        "sftp",
+        "-b",
+        "/dev/null",
+        "-o",
+        &format!("ControlPath={SOCK}"),
+        TARGET,
+    ];
+    let (code, _o, sftp_err) = exec(&client, &sftp_cmd).await;
     assert_ne!(
         code,
         Some(0),
         "the sftp channel is not granted and must be refused per-channel"
+    );
+    assert!(
+        !sftp_err.contains("Permission denied") && !sftp_err.to_lowercase().contains("connection refused"),
+        "sftp must be refused at the MULTIPLEXED channel gate, not by a fresh connect/auth (no Permission denied / Connection refused); stderr={sftp_err:?}"
+    );
+    assert!(
+        sftp_err.contains("subsystem request failed")
+            || sftp_err.contains("Connection closed")
+            || sftp_err.to_lowercase().contains("access denied"),
+        "sftp stderr must evidence a multiplexed subsystem/channel refusal; stderr={sftp_err:?}"
+    );
+
+    // (3b) POSITIVE control on the SAME authenticated master: grant Sftp; the next
+    // sftp channel re-authorizes (decision_ttl=0) and SUCCEEDS — a positive+negative
+    // pair on ONE auth nails per-channel gating (not a per-connection artifact).
+    cp.set_capabilities(
+        NODE_ID,
+        &[Capability::Shell, Capability::Exec, Capability::Sftp],
+    );
+    let (code, _o, sftp_ok_err) = exec(&client, &sftp_cmd).await;
+    assert_eq!(
+        code,
+        Some(0),
+        "once Sftp is granted, the SAME-master sftp channel must SUCCEED; stderr={sftp_ok_err:?}"
     );
 
     // (4) A Lock pushed while the multiplexed session is LIVE tears the whole thing

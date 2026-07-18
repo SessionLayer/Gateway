@@ -281,6 +281,14 @@ pub const OTEL_STATUS_CODE: &str = "otel.status_code";
 /// reflects denials (a recorded `sessionlayer.outcome` alone leaves status Unset,
 /// so the derived error-rate was blind to fail-closed denials). `outcome` is a
 /// stable enum label — never content. No-op cost when the exporter is off.
+///
+/// **RED coverage (OTEL-CONTRACT §4, SEC-F2):** the error-rate deliberately covers
+/// the connect-phase denials (via `close_with`) **and** CP-down at the auth phase
+/// (via `note_cp_down`) — the genuine fail-closed faults. It excludes ordinary
+/// auth-phase rejections (`SourceBlocked`/`AuthFailed`/`DeviceFlowTimeout`), which
+/// are normal internet noise, not faults; erroring those would peg the rate near
+/// 100% and destroy the SLO signal. That is why [`SshOutcome::span_label`]
+/// enumerates all 7 outcomes but only the fault outcomes reach this function.
 pub fn record_span_fail_closed(span: &tracing::Span, outcome: &str) {
     span.record(attr::OUTCOME, outcome);
     span.record(OTEL_STATUS_CODE, "error");
@@ -360,6 +368,72 @@ mod tests {
                 .iter()
                 .any(|kv| kv.key.as_str() == attr::OUTCOME),
             "the fail-closed outcome enum is recorded on the span (never content)"
+        );
+    }
+
+    /// SEC-F2: a CP outage at the AUTH phase (`note_cp_down`, before any channel) is a
+    /// genuine fail-closed fault and MUST error the span so a CP-down storm shows in
+    /// the RED error-rate; an ordinary auth rejection (`AuthFailed`, never passed to
+    /// `record_span_fail_closed`) must NOT error the span, or the rate pegs on
+    /// internet noise and the SLO signal is lost.
+    #[test]
+    fn cp_down_at_auth_errors_the_span_but_auth_noise_does_not() {
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            // CP-down at auth: exactly what `note_cp_down` does.
+            let cp_down = tracing::info_span!(
+                "gateway.session",
+                marker = "cp_down",
+                sessionlayer.outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            );
+            {
+                let _e = cp_down.enter();
+                record_span_fail_closed(&cp_down, "cp_unavailable");
+            }
+            // Ordinary AuthFailed: russh rejects, `close_with` never runs, and nothing
+            // marks the span — it ends Unset (normal noise, not a fault).
+            let auth_noise = tracing::info_span!(
+                "gateway.session",
+                marker = "auth_noise",
+                sessionlayer.outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            );
+            let _e = auth_noise.enter();
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let by_marker = |m: &str| {
+            spans
+                .iter()
+                .find(|s| {
+                    s.attributes.iter().any(|kv| {
+                        kv.key.as_str() == "marker"
+                            && matches!(&kv.value, opentelemetry::Value::String(v) if v.as_str() == m)
+                    })
+                })
+                .unwrap_or_else(|| panic!("span {m} exported"))
+        };
+        assert_eq!(
+            by_marker("cp_down").status,
+            Status::error(""),
+            "CP-down at the auth phase must error the span so it is visible in RED error-rate"
+        );
+        assert_eq!(
+            by_marker("auth_noise").status,
+            Status::Unset,
+            "an ordinary auth rejection must NOT error the span (preserve the SLO signal)"
         );
     }
 

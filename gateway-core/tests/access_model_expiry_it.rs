@@ -233,6 +233,10 @@ async fn mid_session_expiry_modes_and_lock_override() -> anyhow::Result<()> {
         "hard_kill must tear the live session down, not exit clean"
     );
     assert!(
+        stdout.contains("UP"),
+        "hard_kill must be a LIVE teardown: the channel opened and the shell ran (UP) BEFORE teardown, not a connect-time open-refusal; stdout={stdout:?}"
+    );
+    assert!(
         !stdout.contains("DONE_HARDKILL"),
         "hard_kill must cut the session short at grant_expiry; stdout={stdout:?}"
     );
@@ -290,6 +294,10 @@ async fn mid_session_expiry_modes_and_lock_override() -> anyhow::Result<()> {
         code,
         Some(0),
         "a Lock must tear the session down even in run_to_ttl mode"
+    );
+    assert!(
+        stdout.contains("UP"),
+        "the Lock teardown must be a LIVE teardown: the channel opened and the shell ran (UP) before the lock, not an open-refusal; stdout={stdout:?}"
     );
     assert!(
         !stdout.contains("DONE_LOCK"),

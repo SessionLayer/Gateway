@@ -354,6 +354,12 @@ impl SshHandler {
     /// record and the KI service-unavailable message, and log the outcome.
     fn note_cp_down(&self, method: &str) {
         self.conn.cp_unavailable.store(true, Ordering::SeqCst);
+        // SEC-F2: a CP outage at the AUTH phase (before any channel, so `close_with`
+        // never runs) is a genuine fail-closed SYSTEM fault — mark the span error so a
+        // CP-down storm shows in the span-metrics RED error-rate. Ordinary auth
+        // rejections (SourceBlocked/AuthFailed/DeviceFlowTimeout) are NOT errored:
+        // they are normal internet noise, not faults (OTEL-CONTRACT §4).
+        crate::telemetry::record_span_fail_closed(&self.session_span, "cp_unavailable");
         tracing::warn!(source_ip = %self.source_ip, outcome = "cp_unavailable", method, "CP unreachable during resolution; failing closed");
     }
 
