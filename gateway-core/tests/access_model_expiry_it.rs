@@ -3,10 +3,12 @@
 //!
 //! The CP signs `grant_expiry` into the decision context; the Gateway enforces, per
 //! access model, what happens to a LIVE session when that grant passes:
-//!   * `run_to_ttl`     — in-flight channels run to natural close (only NEW channels
-//!                        are refused after expiry).
-//!   * `hard_kill`      — the live session is torn down at `grant_expiry`.
-//!   * `grace_then_kill`— torn down a grace window after `grant_expiry`.
+//!
+//! - `run_to_ttl` — in-flight channels run to natural close (only NEW channels are
+//!   refused after expiry).
+//! - `hard_kill` — the live session is torn down at `grant_expiry`.
+//! - `grace_then_kill` — torn down a grace window after `grant_expiry`.
+//!
 //! And, regardless of mode, a **Lock always tears the session down immediately**.
 //!
 //! One node + one client + one mock CP are reused across the four scenarios; each

@@ -7,11 +7,12 @@
 //! — a proxy cannot resurrect in-flight bytes through a dead box, and this platform
 //! has no cross-gateway session resumption. So NFR-1 ("losing one instance MUST NOT
 //! drop existing sessions") is proven at the FLEET level, which is what it means:
-//!   (A) a live session ANCHORED ON THE SURVIVING instance keeps passing I/O AFTER
-//!       the peer is killed (write-a-command / read-the-echo, post-kill), unaffected;
-//!   (B) the killed instance's node OWNERSHIP is RELEASED (presence) so a surviving
-//!       gateway takes it over — failover, not a stuck lock;
-//!   (C) NEW sessions still establish while any instance is healthy.
+//!
+//! - (A) a live session ANCHORED ON THE SURVIVING instance keeps passing I/O AFTER
+//!   the peer is killed (write-a-command / read-the-echo, post-kill), unaffected;
+//! - (B) the killed instance's node OWNERSHIP is RELEASED (presence) so a surviving
+//!   gateway takes it over — failover, not a stuck lock;
+//! - (C) NEW sessions still establish while any instance is healthy.
 
 mod support;
 
