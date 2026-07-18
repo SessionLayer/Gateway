@@ -35,6 +35,31 @@ service Authorization {
   // signed decision context + the minted session token; DENY returns the generic
   // decision and no token.
   rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+
+  // NotifySessionEnd is the Gateway's reliable session-end signal (FR-SESS-3,
+  // Session 25): it releases the session's concurrency lease (and stamps the
+  // session ended if nothing else has) PROMPTLY on every teardown path —
+  // including the degraded ones where no recording exists and
+  // Recording.FinalizeRecording therefore never fires. Purely additive
+  // lifecycle signalling: recording finalization and the S8/S9 byte path are
+  // unchanged. Idempotent (a repeat, or one racing FinalizeRecording, is a
+  // no-op). Same tier as Authorize: mTLS-required, and the CP acts only when
+  // the AUTHENTICATED caller is the gateway that brokered the session — one
+  // Gateway can never free another's slot. Added in Session 25 (additive;
+  // protocol stays 1.1).
+  rpc NotifySessionEnd(NotifySessionEndRequest) returns (NotifySessionEndResponse);
+
+  // ExtendSessionLease re-stamps a live session's concurrency-lease expiry
+  // (FR-SESS-3 exact accounting, Session 25). A RunToTtl session that outlives
+  // grant_expiry must STILL occupy its slot; the Gateway extends the lease
+  // ahead of expiry while such a session runs, so the leak-reaper (which only
+  // touches leases past expiry + grace) never frees a slot that is genuinely
+  // in use. The extension window is SERVER-authoritative (the request carries
+  // no duration — a client can never push a lease arbitrarily far out).
+  // Caller-bound exactly like NotifySessionEnd; extending an ended or
+  // already-released lease is refused. Added in Session 25 (additive; protocol
+  // stays 1.1).
+  rpc ExtendSessionLease(ExtendSessionLeaseRequest) returns (ExtendSessionLeaseResponse);
 }
 
 // The SSH capability enum (FR-AUTHZ-6 / D14). Independently grantable; default
@@ -349,4 +374,63 @@ message DecisionContext {
   // 13 (additive; protocol stays 1.1). Absent/UNSPECIFIED is treated as STANDING by an
   // older Gateway (N-1), which is the safe default.
   AccessModel access_model = 16;
+
+  // The resolved per-identity idle timeout for THIS session, in seconds
+  // (FR-SESS-3, Session 25): the most restrictive matching
+  // config.session_limit_policy.idle_timeout_seconds, else the
+  // operator_settings.default_idle_timeout_seconds fallback. 0/absent means no
+  // per-identity idle policy — only the Gateway's static idle bound applies.
+  // SIGNED so the value reaches the Gateway on trusted data (a client can
+  // never supply it); the Gateway applies it TIGHTEN-ONLY against its static
+  // max_session_idle_secs (the smaller wins — the context can shorten, never
+  // extend, the idle window). An N-1 Gateway ignores the field and keeps the
+  // static bound: safe (the CP-side max-duration ceiling still holds).
+  // Additive; protocol stays 1.1.
+  int64 idle_timeout_seconds = 17;
+}
+
+// NotifySessionEndRequest identifies the ended session. The caller is the mTLS
+// gateway identity, never a request field (the CP releases the lease only when
+// that caller brokered session_id).
+message NotifySessionEndRequest {
+  // The SessionLayer session id (UUID) whose session ended.
+  string session_id = 1;
+
+  // Why the session ended, for the lifecycle audit trail. Advisory diagnostics
+  // (a closed vocabulary, no free text): the authoritative teardown "why" for a
+  // lock/expiry lives in the decision/lock audit chain.
+  SessionEndReason reason = 2;
+}
+
+message NotifySessionEndResponse {
+  // True when this call released a still-live lease; false when the lease was
+  // already released (idempotent repeat / FinalizeRecording won the race) or
+  // none existed (e.g. break-glass took no lease). Diagnostics only.
+  bool released = 1;
+}
+
+// Why a session ended (NotifySessionEnd). Enum-only — these values may be used
+// as low-cardinality metric tags; no identity/session data belongs here.
+enum SessionEndReason {
+  SESSION_END_REASON_UNSPECIFIED = 0;
+  SESSION_END_REASON_CLOSED = 1;         // orderly close (client disconnect / EOF)
+  SESSION_END_REASON_EXPIRED = 2;        // grant_expiry teardown (mid-session expiry)
+  SESSION_END_REASON_IDLE_TIMEOUT = 3;   // idle bound hit (static or per-identity)
+  SESSION_END_REASON_LOCKED = 4;         // lock-driven teardown (S10)
+  SESSION_END_REASON_ERROR = 5;          // abnormal teardown (I/O error, abort)
+}
+
+// ExtendSessionLeaseRequest identifies the live session whose lease to
+// re-stamp. Deliberately NO duration field: the extension window is the CP's
+// (server-authoritative), so a compromised Gateway cannot park a lease in the
+// far future.
+message ExtendSessionLeaseRequest {
+  // The SessionLayer session id (UUID) whose lease to extend.
+  string session_id = 1;
+}
+
+message ExtendSessionLeaseResponse {
+  // The lease's new expiry (Unix epoch seconds, UTC). The Gateway re-extends
+  // ahead of this while a RunToTtl session keeps running past grant_expiry.
+  int64 expires_at_epoch_seconds = 1;
 }
