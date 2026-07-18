@@ -82,7 +82,7 @@ jobs:
           java-version: "25"
 
       - name: Install Rust toolchain (Gateway + Agent)
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # 1.95.0 pinned
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.95.0 pinned
         with:
           toolchain: "1.95.0"
 
