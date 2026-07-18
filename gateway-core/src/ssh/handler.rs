@@ -283,6 +283,10 @@ impl SshHandler {
             sessionlayer.node_id = tracing::field::Empty,
             sessionlayer.access_model = tracing::field::Empty,
             sessionlayer.outcome = tracing::field::Empty,
+            // Declared here so the fail-closed path can set the span STATUS to error
+            // (S23 A8 / S24 Part C) — a recorded outcome alone leaves status Unset and
+            // the span-metrics RED error-rate blind to denials.
+            otel.status_code = tracing::field::Empty,
         );
         Self {
             deps,
@@ -690,6 +694,10 @@ impl SshHandler {
     /// Emit a §7.1 refusal on `channel` and close it (a denial or a node fault).
     /// The authorized happy path never calls this — it bridges the channel.
     fn close_with(&self, channel: ChannelId, session: &mut Session, outcome: SshOutcome) {
+        // Mark the trace root as a fail-closed error (S23 A8): every value reaching
+        // here is a denial / node-fault, so the span-metrics RED error-rate must see
+        // it. The outcome enum is a stable label, never content.
+        crate::telemetry::record_span_fail_closed(&self.session_span, outcome.span_label());
         if let Some(msg) = outcome.user_message() {
             let line = format!("{msg}\r\n").into_bytes();
             let _ = session.extended_data(channel, 1, line);

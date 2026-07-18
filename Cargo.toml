@@ -120,9 +120,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # set (telemetry.rs); local `tracing`/fmt logging is otherwise unchanged. The
 # exporter's gRPC transport is **tonic/ring** (`grpc-tonic`, no `openssl` — the
 # deny.toml supply-chain policy); `reqwest`/http export is deliberately excluded.
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+# `metrics` adds the two native saturation gauges (S24, CARRYFORWARDS B5:
+# `live_sessions`, `lock_feed_healthy`) over the SAME OTLP export path — a
+# push-only PeriodicReader, never an inbound listener on the Tier-0 box.
+opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
 tracing-opentelemetry = "0.33"
 
 # Ser/de, errors, CLI.
