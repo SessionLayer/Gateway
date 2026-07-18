@@ -62,5 +62,9 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          # gcc-aarch64-linux-gnu is the cross compiler; libc6-dev-arm64-cross adds the
+          # target libc headers/objects in the cross sysroot (without it the cross-gcc
+          # falls back to the host /usr/include and ring's C build fails on
+          # bits/libc-header-start.h).
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
