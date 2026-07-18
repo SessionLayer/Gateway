@@ -197,11 +197,16 @@ async fn mid_session_expiry_modes_and_lock_override() -> anyhow::Result<()> {
     cp.set_node_connection(NODE_ID, &format!("127.0.0.1:{node_port}"), trust);
     let client = client_container(&pin).await;
 
+    // grant_expiry is set AFTER the gateway is up (enroll + lock-feed sync are slow
+    // on the 2-core box), right before the session, so a small skew margin can't
+    // race the setup latency and expire the grant before the first channel opens.
+    const EXP: i64 = 10; // seconds ahead — comfortably past connect, before the command ends
+
     // ── run_to_ttl: a command that runs PAST grant_expiry completes normally. ──
-    cp.set_grant_expiry(now_epoch() + 3);
     let (gw, sd) = start_gateway(&cp, Arc::new(gw_config(MidSessionExpiryMode::RunToTtl, 0))).await;
+    cp.set_grant_expiry(now_epoch() + EXP);
     let (code, stdout, stderr) =
-        ssh_run(&client, gw, "sh -c 'echo UP; sleep 6; echo DONE_RUNTOTTL'").await;
+        ssh_run(&client, gw, "sh -c 'echo UP; sleep 14; echo DONE_RUNTOTTL'").await;
     assert_eq!(
         code,
         Some(0),
@@ -214,11 +219,11 @@ async fn mid_session_expiry_modes_and_lock_override() -> anyhow::Result<()> {
     drop(sd);
 
     // ── hard_kill: the same over-running command is CUT SHORT at grant_expiry. ──
-    cp.set_grant_expiry(now_epoch() + 3);
     let (gw, sd) = start_gateway(&cp, Arc::new(gw_config(MidSessionExpiryMode::HardKill, 0))).await;
+    cp.set_grant_expiry(now_epoch() + EXP);
     let started = Instant::now();
     let (code, stdout, _stderr) =
-        ssh_run(&client, gw, "sh -c 'echo UP; sleep 30; echo DONE_HARDKILL'").await;
+        ssh_run(&client, gw, "sh -c 'echo UP; sleep 60; echo DONE_HARDKILL'").await;
     let hard_elapsed = started.elapsed();
     assert_ne!(
         code,
@@ -230,22 +235,22 @@ async fn mid_session_expiry_modes_and_lock_override() -> anyhow::Result<()> {
         "hard_kill must cut the session short at grant_expiry; stdout={stdout:?}"
     );
     assert!(
-        hard_elapsed < Duration::from_secs(20),
-        "hard_kill teardown must be prompt (well before the 30s sleep); elapsed={hard_elapsed:?}"
+        hard_elapsed < Duration::from_secs(18),
+        "hard_kill teardown is prompt at grant_expiry (~{EXP}s), well before the grace window and the 60s sleep; elapsed={hard_elapsed:?}"
     );
     drop(sd);
 
     // ── grace_then_kill: torn down, but only AFTER the grace window (survives well
     //    past grant_expiry — distinguishing it from hard_kill's immediate teardown). ──
-    cp.set_grant_expiry(now_epoch() + 2);
     let (gw, sd) = start_gateway(
         &cp,
-        Arc::new(gw_config(MidSessionExpiryMode::GraceThenKill, 8)),
+        Arc::new(gw_config(MidSessionExpiryMode::GraceThenKill, 10)),
     )
     .await;
+    cp.set_grant_expiry(now_epoch() + EXP);
     let started = Instant::now();
     let (code, stdout, _stderr) =
-        ssh_run(&client, gw, "sh -c 'echo UP; sleep 30; echo DONE_GRACE'").await;
+        ssh_run(&client, gw, "sh -c 'echo UP; sleep 90; echo DONE_GRACE'").await;
     let grace_elapsed = started.elapsed();
     assert_ne!(
         code,
@@ -256,11 +261,12 @@ async fn mid_session_expiry_modes_and_lock_override() -> anyhow::Result<()> {
         !stdout.contains("DONE_GRACE"),
         "grace_then_kill must cut the session short; stdout={stdout:?}"
     );
-    assert!(grace_elapsed >= Duration::from_secs(6), "grace_then_kill must survive the grace window past grant_expiry (grace applied); elapsed={grace_elapsed:?}");
+    assert!(grace_elapsed >= Duration::from_secs(15), "grace_then_kill must survive the grace window (grant_expiry ~{EXP}s + 10s grace) past hard_kill's ~{EXP}s teardown; elapsed={grace_elapsed:?}");
     drop(sd);
 
     // ── Lock overrides EVERY mode: with run_to_ttl (which never tears a live session
     //    down on expiry), a pushed Lock still tears it down immediately. ──
+    let (gw, sd) = start_gateway(&cp, Arc::new(gw_config(MidSessionExpiryMode::RunToTtl, 0))).await;
     cp.set_grant_expiry(now_epoch() + 3600); // far out — expiry is NOT the cause here.
     cp.push_lock_after_delay(
         gateway_core::pb::Lock {
@@ -274,7 +280,6 @@ async fn mid_session_expiry_modes_and_lock_override() -> anyhow::Result<()> {
         },
         Duration::from_secs(3),
     );
-    let (gw, sd) = start_gateway(&cp, Arc::new(gw_config(MidSessionExpiryMode::RunToTtl, 0))).await;
     let started = Instant::now();
     let (code, stdout, _stderr) =
         ssh_run(&client, gw, "sh -c 'echo UP; sleep 30; echo DONE_LOCK'").await;
