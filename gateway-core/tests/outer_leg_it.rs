@@ -660,7 +660,11 @@ async fn device_flow_instruction_carries_user_code_and_verification_uri() -> any
         ],
     )
     .await;
-    assert_ne!(code, Some(0), "device-flow login: authz ok, node offline; stderr={stderr}");
+    assert_ne!(
+        code,
+        Some(0),
+        "device-flow login: authz ok, node offline; stderr={stderr}"
+    );
     assert!(
         stderr.contains("WDJB-MJHT"),
         "the device user-code must be surfaced in the KI instruction field; stderr={stderr:?}"
@@ -755,7 +759,11 @@ async fn pin_silently_reconnects_within_ttl_and_falls_back_on_source_change() ->
         ],
     )
     .await;
-    assert_ne!(code, Some(0), "source-change fallback: authz ok, node offline");
+    assert_ne!(
+        code,
+        Some(0),
+        "source-change fallback: authz ok, node offline"
+    );
     assert!(
         stderr.contains(NODE_OFFLINE),
         "a source-mismatched pin must fall back to the next method (OTP), not hard-fail; stderr={stderr:?}"
@@ -802,7 +810,11 @@ async fn a_long_lived_key_offered_as_a_standing_path_is_refused() -> anyhow::Res
         vec![],
     )
     .await;
-    assert_ne!(code, Some(0), "a standing long-lived key must not authenticate");
+    assert_ne!(
+        code,
+        Some(0),
+        "a standing long-lived key must not authenticate"
+    );
     assert!(
         stderr.to_lowercase().contains("permission denied"),
         "a long-lived key with no active pin must be refused (no standing key store); stderr={stderr:?}"
