@@ -44,6 +44,7 @@ fn main() {
             let cfg = HardeningConfig {
                 landlock: LandlockConfig {
                     enabled: true,
+                    required: false,
                     read_only_paths: vec![],
                     read_write_paths: vec![arg.clone().into()],
                 },

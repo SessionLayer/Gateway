@@ -230,6 +230,16 @@ pub fn disabled_recorder() -> Arc<dyn SessionRecorder> {
     Arc::new(NullSessionRecorder)
 }
 
+/// Whether the inner→outer pump must stop forwarding node output: the shared
+/// session-abort flag (a lock/expiry teardown, §8.4) OR the recorder tap (torn /
+/// strict-recording failure). The flag is checked DIRECTLY — not only through the
+/// tap — because the non-strict `disabled_recorder()` answers `should_abort()==false`,
+/// so the tap alone would keep relaying post-lock node output on a degraded session
+/// (F-bridge-output-teardown-1).
+fn should_stop(abort: &std::sync::atomic::AtomicBool, tap: &dyn RecorderTap) -> bool {
+    abort.load(std::sync::atomic::Ordering::SeqCst) || tap.should_abort()
+}
+
 /// Relay the inner channel's messages to the outer session until the inner
 /// channel closes. Runs on its own task per bridged channel; `outer` is the outer
 /// channel id the node output is written back to.
@@ -239,13 +249,13 @@ pub(crate) async fn pump_inner_to_outer(
     handle: Handle,
     outer: ChannelId,
     tap: Arc<dyn RecorderTap>,
+    abort: Arc<std::sync::atomic::AtomicBool>,
 ) {
     while let Some(msg) = inner.wait().await {
-        // Fail closed: if recording has failed under strict mode, STOP forwarding
-        // node output immediately — no un-recorded bytes reach the client while the
-        // disconnect is in flight (mirrors the input path; red-team output-teardown
-        // race). The connection is being torn down; drop the channel.
-        if tap.should_abort() {
+        // Fail closed: a lock/expiry teardown flips the shared abort flag, or strict
+        // recording fails → STOP forwarding node output immediately (no bytes reach
+        // the client while the disconnect is in flight; mirrors the input path).
+        if should_stop(&abort, tap.as_ref()) {
             break;
         }
         match msg {
@@ -254,13 +264,16 @@ pub(crate) async fn pump_inner_to_outer(
             // client's receive rate (no unbounded buffering, F-bridge-backpressure-1).
             ChannelMsg::Data { data } => {
                 tap.tap(outer, TapDirection::Output, None, &data);
-                if tap.should_abort() || outer_write.data_bytes(data).await.is_err() {
+                if should_stop(&abort, tap.as_ref()) || outer_write.data_bytes(data).await.is_err()
+                {
                     break;
                 }
             }
             ChannelMsg::ExtendedData { data, ext } => {
                 tap.tap(outer, TapDirection::Output, Some(ext), &data);
-                if tap.should_abort() || outer_write.extended_data_bytes(ext, data).await.is_err() {
+                if should_stop(&abort, tap.as_ref())
+                    || outer_write.extended_data_bytes(ext, data).await.is_err()
+                {
                     break;
                 }
             }
@@ -289,4 +302,38 @@ pub(crate) async fn pump_inner_to_outer(
     // The node closed the channel (or we broke on a write error): close the outer
     // channel so the client's session ends cleanly.
     let _ = outer_write.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FixedTap(bool);
+    impl RecorderTap for FixedTap {
+        fn tap(&self, _c: ChannelId, _d: TapDirection, _e: Option<u32>, _data: &[u8]) {}
+        fn should_abort(&self) -> bool {
+            self.0
+        }
+    }
+
+    // F-bridge-output-teardown-1: the non-strict disabled_recorder() answers
+    // should_abort()==false, so the output pump must stop on the SHARED session-abort
+    // flag (a lock/expiry teardown) — else it relays post-lock node output on a
+    // degraded/unrecorded session. Pre-fix the pump checked only the tap → this was
+    // false and node output kept flowing.
+    #[test]
+    fn output_pump_stops_on_shared_abort_even_when_tap_never_aborts() {
+        let abort = AtomicBool::new(false);
+        let disabled = FixedTap(false);
+        assert!(!should_stop(&abort, &disabled)); // flowing while un-locked
+        abort.store(true, Ordering::SeqCst); // lock/expiry teardown fires
+        assert!(should_stop(&abort, &disabled)); // MUST stop
+    }
+
+    // Control: the strict recorder's own torn/abort signal still stops the pump.
+    #[test]
+    fn output_pump_stops_on_recorder_tap_abort() {
+        assert!(should_stop(&AtomicBool::new(false), &FixedTap(true)));
+    }
 }

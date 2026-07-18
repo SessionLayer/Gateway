@@ -467,7 +467,9 @@ impl Recorder {
     /// Fetch a fresh credential and PUT the object, retrying transient faults with
     /// exponential backoff up to `upload_max_attempts` (#4). Each attempt mints a
     /// fresh short-lived credential and a fresh streaming body.
-    async fn upload_with_retry(&self, source: &upload::UploadSource) -> bool {
+    // Returns (upload_succeeded, object_version_id) — the S3 `x-amz-version-id` of
+    // the PUT object, so FinalizeRecording can pin replay/export to this version.
+    async fn upload_with_retry(&self, source: &upload::UploadSource) -> (bool, Option<String>) {
         let mut backoff = std::time::Duration::from_millis(200);
         for attempt in 1..=self.upload_max_attempts {
             let cred = match self.cpauth.request_upload(&self.recording_id).await {
@@ -480,22 +482,22 @@ impl Recorder {
             if let Some(cred) = cred {
                 let headers: BTreeMap<String, String> = cred.required_headers.into_iter().collect();
                 match self.uploader.put(&cred.url, &headers, source).await {
-                    Ok(()) => return true,
+                    Ok(version_id) => return (true, version_id),
                     Err(e) if e.is_retryable() && attempt < self.upload_max_attempts => {
                         tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, attempt, error = %e, "WORM upload failed; retrying");
                     }
                     Err(e) => {
                         tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, attempt, error = %e, "WORM upload failed; no more retries");
-                        return false;
+                        return (false, None);
                     }
                 }
             } else if attempt >= self.upload_max_attempts {
-                return false;
+                return (false, None);
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
         }
-        false
+        (false, None)
     }
 
     /// After a capture failure: strict ⇒ tear the connection down (once);
@@ -618,11 +620,11 @@ impl SessionRecorder for Recorder {
             // session-long begin-time credential would expire before a long
             // session's PUT (§12.2). Bounded retry with backoff (#4). Bytes never
             // traverse the CP.
-            let upload_ok = match &prepared.source {
+            let (upload_ok, object_version_id) = match &prepared.source {
                 Ok(source) => self.upload_with_retry(source).await,
                 Err(e) => {
                     tracing::warn!(session_id = %self.session_id, recording_id = %self.recording_id, error = %e, outcome = "recording_failed", "recording object unavailable (spool error); not uploaded");
-                    false
+                    (false, None)
                 }
             };
             let status = match (prepared.capture_failed, upload_ok) {
@@ -644,6 +646,7 @@ impl SessionRecorder for Recorder {
                 content_digest: prepared.content_digest,
                 byte_len: prepared.byte_len,
                 sftp_audit: prepared.audits,
+                object_version_id: object_version_id.unwrap_or_default(),
             };
             match self.cpauth.finalize_recording(req).await {
                 Ok(_) if status == RecordingStatus::Finalized => tracing::info!(

@@ -62,6 +62,17 @@ pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
     setgid(gid).context("setgid")?;
     setuid(uid).context("setuid")?;
 
+    // CWE-528: `setuid` RESETS the process dumpable flag to
+    // `/proc/sys/fs/suid_dumpable` (kernel `commit_creds` on any euid/egid change),
+    // re-enabling the coredumps `hardening::coredump` disabled at startup. Pipe
+    // `core_pattern` handlers (systemd-coredump / apport) ignore `RLIMIT_CORE`, so
+    // `PR_SET_DUMPABLE=0` is the ONLY effective gate. Re-assert it IMMEDIATELY after
+    // the cred change — before the verify/reversibility checks below — so the dumpable
+    // window is a single instruction, not the ~4-syscall verify sequence a crash could
+    // hit and spill SSH plaintext / the inner key (F-privdrop-dumpable-window-1).
+    nix::sys::prctl::set_dumpable(false)
+        .context("re-asserting PR_SET_DUMPABLE=0 after privilege drop")?;
+
     // Verify the drop took on real AND effective uid...
     if Uid::current() != uid || Uid::effective() != uid {
         bail!(
@@ -72,20 +83,13 @@ pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
     }
     // ...and that it is irreversible (a full setuid from euid 0 also sets the
     // saved-set-uid, so regaining root must now be impossible). If this somehow
-    // succeeds we are unexpectedly root again — abort rather than run on.
+    // succeeds we are unexpectedly root again — abort rather than run on. (A failed
+    // setuid(0) changes no creds, so the dumpable flag set above stays 0.)
     if setuid(Uid::from_raw(0)).is_ok() {
         bail!("privilege drop is reversible (regained root after setuid); aborting");
     }
 
-    // CWE-528: `setuid` RESETS the process dumpable flag to
-    // `/proc/sys/fs/suid_dumpable` (kernel `commit_creds` on any euid/egid change),
-    // re-enabling the coredumps `hardening::coredump` disabled at startup. Pipe
-    // `core_pattern` handlers (systemd-coredump / apport) ignore `RLIMIT_CORE`, so
-    // `PR_SET_DUMPABLE=0` is the ONLY effective gate — re-assert it after the drop,
-    // and verify fail-closed (a dumpable Tier-0 process could spill SSH plaintext /
-    // the inner key to a core on crash).
-    nix::sys::prctl::set_dumpable(false)
-        .context("re-asserting PR_SET_DUMPABLE=0 after privilege drop")?;
+    // Confirm the dumpable re-assert held (fail closed).
     if nix::sys::prctl::get_dumpable().context("reading PR_GET_DUMPABLE")? {
         bail!(
             "process still dumpable after privilege drop (setuid re-enabled coredumps); aborting"

@@ -880,6 +880,13 @@ impl Default for HardeningConfig {
 pub struct LandlockConfig {
     /// Master switch. Off by default.
     pub enabled: bool,
+    /// Fail CLOSED if Landlock cannot be FULLY enforced (a kernel with no Landlock, or
+    /// only a partial ABI). Off by default (best-effort degrade with a loud warn,
+    /// backed by the container read-only rootfs); regulated Tier-0 deploys set this so
+    /// the Gateway — the platform's largest blast radius — refuses to start without
+    /// filesystem confinement, mirroring the Agent's `--require-full-landlock`
+    /// (F-landlock-require-1).
+    pub required: bool,
     /// Absolute paths the Gateway may READ (config, the CA/trust bundle, host key,
     /// `/etc/resolv.conf` + `/etc/ssl` for TLS/DNS). Missing paths are skipped with
     /// a warning (a rule over a non-existent path is not fatal).

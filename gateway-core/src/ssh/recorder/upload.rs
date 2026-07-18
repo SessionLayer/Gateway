@@ -190,7 +190,7 @@ impl HttpUploader {
         url: &str,
         required_headers: &BTreeMap<String, String>,
         source: &UploadSource,
-    ) -> Result<(), UploadError> {
+    ) -> Result<Option<String>, UploadError> {
         let target = parse_url(url)?;
         if target.https {
             if self.tls.is_none() {
@@ -211,7 +211,7 @@ impl HttpUploader {
         target: &UrlParts,
         required_headers: &BTreeMap<String, String>,
         source: &UploadSource,
-    ) -> Result<(), UploadError> {
+    ) -> Result<Option<String>, UploadError> {
         let tcp = TcpStream::connect((target.host.as_str(), target.port))
             .await
             .map_err(|_| UploadError::Transport)?;
@@ -246,7 +246,7 @@ async fn send_put<IO>(
     target: &UrlParts,
     required_headers: &BTreeMap<String, String>,
     source: &UploadSource,
-) -> Result<(), UploadError>
+) -> Result<Option<String>, UploadError>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -278,12 +278,19 @@ where
         .await
         .map_err(|_| UploadError::Transport)?;
     let status = response.status();
-    // Do NOT read the (untrusted, possibly hostile-sized) response body — only the
-    // status is used; the connection is aborted by the guard on return (#5).
+    // Capture the object-store version id (S3 `x-amz-version-id`) so replay/export
+    // can pin THIS finalized version, not a later shadow PUT to the same key
+    // (§15 crown-jewels; WORM Object Lock protects a version, not a key from a new
+    // version). Do NOT read the (untrusted, possibly hostile-sized) response body.
+    let version_id = response
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     drop(response);
 
     if status.is_success() {
-        Ok(())
+        Ok(version_id)
     } else {
         Err(UploadError::Status(status.as_u16()))
     }

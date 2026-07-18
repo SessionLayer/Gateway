@@ -30,6 +30,14 @@ use std::collections::BTreeMap;
 /// selected at runtime (it is opt-in; epoll is the default) they are hard-denied
 /// (KILL), not merely EPERM'd.
 pub fn install(mode: SeccompMode, io_uring_active: bool) -> anyhow::Result<()> {
+    // Fail CLOSED on an arch with no defined allow-list (only x86_64/aarch64), so a
+    // Tier-0 build for an unsupported arch aborts rather than running unfiltered.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (mode, io_uring_active);
+        anyhow::bail!("seccomp allow-list is only defined for x86_64 and aarch64 (fail closed)");
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     match mode {
         SeccompMode::Off => {
             tracing::debug!("seccomp filter disabled by config");
@@ -114,6 +122,13 @@ fn target_arch() -> seccompiler::TargetArch {
 fn target_arch() -> seccompiler::TargetArch {
     seccompiler::TargetArch::aarch64
 }
+// The allow-list is only defined for x86_64/aarch64; on any other Linux arch
+// `install` bails BEFORE this is reached (fail closed, mirroring the Agent). This
+// stub only satisfies the type-checker so the crate still compiles there.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn target_arch() -> seccompiler::TargetArch {
+    unreachable!("seccomp is only applied on x86_64/aarch64 — install() bails otherwise")
+}
 
 /// The steady-state syscall allow-list. Deliberately generous: the ERRNO default
 /// makes an omission a degraded operation, not a crash, but a complete list keeps
@@ -145,7 +160,6 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_ftruncate,
         libc::SYS_flock,
         libc::SYS_fallocate,
-        libc::SYS_sendfile,
         libc::SYS_splice,
         libc::SYS_pipe2,
         libc::SYS_ppoll,
@@ -182,7 +196,6 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_fchownat,
         libc::SYS_umask,
         libc::SYS_utimensat,
-        libc::SYS_fadvise64,
         libc::SYS_fchdir,
         // Landlock self-confinement: a blocking-pool thread spawned AFTER seccomp is
         // installed re-confines itself via `on_thread_start` — allow these so that
@@ -301,6 +314,13 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         // Legacy setrlimit (glibc routes through prlimit64, but keep it for the
         // sibling coredump-disable path that may call setrlimit directly).
         libc::SYS_setrlimit,
+        // F-hardening-aarch64-1: libc names SYS_sendfile/SYS_fadvise64 only on
+        // x86_64-gnu, not aarch64-gnu — keeping them in the common list breaks the
+        // arm64 build (E0425). The Gateway uses `splice` for the byte bridge (never
+        // sendfile) and issues no posix_fadvise, so on aarch64 they are simply
+        // unlisted → EPERM under the EPERM-default, harmless.
+        libc::SYS_sendfile,
+        libc::SYS_fadvise64,
     ]);
 
     // io_uring is a known sandbox-escape primitive; only allow it when the reactor
