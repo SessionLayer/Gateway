@@ -170,3 +170,117 @@ async fn signed_inner_cert_is_accepted_by_a_real_node() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// FR-AUD-4: the node's OWN sshd auth log is a tamper-independent SECOND trail. On a
+/// cert login the node (VERBOSE) records the certificate **key-id**, which is
+/// `session_id + identity` — the exact correlation handle the CP records for the
+/// cert it signed (`signed_key_ids`, standing in for the `audit_event` row here).
+/// Prove the node-log key-id and the CP's record cross-correlate.
+#[tokio::test]
+async fn node_sshd_log_key_id_cross_correlates_with_the_cp_signed_cert() -> anyhow::Result<()> {
+    build_node_image().await?;
+    let cp = MockCp::start().await;
+
+    let dir = tempfile::tempdir()?;
+    let store = identity::IdentityStore::open(dir.path())?;
+    let params = cp.channel_params(CT, RT);
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &cp.mint_enrollment_token(),
+        "gw-aud4",
+    )
+    .await?;
+
+    let session_id = "sess-aud4";
+    let principal = "deploy";
+    let token = cp.mint_session_token(
+        &cred.gateway_id,
+        session_id,
+        "node-aud4",
+        principal,
+        Duration::from_secs(120),
+    );
+    let inner = signing::InnerKeyPair::generate()?;
+    let channel = mtls::connect_mtls(&params, &cred.ca_chain_der, &cred.identity).await?;
+    let signed = signing::sign_session_certificate(channel, &token, &inner, None, RT).await?;
+    // The key-id the node will log == session_id + identity, and the CP recorded it.
+    let expected_key_id = format!("{session_id}+{principal}");
+    assert_eq!(signed.key_id, expected_key_id);
+    assert!(
+        cp.signed_key_ids().contains(&expected_key_id),
+        "the CP recorded the signed cert's key-id (the audit correlation handle)"
+    );
+
+    let node = GenericImage::new(NODE_IMAGE, NODE_TAG)
+        .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+        .with_startup_timeout(Duration::from_secs(120))
+        .with_env_var("TRUSTED_USER_CA", cp.session_ca_public_line())
+        .with_copy_to(
+            CopyTargetOptions::new("/certs/inner").with_mode(0o600),
+            inner.private_key_openssh_pem()?.as_bytes().to_vec(),
+        )
+        .with_copy_to(
+            CopyTargetOptions::new("/certs/inner-cert.pub").with_mode(0o644),
+            signed.certificate_line.clone().into_bytes(),
+        )
+        .start()
+        .await?;
+
+    let cmd = ExecCommand::new([
+        "ssh",
+        "-i",
+        "/certs/inner",
+        "-o",
+        "CertificateFile=/certs/inner-cert.pub",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "deploy@localhost",
+        "true",
+    ]);
+    let mut result = node.exec(cmd).await?;
+    let _ = result.stdout_to_vec().await?;
+    let code = result.exit_code().await?;
+    assert_eq!(
+        code,
+        Some(0),
+        "the cert login must succeed so the node logs the key-id"
+    );
+
+    // The node's own sshd VERBOSE auth log (its container stderr) is the second trail:
+    // it records the cert key-id, cross-correlatable with the CP's signed_key_ids.
+    let mut node_log = String::new();
+    for _ in 0..40 {
+        node_log = String::from_utf8_lossy(&node.stderr_to_vec().await?).into_owned();
+        if node_log.contains(&expected_key_id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        node_log.contains(&expected_key_id),
+        "the node sshd log must carry the cert key-id (session_id+identity); log tail:\n{}",
+        &node_log[node_log.len().saturating_sub(2000)..]
+    );
+    // The key-id decomposes as session_id + identity, matching the CP record — the
+    // node-local trail and the CP audit trail resolve to the SAME session.
+    assert!(
+        node_log.contains(session_id),
+        "the node log carries the session_id"
+    );
+    assert_eq!(
+        signed.key_id,
+        *cp.signed_key_ids().last().unwrap(),
+        "the node-logged key-id equals the CP's recorded signed key-id"
+    );
+
+    drop(node);
+    Ok(())
+}

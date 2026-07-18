@@ -522,6 +522,10 @@ async fn start_outer_leg(
         Duration::from_secs(ssh_cfg.reeval.lock_feed_connect_timeout_secs),
     )
     .spawn(shutdown.clone());
+    // Native saturation gauges (S24 Part C; CARRYFORWARDS B5) — the span-derived RED
+    // metrics cannot compute these. Inert unless the OTLP endpoint is set; observable
+    // (pull) callbacks, so no new listener / push loop on the Tier-0 box.
+    gateway_core::telemetry::register_gateway_gauges(live_sessions.clone(), lock_set.clone());
     // Session Nine: the real session recorder (asciicast v2 + SFTP/SCP decode +
     // customer-key encryption + hash-chained WORM upload). Reuses the one CP
     // client; reads the optional upload-CA up front (fail closed on misconfig).

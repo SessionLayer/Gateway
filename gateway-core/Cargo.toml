@@ -124,3 +124,8 @@ p256 = { workspace = true }
 # replayed tokens, oversized frames, an unknown path) against the real WSS server.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+# S24 Part C: the span-status + native-gauge tests read spans/metrics back through
+# an in-memory exporter (`testing`) and a `ManualReader`; test-only, no effect on
+# the production build (dev-deps do not).
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

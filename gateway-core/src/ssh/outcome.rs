@@ -86,6 +86,22 @@ impl SshOutcome {
         1
     }
 
+    /// A stable, non-disclosing enum label for the trace span `sessionlayer.outcome`
+    /// attribute (S24 Part C; OTEL-CONTRACT §4) — never content, so a reviewer can
+    /// see every value that can be emitted. Matches the structured-log `outcome=`
+    /// vocabulary the call sites already use.
+    pub fn span_label(&self) -> &'static str {
+        match self {
+            SshOutcome::SourceBlocked => "source_blocked",
+            SshOutcome::AuthFailed => "auth_failed",
+            SshOutcome::PolicyDenied => "policy_denied",
+            SshOutcome::DeviceFlowTimeout => "device_flow_timeout",
+            SshOutcome::ServiceUnavailable => "cp_unavailable",
+            SshOutcome::NodeUnreachable => "node_unreachable",
+            SshOutcome::RecordingUnavailable => "recording_unavailable",
+        }
+    }
+
     /// Whether this outcome is a **pre-authorization** result (must stay
     /// generic — no identity/node/rule existence disclosure). [`NodeUnreachable`]
     /// is post-authorization (the user is already entitled to know the node

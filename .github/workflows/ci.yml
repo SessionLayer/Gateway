@@ -33,6 +33,10 @@ jobs:
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
+          # S24 Part C / CARRYFORWARDS B4: prove the arm64 build compiles in CI (the
+          # Tier-0 hardening constants were cfg-gated for aarch64 in S23; nothing
+          # verified it at build level until now).
+          targets: aarch64-unknown-linux-gnu
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -46,3 +50,21 @@ jobs:
 
       - name: Run gate
         run: ./scripts/gate.sh
+
+      # aarch64 cross-check (S24 Part C / CARRYFORWARDS B4): the arm64 build was
+      # code-supported + statically verified in S23 but never compiled in CI. A
+      # `check` (not a full link) is enough to prove the cfg-gated hardening
+      # constants + every dep resolve on aarch64. ring/build scripts compile target
+      # asm, so the aarch64 cross-toolchain is required even for `check`.
+      - name: aarch64 cross-check
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          sudo apt-get update
+          # gcc-aarch64-linux-gnu is the cross compiler; libc6-dev-arm64-cross adds the
+          # target libc headers/objects in the cross sysroot (without it the cross-gcc
+          # falls back to the host /usr/include and ring's C build fails on
+          # bits/libc-header-start.h).
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          cargo check --workspace --all-features --target aarch64-unknown-linux-gnu

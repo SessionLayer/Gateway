@@ -283,6 +283,10 @@ impl SshHandler {
             sessionlayer.node_id = tracing::field::Empty,
             sessionlayer.access_model = tracing::field::Empty,
             sessionlayer.outcome = tracing::field::Empty,
+            // Declared here so the fail-closed path can set the span STATUS to error
+            // (S23 A8 / S24 Part C) — a recorded outcome alone leaves status Unset and
+            // the span-metrics RED error-rate blind to denials.
+            otel.status_code = tracing::field::Empty,
         );
         Self {
             deps,
@@ -350,6 +354,12 @@ impl SshHandler {
     /// record and the KI service-unavailable message, and log the outcome.
     fn note_cp_down(&self, method: &str) {
         self.conn.cp_unavailable.store(true, Ordering::SeqCst);
+        // SEC-F2: a CP outage at the AUTH phase (before any channel, so `close_with`
+        // never runs) is a genuine fail-closed SYSTEM fault — mark the span error so a
+        // CP-down storm shows in the span-metrics RED error-rate. Ordinary auth
+        // rejections (SourceBlocked/AuthFailed/DeviceFlowTimeout) are NOT errored:
+        // they are normal internet noise, not faults (OTEL-CONTRACT §4).
+        crate::telemetry::record_span_fail_closed(&self.session_span, "cp_unavailable");
         tracing::warn!(source_ip = %self.source_ip, outcome = "cp_unavailable", method, "CP unreachable during resolution; failing closed");
     }
 
@@ -690,6 +700,10 @@ impl SshHandler {
     /// Emit a §7.1 refusal on `channel` and close it (a denial or a node fault).
     /// The authorized happy path never calls this — it bridges the channel.
     fn close_with(&self, channel: ChannelId, session: &mut Session, outcome: SshOutcome) {
+        // Mark the trace root as a fail-closed error (S23 A8): every value reaching
+        // here is a denial / node-fault, so the span-metrics RED error-rate must see
+        // it. The outcome enum is a stable label, never content.
+        crate::telemetry::record_span_fail_closed(&self.session_span, outcome.span_label());
         if let Some(msg) = outcome.user_message() {
             let line = format!("{msg}\r\n").into_bytes();
             let _ = session.extended_data(channel, 1, line);
@@ -965,7 +979,7 @@ impl SshHandler {
                 self.close_with(channel, session, SshOutcome::PolicyDenied);
                 return Err(());
             }
-        } else if now + grant_expiry_skew_secs >= ge {
+        } else if grant_is_expired(now, ge, grant_expiry_skew_secs) {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "grant_expired", "grant expired; refusing new channel");
             self.close_with(channel, session, SshOutcome::PolicyDenied);
             return Err(());
@@ -1954,9 +1968,69 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether a grant with a fixed expiry is expired against the local clock,
+/// CONSERVATIVELY — early, never late (Design §2.4, FR-BOOT-4). With a
+/// non-negative `skew_secs` the Gateway treats the grant as expired `skew_secs`
+/// BEFORE `grant_expiry`, so a fast local clock (bounded NTP drift) never serves a
+/// new privileged channel past the real expiry. `grant_expiry == 0` means "no
+/// fixed expiry" and is handled by the caller (break-glass fail-closed vs
+/// standing/JIT decision-ttl+lock bounding), never expired here.
+fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64) -> bool {
+    grant_expiry != 0 && now_epoch.saturating_add(skew_secs) >= grant_expiry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-BOOT-4: the Gateway expires grants CONSERVATIVELY — early, never late —
+    /// when comparing the CP-issued `grant_expiry` to its local clock (the NTP
+    /// assumption, Design §2.4). A non-negative skew can only bring the refusal
+    /// FORWARD in time, and a grant is ALWAYS treated as expired at/after its real
+    /// expiry regardless of skew.
+    #[test]
+    fn grants_expire_conservatively_early_never_late() {
+        let skew = 30;
+        let ge = 1_000_000;
+
+        // Expires exactly `skew` seconds early — not one second before that.
+        assert!(
+            !grant_is_expired(ge - skew - 1, ge, skew),
+            "still valid just before the skewed cutoff"
+        );
+        assert!(
+            grant_is_expired(ge - skew, ge, skew),
+            "expired `skew` seconds early (conservative)"
+        );
+
+        // NEVER late: at and after the real expiry it is always expired, any skew.
+        for now in [ge, ge + 1, ge + 10_000] {
+            assert!(
+                grant_is_expired(now, ge, 0),
+                "expired at/after grant_expiry with zero skew"
+            );
+            assert!(
+                grant_is_expired(now, ge, skew),
+                "still expired at/after grant_expiry with skew"
+            );
+        }
+
+        // Monotone in skew: a larger non-negative skew can only expire EARLIER (or
+        // equal), never later — the "never late" guarantee across the skew range.
+        for now in [ge - 100, ge - 31, ge - 30, ge - 1, ge, ge + 1] {
+            if grant_is_expired(now, ge, 0) {
+                assert!(
+                    grant_is_expired(now, ge, skew),
+                    "positive skew must not un-expire what a zero-skew clock already expired"
+                );
+            }
+        }
+
+        // grant_expiry == 0 is "no fixed expiry" (caller-handled), never expired here.
+        assert!(!grant_is_expired(i64::MAX / 2, 0, skew));
+        // Overflow-safe: a pathological huge clock does not panic.
+        assert!(grant_is_expired(i64::MAX, ge, skew));
+    }
 
     #[test]
     fn session_id_is_a_canonical_uuid() {
