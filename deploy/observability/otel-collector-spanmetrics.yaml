@@ -1,0 +1,56 @@
+# SessionLayer — OpenTelemetry Collector config deriving Gateway/Agent RED metrics
+# from spans (Session 23, Part B).
+#
+# WHY span-derived: the Gateway and Agent are Tier-0 Rust binaries that emit OTel
+# *traces* only (gateway-core/src/telemetry.rs, agent/src/telemetry.rs) — they do
+# NOT run a Prometheus metrics pipeline, deliberately (fewer moving parts on the
+# plaintext data plane; no extra egress from Tier-0). So their Rate/Errors/Duration
+# is derived centrally by the collector's `spanmetrics` connector off the S21 span
+# inventory, with zero code change to the hardened binaries. The CP's own SLOs come
+# from its Micrometer meters (ControlPlane-API/deploy/observability/prometheus-slo-rules.yaml);
+# these span-metrics complete the data-path half.
+#
+# S21 span inventory (OTEL-CONTRACT): gateway.session / outer_leg.auth / node.connect
+# / host_verify / bridge_setup (Gateway root) → cp.authorize / cp.cert_sign (CP,
+# gRPC children) → agent.dial_back / agent.splice (Agent, session-correlated).
+# Attributes are IDs + closed enums + outcomes only — NEVER plaintext (proven by
+# ObservabilityIT + telemetry_no_content.rs), so promoting them to metric dimensions
+# is safe.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        # Buckets straddle the NFR-4 250 ms establishment budget so the data-path
+        # legs (host_verify, node.connect, bridge_setup) are queryable against it.
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]
+    dimensions:
+      # Low-cardinality closed enums only (never session_id/correlation_id/node_id —
+      # those stay on the trace per OTEL-CONTRACT §7).
+      - name: sessionlayer.outcome
+      - name: sessionlayer.access_model
+    exemplars:
+      enabled: true
+    metrics_flush_interval: 15s
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    # Keep the resource service.name as a metric label so Gateway vs Agent split.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [spanmetrics]
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      exporters: [prometheus]

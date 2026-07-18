@@ -858,12 +858,21 @@ impl SshHandler {
         recorder.open_channel(channel, rec_kind);
         let tap: Arc<dyn RecorderTap> = recorder;
 
+        // Pass the shared session-abort flag DIRECTLY so the output pump observes a
+        // lock/expiry teardown even for the non-strict disabled recorder (whose
+        // should_abort() is always false) — symmetric with the input path
+        // (F-bridge-output-teardown-1).
+        let abort = self
+            .session_abort
+            .clone()
+            .expect("session registered before the pump starts");
         let pump = tokio::spawn(bridge::pump_inner_to_outer(
             read,
             outer_write,
             session.handle(),
             channel,
             tap,
+            abort,
         ));
         self.pumps.insert(channel, pump);
         self.session_span.record("sessionlayer.outcome", "allow");

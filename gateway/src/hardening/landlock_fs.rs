@@ -78,12 +78,28 @@ pub fn confine(cfg: &LandlockConfig, log_status: bool) -> anyhow::Result<()> {
                 );
             }
             RulesetStatus::NotEnforced => {
-                // Kernel-capability gap — documented Accepted-Risk degrade.
+                // Kernel-capability gap — documented Accepted-Risk degrade (unless
+                // landlock.required is set, in which case we fail closed below).
                 tracing::warn!(
                     "Landlock is unavailable on this kernel (no LSM support); filesystem confinement DISABLED (Accepted-Risk) — rely on the container read-only rootfs + dropped capabilities"
                 );
             }
         }
+    }
+    // F-landlock-require-1: on the Tier-0 Gateway an operator can demand FULL
+    // confinement — refuse to start on a kernel that can't provide it (mirrors the
+    // Agent's --require-full-landlock). Default off (best-effort degrade above).
+    enforce_required(cfg.required, status.ruleset)
+}
+
+/// Fail closed when `required` is set but Landlock is not fully enforced. Factored
+/// out so the decision is unit-testable without a Landlock-less kernel.
+fn enforce_required(required: bool, ruleset: RulesetStatus) -> anyhow::Result<()> {
+    if required && !matches!(ruleset, RulesetStatus::FullyEnforced) {
+        anyhow::bail!(
+            "landlock.required is set but Landlock is only {ruleset:?} on this kernel — refusing \
+             to start a Tier-0 Gateway without full filesystem confinement (fail closed)"
+        );
     }
     Ok(())
 }
@@ -106,5 +122,21 @@ fn open_rule_path(path: &Path) -> anyhow::Result<Option<PathFd>> {
             }
             Err(anyhow::Error::new(e).context(format!("landlock: opening {}", path.display())))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F-landlock-require-1: with landlock.required set, anything short of full
+    // enforcement must abort startup; unset, the best-effort degrade never blocks.
+    #[test]
+    fn required_fails_closed_unless_fully_enforced() {
+        assert!(enforce_required(true, RulesetStatus::NotEnforced).is_err());
+        assert!(enforce_required(true, RulesetStatus::PartiallyEnforced).is_err());
+        assert!(enforce_required(true, RulesetStatus::FullyEnforced).is_ok());
+        assert!(enforce_required(false, RulesetStatus::NotEnforced).is_ok());
+        assert!(enforce_required(false, RulesetStatus::PartiallyEnforced).is_ok());
     }
 }
