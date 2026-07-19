@@ -2175,14 +2175,38 @@ const LEASE_EXTEND_LEAD_SECS: i64 = 60;
 const LEASE_RETRY_SECS: i64 = 5;
 const LEASE_MIN_TICK_SECS: i64 = 5;
 
+/// How the keeper reacts to an `ExtendSessionLease` failure (S25 review F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseRefusal {
+    /// Transport-shaped fault: retry on the next tick; the lease is presumed live.
+    RetryTransient,
+    /// An N-1 CP without the RPC (UNIMPLEMENTED): benign, stop quietly.
+    StopQuiet,
+    /// Any other refusal of a session THIS Gateway still considers live — the
+    /// signature of "the CP no longer holds the lease" (reaped under a sustained
+    /// partition, or released), i.e. the one exactness break. Stop LOUDLY so an
+    /// operator can correlate the transient under-count (AR-GW-LEASE-PARTITION).
+    StopLoud,
+}
+
+fn classify_lease_failure(e: &CpError) -> LeaseRefusal {
+    if e.code() == Some(tonic::Code::Unimplemented) {
+        LeaseRefusal::StopQuiet
+    } else if e.is_cp_down() {
+        LeaseRefusal::RetryTransient
+    } else {
+        LeaseRefusal::StopLoud
+    }
+}
+
 /// Keep a live session's CP concurrency lease stamped (FR-SESS-3 exact
 /// accounting, Session 25): the first extension fires a lead ahead of
 /// `grant_expiry` (immediately when already inside that window; one lead out when
 /// the grant has no fixed expiry, to learn the server-authoritative window), then
 /// re-extends at half the returned window. Accounting, never authorization: a
-/// transient fault only delays the next tick, and a policy-shaped refusal (lease
-/// already released; an N-1 CP without the RPC) stops the keeper quietly. The
-/// session itself is never touched.
+/// transient fault only delays the next tick, and any refusal stops the keeper
+/// (the CP is authoritative for the lease) — quietly for an N-1 CP, LOUDLY when
+/// a live session's lease is gone (F3). The session itself is never touched.
 async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant_expiry: i64) {
     let mut next_at = if grant_expiry > 0 {
         grant_expiry - LEASE_EXTEND_LEAD_SECS
@@ -2200,14 +2224,20 @@ async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant
                 let half_window = (resp.expires_at_epoch_seconds - now) / 2;
                 next_at = now + half_window.max(LEASE_MIN_TICK_SECS);
             }
-            Err(e) if e.is_cp_down() => {
-                tracing::debug!(session_id = %session_id, error = %e, "lease extension failed transiently; retrying");
-                next_at = now_epoch_secs() + LEASE_RETRY_SECS;
-            }
-            Err(e) => {
-                tracing::debug!(session_id = %session_id, code = ?e.code(), "lease extension refused; stopping the keeper");
-                return;
-            }
+            Err(e) => match classify_lease_failure(&e) {
+                LeaseRefusal::RetryTransient => {
+                    tracing::debug!(session_id = %session_id, error = %e, "lease extension failed transiently; retrying");
+                    next_at = now_epoch_secs() + LEASE_RETRY_SECS;
+                }
+                LeaseRefusal::StopQuiet => {
+                    tracing::debug!(session_id = %session_id, "CP predates ExtendSessionLease (N-1); stopping the keeper");
+                    return;
+                }
+                LeaseRefusal::StopLoud => {
+                    tracing::warn!(session_id = %session_id, code = ?e.code(), "live session's lease refused extension — the CP no longer holds it (reaped/released); the concurrency count under-reports until this session ends");
+                    return;
+                }
+            },
         }
     }
 }
@@ -2323,6 +2353,44 @@ mod tests {
             0,
             "a zero static bound is never loosened by a context"
         );
+    }
+
+    /// F3: the lease keeper's failure taxonomy. Transient faults retry; an N-1
+    /// UNIMPLEMENTED stops quietly; every OTHER refusal of a live session's
+    /// lease stops LOUDLY (the WARN call site is keyed on `StopLoud`) — it is
+    /// the observable signature of the AR-GW-LEASE-PARTITION under-count.
+    #[test]
+    fn lease_failure_is_loud_only_when_a_live_lease_is_gone() {
+        use crate::cpauth::CpError;
+        for transient in [
+            CpError::Timeout(Duration::from_secs(1)),
+            CpError::CircuitOpen,
+            CpError::Rpc(tonic::Status::unavailable("x")),
+            CpError::Rpc(tonic::Status::internal("x")),
+        ] {
+            assert_eq!(
+                classify_lease_failure(&transient),
+                LeaseRefusal::RetryTransient,
+                "{transient:?} must retry, not stop"
+            );
+        }
+        assert_eq!(
+            classify_lease_failure(&CpError::Rpc(tonic::Status::unimplemented("x"))),
+            LeaseRefusal::StopQuiet,
+            "an N-1 CP without the RPC is benign"
+        );
+        for gone in [
+            tonic::Status::failed_precondition("released"),
+            tonic::Status::not_found("no lease"),
+            tonic::Status::permission_denied("not yours"),
+            tonic::Status::invalid_argument("bad id"),
+        ] {
+            assert_eq!(
+                classify_lease_failure(&CpError::Rpc(gone.clone())),
+                LeaseRefusal::StopLoud,
+                "a refusal of a live session's lease must stop LOUDLY: {gone:?}"
+            );
+        }
     }
 
     #[test]

@@ -395,6 +395,34 @@ async fn session_end_signal_on_every_teardown_path_and_exact_leases() -> anyhow:
     let sid_efail = cp.last_authorize_request().unwrap().session_id;
     let n = wait_for_end(&cp, &sid_efail).await;
     assert_eq!(n.reason, SessionEndReason::Closed as i32);
+
+    // ── 7. Reaped-under-live (F3): the CP releases the lease out from under a
+    //       live session — the keeper's next extension is refused, it STOPS
+    //       (loudly, operator-side) instead of retrying, and the session is
+    //       never affected. ──
+    cp.set_grant_expiry(now_epoch() + 5);
+    cp.reap_next_lease_after_first_extension(Some(sid_efail.clone()));
+    let (code, stdout, stderr) = ssh_run(
+        &client,
+        gw,
+        &live,
+        "sh -c 'echo UP; sleep 14; echo DONE_REAPED'",
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "a refused lease extension must never affect the live session; stderr={stderr}"
+    );
+    assert!(stdout.contains("DONE_REAPED"));
+    let sid_reaped = cp.last_authorize_request().unwrap().session_id;
+    let tries = cp.lease_extensions_for(&sid_reaped);
+    assert!(
+        (1..=2).contains(&tries),
+        "the keeper stops on the refusal (at most one success then one refusal), not retry forever; got {tries} attempts"
+    );
+    let n = wait_for_end(&cp, &sid_reaped).await;
+    assert_eq!(n.reason, SessionEndReason::Closed as i32);
     drop(sd);
 
     // ── Exactly-once-ish: one signal per session, never a double-send from a
@@ -402,7 +430,13 @@ async fn session_end_signal_on_every_teardown_path_and_exact_leases() -> anyhow:
     tokio::time::sleep(Duration::from_secs(2)).await;
     let all = cp.session_end_notifications();
     for sid in [
-        &sid_close, &sid_abort, &sid_exp, &sid_lock, &sid_ttl, &sid_efail,
+        &sid_close,
+        &sid_abort,
+        &sid_exp,
+        &sid_lock,
+        &sid_ttl,
+        &sid_efail,
+        &sid_reaped,
     ] {
         assert_eq!(
             all.iter().filter(|n| n.session_id == **sid).count(),

@@ -2666,6 +2666,48 @@ impl MockCp {
         self.state.lease_extensions.lock().unwrap().len()
     }
 
+    /// ExtendSessionLease attempts for ONE session (including refused ones).
+    pub fn lease_extensions_for(&self, session_id: &str) -> usize {
+        self.state
+            .lease_extensions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| *s == session_id)
+            .count()
+    }
+
+    /// Simulate the CP lease reaper (S25 review F3): once a session NEWER than
+    /// `prior_session_id` has recorded its first extension attempt, release its
+    /// lease out from under it — the next extension is then refused while the
+    /// session is still live (the keeper must stop loudly; the session must not
+    /// be touched).
+    pub fn reap_next_lease_after_first_extension(&self, prior_session_id: Option<String>) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let sid = state
+                    .authorize_requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map(|r| r.session_id.clone());
+                let Some(sid) = sid else { continue };
+                if prior_session_id.as_deref() == Some(sid.as_str()) {
+                    continue;
+                }
+                if !state.lease_extensions.lock().unwrap().contains(&sid) {
+                    continue;
+                }
+                if let Some(l) = state.leases.lock().unwrap().get_mut(&sid) {
+                    l.released = true;
+                }
+                return;
+            }
+        });
+    }
+
     /// Make ExtendSessionLease fail UNAVAILABLE (a transient CP fault).
     pub fn set_extend_unavailable(&self, on: bool) {
         *self.state.extend_unavailable.lock().unwrap() = on;
