@@ -40,12 +40,13 @@ use gateway_core::pb::{
     lock_event, AccessModel, AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest,
     BeginDeviceFlowResponse, BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution,
     Capability, ClientHello, ComponentInfo, ConnectorKind, CustomerKey, Decision, DecisionContext,
-    DeviceFlowStatus, EnrollGatewayRequest, EnrollGatewayResponse, FinalizeRecordingRequest,
-    FinalizeRecordingResponse, Heartbeat, HostVerification, IssueGatewayServerCertificateRequest,
-    IssueGatewayServerCertificateResponse, KeySealAlgorithm, Lock, LockEvent, LockRemoval,
-    LockSnapshot, NodeConnection, PollDeviceFlowRequest, PollDeviceFlowResponse,
-    PresenceHeartbeatRequest, PresenceHeartbeatResponse, PresenceReleaseRequest,
-    PresenceReleaseResponse, ProtocolVersion, RenewGatewayIdentityRequest,
+    DeviceFlowStatus, EnrollGatewayRequest, EnrollGatewayResponse, ExtendSessionLeaseRequest,
+    ExtendSessionLeaseResponse, FinalizeRecordingRequest, FinalizeRecordingResponse, Heartbeat,
+    HostVerification, IssueGatewayServerCertificateRequest, IssueGatewayServerCertificateResponse,
+    KeySealAlgorithm, Lock, LockEvent, LockRemoval, LockSnapshot, NodeConnection,
+    NotifySessionEndRequest, NotifySessionEndResponse, PollDeviceFlowRequest,
+    PollDeviceFlowResponse, PresenceHeartbeatRequest, PresenceHeartbeatResponse,
+    PresenceReleaseRequest, PresenceReleaseResponse, ProtocolVersion, RenewGatewayIdentityRequest,
     RenewGatewayIdentityResponse, RequestUploadRequest, RequestUploadResponse,
     ResolveBreakglassCodeRequest, ResolveBreakglassCodeResponse, ResolveBreakglassKeyRequest,
     ResolveBreakglassKeyResponse, ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest,
@@ -524,6 +525,31 @@ struct MockState {
     /// Every `AuthorizeRequest` the mock received, in order — for Part A assertions
     /// (node_name populated, name resolution authoritative).
     authorize_requests: Mutex<Vec<AuthorizeRequest>>,
+
+    // ---- Session 25: FR-SESS-3 lease lifecycle -------------------------------
+    /// Concurrency leases taken on a standing/JIT ALLOW (break-glass takes none),
+    /// keyed by session_id. NotifySessionEnd releases; ExtendSessionLease re-stamps.
+    leases: Mutex<HashMap<String, LeaseRecord>>,
+    /// Every NotifySessionEnd received (assertions: exactly-once, right reason).
+    session_end_notifications: Mutex<Vec<NotifySessionEndRequest>>,
+    /// session_ids of every ExtendSessionLease ATTEMPT — recorded before the
+    /// failure gate so failure-injection tests still see the Gateway trying.
+    lease_extensions: Mutex<Vec<String>>,
+    /// The server-authoritative extension window ExtendSessionLease grants (secs).
+    extend_window_secs: Mutex<i64>,
+    /// When set, ExtendSessionLease returns UNAVAILABLE (a transient CP fault).
+    extend_unavailable: Mutex<bool>,
+    /// The per-identity idle timeout signed into every decision context
+    /// (`idle_timeout_seconds`; 0 = no per-identity idle policy).
+    idle_timeout_secs: Mutex<i64>,
+}
+
+/// One session's concurrency lease (Session 25): released exactly once by the
+/// brokering gateway's NotifySessionEnd; re-stamped by ExtendSessionLease.
+struct LeaseRecord {
+    gateway_id: String,
+    released: bool,
+    expires_at: i64,
 }
 
 impl MockState {
@@ -1273,7 +1299,26 @@ impl MockState {
             identity_groups: r.identity_groups.clone(),
             node_labels,
             access_model: access_model as i32,
+            idle_timeout_seconds: *self.idle_timeout_secs.lock().unwrap(),
         }
+    }
+
+    /// Take the session's concurrency lease, as the real CP does inside the ALLOW
+    /// tx (FR-SESS-3). Expires with the grant (the reaper backstop model).
+    fn create_lease(&self, session_id: &str, gateway_id: &str) {
+        let expires = self
+            .grant_expiry_override
+            .lock()
+            .unwrap()
+            .unwrap_or(unix_now() as i64 + 3600);
+        self.leases.lock().unwrap().insert(
+            session_id.to_string(),
+            LeaseRecord {
+                gateway_id: gateway_id.to_string(),
+                released: false,
+                expires_at: expires,
+            },
+        );
     }
 
     /// Build an ALLOW response for a pre-built context: mint the single-use session
@@ -1462,11 +1507,62 @@ impl Authorization for MockSvc {
 
         // ALLOW (standing): mint the single-use session + recording tokens + the
         // SIGNED decision context (Part E node connection attached if registered).
-        Ok(Response::new(self.allow_response(
-            &gid,
-            &r,
-            AccessModel::Standing,
-        )))
+        // The concurrency lease is taken inside the ALLOW (FR-SESS-3, Session 25);
+        // break-glass (above) is cap-exempt and takes none.
+        let resp = self.allow_response(&gid, &r, AccessModel::Standing);
+        self.create_lease(&r.session_id, &gid);
+        Ok(Response::new(resp))
+    }
+
+    async fn notify_session_end(
+        &self,
+        request: Request<NotifySessionEndRequest>,
+    ) -> Result<Response<NotifySessionEndResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        self.session_end_notifications
+            .lock()
+            .unwrap()
+            .push(r.clone());
+        // Caller-bound + idempotent, like the real CP: only the brokering
+        // gateway's FIRST signal releases a still-live lease.
+        let released = match self.leases.lock().unwrap().get_mut(&r.session_id) {
+            Some(l) if !l.released && l.gateway_id == gid => {
+                l.released = true;
+                true
+            }
+            _ => false,
+        };
+        Ok(Response::new(NotifySessionEndResponse { released }))
+    }
+
+    async fn extend_session_lease(
+        &self,
+        request: Request<ExtendSessionLeaseRequest>,
+    ) -> Result<Response<ExtendSessionLeaseResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        // Attempts are recorded BEFORE the failure gate so a failure-injection
+        // test can still assert the Gateway kept trying.
+        self.lease_extensions
+            .lock()
+            .unwrap()
+            .push(r.session_id.clone());
+        if *self.extend_unavailable.lock().unwrap() {
+            return Err(Status::unavailable("control plane temporarily unavailable"));
+        }
+        let window = *self.extend_window_secs.lock().unwrap();
+        match self.leases.lock().unwrap().get_mut(&r.session_id) {
+            Some(l) if !l.released && l.gateway_id == gid => {
+                l.expires_at = unix_now() as i64 + window;
+                Ok(Response::new(ExtendSessionLeaseResponse {
+                    expires_at_epoch_seconds: l.expires_at,
+                }))
+            }
+            // Released / unknown / another gateway's lease: refused (the window is
+            // server-authoritative and caller-bound).
+            _ => Err(Status::failed_precondition("no live lease for this caller")),
+        }
     }
 }
 
@@ -1981,6 +2077,12 @@ impl MockCpBuilder {
             presence_staleness: self.presence_staleness,
             node_name_to_id: Mutex::new(HashMap::new()),
             authorize_requests: Mutex::new(Vec::new()),
+            leases: Mutex::new(HashMap::new()),
+            session_end_notifications: Mutex::new(Vec::new()),
+            lease_extensions: Mutex::new(Vec::new()),
+            extend_window_secs: Mutex::new(60),
+            extend_unavailable: Mutex::new(false),
+            idle_timeout_secs: Mutex::new(0),
         });
 
         let tls = ServerTlsConfig::new()
@@ -2546,6 +2648,42 @@ impl MockCp {
     /// break-glass ALLOW un-time-boxed → the GW must fail closed).
     pub fn set_grant_expiry(&self, epoch_seconds: i64) {
         *self.state.grant_expiry_override.lock().unwrap() = Some(epoch_seconds);
+    }
+
+    /// Session 25 (FR-SESS-3): sign a per-identity idle timeout into every
+    /// decision context (0 = no per-identity idle policy).
+    pub fn set_idle_timeout(&self, secs: i64) {
+        *self.state.idle_timeout_secs.lock().unwrap() = secs;
+    }
+
+    /// Every NotifySessionEnd received, in order (session_id + reason).
+    pub fn session_end_notifications(&self) -> Vec<NotifySessionEndRequest> {
+        self.state.session_end_notifications.lock().unwrap().clone()
+    }
+
+    /// ExtendSessionLease attempts observed (including injected failures).
+    pub fn lease_extension_count(&self) -> usize {
+        self.state.lease_extensions.lock().unwrap().len()
+    }
+
+    /// Make ExtendSessionLease fail UNAVAILABLE (a transient CP fault).
+    pub fn set_extend_unavailable(&self, on: bool) {
+        *self.state.extend_unavailable.lock().unwrap() = on;
+    }
+
+    /// The server-authoritative window ExtendSessionLease re-stamps (seconds).
+    pub fn set_extend_window(&self, secs: i64) {
+        *self.state.extend_window_secs.lock().unwrap() = secs;
+    }
+
+    /// Whether the session's lease is released (`None` = no lease was taken).
+    pub fn lease_released(&self, session_id: &str) -> Option<bool> {
+        self.state
+            .leases
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|l| l.released)
     }
 
     /// G6: make the lock feed unavailable so the Gateway's feed never becomes healthy.

@@ -246,6 +246,7 @@ mod tests {
             identity_groups: vec!["admins".into()],
             node_labels: vec!["env=prod".into()],
             access_model: crate::pb::AccessModel::Standing as i32,
+            idle_timeout_seconds: 0,
         }
     }
 
