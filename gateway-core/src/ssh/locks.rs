@@ -8,11 +8,11 @@
 //! matching ones immediately through the S9 recorder finalize path.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::pb::{DecisionContext, Lock, LockMode, LockTarget};
+use crate::pb::{DecisionContext, Lock, LockMode, LockTarget, SessionEndReason};
 
 /// The trusted, per-session facts a lock is matched against — taken from the
 /// SIGNED decision context (so a Gateway can never dodge a lock by lying about
@@ -264,6 +264,10 @@ pub struct SessionControl {
     /// down here stops plaintext immediately (mirrors S9 strict-mode teardown).
     abort: Arc<AtomicBool>,
     terminated: Arc<AtomicBool>,
+    /// Why the session was torn down (a `SessionEndReason` value; 0 = unset,
+    /// first cause wins). The handler's Drop reads it for the FR-SESS-3
+    /// session-end signal (Session 25).
+    end_reason: Arc<AtomicI32>,
 }
 
 impl SessionControl {
@@ -278,6 +282,7 @@ impl SessionControl {
             handle,
             abort,
             terminated: Arc::new(AtomicBool::new(false)),
+            end_reason: Arc::new(AtomicI32::new(SessionEndReason::Unspecified as i32)),
         }
     }
 
@@ -289,6 +294,27 @@ impl SessionControl {
 
     fn matches(&self, target: &LockTarget) -> bool {
         target_matches(target, &self.bindings.lock().unwrap())
+    }
+
+    /// Tear the session down, recording WHY (first recorded cause wins — a lock
+    /// racing an expiry keeps the earlier cause) so the handler's Drop can carry
+    /// it in the session-end signal. Operator-side diagnostics only: the SSH user
+    /// still sees the one generic teardown message (§7.1).
+    pub fn terminate_with(&self, reason: SessionEndReason) {
+        let _ = self.end_reason.compare_exchange(
+            SessionEndReason::Unspecified as i32,
+            reason as i32,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        self.terminate();
+    }
+
+    /// The teardown cause recorded by [`Self::terminate_with`] (UNSPECIFIED when
+    /// the session ended without an out-of-band teardown).
+    pub fn end_reason(&self) -> SessionEndReason {
+        SessionEndReason::try_from(self.end_reason.load(Ordering::SeqCst))
+            .unwrap_or(SessionEndReason::Unspecified)
     }
 
     /// Tear the session down immediately (idempotent). Non-blocking: the outer
@@ -367,7 +393,7 @@ impl LiveSessionRegistry {
                 .collect()
         };
         for c in &victims {
-            c.terminate();
+            c.terminate_with(SessionEndReason::Locked);
         }
         victims.len()
     }
@@ -382,7 +408,8 @@ impl LiveSessionRegistry {
             sessions.values().cloned().collect()
         };
         for c in &victims {
-            c.terminate();
+            // An orderly drain, not a policy action: CLOSED, not LOCKED/ERROR.
+            c.terminate_with(SessionEndReason::Closed);
         }
         victims.len()
     }
@@ -410,7 +437,7 @@ impl LiveSessionRegistry {
                 .collect()
         };
         for c in &victims {
-            c.terminate();
+            c.terminate_with(SessionEndReason::Locked);
         }
         victims.len()
     }
@@ -457,6 +484,7 @@ mod tests {
             identity_groups: groups.iter().map(|s| s.to_string()).collect(),
             node_labels: labels.iter().map(|s| s.to_string()).collect(),
             access_model: crate::pb::AccessModel::Standing as i32,
+            idle_timeout_seconds: 0,
         }
     }
 

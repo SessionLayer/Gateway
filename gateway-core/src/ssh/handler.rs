@@ -24,7 +24,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,7 @@ use crate::cpauth::{CpAuthClient, CpError};
 use crate::decisionctx;
 use crate::pb::{
     AccessModel, AuthorizeRequest, Capability, ConnectorKind, Decision, DecisionContext,
-    DeviceFlowStatus, ResolvedIdentity, SignContext,
+    DeviceFlowStatus, ResolvedIdentity, SessionEndReason, SignContext,
 };
 use crate::signing::InnerKeyPair;
 use crate::ssh::bridge::{
@@ -220,6 +220,21 @@ pub struct SshHandler {
     session_control: Option<SessionControl>,
     /// The mid-session identity-expiry timer (Part F), rearmed on re-authorize.
     expiry_task: Option<tokio::task::JoinHandle<()>>,
+    /// Epoch seconds of the last session-channel byte in either direction, for
+    /// the per-session idle watchdog (FR-SESS-3, Session 25). Input is stamped in
+    /// `data`/`window_change_request`; output via the pump's [`ActivityTap`].
+    activity: Arc<AtomicU64>,
+    /// The per-session idle watchdog (FR-SESS-3): tears the session down when no
+    /// bytes have moved for the effective (tighten-only) idle bound. Rearmed on
+    /// re-authorize; aborted on Drop.
+    idle_task: Option<tokio::task::JoinHandle<()>>,
+    /// The concurrency-lease keeper (FR-SESS-3 exact accounting): re-stamps the
+    /// CP lease ahead of expiry while the session lives. Aborted on Drop.
+    lease_task: Option<tokio::task::JoinHandle<()>>,
+    /// Set once Authorize returned ALLOW: the CP took a concurrency lease inside
+    /// that decision, so teardown owes it a session-end signal — even when the
+    /// Gateway then failed the session closed (unverified context, node fault).
+    lease_expected: AtomicBool,
     /// Shared with the accept loop (pre-auth deadline + auth-failed record).
     conn: Arc<ConnState>,
 }
@@ -315,6 +330,10 @@ impl SshHandler {
             live_guard: None,
             session_control: None,
             expiry_task: None,
+            activity: Arc::new(AtomicU64::new(0)),
+            idle_task: None,
+            lease_task: None,
+            lease_expected: AtomicBool::new(false),
             conn,
         }
     }
@@ -867,10 +886,15 @@ impl SshHandler {
         let (_outer_read, outer_write) = outer_chan.split();
 
         // Register the channel with the recorder (the asciicast header already
-        // carries the PTY size via `rec_kind`), then hand it to the pump as a tap.
+        // carries the PTY size via `rec_kind`), then hand it to the pump as a tap
+        // — wrapped so node→client output also stamps the idle watchdog's
+        // activity clock (the tap/bridge seam itself is unchanged).
         let recorder = self.recorder.clone().expect("recorder set above");
         recorder.open_channel(channel, rec_kind);
-        let tap: Arc<dyn RecorderTap> = recorder;
+        let tap: Arc<dyn RecorderTap> = Arc::new(ActivityTap {
+            tap: recorder,
+            activity: self.activity.clone(),
+        });
 
         // Pass the shared session-abort flag DIRECTLY so the output pump observes a
         // lock/expiry teardown even for the non-strict disabled recorder (whose
@@ -948,6 +972,7 @@ impl SshHandler {
                         if let Some(control) = self.session_control.clone() {
                             control.update_bindings(fresh.bindings.clone());
                             self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
+                            self.arm_idle(fresh.context.idle_timeout_seconds);
                         }
                         authz = fresh;
                     }
@@ -1023,6 +1048,8 @@ impl SshHandler {
         );
         self.session_control = Some(control);
         self.arm_expiry(authz.context.grant_expiry_epoch_seconds);
+        self.arm_idle(authz.context.idle_timeout_seconds);
+        self.arm_lease_keeper(authz);
     }
 
     /// (Re)arm the mid-session identity-expiry timer for `grant_expiry` (Part F).
@@ -1042,7 +1069,7 @@ impl SshHandler {
         if grant_expiry == 0 && self.session_is_break_glass() {
             if let Some(control) = self.session_control.clone() {
                 tracing::warn!(session_id = %self.session_id, break_glass = true, outcome = "grant_expired", "break-glass session without a grant_expiry; tearing down (must be time-boxed)");
-                control.terminate();
+                control.terminate_with(SessionEndReason::Expired);
             }
             return;
         }
@@ -1063,8 +1090,75 @@ impl SshHandler {
         self.expiry_task = Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(wait)).await;
             tracing::info!(session_id = %session_id, outcome = "grant_expired", "mid-session grant expiry: tearing session down");
-            control.terminate();
+            control.terminate_with(SessionEndReason::Expired);
         }));
+    }
+
+    /// (Re)arm the per-session idle watchdog (FR-SESS-3, Session 25): tear the
+    /// session down once no session-channel byte has moved for the effective idle
+    /// bound — `min(static max_session_idle_secs, signed idle_timeout_seconds)`,
+    /// TIGHTEN-ONLY (the context can shorten, never extend, the static bound; the
+    /// static russh inactivity timers stay armed regardless). Teardown runs the
+    /// same [`SessionControl`] path as a lock/expiry, so the recorder finalize +
+    /// session-end signal fire normally; a Lock still overrides immediately.
+    fn arm_idle(&mut self, context_idle_secs: i64) {
+        if let Some(task) = self.idle_task.take() {
+            task.abort();
+        }
+        // Wall-clock deadlines, mirroring arm_expiry (review info-1): a backward
+        // NTP step can stretch one idle window, but host time is outside the
+        // attacker model (Design §2.4) and the tightened transport backstop
+        // still bounds the session.
+        let idle = effective_idle_secs(
+            self.deps.config.inner.max_session_idle_secs,
+            context_idle_secs,
+        );
+        if idle == 0 {
+            return;
+        }
+        let Some(control) = self.session_control.clone() else {
+            return;
+        };
+        // Start the idle clock now — a zero "last activity" would fire instantly.
+        self.activity
+            .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
+        let activity = self.activity.clone();
+        let session_id = self.session_id.clone();
+        self.idle_task = Some(tokio::spawn(async move {
+            loop {
+                let deadline = activity.load(Ordering::Relaxed) as i64 + idle as i64;
+                let now = now_epoch_secs();
+                if now >= deadline {
+                    tracing::info!(session_id = %session_id, idle_secs = idle, outcome = "idle_timeout", "session idle bound reached; tearing session down");
+                    control.terminate_with(SessionEndReason::IdleTimeout);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs((deadline - now) as u64)).await;
+            }
+        }));
+    }
+
+    /// Start the concurrency-lease keeper once per connection (FR-SESS-3 exact
+    /// accounting, Session 25): a live session outliving `grant_expiry` (RunToTtl)
+    /// must still occupy its slot, so the lease is re-stamped ahead of expiry for
+    /// as long as the session runs. Break-glass is exempt from the concurrency cap
+    /// and takes no lease — nothing to keep.
+    fn arm_lease_keeper(&mut self, authz: &Arc<Authorized>) {
+        if self.lease_task.is_some() || self.session_is_break_glass() {
+            return;
+        }
+        // Only a RunToTtl session can outlive its grant and must keep occupying
+        // its slot. GraceThenKill/HardKill die at/near grant_expiry — there the
+        // CP-side lease self-heal already matches the session lifetime, and
+        // extending would let a lost end-signal over-count past expiry (F-4).
+        if self.mid_session_expiry_mode() != MidSessionExpiryMode::RunToTtl {
+            return;
+        }
+        self.lease_task = Some(tokio::spawn(keep_lease_stamped(
+            self.deps.cpauth.clone(),
+            self.session_id.clone(),
+            authz.context.grant_expiry_epoch_seconds,
+        )));
     }
 
     /// Resolve the target, apply the credential reducer, call `Authorize`, and on
@@ -1131,10 +1225,22 @@ impl SshHandler {
             breakglass_token: self.breakglass_token.clone().unwrap_or_default(),
         };
 
-        match self.deps.cpauth.authorize(req).await {
-            Ok(resp)
-                if resp.decision == Decision::Allow as i32 && !resp.session_token.is_empty() =>
-            {
+        let resp = match self.deps.cpauth.authorize(req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.note_cp_down("authorize");
+                tracing::warn!(error = %e, source_ip = %self.source_ip, outcome = "cp_unavailable", "authorization RPC failed; failing closed (service unavailable)");
+                return Err(SshOutcome::ServiceUnavailable);
+            }
+        };
+        // The CP takes the concurrency lease inside the ALLOW tx (FR-SESS-3), so
+        // from this point teardown owes a session-end signal even if the Gateway
+        // fails the session closed below (unverified context, missing material).
+        if resp.decision == Decision::Allow as i32 {
+            self.lease_expected.store(true, Ordering::SeqCst);
+        }
+        match resp {
+            resp if resp.decision == Decision::Allow as i32 && !resp.session_token.is_empty() => {
                 // The node connection + host-verification material is mandatory.
                 let Some(nc) = resp.node_connection else {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = "node_unreachable", reason = "no_node_connection", "authorized but the CP returned no node connection; failing closed");
@@ -1243,16 +1349,11 @@ impl SshHandler {
                     bindings,
                 })
             }
-            Ok(_) => {
+            _ => {
                 // DENY, a Lock, no-match, or ALLOW-without-token — one generic
                 // denial to the user; the CP logged the specific reason.
                 tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, break_glass = self.break_glass, outcome = "policy_denied", reason = "authorization_denied", "generic denial");
                 Err(SshOutcome::PolicyDenied)
-            }
-            Err(e) => {
-                self.note_cp_down("authorize");
-                tracing::warn!(error = %e, source_ip = %self.source_ip, outcome = "cp_unavailable", "authorization RPC failed; failing closed (service unavailable)");
-                Err(SshOutcome::ServiceUnavailable)
             }
         }
     }
@@ -1339,7 +1440,7 @@ impl SshHandler {
         drop(inner_kp); // the local keypair is no longer needed (zeroized on drop)
 
         let verifier = HostVerifier::new(authz.trust.clone());
-        let cfg = self.inner_leg_config();
+        let cfg = self.inner_leg_config(authz.context.idle_timeout_seconds);
         match InnerClient::establish(stream, verifier, &authz.node.principal, cert, key, &cfg)
             .instrument(tracing::info_span!(parent: &self.session_span, "gateway.host_verify"))
             .await
@@ -1359,13 +1460,45 @@ impl SshHandler {
         }
     }
 
-    fn inner_leg_config(&self) -> InnerLegConfig {
+    fn inner_leg_config(&self, context_idle_secs: i64) -> InnerLegConfig {
         let inner = &self.deps.config.inner;
+        // Transport-level backstop for the per-session idle bound (FR-SESS-3):
+        // the effective (tighten-only) idle plus a small slack so the watchdog —
+        // which attributes IDLE_TIMEOUT and runs the clean teardown — is ALWAYS
+        // the enforcer, including when the bound IS the static one (review F-3:
+        // clamping the backstop to exactly `static` let russh race the watchdog
+        // and report CLOSED). effective ≤ static by construction, so this stays
+        // within static + slack; the watchdog still fires at effective exactly.
+        let idle = effective_idle_secs(inner.max_session_idle_secs, context_idle_secs)
+            .saturating_add(IDLE_BACKSTOP_SLACK_SECS);
         InnerLegConfig {
             handshake_timeout: Duration::from_secs(inner.handshake_timeout_secs),
             window_size: inner.window_bytes,
             max_packet_size: inner.max_packet_bytes,
-            idle_timeout: Duration::from_secs(inner.max_session_idle_secs),
+            idle_timeout: Duration::from_secs(idle),
+        }
+    }
+
+    /// Why this session ended, for the session-end signal (advisory diagnostics;
+    /// a closed vocabulary). An out-of-band teardown (lock / expiry / idle /
+    /// drain) recorded its cause on the [`SessionControl`]; otherwise a session
+    /// that never became functional (refused context, node fault, refused
+    /// recording) ended abnormally, and everything else is an orderly close.
+    fn end_reason(&self) -> SessionEndReason {
+        let recorded = self
+            .session_control
+            .as_ref()
+            .map(|c| c.end_reason())
+            .unwrap_or(SessionEndReason::Unspecified);
+        if recorded != SessionEndReason::Unspecified {
+            recorded
+        } else if self.authz_denied.is_some()
+            || self.inner_failed.is_some()
+            || self.recorder_failed.is_some()
+        {
+            SessionEndReason::Error
+        } else {
+            SessionEndReason::Closed
         }
     }
 }
@@ -1382,12 +1515,32 @@ impl Drop for SshHandler {
         if let Some(task) = self.expiry_task.take() {
             task.abort();
         }
+        if let Some(task) = self.idle_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.lease_task.take() {
+            task.abort();
+        }
         // Finalize the recording off the Drop path (flush → seal-final → upload →
         // FinalizeRecording). Spawned via the tracker so teardown never blocks but a
         // graceful shutdown can still await it (#3); the recorder holds its own CP
         // client + uploader.
         if let Some(rec) = self.recorder.take() {
             self.deps.finalize_tracker.spawn(rec.finalize());
+        }
+        // FR-SESS-3 (Session 25): release the concurrency lease PROMPTLY on EVERY
+        // teardown path — including the degraded ones where FinalizeRecording
+        // never fires (Null/None recorder, never-began, authorize-then-abort).
+        // Drop is the one funnel every path ends in, so this single send site is
+        // the exactly-once guard. Spawned via the finalize tracker (never blocks
+        // teardown; a graceful drain still awaits delivery); best-effort — the
+        // CP-side lease expiry/reaper self-heals a lost signal.
+        if self.lease_expected.load(Ordering::SeqCst) {
+            self.deps.finalize_tracker.spawn(Box::pin(send_session_end(
+                self.deps.cpauth.clone(),
+                self.session_id.clone(),
+                self.end_reason(),
+            )));
         }
     }
 }
@@ -1650,6 +1803,11 @@ impl Handler for SshHandler {
             rec.tap(channel, TapDirection::Input, None, data);
         }
         if let Some(w) = self.writers.get(&channel) {
+            // Only genuinely-FORWARDED client input counts as session activity
+            // for the idle watchdog (review info-2): bytes aimed at a closed or
+            // refused channel must not reset the idle clock.
+            self.activity
+                .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
             let _ = w.data(data).await;
         }
         Ok(())
@@ -1705,6 +1863,10 @@ impl Handler for SshHandler {
             rec.resize(channel, col as u16, row as u16);
         }
         if let Some(w) = self.writers.get(&channel) {
+            // A resize on a live bridged channel is session activity (same
+            // forwarded-only rule as `data`, review info-2).
+            self.activity
+                .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
             let _ = w.window_change(col, row, pw, ph).await;
         }
         Ok(())
@@ -1979,6 +2141,157 @@ fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64) -> bool {
     grant_expiry != 0 && now_epoch.saturating_add(skew_secs) >= grant_expiry
 }
 
+/// The tighten-only per-session idle bound (FR-SESS-3, Session 25): the SIGNED
+/// per-identity `idle_timeout_seconds` may only SHORTEN the static
+/// `max_session_idle_secs` — the smaller wins. 0/absent (no per-identity policy),
+/// a negative value, or a value at/above the static bound leave the static bound
+/// in force: a decision context can never loosen the operator's ceiling.
+fn effective_idle_secs(static_secs: u64, context_secs: i64) -> u64 {
+    if context_secs > 0 {
+        static_secs.min(context_secs as u64)
+    } else {
+        static_secs
+    }
+}
+
+/// Slack added to the inner transport's inactivity backstop over the effective
+/// idle bound so the idle watchdog — which attributes IDLE_TIMEOUT and drives the
+/// clean SessionControl teardown — reliably fires before russh's own inactivity
+/// abort, in every case including effective == static (review F-3). The bound
+/// itself is enforced by the watchdog at exactly `effective`.
+const IDLE_BACKSTOP_SLACK_SECS: u64 = 5;
+
+/// Wraps the pump's recorder tap so node→client output stamps the per-session
+/// idle watchdog's activity clock (input is stamped in `data`). Pure delegation
+/// otherwise — the S8/S9 tap/bridge seam is unchanged.
+struct ActivityTap {
+    tap: Arc<dyn RecorderTap>,
+    activity: Arc<AtomicU64>,
+}
+
+impl RecorderTap for ActivityTap {
+    fn tap(&self, channel: ChannelId, direction: TapDirection, ext: Option<u32>, data: &[u8]) {
+        self.activity
+            .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
+        self.tap.tap(channel, direction, ext, data);
+    }
+
+    fn resize(&self, channel: ChannelId, cols: u16, rows: u16) {
+        self.tap.resize(channel, cols, rows);
+    }
+
+    fn should_abort(&self) -> bool {
+        self.tap.should_abort()
+    }
+}
+
+/// How far ahead of the last-known lease expiry the keeper re-stamps, how soon a
+/// transient failure is retried, and the floor on the server-driven cadence (a
+/// tiny returned window must not busy-loop the CP).
+const LEASE_EXTEND_LEAD_SECS: i64 = 60;
+const LEASE_RETRY_SECS: i64 = 5;
+const LEASE_MIN_TICK_SECS: i64 = 5;
+
+/// How the keeper reacts to an `ExtendSessionLease` failure (S25 reviews
+/// F3 + S25-GW-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseRefusal {
+    /// Not a verdict on the lease: transport faults plus retryable/unexpected
+    /// codes — ABORTED (the CP extends inside a Postgres tx, which can
+    /// serialize-conflict), CANCELLED, RESOURCE_EXHAUSTED, anything else.
+    /// Retry at the floor; never abandon the slot accounting on a blip.
+    RetryTransient,
+    /// An N-1 CP without the RPC (UNIMPLEMENTED): benign, stop quietly.
+    StopQuiet,
+    /// NOT_FOUND / FAILED_PRECONDITION: the CP no longer holds a lease this
+    /// Gateway still considers live (reaped under a sustained partition, or
+    /// released) — the one exactness break. Stop LOUDLY so an operator can
+    /// correlate the transient under-count (F3, AR-GW-LEASE-PARTITION).
+    StopLoud,
+}
+
+fn classify_lease_failure(e: &CpError) -> LeaseRefusal {
+    match e.code() {
+        Some(tonic::Code::Unimplemented) => LeaseRefusal::StopQuiet,
+        Some(tonic::Code::NotFound) | Some(tonic::Code::FailedPrecondition) => {
+            LeaseRefusal::StopLoud
+        }
+        _ => LeaseRefusal::RetryTransient,
+    }
+}
+
+/// Keep a live session's CP concurrency lease stamped (FR-SESS-3 exact
+/// accounting, Session 25): the first extension fires a lead ahead of
+/// `grant_expiry` (immediately when already inside that window; one lead out when
+/// the grant has no fixed expiry, to learn the server-authoritative window), then
+/// re-extends at half the returned window. Accounting, never authorization: only
+/// a definitive "the lease is gone" verdict stops the keeper — quietly for an
+/// N-1 CP, LOUDLY for a lost live lease (F3) — while every other failure just
+/// delays the next tick (S25-GW-1). The session itself is never touched.
+async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant_expiry: i64) {
+    let mut next_at = if grant_expiry > 0 {
+        grant_expiry - LEASE_EXTEND_LEAD_SECS
+    } else {
+        now_epoch_secs() + LEASE_EXTEND_LEAD_SECS
+    };
+    loop {
+        let wait = next_at - now_epoch_secs();
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+        }
+        match cpauth.extend_session_lease(&session_id).await {
+            Ok(resp) => {
+                let now = now_epoch_secs();
+                let half_window = (resp.expires_at_epoch_seconds - now) / 2;
+                next_at = now + half_window.max(LEASE_MIN_TICK_SECS);
+            }
+            Err(e) => match classify_lease_failure(&e) {
+                LeaseRefusal::RetryTransient => {
+                    tracing::debug!(session_id = %session_id, error = %e, "lease extension failed transiently; retrying");
+                    next_at = now_epoch_secs() + LEASE_RETRY_SECS;
+                }
+                LeaseRefusal::StopQuiet => {
+                    tracing::debug!(session_id = %session_id, "CP predates ExtendSessionLease (N-1); stopping the keeper");
+                    return;
+                }
+                LeaseRefusal::StopLoud => {
+                    tracing::warn!(session_id = %session_id, code = ?e.code(), "live session's lease refused extension — the CP no longer holds it (reaped/released); the concurrency count under-reports until this session ends");
+                    return;
+                }
+            },
+        }
+    }
+}
+
+const SESSION_END_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Deliver the FR-SESS-3 session-end signal: best-effort + bounded (one retry on
+/// a transport-shaped failure), quiet on an N-1 CP without the RPC. Runs off the
+/// Drop path (spawned via the finalize tracker), so it can never block or fail
+/// teardown; an undelivered signal is self-healed by the CP lease expiry/reaper.
+async fn send_session_end(cpauth: Arc<CpAuthClient>, session_id: String, reason: SessionEndReason) {
+    for attempt in 0..2u8 {
+        match cpauth.notify_session_end(&session_id, reason).await {
+            Ok(resp) => {
+                tracing::debug!(session_id = %session_id, reason = ?reason, released = resp.released, "session-end signal delivered");
+                return;
+            }
+            Err(e) if e.code() == Some(tonic::Code::Unimplemented) => {
+                tracing::debug!(session_id = %session_id, "CP predates NotifySessionEnd (N-1); relying on lease expiry");
+                return;
+            }
+            Err(e) if attempt == 0 && e.is_cp_down() => {
+                tracing::debug!(session_id = %session_id, error = %e, "session-end signal failed; retrying once");
+                tokio::time::sleep(SESSION_END_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %session_id, error = %e, "session-end signal undelivered; the CP lease reaper will self-heal");
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2030,6 +2343,84 @@ mod tests {
         assert!(!grant_is_expired(i64::MAX / 2, 0, skew));
         // Overflow-safe: a pathological huge clock does not panic.
         assert!(grant_is_expired(i64::MAX, ge, skew));
+    }
+
+    /// FR-SESS-3 (Session 25): the signed per-identity idle timeout is
+    /// TIGHTEN-ONLY against the static bound — it can shorten it, never extend
+    /// it, and 0/absent/garbage leaves the static bound in force.
+    #[test]
+    fn idle_bound_is_tighten_only() {
+        assert_eq!(effective_idle_secs(900, 300), 300, "context tightens");
+        assert_eq!(effective_idle_secs(900, 1), 1, "smallest positive tightens");
+        assert_eq!(effective_idle_secs(900, 900), 900, "equal keeps static");
+        assert_eq!(
+            effective_idle_secs(900, 4000),
+            900,
+            "a larger context value must be clamped to the static bound (never loosen)"
+        );
+        assert_eq!(
+            effective_idle_secs(900, 0),
+            900,
+            "0 = no per-identity policy"
+        );
+        assert_eq!(effective_idle_secs(900, -5), 900, "negative → static");
+        assert_eq!(
+            effective_idle_secs(900, i64::MAX),
+            900,
+            "overflow-shaped context value still clamps to static"
+        );
+        assert_eq!(
+            effective_idle_secs(0, 300),
+            0,
+            "a zero static bound is never loosened by a context"
+        );
+    }
+
+    /// F3 + S25-GW-1: the lease keeper's failure taxonomy. ONLY a definitive
+    /// "lease is gone" verdict (NOT_FOUND / FAILED_PRECONDITION) stops LOUDLY
+    /// (the WARN call site is keyed on `StopLoud` — the AR-GW-LEASE-PARTITION
+    /// signature); UNIMPLEMENTED (N-1) stops quietly; EVERYTHING else —
+    /// transport faults and retryable/unexpected codes, notably ABORTED (the
+    /// CP's lease tx can serialize-conflict), CANCELLED, RESOURCE_EXHAUSTED —
+    /// reschedules at the retry floor and never abandons the accounting.
+    #[test]
+    fn lease_failure_taxonomy_retries_blips_and_is_loud_only_for_a_lost_lease() {
+        use crate::cpauth::CpError;
+        for retry in [
+            CpError::Timeout(Duration::from_secs(1)),
+            CpError::CircuitOpen,
+            CpError::Rpc(tonic::Status::unavailable("x")),
+            CpError::Rpc(tonic::Status::internal("x")),
+            CpError::Rpc(tonic::Status::aborted("serialize conflict")),
+            CpError::Rpc(tonic::Status::cancelled("x")),
+            CpError::Rpc(tonic::Status::resource_exhausted("x")),
+            CpError::Rpc(tonic::Status::deadline_exceeded("x")),
+            CpError::Rpc(tonic::Status::unknown("x")),
+            // Unexpected codes are NOT a lease verdict either: keep trying.
+            CpError::Rpc(tonic::Status::permission_denied("x")),
+            CpError::Rpc(tonic::Status::invalid_argument("x")),
+        ] {
+            assert_eq!(
+                classify_lease_failure(&retry),
+                LeaseRefusal::RetryTransient,
+                "{retry:?} must reschedule, never stop the keeper"
+            );
+        }
+        assert_eq!(
+            classify_lease_failure(&CpError::Rpc(tonic::Status::unimplemented("x"))),
+            LeaseRefusal::StopQuiet,
+            "an N-1 CP without the RPC is benign"
+        );
+        for gone in [
+            tonic::Status::failed_precondition("released"),
+            tonic::Status::not_found("no lease"),
+        ] {
+            assert_eq!(
+                classify_lease_failure(&CpError::Rpc(gone.clone())),
+                LeaseRefusal::StopLoud,
+                "a lost live lease must stop LOUDLY: {gone:?}"
+            );
+        }
     }
 
     #[test]

@@ -27,14 +27,15 @@ use crate::pb::presence_client::PresenceClient;
 use crate::pb::recording_client::RecordingClient;
 use crate::pb::{
     AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest, BeginDeviceFlowResponse,
-    BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution, FinalizeRecordingRequest,
-    FinalizeRecordingResponse, IssueGatewayServerCertificateRequest,
-    IssueGatewayServerCertificateResponse, PollDeviceFlowRequest, PollDeviceFlowResponse,
-    PresenceHeartbeatRequest, PresenceHeartbeatResponse, PresenceReleaseRequest,
-    PresenceReleaseResponse, RequestUploadRequest, RequestUploadResponse,
+    BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution, ExtendSessionLeaseRequest,
+    ExtendSessionLeaseResponse, FinalizeRecordingRequest, FinalizeRecordingResponse,
+    IssueGatewayServerCertificateRequest, IssueGatewayServerCertificateResponse,
+    NotifySessionEndRequest, NotifySessionEndResponse, PollDeviceFlowRequest,
+    PollDeviceFlowResponse, PresenceHeartbeatRequest, PresenceHeartbeatResponse,
+    PresenceReleaseRequest, PresenceReleaseResponse, RequestUploadRequest, RequestUploadResponse,
     ResolveBreakglassCodeRequest, ResolveBreakglassKeyRequest, ResolveOtpRequest,
-    ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity, SignGatewayHostCertificateRequest,
-    SignGatewayHostCertificateResponse,
+    ResolvePinRequest, ResolveUserCertRequest, ResolvedIdentity, SessionEndReason,
+    SignGatewayHostCertificateRequest, SignGatewayHostCertificateResponse,
 };
 
 /// A failure calling the CP. Fail-closed at every variant.
@@ -506,6 +507,47 @@ impl CpAuthClient {
     ) -> Result<FinalizeRecordingResponse, CpError> {
         self.call(move |ch| async move { RecordingClient::new(ch).finalize_recording(req).await })
             .await
+    }
+
+    /// Release this session's concurrency lease promptly at teardown (FR-SESS-3,
+    /// Session 25) — the reliable session-end signal, independent of
+    /// `FinalizeRecording` so the degraded (unrecorded) paths release too. The
+    /// caller is bound by its mTLS identity (the CP acts only for the gateway that
+    /// brokered the session); idempotent server-side. Best-effort by contract: the
+    /// caller must never block or fail teardown on an error — the CP's lease
+    /// expiry/reaper self-heal covers a lost signal.
+    pub async fn notify_session_end(
+        &self,
+        session_id: &str,
+        reason: SessionEndReason,
+    ) -> Result<NotifySessionEndResponse, CpError> {
+        let session_id = session_id.to_string();
+        self.call(move |ch| {
+            let req = NotifySessionEndRequest {
+                session_id,
+                reason: reason as i32,
+            };
+            async move { AuthorizationClient::new(ch).notify_session_end(req).await }
+        })
+        .await
+    }
+
+    /// Re-stamp a live session's concurrency-lease expiry (FR-SESS-3 exact
+    /// accounting, Session 25): a RunToTtl session outliving `grant_expiry` must
+    /// still occupy its slot. The extension window is SERVER-authoritative (no
+    /// duration is sent); the response carries the new expiry the caller schedules
+    /// the next extension against. Accounting, never authorization: a failure must
+    /// never affect the session itself.
+    pub async fn extend_session_lease(
+        &self,
+        session_id: &str,
+    ) -> Result<ExtendSessionLeaseResponse, CpError> {
+        let session_id = session_id.to_string();
+        self.call(move |ch| {
+            let req = ExtendSessionLeaseRequest { session_id };
+            async move { AuthorizationClient::new(ch).extend_session_lease(req).await }
+        })
+        .await
     }
 
     /// Mint the inner-leg certificate over the authenticated mTLS channel (Session
