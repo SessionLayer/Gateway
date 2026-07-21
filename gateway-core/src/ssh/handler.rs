@@ -1105,6 +1105,10 @@ impl SshHandler {
         if let Some(task) = self.idle_task.take() {
             task.abort();
         }
+        // Wall-clock deadlines, mirroring arm_expiry (review info-1): a backward
+        // NTP step can stretch one idle window, but host time is outside the
+        // attacker model (Design §2.4) and the tightened transport backstop
+        // still bounds the session.
         let idle = effective_idle_secs(
             self.deps.config.inner.max_session_idle_secs,
             context_idle_secs,
@@ -1141,6 +1145,13 @@ impl SshHandler {
     /// and takes no lease — nothing to keep.
     fn arm_lease_keeper(&mut self, authz: &Arc<Authorized>) {
         if self.lease_task.is_some() || self.session_is_break_glass() {
+            return;
+        }
+        // Only a RunToTtl session can outlive its grant and must keep occupying
+        // its slot. GraceThenKill/HardKill die at/near grant_expiry — there the
+        // CP-side lease self-heal already matches the session lifetime, and
+        // extending would let a lost end-signal over-count past expiry (F-4).
+        if self.mid_session_expiry_mode() != MidSessionExpiryMode::RunToTtl {
             return;
         }
         self.lease_task = Some(tokio::spawn(keep_lease_stamped(
@@ -1453,11 +1464,13 @@ impl SshHandler {
         let inner = &self.deps.config.inner;
         // Transport-level backstop for the per-session idle bound (FR-SESS-3):
         // the effective (tighten-only) idle plus a small slack so the watchdog —
-        // which attributes the teardown and runs the clean path — reliably fires
-        // first. Never looser than the static bound (slack is clamped to it).
+        // which attributes IDLE_TIMEOUT and runs the clean teardown — is ALWAYS
+        // the enforcer, including when the bound IS the static one (review F-3:
+        // clamping the backstop to exactly `static` let russh race the watchdog
+        // and report CLOSED). effective ≤ static by construction, so this stays
+        // within static + slack; the watchdog still fires at effective exactly.
         let idle = effective_idle_secs(inner.max_session_idle_secs, context_idle_secs)
-            .saturating_add(IDLE_BACKSTOP_SLACK_SECS)
-            .min(inner.max_session_idle_secs);
+            .saturating_add(IDLE_BACKSTOP_SLACK_SECS);
         InnerLegConfig {
             handshake_timeout: Duration::from_secs(inner.handshake_timeout_secs),
             window_size: inner.window_bytes,
@@ -1789,10 +1802,12 @@ impl Handler for SshHandler {
             // Tap the input stream (`i`) BEFORE forwarding.
             rec.tap(channel, TapDirection::Input, None, data);
         }
-        // Client input counts as session activity for the idle watchdog.
-        self.activity
-            .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
         if let Some(w) = self.writers.get(&channel) {
+            // Only genuinely-FORWARDED client input counts as session activity
+            // for the idle watchdog (review info-2): bytes aimed at a closed or
+            // refused channel must not reset the idle clock.
+            self.activity
+                .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
             let _ = w.data(data).await;
         }
         Ok(())
@@ -1847,10 +1862,11 @@ impl Handler for SshHandler {
         if let Some(rec) = &self.recorder {
             rec.resize(channel, col as u16, row as u16);
         }
-        // An interactive resize counts as session activity for the idle watchdog.
-        self.activity
-            .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
         if let Some(w) = self.writers.get(&channel) {
+            // A resize on a live bridged channel is session activity (same
+            // forwarded-only rule as `data`, review info-2).
+            self.activity
+                .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
             let _ = w.window_change(col, row, pw, ph).await;
         }
         Ok(())
@@ -2141,7 +2157,8 @@ fn effective_idle_secs(static_secs: u64, context_secs: i64) -> u64 {
 /// Slack added to the inner transport's inactivity backstop over the effective
 /// idle bound so the idle watchdog — which attributes IDLE_TIMEOUT and drives the
 /// clean SessionControl teardown — reliably fires before russh's own inactivity
-/// abort. Clamped so the backstop is never looser than the static bound.
+/// abort, in every case including effective == static (review F-3). The bound
+/// itself is enforced by the watchdog at exactly `effective`.
 const IDLE_BACKSTOP_SLACK_SECS: u64 = 5;
 
 /// Wraps the pump's recorder tap so node→client output stamps the per-session
@@ -2175,27 +2192,31 @@ const LEASE_EXTEND_LEAD_SECS: i64 = 60;
 const LEASE_RETRY_SECS: i64 = 5;
 const LEASE_MIN_TICK_SECS: i64 = 5;
 
-/// How the keeper reacts to an `ExtendSessionLease` failure (S25 review F3).
+/// How the keeper reacts to an `ExtendSessionLease` failure (S25 reviews
+/// F3 + S25-GW-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseRefusal {
-    /// Transport-shaped fault: retry on the next tick; the lease is presumed live.
+    /// Not a verdict on the lease: transport faults plus retryable/unexpected
+    /// codes — ABORTED (the CP extends inside a Postgres tx, which can
+    /// serialize-conflict), CANCELLED, RESOURCE_EXHAUSTED, anything else.
+    /// Retry at the floor; never abandon the slot accounting on a blip.
     RetryTransient,
     /// An N-1 CP without the RPC (UNIMPLEMENTED): benign, stop quietly.
     StopQuiet,
-    /// Any other refusal of a session THIS Gateway still considers live — the
-    /// signature of "the CP no longer holds the lease" (reaped under a sustained
-    /// partition, or released), i.e. the one exactness break. Stop LOUDLY so an
-    /// operator can correlate the transient under-count (AR-GW-LEASE-PARTITION).
+    /// NOT_FOUND / FAILED_PRECONDITION: the CP no longer holds a lease this
+    /// Gateway still considers live (reaped under a sustained partition, or
+    /// released) — the one exactness break. Stop LOUDLY so an operator can
+    /// correlate the transient under-count (F3, AR-GW-LEASE-PARTITION).
     StopLoud,
 }
 
 fn classify_lease_failure(e: &CpError) -> LeaseRefusal {
-    if e.code() == Some(tonic::Code::Unimplemented) {
-        LeaseRefusal::StopQuiet
-    } else if e.is_cp_down() {
-        LeaseRefusal::RetryTransient
-    } else {
-        LeaseRefusal::StopLoud
+    match e.code() {
+        Some(tonic::Code::Unimplemented) => LeaseRefusal::StopQuiet,
+        Some(tonic::Code::NotFound) | Some(tonic::Code::FailedPrecondition) => {
+            LeaseRefusal::StopLoud
+        }
+        _ => LeaseRefusal::RetryTransient,
     }
 }
 
@@ -2203,10 +2224,10 @@ fn classify_lease_failure(e: &CpError) -> LeaseRefusal {
 /// accounting, Session 25): the first extension fires a lead ahead of
 /// `grant_expiry` (immediately when already inside that window; one lead out when
 /// the grant has no fixed expiry, to learn the server-authoritative window), then
-/// re-extends at half the returned window. Accounting, never authorization: a
-/// transient fault only delays the next tick, and any refusal stops the keeper
-/// (the CP is authoritative for the lease) — quietly for an N-1 CP, LOUDLY when
-/// a live session's lease is gone (F3). The session itself is never touched.
+/// re-extends at half the returned window. Accounting, never authorization: only
+/// a definitive "the lease is gone" verdict stops the keeper — quietly for an
+/// N-1 CP, LOUDLY for a lost live lease (F3) — while every other failure just
+/// delays the next tick (S25-GW-1). The session itself is never touched.
 async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant_expiry: i64) {
     let mut next_at = if grant_expiry > 0 {
         grant_expiry - LEASE_EXTEND_LEAD_SECS
@@ -2355,23 +2376,34 @@ mod tests {
         );
     }
 
-    /// F3: the lease keeper's failure taxonomy. Transient faults retry; an N-1
-    /// UNIMPLEMENTED stops quietly; every OTHER refusal of a live session's
-    /// lease stops LOUDLY (the WARN call site is keyed on `StopLoud`) — it is
-    /// the observable signature of the AR-GW-LEASE-PARTITION under-count.
+    /// F3 + S25-GW-1: the lease keeper's failure taxonomy. ONLY a definitive
+    /// "lease is gone" verdict (NOT_FOUND / FAILED_PRECONDITION) stops LOUDLY
+    /// (the WARN call site is keyed on `StopLoud` — the AR-GW-LEASE-PARTITION
+    /// signature); UNIMPLEMENTED (N-1) stops quietly; EVERYTHING else —
+    /// transport faults and retryable/unexpected codes, notably ABORTED (the
+    /// CP's lease tx can serialize-conflict), CANCELLED, RESOURCE_EXHAUSTED —
+    /// reschedules at the retry floor and never abandons the accounting.
     #[test]
-    fn lease_failure_is_loud_only_when_a_live_lease_is_gone() {
+    fn lease_failure_taxonomy_retries_blips_and_is_loud_only_for_a_lost_lease() {
         use crate::cpauth::CpError;
-        for transient in [
+        for retry in [
             CpError::Timeout(Duration::from_secs(1)),
             CpError::CircuitOpen,
             CpError::Rpc(tonic::Status::unavailable("x")),
             CpError::Rpc(tonic::Status::internal("x")),
+            CpError::Rpc(tonic::Status::aborted("serialize conflict")),
+            CpError::Rpc(tonic::Status::cancelled("x")),
+            CpError::Rpc(tonic::Status::resource_exhausted("x")),
+            CpError::Rpc(tonic::Status::deadline_exceeded("x")),
+            CpError::Rpc(tonic::Status::unknown("x")),
+            // Unexpected codes are NOT a lease verdict either: keep trying.
+            CpError::Rpc(tonic::Status::permission_denied("x")),
+            CpError::Rpc(tonic::Status::invalid_argument("x")),
         ] {
             assert_eq!(
-                classify_lease_failure(&transient),
+                classify_lease_failure(&retry),
                 LeaseRefusal::RetryTransient,
-                "{transient:?} must retry, not stop"
+                "{retry:?} must reschedule, never stop the keeper"
             );
         }
         assert_eq!(
@@ -2382,13 +2414,11 @@ mod tests {
         for gone in [
             tonic::Status::failed_precondition("released"),
             tonic::Status::not_found("no lease"),
-            tonic::Status::permission_denied("not yours"),
-            tonic::Status::invalid_argument("bad id"),
         ] {
             assert_eq!(
                 classify_lease_failure(&CpError::Rpc(gone.clone())),
                 LeaseRefusal::StopLoud,
-                "a refusal of a live session's lease must stop LOUDLY: {gone:?}"
+                "a lost live lease must stop LOUDLY: {gone:?}"
             );
         }
     }
