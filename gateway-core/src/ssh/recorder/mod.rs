@@ -43,11 +43,11 @@ use crate::config::RecorderConfig;
 use crate::cpauth::CpAuthClient;
 use crate::pb::{
     BeginRecordingRequest, FileTransferAudit, FinalizeRecordingRequest, KeySealAlgorithm,
-    RecordingContext, RecordingStatus,
+    RecordingContext, RecordingStatus, TunnelAudit,
 };
 use crate::ssh::bridge::{
     RecChannelKind, RecorderError, RecorderFactory, RecorderTap, RecordingParams, SessionRecorder,
-    TapDirection,
+    TapDirection, TunnelCounters, TunnelDirection,
 };
 use crate::ssh::outcome::RECORDING_UNAVAILABLE;
 
@@ -115,6 +115,15 @@ enum ChannelRec {
         scp: Option<ScpDecoder>,
     },
     Sftp(SftpDecoder),
+    /// A forwarded TCP/X11 tunnel (Session 29): metadata-only — NO byte content is
+    /// ever captured. Holds the live byte counters + open time so `close` can emit
+    /// the `*.closed` audit with bytes-in/out + duration.
+    Tunnel {
+        direction: TunnelDirection,
+        target: String,
+        counters: TunnelCounters,
+        opened_at: Instant,
+    },
 }
 
 /// The synchronous capture core (all state behind the recorder's mutex). Generic
@@ -140,6 +149,10 @@ struct Capture<K: Eq + std::hash::Hash + Copy> {
     pending_pt: Zeroizing<Vec<u8>>,
     channels: HashMap<K, ChannelRec>,
     sftp_audit: Vec<FileTransferAudit>,
+    /// Per-tunnel (port-forward/X11) metadata audit, flushed into
+    /// `FinalizeRecordingRequest.tunnel_audit` at finalize — the cleartext CP-side
+    /// correlation copy (mirrors `sftp_audit`), alongside the sealed `m` markers.
+    tunnel_audit: Vec<TunnelAudit>,
     /// The first capture failure (operator reason). Set ⇒ capture stops.
     failed: Option<String>,
     finalized: bool,
@@ -153,6 +166,7 @@ struct FinalizedObject {
     content_digest: String,
     byte_len: i64,
     audits: Vec<FileTransferAudit>,
+    tunnel_audits: Vec<TunnelAudit>,
 }
 
 impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
@@ -183,6 +197,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
             pending_pt: Zeroizing::new(Vec::new()),
             channels: HashMap::new(),
             sftp_audit: Vec::new(),
+            tunnel_audit: Vec::new(),
             failed: None,
             finalized: false,
         })
@@ -235,6 +250,28 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                 self.channels
                     .insert(channel, ChannelRec::Sftp(SftpDecoder::new()));
             }
+            RecChannelKind::Tunnel {
+                direction,
+                target,
+                counters,
+            } => {
+                // Metadata-only (FR-SESS-2): emit a `<family>.opened` marker into the
+                // sealed stream — target, direction, capability, correlation id — but
+                // NEVER the forwarded bytes (arbitrary/binary, no universal decode).
+                self.ensure_header(0, 0)?;
+                let label = tunnel_marker_open(direction, &target);
+                let line = asciicast::event_line(self.elapsed(), EventCode::Marker, &label);
+                self.push_asciicast(&line)?;
+                self.channels.insert(
+                    channel,
+                    ChannelRec::Tunnel {
+                        direction,
+                        target,
+                        counters,
+                        opened_at: Instant::now(),
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -279,6 +316,9 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                 };
                 (Vec::new(), audits)
             }
+            // A tunnel is metadata-only: forwarded bytes are NEVER captured. Byte
+            // COUNTING happens in the forward pumps; nothing is written here.
+            Some(ChannelRec::Tunnel { .. }) => (Vec::new(), Vec::new()),
             None => (Vec::new(), Vec::new()),
         };
         for l in lines {
@@ -336,6 +376,32 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                     self.note_push(r);
                 }
             }
+            ChannelRec::Tunnel {
+                direction,
+                target,
+                counters,
+                opened_at,
+            } => {
+                // Emit the `<family>.closed` marker: bytes-in/out + duration (still
+                // NO forwarded content). Metadata-only, hash-chained like any record.
+                let bytes_in = counters.bytes_in.load(Ordering::Relaxed);
+                let bytes_out = counters.bytes_out.load(Ordering::Relaxed);
+                let duration = opened_at.elapsed().as_secs_f64();
+                let label = tunnel_marker_close(direction, &target, bytes_in, bytes_out, duration);
+                let r =
+                    self.push_asciicast(&asciicast::event_line(elapsed, EventCode::Marker, &label));
+                self.note_push(r);
+                // Cleartext CP-side correlation copy (Session 29) — the same
+                // metadata as the sealed marker, delivered via FinalizeRecording.
+                self.tunnel_audit.push(TunnelAudit {
+                    capability: direction.capability_label().to_string(),
+                    direction: direction.direction_label().to_string(),
+                    target,
+                    bytes_in: bytes_in as i64,
+                    bytes_out: bytes_out as i64,
+                    duration_seconds: duration as i64,
+                });
+            }
         }
     }
 
@@ -364,6 +430,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
             content_digest: self.spool.content_digest_hex(),
             byte_len: self.spool.len() as i64,
             audits: std::mem::take(&mut self.sftp_audit),
+            tunnel_audits: std::mem::take(&mut self.tunnel_audit),
         }
     }
 
@@ -442,6 +509,39 @@ fn audit_marker_label(a: &FileTransferAudit) -> Zeroizing<String> {
         }))
         .expect("audit marker serializes"),
     )
+}
+
+/// The `<family>.opened` audit marker for a forwarded tunnel (Session 29). A
+/// metadata-only asciicast `m` event — target + direction + capability, never the
+/// forwarded bytes. The hash-chain (over the sealed stream) commits to it.
+fn tunnel_marker_open(direction: TunnelDirection, target: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": format!("{}.opened", direction.audit_family()),
+        "direction": direction.direction_label(),
+        "capability": direction.capability_label(),
+        "target": target,
+    }))
+    .expect("tunnel marker serializes")
+}
+
+/// The `<family>.closed` audit marker: bytes-in/out + duration (still no content).
+fn tunnel_marker_close(
+    direction: TunnelDirection,
+    target: &str,
+    bytes_in: u64,
+    bytes_out: u64,
+    duration_secs: f64,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": format!("{}.closed", direction.audit_family()),
+        "direction": direction.direction_label(),
+        "capability": direction.capability_label(),
+        "target": target,
+        "bytes_in": bytes_in,
+        "bytes_out": bytes_out,
+        "duration_secs": duration_secs,
+    }))
+    .expect("tunnel marker serializes")
 }
 
 /// The per-session recorder handed to the SSH handler and (upcast) to the bridge.
@@ -646,6 +746,7 @@ impl SessionRecorder for Recorder {
                 content_digest: prepared.content_digest,
                 byte_len: prepared.byte_len,
                 sftp_audit: prepared.audits,
+                tunnel_audit: prepared.tunnel_audits,
                 object_version_id: object_version_id.unwrap_or_default(),
             };
             match self.cpauth.finalize_recording(req).await {
@@ -1097,6 +1198,58 @@ mod tests {
             inp.contains("scp -t /x; echo pwned"),
             "exec command recorded"
         );
+    }
+
+    /// Session 29 (§1.1-D): a forwarded tunnel is recorded METADATA-ONLY — the
+    /// sealed object carries an `opened`/`closed` marker pair (target, direction,
+    /// capability, byte counts, duration) and NO forwarded byte content, and the
+    /// hash-chain commits to them.
+    #[test]
+    fn tunnel_channel_records_metadata_only() {
+        let (pub_der, secret) = customer_keypair();
+        let config = RecorderConfig::default();
+        let mut cap = capture(&config, &pub_der);
+
+        let counters = TunnelCounters::default();
+        cap.open_channel(
+            7,
+            RecChannelKind::Tunnel {
+                direction: TunnelDirection::Local,
+                target: "db.internal:5432".to_string(),
+                counters: counters.clone(),
+            },
+        )
+        .unwrap();
+        // Bytes moved by the (real) forward pumps; here we set the shared counters
+        // directly, then a stray content tap MUST be ignored (no capture).
+        counters.bytes_in.store(4096, Ordering::Relaxed);
+        counters.bytes_out.store(8192, Ordering::Relaxed);
+        cap.tap(7, TapDirection::Input, None, b"\x00\x01\x02 binary payload")
+            .unwrap();
+        cap.tap(7, TapDirection::Output, None, b"more opaque bytes")
+            .unwrap();
+        cap.close_channel(7);
+
+        let object = object_bytes(cap.finalize_object().source);
+        let header = seal::parse_header(&object).unwrap();
+        let key = seal::unseal_data_key(&header, &secret).unwrap();
+        let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
+        let text = String::from_utf8(plaintext).unwrap();
+
+        // No forwarded byte content anywhere in the sealed object.
+        assert!(
+            !text.contains("binary payload") && !text.contains("opaque bytes"),
+            "forwarded bytes MUST NOT be captured"
+        );
+        let (_hdr, events) = parse_asciicast(text.as_bytes());
+        // Exactly two markers: opened then closed. No terminal i/o.
+        assert_eq!(events.len(), 2, "one opened + one closed marker only");
+        assert!(events.iter().all(|(c, _)| c == "m"), "markers only");
+        assert!(events[0].1.contains("port_forward.opened"));
+        assert!(events[0].1.contains("db.internal:5432"));
+        assert!(events[0].1.contains("port_forward_local"));
+        assert!(events[1].1.contains("port_forward.closed"));
+        assert!(events[1].1.contains("4096") && events[1].1.contains("8192"));
     }
 
     /// Part D: altering a recorded record changes the hash-chain head (tamper

@@ -1372,16 +1372,21 @@ impl Session {
                         let result = handler
                             .tcpip_forward(&address, &mut returned_port, self)
                             .await?;
+                        // [SessionLayer patch] RFC 4254 §4: reply ONLY when
+                        // want_reply=TRUE (upstream replied unconditionally,
+                        // confusing reply attribution for a pipelining client).
                         if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, {
-                                    enc.write.push(msg::REQUEST_SUCCESS);
-                                    if self.common.wants_reply && port == 0 && returned_port != 0 {
-                                        map_err!(returned_port.encode(&mut enc.write))?;
-                                    }
-                                })
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                            if self.common.wants_reply {
+                                if result {
+                                    push_packet!(enc.write, {
+                                        enc.write.push(msg::REQUEST_SUCCESS);
+                                        if port == 0 && returned_port != 0 {
+                                            map_err!(returned_port.encode(&mut enc.write))?;
+                                        }
+                                    })
+                                } else {
+                                    push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                                }
                             }
                         }
                         Ok(())
@@ -1392,11 +1397,15 @@ impl Session {
                         map_err!(ensure_end(r))?;
                         debug!("handler.cancel_tcpip_forward {address:?} {port:?}");
                         let result = handler.cancel_tcpip_forward(&address, port, self).await?;
+                        // [SessionLayer patch] RFC 4254 §4: reply only when
+                        // want_reply=TRUE (as tcpip-forward above).
                         if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                            if self.common.wants_reply {
+                                if result {
+                                    push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
+                                } else {
+                                    push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                                }
                             }
                         }
                         Ok(())

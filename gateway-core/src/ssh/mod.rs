@@ -15,6 +15,7 @@
 
 pub mod bridge;
 pub mod connector;
+pub mod forward;
 pub mod handler;
 pub mod hostverify;
 pub mod innerleg;

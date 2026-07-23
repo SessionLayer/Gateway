@@ -24,7 +24,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,12 +44,14 @@ use crate::pb::{
 use crate::signing::InnerKeyPair;
 use crate::ssh::bridge::{
     self, RecChannelKind, RecorderFactory, RecorderTap, RecordingParams, SessionRecorder,
-    TapDirection,
+    TapDirection, TunnelCounters, TunnelDirection,
 };
 use crate::ssh::connector::{NodeConnector, NodeDial, NodeTarget, SessionGrant};
+use crate::ssh::forward::{self, ReverseDispatcher};
 use crate::ssh::hostverify::{HostTrust, HostVerifier};
 use crate::ssh::innerleg::{
     ChannelKind, InnerClient, InnerLegConfig, InnerLegError, InnerWriteHalf, PtyParams,
+    ReverseOpen, X11Params,
 };
 use crate::ssh::locks::{LiveSessionRegistry, LockBindings, LockSet, SessionControl, SessionGuard};
 use crate::ssh::outcome::{SshOutcome, DEVICE_FLOW_TIMEOUT, SERVICE_UNAVAILABLE};
@@ -207,6 +209,37 @@ pub struct SshHandler {
     /// Count of session channels opened on this connection (Tier-0 cap, russh
     /// enforces none).
     channels_opened: usize,
+    /// Stashed `x11-req` per session channel (Session 29): relayed UNCHANGED to the
+    /// node when the inner session channel opens (like [`Self::pty`]). Only present
+    /// when the `x11` capability was granted (gated at `x11_request`). The auth
+    /// cookie is a secret — NEVER logged.
+    x11_reqs: HashMap<ChannelId, X11Params>,
+    /// Concurrent forwarded-tunnel count — local-forward + node-initiated reverse
+    /// channels (Session 29). Shared with the [`ReverseDispatcher`] + each tunnel
+    /// pump so ALL forwards from one connection share one concurrency cap
+    /// (`max_channels_per_connection`); decremented when a tunnel ends.
+    active_tunnels: Arc<AtomicUsize>,
+    /// The remote-forward (`ssh -R`) listeners currently bound on the node, keyed by
+    /// `(bind_address, bound_port)`, capped at `max_channels_per_connection` (bounds
+    /// `tcpip_forward` fan-out per grant). Tracked as a set so `cancel-tcpip-forward`
+    /// decrements only on a real match (a spurious/duplicate cancel cannot under-
+    /// count the cap, F-reliability-4).
+    remote_forwards: std::collections::HashSet<(String, u32)>,
+    /// The session's signed `grant_expiry` (epoch seconds), shared with the reverse
+    /// dispatcher so it enforces the SAME time-box the local-forward path does; a
+    /// mid-session re-authorize updates it in place.
+    grant_expiry: Arc<AtomicI64>,
+    /// The reverse-channel sink handed to the inner leg's client handler; `Some`
+    /// once the inner leg is established (Session 29).
+    reverse_tx: Option<tokio::sync::mpsc::Sender<ReverseOpen>>,
+    /// The reverse-channel dispatcher task (remote-forward + X11 relay); aborted on
+    /// connection Drop for deterministic teardown.
+    reverse_dispatcher: Option<tokio::task::JoinHandle<()>>,
+    /// Local-forward (`ssh -L`) bridge tasks, aborted on Drop; finished handles
+    /// are reaped on every new open (as the reverse dispatcher's JoinSet) so a
+    /// busy `-L` proxying many short-lived connections cannot grow this unbounded
+    /// over a long session (F-fwd-local-pump-leak-1).
+    local_forward_pumps: tokio::task::JoinSet<()>,
     /// Count of credential-resolution attempts (bounds the CP-RPC amplification
     /// per connection — russh does NOT enforce its own `max_auth_attempts`).
     auth_attempts: usize,
@@ -325,6 +358,13 @@ impl SshHandler {
             writers: HashMap::new(),
             pumps: HashMap::new(),
             channels_opened: 0,
+            x11_reqs: HashMap::new(),
+            active_tunnels: Arc::new(AtomicUsize::new(0)),
+            remote_forwards: std::collections::HashSet::new(),
+            grant_expiry: Arc::new(AtomicI64::new(0)),
+            reverse_tx: None,
+            reverse_dispatcher: None,
+            local_forward_pumps: tokio::task::JoinSet::new(),
             auth_attempts: 0,
             session_abort: None,
             live_guard: None,
@@ -742,115 +782,19 @@ impl SshHandler {
         kind: ChannelKind,
         session: &mut Session,
     ) {
-        // (1) Connect-time authorization — decided once per connection, cached.
-        if self.authz.is_none() && self.authz_denied.is_none() {
-            match self.decide().await {
-                Ok(a) => self.authz = Some(Arc::new(a)),
-                Err(o) => self.authz_denied = Some(o),
-            }
-        }
-        if let Some(o) = self.authz_denied {
+        // (1) Shared admission (FR-SESS-2 / FR-CHAN-2): authorize once, per-channel
+        // local recheck, register + lock recheck, capability gate, begin recorder,
+        // establish the inner leg. A refusal closes THIS channel with the generic
+        // §7.1 outcome; live channels keep flowing.
+        let accepts = required_capabilities(&kind);
+        if let Err(o) = self.admit(accepts, session).await {
             self.close_with(channel, session, o);
             return;
         }
-        let authz = self.authz.clone().expect("authorized cached above");
-
-        // (1.5) Per-channel-open LOCAL re-evaluation (FR-CHAN-2, Design §6.3):
-        // decision_ttl re-validate (forced when the lock feed is unhealthy),
-        // grant_expiry vs the Gateway clock (conservative/early), source pin, and
-        // the local lock-set (deny wins, datastore-independent). No CP call except
-        // the forced re-authorize. A failure closes THIS channel with the generic
-        // §7.1 denial; live channels keep flowing.
-        let authz = match self.local_recheck(authz, channel, session).await {
-            Ok(a) => a,
-            Err(()) => return,
-        };
-
-        // (1.6) Register the live session for lock-triggered teardown and arm the
-        // mid-session identity-expiry timer (Parts D/F), once per connection.
-        self.ensure_registered(&authz, session);
-
-        // (1.7) Re-check the lock-set AFTER registering — closes the teardown TOCTOU
-        // with the feed's add-before-scan: a lock pushed concurrently with this
-        // channel-open is now either seen here (deny) or finds this session in the
-        // registry (torn down), so a matching lock can never leave a live channel.
-        if let Some(lock) = self.deps.lock_set.matching(&authz.bindings) {
-            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %sanitize(&lock.lock_id), outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock (post-register recheck)");
-            self.close_with(channel, session, SshOutcome::PolicyDenied);
-            return;
-        }
-
-        // (2) Capability gate at channel-open (FR-SESS-2): the channel is admitted
-        // only if one of its acceptable capabilities is granted; UNSPECIFIED (the
-        // "never granted" sentinel for an unknown subsystem) is rejected outright.
-        let accepts = required_capabilities(&kind);
-        let granted = accepts
-            .iter()
-            .any(|c| *c != Capability::Unspecified && authz.capabilities.contains(&(*c as i32)));
-        if !granted {
-            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "capability_withheld", accepts = ?accepts, "channel refused: capability not granted");
-            self.close_with(channel, session, SshOutcome::PolicyDenied);
-            return;
-        }
-
-        // (2.5) Begin the session recording ONCE, before any bytes flow. Recording
-        // is mandatory (§12/FR-AUD-1): in strict mode a setup failure (incl. no
-        // customer key) refuses the session here; non-strict proceeds unrecorded
-        // (logged loudly, never silent).
-        if self.recorder.is_none() {
-            if let Some(o) = self.recorder_failed {
-                self.close_with(channel, session, o);
-                return;
-            }
-            // Break-glass ALWAYS forces strict recording (FR-ACC-6): the session dies
-            // if recording fails. Gated on BOTH the local break-glass flag and the
-            // SIGNED access_model (belt-and-suspenders). `force_strict` can only
-            // tighten the configured strict mode, never loosen it.
-            let force_strict = self.session_is_break_glass();
-            let params = RecordingParams {
-                recording_token: authz.recording_token.clone(),
-                session_id: self.session_id.clone(),
-                node_id: authz.node.node_id.clone(),
-                principal: authz.node.principal.clone(),
-                teardown: Some(session.handle()),
-                abort: self
-                    .session_abort
-                    .clone()
-                    .expect("session registered before the recorder begins"),
-                force_strict,
-            };
-            let strict = self.deps.config.recorder.strict || force_strict;
-            match self.deps.recorder_factory.begin(params).await {
-                Ok(r) => self.recorder = Some(r),
-                Err(e) if strict => {
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, break_glass = force_strict, outcome = "recording_unavailable", "strict-mode recording setup failed; refusing the session");
-                    self.recorder_failed = Some(SshOutcome::RecordingUnavailable);
-                    self.close_with(channel, session, SshOutcome::RecordingUnavailable);
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, "STRICT MODE OFF: recording setup failed; proceeding UNRECORDED (degraded)");
-                    self.recorder = Some(bridge::disabled_recorder());
-                }
-            }
-        }
-
-        // (3) Establish the inner leg once (dial + host-verify + sign + handshake).
-        if self.inner.is_none() {
-            if let Some(o) = self.inner_failed {
-                self.close_with(channel, session, o);
-                return;
-            }
-            match self.establish_inner(&authz).await {
-                Ok(c) => self.inner = Some(c),
-                Err(o) => {
-                    self.inner_failed = Some(o);
-                    self.close_with(channel, session, o);
-                    return;
-                }
-            }
-        }
-        let inner = self.inner.as_ref().expect("inner client established above");
+        let inner = self
+            .inner
+            .as_ref()
+            .expect("inner client established by admit");
 
         // (4) Open the matching channel on the node, replaying any PTY. Classify
         // the channel for the recorder BEFORE `kind` is moved into the node open,
@@ -862,7 +806,10 @@ impl SshHandler {
             .unwrap_or((0, 0));
         let rec_kind = classify_rec_kind(&kind, pty_cols, pty_rows);
         let pty = self.pty.get(&channel);
-        let inner_chan = match inner.open_channel(kind, pty).await {
+        // Relay a stashed x11-req (Session 29) to the node's session channel, in the
+        // OpenSSH order (after pty, before shell). Only present when x11 was granted.
+        let x11 = self.x11_reqs.get(&channel);
+        let inner_chan = match inner.open_channel(kind, pty, x11).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "node_unreachable", "inner channel open/replay failed");
@@ -920,14 +867,13 @@ impl SshHandler {
     /// The per-channel-open local checks (FR-CHAN-2). Runs entirely against the
     /// cached, signature-verified context + the pushed lock-set — no CP call except
     /// a forced re-authorize when `decision_ttl` has elapsed (or the lock feed is
-    /// unhealthy → `decision_ttl` treated as 0, FR-CHAN-4). On any denial it closes
-    /// the channel with the generic §7.1 outcome and returns `Err(())`.
-    async fn local_recheck(
+    /// unhealthy → `decision_ttl` treated as 0, FR-CHAN-4). On any denial it returns
+    /// the generic §7.1 outcome; the shared admission path ([`Self::admit`]) signals
+    /// it however its channel type requires.
+    async fn local_recheck_value(
         &mut self,
         mut authz: Arc<Authorized>,
-        channel: ChannelId,
-        session: &mut Session,
-    ) -> Result<Arc<Authorized>, ()> {
+    ) -> Result<Arc<Authorized>, SshOutcome> {
         let grant_expiry_skew_secs = self.deps.config.reeval.grant_expiry_skew_secs;
 
         // (a) Re-validate. A BREAK-GLASS session is authorized ONCE by its single-use
@@ -942,8 +888,7 @@ impl SshHandler {
         if self.session_is_break_glass() {
             if !self.deps.lock_set.healthy() {
                 tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "breakglass_lock_feed_unhealthy", "break-glass: lock feed unhealthy; refusing new channel (fail closed)");
-                self.close_with(channel, session, SshOutcome::PolicyDenied);
-                return Err(());
+                return Err(SshOutcome::PolicyDenied);
             }
         } else {
             // Standing/JIT re-validate: re-authorize when decision_ttl has elapsed, or
@@ -971,6 +916,10 @@ impl SshHandler {
                         // rearm the expiry timer against the refreshed grant_expiry.
                         if let Some(control) = self.session_control.clone() {
                             control.update_bindings(fresh.bindings.clone());
+                            // Refresh the shared grant_expiry so the reverse dispatcher
+                            // enforces the re-authorized (extended/shortened) time-box.
+                            self.grant_expiry
+                                .store(fresh.context.grant_expiry_epoch_seconds, Ordering::SeqCst);
                             self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
                             self.arm_idle(fresh.context.idle_timeout_seconds);
                         }
@@ -981,8 +930,7 @@ impl SshHandler {
                         // channel-open; existing channels keep flowing (allow fails open
                         // for the live session, deny/new fails closed — §2, NFR-2).
                         tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "revalidate_failed", "per-channel re-authorize failed; refusing new channel");
-                        self.close_with(channel, session, o);
-                        return Err(());
+                        return Err(o);
                     }
                 }
             }
@@ -1001,13 +949,11 @@ impl SshHandler {
         if ge == 0 {
             if self.session_is_break_glass() {
                 tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, break_glass = true, outcome = "policy_denied", reason = "breakglass_no_grant_expiry", "break-glass ALLOW without a grant_expiry; refusing (must be time-boxed)");
-                self.close_with(channel, session, SshOutcome::PolicyDenied);
-                return Err(());
+                return Err(SshOutcome::PolicyDenied);
             }
         } else if grant_is_expired(now, ge, grant_expiry_skew_secs) {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "grant_expired", "grant expired; refusing new channel");
-            self.close_with(channel, session, SshOutcome::PolicyDenied);
-            return Err(());
+            return Err(SshOutcome::PolicyDenied);
         }
 
         // (c) Source pin: a channel-open whose source differs from the decision's is
@@ -1017,16 +963,14 @@ impl SshHandler {
             && authz.context.source_address != self.source_ip()
         {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "source_pin_mismatch", "channel source does not match the decision context");
-            self.close_with(channel, session, SshOutcome::PolicyDenied);
-            return Err(());
+            return Err(SshOutcome::PolicyDenied);
         }
 
         // (d) Local lock-set (deny wins, independent of the datastore). A live match
         // is also being torn down by the feed; refusing here closes the race window.
         if let Some(lock) = self.deps.lock_set.matching(&authz.bindings) {
             tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %sanitize(&lock.lock_id), outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock");
-            self.close_with(channel, session, SshOutcome::PolicyDenied);
-            return Err(());
+            return Err(SshOutcome::PolicyDenied);
         }
 
         Ok(authz)
@@ -1047,14 +991,198 @@ impl SshHandler {
                 .register(self.session_id.clone(), control.clone()),
         );
         self.session_control = Some(control);
+        self.grant_expiry
+            .store(authz.context.grant_expiry_epoch_seconds, Ordering::SeqCst);
         self.arm_expiry(authz.context.grant_expiry_epoch_seconds);
         self.arm_idle(authz.context.idle_timeout_seconds);
         self.arm_lease_keeper(authz);
     }
 
+    /// Connect-time authorization, decided once per connection and cached. Returns
+    /// the shared [`Authorized`] or the cached denial outcome.
+    async fn ensure_authorized(&mut self) -> Result<Arc<Authorized>, SshOutcome> {
+        if self.authz.is_none() && self.authz_denied.is_none() {
+            match self.decide().await {
+                Ok(a) => self.authz = Some(Arc::new(a)),
+                Err(o) => self.authz_denied = Some(o),
+            }
+        }
+        if let Some(o) = self.authz_denied {
+            return Err(o);
+        }
+        Ok(self.authz.clone().expect("authorized cached above"))
+    }
+
+    /// A lightweight capability gate (Session 29): authorize once, then check the
+    /// grant carries one of `accepts`. Used where a request must be gated but not
+    /// yet fully admitted (e.g. stashing an `x11-req` before the shell opens); full
+    /// admission ([`Self::admit`]) runs the lock/recorder/inner steps.
+    async fn decide_capability(
+        &mut self,
+        accepts: &[Capability],
+    ) -> Result<Arc<Authorized>, SshOutcome> {
+        let authz = self.ensure_authorized().await?;
+        if capability_granted(accepts, &authz) {
+            Ok(authz)
+        } else {
+            Err(SshOutcome::PolicyDenied)
+        }
+    }
+
+    /// Shared capability-gated admission for a channel or global request (FR-SESS-2 /
+    /// FR-CHAN-2): authorize once, per-channel local recheck, register + post-register
+    /// lock recheck, gate on `accepts` (against the possibly-refreshed grant), then
+    /// ensure the recorder + inner leg. Returns the shared [`Authorized`], or the
+    /// §7.1 outcome the caller signals however its channel type requires (close a
+    /// channel, drop a reply, `channel_failure`). Deny-wins, fail-closed — the SAME
+    /// path shell/exec/sftp run, so a Lock tears a forward down like any channel.
+    async fn admit(
+        &mut self,
+        accepts: &[Capability],
+        session: &mut Session,
+    ) -> Result<Arc<Authorized>, SshOutcome> {
+        let authz = self.ensure_authorized().await?;
+        let authz = self.local_recheck_value(authz).await?;
+        self.ensure_registered(&authz, session);
+        if let Some(lock) = self.deps.lock_set.matching(&authz.bindings) {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, lock_id = %sanitize(&lock.lock_id), outcome = "policy_denied", reason = "locked", "channel refused by a pushed lock (post-register recheck)");
+            return Err(SshOutcome::PolicyDenied);
+        }
+        // Capability gate on the (re-authorize-refreshed) grant; UNSPECIFIED (the
+        // "never granted" sentinel) is rejected outright.
+        if !capability_granted(accepts, &authz) {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "capability_withheld", accepts = ?accepts, "channel refused: capability not granted");
+            return Err(SshOutcome::PolicyDenied);
+        }
+        self.ensure_recorder(&authz, session).await?;
+        self.ensure_inner(&authz, session).await?;
+        Ok(authz)
+    }
+
+    /// Begin the mandatory session recording once, before any bytes flow (§12/
+    /// FR-AUD-1). Strict mode (or a break-glass session, which forces strict)
+    /// refuses on failure; non-strict proceeds unrecorded (logged loudly).
+    async fn ensure_recorder(
+        &mut self,
+        authz: &Arc<Authorized>,
+        session: &mut Session,
+    ) -> Result<(), SshOutcome> {
+        if self.recorder.is_some() {
+            return Ok(());
+        }
+        if let Some(o) = self.recorder_failed {
+            return Err(o);
+        }
+        let force_strict = self.session_is_break_glass();
+        let params = RecordingParams {
+            recording_token: authz.recording_token.clone(),
+            session_id: self.session_id.clone(),
+            node_id: authz.node.node_id.clone(),
+            principal: authz.node.principal.clone(),
+            teardown: Some(session.handle()),
+            abort: self
+                .session_abort
+                .clone()
+                .expect("session registered before the recorder begins"),
+            force_strict,
+        };
+        let strict = self.deps.config.recorder.strict || force_strict;
+        match self.deps.recorder_factory.begin(params).await {
+            Ok(r) => {
+                self.recorder = Some(r);
+                Ok(())
+            }
+            Err(e) if strict => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, break_glass = force_strict, outcome = "recording_unavailable", "strict-mode recording setup failed; refusing the session");
+                self.recorder_failed = Some(SshOutcome::RecordingUnavailable);
+                Err(SshOutcome::RecordingUnavailable)
+            }
+            Err(e) => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, "STRICT MODE OFF: recording setup failed; proceeding UNRECORDED (degraded)");
+                self.recorder = Some(bridge::disabled_recorder());
+                Ok(())
+            }
+        }
+    }
+
+    /// Establish the inner leg once (dial + host-verify + sign + handshake) and
+    /// spawn the reverse-channel dispatcher (Session 29: remote-forward + X11
+    /// relay). The reverse sink is baked into the inner client so node-initiated
+    /// channels reach the outer client only for a session that requested them.
+    async fn ensure_inner(
+        &mut self,
+        authz: &Arc<Authorized>,
+        session: &mut Session,
+    ) -> Result<(), SshOutcome> {
+        if self.inner.is_some() {
+            return Ok(());
+        }
+        if let Some(o) = self.inner_failed {
+            return Err(o);
+        }
+        // Fail-closed per direction: relay a node-initiated reverse channel ONLY
+        // for a capability actually granted, so even a compromised node cannot push
+        // an unsolicited forwarded-tcpip/x11 at the client. When NEITHER is granted,
+        // hand the inner leg no reverse sink at all (it then REJECTS reverse opens
+        // at the source — never accepting+enqueuing them, F-reliability-2).
+        let allow_remote = authz
+            .capabilities
+            .contains(&(Capability::PortForwardRemote as i32));
+        let allow_x11 = authz.capabilities.contains(&(Capability::X11 as i32));
+        let reverse_capable = allow_remote || allow_x11;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let reverse_tx = reverse_capable.then(|| tx.clone());
+        match self.establish_inner(authz, reverse_tx.clone()).await {
+            Ok(c) => {
+                self.inner = Some(c);
+                self.reverse_tx = reverse_tx;
+                if reverse_capable {
+                    let recorder = self.recorder.clone().expect("recorder begun before inner");
+                    let abort = self
+                        .session_abort
+                        .clone()
+                        .expect("session registered before inner");
+                    let dispatcher = ReverseDispatcher {
+                        rx,
+                        outer: session.handle(),
+                        recorder,
+                        lock_set: self.deps.lock_set.clone(),
+                        // The LIVE bindings (shared with SessionControl), not a
+                        // frozen clone — a mid-session re-auth relabel must gate
+                        // reverse opens too (F-fwd-reverse-stale-bindings-1).
+                        bindings: self
+                            .session_control
+                            .as_ref()
+                            .expect("session registered before inner")
+                            .shared_bindings(),
+                        abort,
+                        active_tunnels: self.active_tunnels.clone(),
+                        max_channels: self.deps.config.inner.max_channels_per_connection,
+                        allow_remote,
+                        allow_x11,
+                        grant_expiry: self.grant_expiry.clone(),
+                        grant_expiry_skew_secs: self.deps.config.reeval.grant_expiry_skew_secs,
+                        op_timeout: Duration::from_secs(
+                            self.deps.config.inner.handshake_timeout_secs,
+                        ),
+                        session_id: self.session_id.clone(),
+                        source_ip: self.source_ip,
+                    };
+                    self.reverse_dispatcher = Some(tokio::spawn(dispatcher.run()));
+                }
+                Ok(())
+            }
+            Err(o) => {
+                self.inner_failed = Some(o);
+                Err(o)
+            }
+        }
+    }
+
     /// (Re)arm the mid-session identity-expiry timer for `grant_expiry` (Part F).
     /// In `run_to_ttl` mode there is no active teardown (new channels are already
-    /// refused after expiry by [`Self::local_recheck`]); the other modes tear the
+    /// refused after expiry by [`Self::local_recheck_value`]); the other modes tear the
     /// live session down at (or a grace after) `grant_expiry`. A Lock overrides all.
     fn arm_expiry(&mut self, grant_expiry: i64) {
         if let Some(task) = self.expiry_task.take() {
@@ -1363,7 +1491,11 @@ impl SshHandler {
     /// only returned), verify the node host identity during the handshake (Part C,
     /// no TOFU), and authenticate. Fail-closed with the §7.1 outcome at every step;
     /// a host-verification abort is generic to the user, specific in the log.
-    async fn establish_inner(&self, authz: &Authorized) -> Result<InnerClient, SshOutcome> {
+    async fn establish_inner(
+        &self,
+        authz: &Authorized,
+        reverse_tx: Option<tokio::sync::mpsc::Sender<ReverseOpen>>,
+    ) -> Result<InnerClient, SshOutcome> {
         use tracing::Instrument;
         // Stamp the trace root with the (non-secret) decision facts now that they
         // are known (OTEL-CONTRACT §4).
@@ -1441,9 +1573,17 @@ impl SshHandler {
 
         let verifier = HostVerifier::new(authz.trust.clone());
         let cfg = self.inner_leg_config(authz.context.idle_timeout_seconds);
-        match InnerClient::establish(stream, verifier, &authz.node.principal, cert, key, &cfg)
-            .instrument(tracing::info_span!(parent: &self.session_span, "gateway.host_verify"))
-            .await
+        match InnerClient::establish(
+            stream,
+            verifier,
+            &authz.node.principal,
+            cert,
+            key,
+            &cfg,
+            reverse_tx,
+        )
+        .instrument(tracing::info_span!(parent: &self.session_span, "gateway.host_verify"))
+        .await
         {
             Ok(inner) => {
                 tracing::info!(outcome = "host_verified", source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&authz.node.node_id), host_verified = ?inner.verified(), key_id = %sanitize(&signed.key_id), "inner leg established; node host identity verified (no TOFU)");
@@ -1510,6 +1650,12 @@ impl Drop for SshHandler {
         for (_, pump) in self.pumps.drain() {
             pump.abort();
         }
+        // Session 29: abort the reverse-channel dispatcher + any live local-forward
+        // bridges so forwarded tunnels tear down with the connection (no leak).
+        if let Some(d) = self.reverse_dispatcher.take() {
+            d.abort();
+        }
+        self.local_forward_pumps.abort_all();
         // Stop the mid-session-expiry timer (the connection is already ending). The
         // live_guard drops here too, deregistering the session from the lock registry.
         if let Some(task) = self.expiry_task.take() {
@@ -1845,6 +1991,7 @@ impl Handler for SshHandler {
         }
         self.pending_channels.remove(&channel);
         self.pty.remove(&channel);
+        self.x11_reqs.remove(&channel);
         Ok(())
     }
 
@@ -1883,63 +2030,245 @@ impl Handler for SshHandler {
         Ok(false)
     }
 
-    /// A `direct-tcpip` channel open. Two cases:
+    /// A `direct-tcpip` channel open. Three cases, in strict precedence:
     ///
-    /// - **ProxyJump host-cert MITM** (Session Sixteen, Part C): when
-    ///   `ssh.proxy_jump.enabled` and this is the OUTER jump connection, the request
-    ///   is `ssh -J gw login@node` opening a forward to the node. We DO NOT proxy TCP
-    ///   — we accept the channel and terminate the inner hop ourselves, presenting a
-    ///   host-CA host cert for the node (no TOFU) and running the full recorded
-    ///   session seam (see [`crate::ssh::proxyjump`]).
-    /// - Otherwise it is a plain **local port-forward**, which is refused (the
-    ///   capability gate; agent/port forwarding are default-deny). Dropping the reply
-    ///   handle rejects the channel. Nested ProxyJump (a forward from an already-MITM
-    ///   inner hop) is likewise refused.
+    /// 1. **Nested ProxyJump refused (structural invariant):** a `direct-tcpip` from
+    ///    an already-terminated ProxyJump inner hop is refused UNCONDITIONALLY — one
+    ///    MITM hop only, never a forward chain. A `port_forward_local` grant must
+    ///    NEVER let this through (Session 29 preserves this exactly).
+    /// 2. **ProxyJump host-cert MITM** (Session Sixteen, Part C): when
+    ///    `ssh.proxy_jump.enabled` and this is the OUTER jump connection, the request
+    ///    is `ssh -J gw login@node`; we terminate the inner hop with a host-CA host
+    ///    cert (no TOFU) and run the full recorded session seam. In this mode a
+    ///    `direct-tcpip` is ProxyJump, never a local forward.
+    /// 3. **Local port-forward** (`ssh -L`, Session 29): otherwise, gated on
+    ///    `port_forward_local`. When granted, the NODE dials `host:port` (via the
+    ///    inner leg) so the forward reaches only what the node itself can reach (no
+    ///    Gateway-side SSRF escape); bytes are bridged opaquely (metadata-only
+    ///    recording). Refused generically otherwise (drop the reply → channel_failure).
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: Channel<russh::server::Msg>,
         host_to_connect: &str,
-        _port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
         reply: russh::server::ChannelOpenHandle,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Nested ProxyJump (forward from an already-terminated inner hop) is refused:
-        // one MITM hop only, never a forward chain.
-        let proxy_jump = if self.proxyjump_node.is_some() {
-            None
-        } else {
-            self.deps.proxy_jump.clone()
-        };
-        let Some(pj) = proxy_jump else {
-            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", "direct-tcpip (local port-forward) refused");
-            return Ok(());
-        };
-        // Tier-0 per-connection channel cap (shared with channel_open_session): a
-        // ProxyJump inner hop spawns a russh server + a login-grace watchdog, and the
-        // host-cert fetch mints a host-CA cert — all before the inner authorize. Cap
-        // the direct-tcpip opens so an authenticated-but-ungranted jump connection
-        // cannot flood inner-server spawns / host-CA signing / memory (S16 F-proxyjump-dos).
-        self.channels_opened += 1;
-        if self.channels_opened > self.deps.config.inner.max_channels_per_connection {
-            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection channel cap exceeded; refusing ProxyJump direct-tcpip");
+        // (1) Nested ProxyJump: an already-terminated inner hop NEVER forwards,
+        // regardless of any port-forward grant (structural one-hop-only invariant).
+        if self.proxyjump_node.is_some() {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", reason = "nested_proxyjump", "direct-tcpip from a terminated ProxyJump inner hop refused (one hop only)");
             return Ok(());
         }
-        // Accept the forwarded channel and hand it to an inner SSH server that
-        // presents the node's host cert. Spawned so the outer connection keeps
-        // pumping this channel's bytes to the inner server's stream.
-        reply.accept().await;
-        let stream = channel.into_stream();
-        let deps = self.deps.clone();
-        let source_ip = self.source_ip;
-        let host = host_to_connect.to_string();
-        let login_grace = Duration::from_secs(self.deps.config.login_grace_secs);
-        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, node = %sanitize(host_to_connect), outcome = "proxyjump_inner", "ProxyJump: terminating inner hop with a host-CA host cert (no TOFU)");
-        tokio::spawn(async move {
-            crate::ssh::proxyjump::serve_inner_hop(deps, pj, source_ip, host, stream, login_grace)
+        // (2) ProxyJump host-cert MITM: when enabled, direct-tcpip is ProxyJump.
+        if let Some(pj) = self.deps.proxy_jump.clone() {
+            self.channels_opened += 1;
+            if self.channels_opened > self.deps.config.inner.max_channels_per_connection {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection channel cap exceeded; refusing ProxyJump direct-tcpip");
+                return Ok(());
+            }
+            reply.accept().await;
+            let stream = channel.into_stream();
+            let deps = self.deps.clone();
+            let source_ip = self.source_ip;
+            let host = host_to_connect.to_string();
+            let login_grace = Duration::from_secs(self.deps.config.login_grace_secs);
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, node = %sanitize(host_to_connect), outcome = "proxyjump_inner", "ProxyJump: terminating inner hop with a host-CA host cert (no TOFU)");
+            tokio::spawn(async move {
+                crate::ssh::proxyjump::serve_inner_hop(
+                    deps,
+                    pj,
+                    source_ip,
+                    host,
+                    stream,
+                    login_grace,
+                )
                 .await;
+            });
+            return Ok(());
+        }
+
+        // (3) Local port-forward, gated on `port_forward_local`. Admission runs the
+        // SAME authorize / lock-recheck / recorder / inner-leg path every channel
+        // gets; a refusal drops the reply (generic channel_failure, §7.1).
+        match self.admit(&[Capability::PortForwardLocal], session).await {
+            Ok(_) => {}
+            Err(o) => {
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = o.span_label(), reason = "local_forward", "local port-forward refused");
+                return Ok(());
+            }
+        }
+        // Bound concurrent forward fan-out per connection (grant is not a licence
+        // for unbounded tunnels; S16 F-proxyjump-dos).
+        let max = self.deps.config.inner.max_channels_per_connection;
+        if !forward::reserve_tunnel_slot(&self.active_tunnels, max) {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection tunnel cap exceeded; refusing local forward");
+            return Ok(());
+        }
+        // Dial FROM THE NODE (via the inner leg): the node reaches the target, not
+        // the Gateway's network namespace.
+        let inner = self.inner.as_ref().expect("inner established by admit");
+        let inner_chan = match inner
+            .open_direct_tcpip(
+                host_to_connect,
+                port_to_connect,
+                originator_address,
+                originator_port,
+            )
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.active_tunnels.fetch_sub(1, Ordering::SeqCst);
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "node_unreachable", "node refused/failed the local-forward dial");
+                return Ok(());
+            }
+        };
+        reply.accept().await;
+        let counters = TunnelCounters::default();
+        let outer_id = channel.id();
+        let target = format!("{host_to_connect}:{port_to_connect}");
+        let recorder = self.recorder.clone().expect("recorder begun by admit");
+        recorder.open_channel(
+            outer_id,
+            RecChannelKind::Tunnel {
+                direction: TunnelDirection::Local,
+                target: sanitize(&target),
+                counters: counters.clone(),
+            },
+        );
+        tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, target = %sanitize(&target), capability = "port_forward_local", outcome = "forward_opened", "local port-forward bridged (node-dialled)");
+        let abort = self
+            .session_abort
+            .clone()
+            .expect("session registered by admit");
+        let bridge = forward::tunnel_bridge_task(channel, inner_chan, counters, abort);
+        let active = self.active_tunnels.clone();
+        // Reap finished bridges so the set does not grow unbounded under churn.
+        while self.local_forward_pumps.try_join_next().is_some() {}
+        self.local_forward_pumps.spawn(async move {
+            let _ = bridge.await;
+            recorder.close_channel(outer_id);
+            active.fetch_sub(1, Ordering::SeqCst);
         });
+        Ok(())
+    }
+
+    /// Remote port-forward request (`ssh -R`, Session 29), gated on
+    /// `port_forward_remote`. When granted, ask the NODE to bind the listener
+    /// (`tcpip_forward`, RFC 4254 §7.1) — the bind lives on the node's side, real
+    /// `ssh -R`-through-a-bastion semantics, no Gateway-side listener leaking across
+    /// sessions. `port == 0` lets the node pick; the chosen port is reported back.
+    /// Incoming connections arrive as `forwarded-tcpip` on the inner leg and are
+    /// relayed to the client by the [`ReverseDispatcher`].
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        match self.admit(&[Capability::PortForwardRemote], session).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", reason = "remote_forward", "remote port-forward refused: capability not granted");
+                return Ok(false);
+            }
+        }
+        // Bound concurrent remote-forward listeners per connection.
+        if self.remote_forwards.len() >= self.deps.config.inner.max_channels_per_connection {
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection listener cap exceeded; refusing remote forward");
+            return Ok(false);
+        }
+        let requested = *port;
+        let inner = self.inner.as_ref().expect("inner established by admit");
+        match inner.remote_forward(address, requested).await {
+            Ok(bound) => {
+                if requested == 0 {
+                    *port = bound;
+                }
+                self.remote_forwards.insert((address.to_string(), *port));
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, bind = %sanitize(address), port = *port, capability = "port_forward_remote", outcome = "forward_bound", "remote port-forward listener bound on the node");
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "node_unreachable", "node refused the remote-forward bind");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Unbind a remote-forward listener on the node (`cancel-tcpip-forward`). A
+    /// de-escalation — always honored when the inner leg is up (no capability gate).
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(false);
+        };
+        match inner.cancel_remote_forward(address, port).await {
+            Ok(()) => {
+                // Decrement only on a real match so a spurious/duplicate cancel cannot
+                // under-count the cap (F-reliability-4).
+                self.remote_forwards.remove(&(address.to_string(), port));
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, bind = %sanitize(address), port, outcome = "forward_unbound", "remote port-forward listener unbound");
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, "node rejected cancel-tcpip-forward");
+                Ok(false)
+            }
+        }
+    }
+
+    /// X11 forwarding request (`ssh -X`/`-Y`, Session 29), gated on `x11`. The
+    /// client sends `x11-req` on its session channel before the shell; we gate it,
+    /// stash the parameters, and relay them UNCHANGED to the node when the inner
+    /// session channel opens (pure pass-through — no cookie rewriting, RFC 4254
+    /// §6.3.1). The node's later `x11` channel is relayed back by the
+    /// [`ReverseDispatcher`]. Ungranted → `channel_failure` (the session survives).
+    async fn x11_request(
+        &mut self,
+        channel: ChannelId,
+        single_connection: bool,
+        x11_auth_protocol: &str,
+        x11_auth_cookie: &str,
+        x11_screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        match self.decide_capability(&[Capability::X11]).await {
+            Ok(_) => {
+                // Too late to relay: the inner session channel already started
+                // (OpenSSH always sends x11-req pre-shell). A non-conforming client
+                // gets an honest channel_failure, not a false ack that never
+                // forwards anything (F-fwd-x11-late-ack-1).
+                if self.writers.contains_key(&channel) {
+                    tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "x11_late", "x11-req after session start refused (cannot be relayed)");
+                    session.channel_failure(channel)?;
+                    return Ok(());
+                }
+                // Cookie is a secret — stored to replay, NEVER logged.
+                self.x11_reqs.insert(
+                    channel,
+                    X11Params {
+                        single_connection,
+                        auth_protocol: x11_auth_protocol.to_string(),
+                        auth_cookie: x11_auth_cookie.to_string(),
+                        screen_number: x11_screen_number,
+                    },
+                );
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, capability = "x11", outcome = "x11_requested", "x11 forwarding granted; relaying request to the node");
+                session.channel_success(channel)?;
+            }
+            Err(_) => {
+                tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "x11", "x11 forwarding refused: capability not granted");
+                session.channel_failure(channel)?;
+            }
+        }
         Ok(())
     }
 }
@@ -1958,6 +2287,14 @@ fn required_capabilities(kind: &ChannelKind) -> &'static [Capability] {
         ChannelKind::Subsystem(name) if name == "sftp" => &[Capability::Sftp, Capability::Scp],
         ChannelKind::Subsystem(_) => &[],
     }
+}
+
+/// Whether the signed grant admits `accepts`: any acceptable, non-UNSPECIFIED
+/// capability is present. UNSPECIFIED (the "never granted" sentinel) never admits.
+fn capability_granted(accepts: &[Capability], authz: &Authorized) -> bool {
+    accepts
+        .iter()
+        .any(|c| *c != Capability::Unspecified && authz.capabilities.contains(&(*c as i32)))
 }
 
 /// Classify a bridged channel for the recorder (Design §12.1, red-team #1): a
@@ -2123,7 +2460,7 @@ fn new_session_id() -> String {
 }
 
 /// The Gateway wall clock as Unix epoch seconds (for grant/lock expiry checks).
-fn now_epoch_secs() -> i64 {
+pub(crate) fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2137,7 +2474,7 @@ fn now_epoch_secs() -> i64 {
 /// new privileged channel past the real expiry. `grant_expiry == 0` means "no
 /// fixed expiry" and is handled by the caller (break-glass fail-closed vs
 /// standing/JIT decision-ttl+lock bounding), never expired here.
-fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64) -> bool {
+pub(crate) fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64) -> bool {
     grant_expiry != 0 && now_epoch.saturating_add(skew_secs) >= grant_expiry
 }
 

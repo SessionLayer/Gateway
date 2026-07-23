@@ -566,6 +566,7 @@ impl MockState {
         subject_pub_wire: &[u8],
         principal: &str,
         session_id: &str,
+        extensions: &[&'static str],
     ) -> Result<SignSessionCertificateResponse, Status> {
         let pubkey = ssh_key::PublicKey::from_bytes(subject_pub_wire)
             .map_err(|_| Status::invalid_argument("subject public key is not an SSH public key"))?;
@@ -590,6 +591,15 @@ impl MockState {
             .and_then(|b| b.key_id(&key_id))
             .and_then(|b| b.valid_principal(principal))
             .map_err(|_| Status::internal("cert builder fields"))?;
+        // Mirror the real CP's CertificateProfiles.extensionsFor: only granted
+        // capabilities become permit-* extensions (default-deny). Without
+        // permit-port-forwarding / permit-X11-forwarding the node's sshd refuses
+        // the corresponding forward (Session 29).
+        for ext in extensions {
+            builder
+                .extension(*ext, "")
+                .map_err(|_| Status::internal("cert extension"))?;
+        }
         let cert = builder
             .sign(&ca)
             .map_err(|_| Status::internal("session CA signing failed"))?;
@@ -845,7 +855,7 @@ impl SessionSigning for MockSvc {
         }
 
         let r = request.into_inner();
-        let (session_id, principal) = {
+        let (session_id, principal, node_id) = {
             let mut toks = self.tokens.lock().unwrap();
             let rec = toks
                 .get_mut(&r.session_token)
@@ -866,10 +876,38 @@ impl SessionSigning for MockSvc {
                 }
             }
             rec.used = true; // atomic mark-used
-            (rec.session_id.clone(), rec.principal.clone())
+            (
+                rec.session_id.clone(),
+                rec.principal.clone(),
+                rec.node_id.clone(),
+            )
         };
 
-        let resp = self.sign_inner(&r.subject_public_key, &principal, &session_id)?;
+        // Map the node's granted capabilities to cert extensions, mirroring the
+        // real CP (CertificateProfiles.extensionsFor): shell→permit-pty,
+        // port_forward_*→permit-port-forwarding, x11→permit-X11-forwarding; NEVER
+        // permit-agent-forwarding (agent forwarding is always refused).
+        let caps = self
+            .node_capabilities
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Capability::Shell as i32, Capability::Exec as i32]);
+        let mut extensions: Vec<&'static str> = Vec::new();
+        if caps.contains(&(Capability::Shell as i32)) {
+            extensions.push("permit-pty");
+        }
+        if caps.contains(&(Capability::PortForwardLocal as i32))
+            || caps.contains(&(Capability::PortForwardRemote as i32))
+        {
+            extensions.push("permit-port-forwarding");
+        }
+        if caps.contains(&(Capability::X11 as i32)) {
+            extensions.push("permit-X11-forwarding");
+        }
+
+        let resp = self.sign_inner(&r.subject_public_key, &principal, &session_id, &extensions)?;
         // FR-AUD-4: the key-id the node's own sshd will log on this certificate — the
         // join between the CP's trail and the node-local one.
         self.signed_key_ids
