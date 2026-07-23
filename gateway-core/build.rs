@@ -1,9 +1,9 @@
 //! Build script: generate the CP <-> Gateway gRPC client (and a server stub used
 //! only by the in-process negotiation test) from the VENDORED contract proto.
 //!
-//! The authoritative proto lives in `ControlPlane-API/contracts/proto/` (Design
-//! §13). Because the parent `SessionLayer/` folder is not a git repo and CI
-//! checks out THIS repo alone, a committed copy is vendored under `proto/`
+//! The authoritative proto lives in the canonical `SessionLayer/Contracts` repo
+//! (Design §13). Because the parent `SessionLayer/` folder is not a git repo and
+//! CI checks out THIS repo alone, a committed copy is vendored under `proto/`
 //! (re-sync via `scripts/vendor-contracts.sh`; see CLAUDE.md). We generate from
 //! the vendored copy so the build is hermetic.
 

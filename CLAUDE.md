@@ -72,7 +72,7 @@ contract.**
   supports peers one minor back within a major line. Resolution is a pure,
   order-independent function (`version::resolve_common_version`); no common
   version **fails closed**. Session One baseline is **1.0** only. See
-  `../ControlPlane-API/contracts/VERSIONING.md`.
+  `contracts/VERSIONING.md` in the canonical `SessionLayer/Contracts` repo.
 
 ## Conventions
 
@@ -88,7 +88,7 @@ contract.**
   mTLS CA). Agents dial OUT to it. Off by default (`ssh.agent.listen_addr` empty),
   and an `OUTBOUND_AGENT` node is then simply offline (never a silent fallback to
   an agentless dial). Wire contract:
-  `../ControlPlane-API/contracts/wire/agent-gateway-v1.md`; payloads are generated
+  `contracts/wire/agent-gateway-v1.md` in the canonical `SessionLayer/Contracts` repo; payloads are generated
   into `gateway_core::pbagent` from the vendored `proto/sessionlayer/agent/v1/`.
 - Structured logging via `tracing` (`RUST_LOG`, default `info`). Never log
   plaintext — and never log SSH secrets/keys/OTP/tokens (Session Seven).

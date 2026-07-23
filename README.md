@@ -36,9 +36,11 @@ cargo nextest run --all-features   # unit + integration tests (Docker for the E2
 ## Contract
 
 The CP↔Gateway gRPC contract and the Agent↔Gateway wire protocol are frozen
-upstream in `ControlPlane-API/contracts/`; byte-identical copies are vendored
-under [`proto/`](proto/) and code-generated in `build.rs`. Re-sync with
-[`scripts/sync-contracts.sh`](scripts/sync-contracts.sh).
+upstream in the canonical [`SessionLayer/Contracts`](https://github.com/SessionLayer/Contracts)
+repo; byte-identical copies are vendored under [`proto/`](proto/) and
+code-generated in `build.rs`. Re-sync with
+[`scripts/vendor-contracts.sh`](scripts/vendor-contracts.sh), pinned by
+[`contracts.lock`](contracts.lock).
 
 ## Documentation
 
