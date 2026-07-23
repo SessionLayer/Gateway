@@ -12,15 +12,53 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use russh::client::{self, Handle, Msg};
+use russh::client::{self, ChannelOpenHandle, Handle, Msg};
 use russh::keys::{Certificate, PrivateKey, PublicKey};
 use russh::{Channel, ChannelReadHalf, ChannelWriteHalf, Pty};
+use tokio::sync::mpsc;
 
 use crate::ssh::connector::ByteStream;
 use crate::ssh::hostverify::{HostVerified, HostVerifier, HostVerifyError};
 
 pub(crate) type InnerReadHalf = ChannelReadHalf;
 pub(crate) type InnerWriteHalf = ChannelWriteHalf<Msg>;
+
+/// A channel the NODE opened back toward the Gateway on the inner (client) leg,
+/// as a consequence of an already-granted forward (Session 29, FR-SESS-2):
+/// - `ForwardedTcpip`: a connection hit a `ssh -R` listener the node bound at the
+///   Gateway's request (`tcpip_forward`) — RFC 4254 §7.2.
+/// - `X11`: the node's sshd opened an X11 channel after we relayed the client's
+///   `x11-req` — RFC 4254 §6.3.2.
+///
+/// The Gateway relays each to the real client on the OUTER leg and bridges bytes
+/// opaquely (metadata-only recording; see [`crate::ssh::forward`]). The inner
+/// channel is already accepted when it arrives here.
+pub(crate) enum ReverseOpen {
+    ForwardedTcpip {
+        channel: Channel<Msg>,
+        connected_address: String,
+        connected_port: u32,
+        originator_address: String,
+        originator_port: u32,
+    },
+    X11 {
+        channel: Channel<Msg>,
+        originator_address: String,
+        originator_port: u32,
+    },
+}
+
+/// X11 forwarding request parameters (RFC 4254 §6.3.1), stashed from the outer
+/// `x11-req` and relayed UNCHANGED to the node's session channel. The Gateway is a
+/// pure pass-through: the fake-cookie / real-cookie substitution is the endpoints'
+/// job (the node's sshd and the client's `ssh`), never the relay's.
+#[derive(Debug, Clone)]
+pub(crate) struct X11Params {
+    pub single_connection: bool,
+    pub auth_protocol: String,
+    pub auth_cookie: String,
+    pub screen_number: u32,
+}
 
 /// Inner-leg bounds (fail-closed timeouts + flow-control sizing).
 #[derive(Debug, Clone)]
@@ -98,6 +136,7 @@ impl InnerClient {
         cert: Certificate,
         key: PrivateKey,
         cfg: &InnerLegConfig,
+        reverse_tx: Option<mpsc::Sender<ReverseOpen>>,
     ) -> Result<Self, InnerLegError> {
         let config = Arc::new(client::Config {
             window_size: cfg.window_size,
@@ -111,6 +150,7 @@ impl InnerClient {
         let handler = InnerHandler {
             verifier,
             outcome: outcome.clone(),
+            reverse_tx,
         };
 
         let connect = client::connect_stream(config, stream, handler);
@@ -173,6 +213,7 @@ impl InnerClient {
         &self,
         kind: ChannelKind,
         pty: Option<&PtyParams>,
+        x11: Option<&X11Params>,
     ) -> Result<Channel<Msg>, InnerLegError> {
         // Bound channel-open + replay by the op timeout so a stalled node cannot
         // park the (shared) handler task on the idle timer (F-innertimeout-1).
@@ -186,6 +227,22 @@ impl InnerClient {
             if let Some(p) = pty {
                 channel
                     .request_pty(false, &p.term, p.col, p.row, p.pix_w, p.pix_h, &p.modes)
+                    .await
+                    .map_err(|e| InnerLegError::ChannelOpen(e.to_string()))?;
+            }
+
+            // Relay the client's x11-req UNCHANGED to the node before the shell
+            // (matches OpenSSH ordering). Pure pass-through: no cookie rewriting
+            // (RFC 4254 §6.3.1 — the endpoints own the fake/real cookie swap).
+            if let Some(x) = x11 {
+                channel
+                    .request_x11(
+                        false,
+                        x.single_connection,
+                        x.auth_protocol.clone(),
+                        x.auth_cookie.clone(),
+                        x.screen_number,
+                    )
                     .await
                     .map_err(|e| InnerLegError::ChannelOpen(e.to_string()))?;
             }
@@ -205,6 +262,62 @@ impl InnerClient {
             )),
         }
     }
+
+    /// Local forward (`ssh -L`, Session 29): ask the NODE — as its SSH client — to
+    /// dial `host:port` and open a `direct-tcpip` channel to it (RFC 4254 §7.2).
+    /// The dial happens FROM THE NODE'S NETWORK, so a granted forward can only
+    /// reach what the node itself can reach (no Gateway-side SSRF escape). Bounded
+    /// by the op timeout so a stalled node cannot park the handler.
+    pub async fn open_direct_tcpip(
+        &self,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+    ) -> Result<Channel<Msg>, InnerLegError> {
+        let open = self.handle.channel_open_direct_tcpip(
+            host_to_connect.to_string(),
+            port_to_connect,
+            originator_address.to_string(),
+            originator_port,
+        );
+        match tokio::time::timeout(self.op_timeout, open).await {
+            Ok(r) => r.map_err(|e| InnerLegError::ChannelOpen(e.to_string())),
+            Err(_) => Err(InnerLegError::ChannelOpen(
+                "node direct-tcpip open timed out".into(),
+            )),
+        }
+    }
+
+    /// Remote forward (`ssh -R`, Session 29): ask the NODE to bind a listener for
+    /// `address:port` (RFC 4254 §7.1). The listener lives on the NODE's side (real
+    /// `ssh -R`-through-a-bastion semantics), so no Gateway-side listener leaks
+    /// across sessions/nodes. `port == 0` lets the node pick; the chosen port is
+    /// returned to report back to the client.
+    pub async fn remote_forward(&self, address: &str, port: u32) -> Result<u32, InnerLegError> {
+        let call = self.handle.tcpip_forward(address.to_string(), port);
+        match tokio::time::timeout(self.op_timeout, call).await {
+            Ok(r) => r.map_err(|e| InnerLegError::ChannelOpen(e.to_string())),
+            Err(_) => Err(InnerLegError::ChannelOpen(
+                "node tcpip-forward timed out".into(),
+            )),
+        }
+    }
+
+    /// Unbind a remote-forward listener on the node (`cancel-tcpip-forward`).
+    pub async fn cancel_remote_forward(
+        &self,
+        address: &str,
+        port: u32,
+    ) -> Result<(), InnerLegError> {
+        let call = self.handle.cancel_tcpip_forward(address.to_string(), port);
+        match tokio::time::timeout(self.op_timeout, call).await {
+            Ok(r) => r.map_err(|e| InnerLegError::ChannelOpen(e.to_string())),
+            Err(_) => Err(InnerLegError::ChannelOpen(
+                "node cancel-tcpip-forward timed out".into(),
+            )),
+        }
+    }
 }
 
 /// Split an opened inner channel into the halves the bridge uses.
@@ -219,6 +332,10 @@ pub(crate) fn split_channel(channel: Channel<Msg>) -> (InnerReadHalf, InnerWrite
 struct InnerHandler {
     verifier: HostVerifier,
     outcome: Arc<Mutex<Option<Result<HostVerified, HostVerifyError>>>>,
+    /// Sink for node-initiated reverse channels (remote-forward / X11). `None`
+    /// when the session was granted no reverse-capable forward: such a channel is
+    /// then REJECTED (fail closed — the node must never open one unbidden).
+    reverse_tx: Option<mpsc::Sender<ReverseOpen>>,
 }
 
 impl client::Handler for InnerHandler {
@@ -233,5 +350,55 @@ impl client::Handler for InnerHandler {
         *self.outcome.lock().unwrap() = Some(result);
         // Returning false makes russh abort the handshake (fail closed, no TOFU).
         Ok(accept)
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        // Dropping `reply` rejects; accept only when a forward was granted and the
+        // outer relay is still live.
+        let Some(tx) = &self.reverse_tx else {
+            return Ok(());
+        };
+        reply.accept().await;
+        let _ = tx
+            .send(ReverseOpen::ForwardedTcpip {
+                channel,
+                connected_address: connected_address.to_string(),
+                connected_port,
+                originator_address: originator_address.to_string(),
+                originator_port,
+            })
+            .await;
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: Channel<Msg>,
+        originator_address: &str,
+        originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(tx) = &self.reverse_tx else {
+            return Ok(());
+        };
+        reply.accept().await;
+        let _ = tx
+            .send(ReverseOpen::X11 {
+                channel,
+                originator_address: originator_address.to_string(),
+                originator_port,
+            })
+            .await;
+        Ok(())
     }
 }

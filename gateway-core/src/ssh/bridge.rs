@@ -82,6 +82,58 @@ pub struct ScpMode {
     pub target: Vec<u8>,
 }
 
+/// The direction/kind of a forwarded (tunnel) channel, for the metadata-only
+/// audit (Session 29, FR-SESS-2). Forwarded bytes are arbitrary/binary with no
+/// universal decode, so a tunnel is NEVER content-captured — only its open/close
+/// metadata is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelDirection {
+    /// `ssh -L`: client → node-dialled `host:port` (`direct-tcpip`).
+    Local,
+    /// `ssh -R`: a node-bound listener → client (`forwarded-tcpip`).
+    Remote,
+    /// `ssh -X`/`-Y`: an X11 channel the node opened back to the client.
+    X11,
+}
+
+impl TunnelDirection {
+    /// The granted capability label for the audit event (stable, non-secret).
+    pub fn capability_label(self) -> &'static str {
+        match self {
+            TunnelDirection::Local => "port_forward_local",
+            TunnelDirection::Remote => "port_forward_remote",
+            TunnelDirection::X11 => "x11",
+        }
+    }
+
+    /// The audit-event family for the open/close marker `type`.
+    pub fn audit_family(self) -> &'static str {
+        match self {
+            TunnelDirection::X11 => "x11_forward",
+            _ => "port_forward",
+        }
+    }
+
+    /// The direction label recorded in the audit event.
+    pub fn direction_label(self) -> &'static str {
+        match self {
+            TunnelDirection::Local => "local",
+            TunnelDirection::Remote => "remote",
+            TunnelDirection::X11 => "x11",
+        }
+    }
+}
+
+/// Shared byte counters for a live tunnel, updated by the two directional pumps
+/// and read at close to emit the `*.closed` audit event. Cheap to clone (`Arc`s).
+#[derive(Debug, Clone, Default)]
+pub struct TunnelCounters {
+    /// Client → node bytes (`ssh -L`/`-R` payload, X11 requests).
+    pub bytes_in: Arc<std::sync::atomic::AtomicU64>,
+    /// Node → client bytes.
+    pub bytes_out: Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// How a bridged channel's plaintext is captured (Design §12.1). The handler
 /// classifies the channel at open time so the tap routes its bytes.
 ///
@@ -108,6 +160,18 @@ pub enum RecChannelKind {
     },
     /// The SFTP subsystem: decoded into per-operation file-transfer audit only.
     Sftp,
+    /// A forwarded TCP/X11 tunnel (Session 29, FR-SESS-2): **metadata-only**. The
+    /// recorder emits `<family>.opened` on open and `<family>.closed` on close
+    /// (with the byte counts from `counters` + duration) — NEVER the forwarded
+    /// bytes. `target` is the dial/bind/originator descriptor for the audit.
+    Tunnel {
+        /// Which forward shape (`ssh -L`/`-R`/X11) this tunnel is.
+        direction: TunnelDirection,
+        /// The dial/bind/originator descriptor recorded in the audit event.
+        target: String,
+        /// Shared byte counters, read at close for the `*.closed` audit.
+        counters: TunnelCounters,
+    },
 }
 
 /// The inputs [`RecorderFactory::begin`] needs to register + key a recording. The
