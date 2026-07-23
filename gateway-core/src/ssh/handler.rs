@@ -235,9 +235,11 @@ pub struct SshHandler {
     /// The reverse-channel dispatcher task (remote-forward + X11 relay); aborted on
     /// connection Drop for deterministic teardown.
     reverse_dispatcher: Option<tokio::task::JoinHandle<()>>,
-    /// Local-forward (`ssh -L`) bridge tasks, aborted on Drop (no leak-until-
-    /// disconnect); each also self-terminates when its channel closes.
-    local_forward_pumps: Vec<tokio::task::JoinHandle<()>>,
+    /// Local-forward (`ssh -L`) bridge tasks, aborted on Drop; finished handles
+    /// are reaped on every new open (as the reverse dispatcher's JoinSet) so a
+    /// busy `-L` proxying many short-lived connections cannot grow this unbounded
+    /// over a long session (F-fwd-local-pump-leak-1).
+    local_forward_pumps: tokio::task::JoinSet<()>,
     /// Count of credential-resolution attempts (bounds the CP-RPC amplification
     /// per connection — russh does NOT enforce its own `max_auth_attempts`).
     auth_attempts: usize,
@@ -362,7 +364,7 @@ impl SshHandler {
             grant_expiry: Arc::new(AtomicI64::new(0)),
             reverse_tx: None,
             reverse_dispatcher: None,
-            local_forward_pumps: Vec::new(),
+            local_forward_pumps: tokio::task::JoinSet::new(),
             auth_attempts: 0,
             session_abort: None,
             live_guard: None,
@@ -1646,9 +1648,7 @@ impl Drop for SshHandler {
         if let Some(d) = self.reverse_dispatcher.take() {
             d.abort();
         }
-        for pump in self.local_forward_pumps.drain(..) {
-            pump.abort();
-        }
+        self.local_forward_pumps.abort_all();
         // Stop the mid-session-expiry timer (the connection is already ending). The
         // live_guard drops here too, deregistering the session from the lock registry.
         if let Some(task) = self.expiry_task.take() {
@@ -2139,11 +2139,13 @@ impl Handler for SshHandler {
             .expect("session registered by admit");
         let bridge = forward::tunnel_bridge_task(channel, inner_chan, counters, abort);
         let active = self.active_tunnels.clone();
-        self.local_forward_pumps.push(tokio::spawn(async move {
+        // Reap finished bridges so the set does not grow unbounded under churn.
+        while self.local_forward_pumps.try_join_next().is_some() {}
+        self.local_forward_pumps.spawn(async move {
             let _ = bridge.await;
             recorder.close_channel(outer_id);
             active.fetch_sub(1, Ordering::SeqCst);
-        }));
+        });
         Ok(())
     }
 

@@ -38,6 +38,12 @@ use crate::ssh::locks::{LockBindings, LockSet};
 /// One directional pump of a forwarded (opaque) tunnel half: relay bytes,
 /// counting them, until either side closes or the shared abort flag flips (a
 /// lock/expiry teardown, §8.4). No content is tapped — tunnels are metadata-only.
+///
+/// Deliberately checks only the session abort flag, NOT the recorder's
+/// `should_abort()` (unlike the shell pump): a strict mid-session recording
+/// failure has no unrecorded-plaintext to protect here (no tunnel content is
+/// ever captured), so tunnels ride out the beat until the session-level
+/// disconnect propagates.
 async fn pump_tunnel<T>(
     mut read: ChannelReadHalf,
     write: ChannelWriteHalf<T>,

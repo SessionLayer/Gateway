@@ -627,6 +627,13 @@ pub struct InnerLegServerConfig {
     /// Tier-0 cap on the number of session channels one connection may open
     /// (bounds pump tasks + node channels + flow-control buffers). A local
     /// resource bound, distinct from the S10 concurrent-session policy limit.
+    ///
+    /// Since Session 29 this value caps three INDEPENDENT per-connection counters
+    /// — session channels opened, concurrent forward tunnels, and remote-forward
+    /// listeners — so the effective per-connection object bound is ~3× this value.
+    /// Deliberate (an "extended cap" per FR-SESS-2's resource doctrine): the
+    /// families have different semantics (monotonic vs concurrent vs held), and
+    /// each stays independently bounded.
     pub max_channels_per_connection: usize,
 }
 
