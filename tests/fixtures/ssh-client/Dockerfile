@@ -61,6 +61,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       openssh-client \
       ca-certificates \
+      xauth \
  && rm -rf /var/lib/apt/lists/* \
  # Assert the packaged client's OpenSSH major line matches the sk-dummy source, so
  # the SK middleware ABI cannot silently drift (reproducible, verified).

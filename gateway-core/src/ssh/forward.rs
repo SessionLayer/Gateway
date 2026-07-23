@@ -20,8 +20,9 @@
 //! counts, duration).
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use russh::client::Msg as ClientMsg;
 use russh::server::{Handle as ServerHandle, Msg as ServerMsg};
@@ -30,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::ssh::bridge::{RecChannelKind, SessionRecorder, TunnelCounters, TunnelDirection};
-use crate::ssh::handler::sanitize;
+use crate::ssh::handler::{grant_is_expired, now_epoch_secs, sanitize};
 use crate::ssh::innerleg::ReverseOpen;
 use crate::ssh::locks::{LockBindings, LockSet};
 
@@ -80,8 +81,11 @@ pub(crate) fn reserve_tunnel_slot(active: &AtomicUsize, max: usize) -> bool {
 }
 
 /// Bridge an already-open outer↔inner tunnel channel pair opaquely (both
-/// directions), returning a task that completes when the tunnel is fully torn
-/// down. Byte counts land in `counters` for the close audit.
+/// directions), returning ONE task that owns both pumps. Aborting the returned
+/// handle (on connection Drop / dispatcher teardown) cancels both pump futures at
+/// once — they are run inside this task, not detached, so teardown is deterministic
+/// and does not wait for transport close. Byte counts land in `counters` for the
+/// close audit.
 pub(crate) fn tunnel_bridge_task(
     outer: Channel<ServerMsg>,
     inner: Channel<ClientMsg>,
@@ -90,24 +94,19 @@ pub(crate) fn tunnel_bridge_task(
 ) -> tokio::task::JoinHandle<()> {
     let (outer_read, outer_write) = outer.split();
     let (inner_read, inner_write) = inner.split();
-    let node_to_client = tokio::spawn(pump_tunnel(
-        inner_read,
-        outer_write,
-        counters.bytes_out.clone(),
-        abort.clone(),
-    ));
-    let client_to_node = tokio::spawn(pump_tunnel(
-        outer_read,
-        inner_write,
-        counters.bytes_in.clone(),
-        abort,
-    ));
     tokio::spawn(async move {
-        // Either half ending tears the tunnel down; abort the peer so no half
-        // leaks until the connection drops (deterministic teardown).
-        let _ = node_to_client.await;
-        client_to_node.abort();
-        let _ = client_to_node.await;
+        let node_to_client = pump_tunnel(
+            inner_read,
+            outer_write,
+            counters.bytes_out.clone(),
+            abort.clone(),
+        );
+        let client_to_node = pump_tunnel(outer_read, inner_write, counters.bytes_in.clone(), abort);
+        // Either half closing tears the tunnel down; select drops (cancels) the peer.
+        tokio::select! {
+            _ = node_to_client => {}
+            _ = client_to_node => {}
+        }
     })
 }
 
@@ -132,6 +131,16 @@ pub(crate) struct ReverseDispatcher {
     pub allow_remote: bool,
     /// Whether the grant carries `x11` — gates a node-initiated `x11` open likewise.
     pub allow_x11: bool,
+    /// The session's signed `grant_expiry` (epoch seconds), shared so a mid-session
+    /// re-authorize updates it. A reverse channel opened after expiry is refused —
+    /// the same time-box the local-forward path enforces (Part F / §8.4), so a
+    /// remote-forward/X11 listener cannot outlive the grant in RunToTtl mode.
+    pub grant_expiry: Arc<AtomicI64>,
+    /// Conservative grant-expiry skew (seconds) — treat the grant as expired early.
+    pub grant_expiry_skew_secs: i64,
+    /// Bound on the outer reverse-channel open, so an unresponsive/stalled client
+    /// cannot hang the (serial) dispatcher and back-pressure the inner run loop.
+    pub op_timeout: Duration,
     pub session_id: String,
     pub source_ip: IpAddr,
 }
@@ -166,6 +175,14 @@ impl ReverseDispatcher {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "locked_or_torn", "reverse forward refused (lock/teardown)");
             return; // dropping `open` closes the inner channel
         }
+        // Time-box: a reverse channel opened after the signed grant expired is
+        // refused, matching the local-forward path — so a node-bound -R listener
+        // (or X11) cannot outlive the grant in the default RunToTtl mode.
+        let ge = self.grant_expiry.load(Ordering::SeqCst);
+        if grant_is_expired(now_epoch_secs(), ge, self.grant_expiry_skew_secs) {
+            tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "grant_expired", "reverse forward refused (grant expired)");
+            return;
+        }
         // Per-connection concurrent-tunnel cap (bounds reverse fan-out from one grant).
         if !reserve_tunnel_slot(&self.active_tunnels, self.max_channels) {
             tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection tunnel cap exceeded; refusing reverse forward");
@@ -180,15 +197,16 @@ impl ReverseDispatcher {
                 originator_address,
                 originator_port,
             } => {
-                let outer = self
-                    .outer
-                    .channel_open_forwarded_tcpip(
+                let outer = tokio::time::timeout(
+                    self.op_timeout,
+                    self.outer.channel_open_forwarded_tcpip(
                         connected_address.clone(),
                         connected_port,
                         originator_address.clone(),
                         originator_port,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 let target = format!(
                     "{}:{} (from {}:{})",
                     connected_address, connected_port, originator_address, originator_port
@@ -200,20 +218,27 @@ impl ReverseDispatcher {
                 originator_address,
                 originator_port,
             } => {
-                let outer = self
-                    .outer
-                    .channel_open_x11(originator_address.clone(), originator_port)
-                    .await;
+                let outer = tokio::time::timeout(
+                    self.op_timeout,
+                    self.outer
+                        .channel_open_x11(originator_address.clone(), originator_port),
+                )
+                .await;
                 let target = format!("x11 (from {}:{})", originator_address, originator_port);
                 (channel, TunnelDirection::X11, target, outer)
             }
         };
 
         let outer = match outer {
-            Ok(c) => c,
-            Err(e) => {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 self.active_tunnels.fetch_sub(1, Ordering::SeqCst);
                 tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, error = %e, outcome = "channel_open_failed", "outer reverse channel open refused by client");
+                return;
+            }
+            Err(_) => {
+                self.active_tunnels.fetch_sub(1, Ordering::SeqCst);
+                tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_open_timeout", "outer reverse channel open timed out (client unresponsive)");
                 return;
             }
         };

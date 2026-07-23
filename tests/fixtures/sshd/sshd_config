@@ -23,6 +23,14 @@ AuthorizedKeysFile .ssh/authorized_keys
 # SFTP subsystem for file-transfer audit tests (both SCP modes + SFTP).
 Subsystem sftp internal-sftp
 
+# X11 + TCP forwarding enabled so the Session 29 port-forward / X11 data-plane
+# E2E can drive real -L/-R/-X through the Gateway. AllowTcpForwarding is OpenSSH's
+# default (yes) but stated explicitly here; X11 forwarding needs xauth (installed
+# in the image) — DISPLAY is set on the node when the Gateway relays the x11-req.
+AllowTcpForwarding yes
+X11Forwarding yes
+X11UseLocalhost yes
+
 UsePAM no
 AllowUsers deploy dba
 AcceptEnv LANG LC_*

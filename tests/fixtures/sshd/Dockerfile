@@ -17,6 +17,7 @@ RUN apt-get update \
       openssh-server \
       openssh-client \
       ca-certificates \
+      xauth \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /run/sshd \
  # Dedicated non-root login accounts = the RBAC-resolved Linux principals.

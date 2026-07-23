@@ -368,15 +368,16 @@ impl client::Handler for InnerHandler {
             return Ok(());
         };
         reply.accept().await;
-        let _ = tx
-            .send(ReverseOpen::ForwardedTcpip {
-                channel,
-                connected_address: connected_address.to_string(),
-                connected_port,
-                originator_address: originator_address.to_string(),
-                originator_port,
-            })
-            .await;
+        // try_send (never .await): a full queue sheds the reverse open (the accepted
+        // inner channel drops → closes) rather than blocking the inner run loop,
+        // which would stall EVERY inner channel incl. the interactive session.
+        let _ = tx.try_send(ReverseOpen::ForwardedTcpip {
+            channel,
+            connected_address: connected_address.to_string(),
+            connected_port,
+            originator_address: originator_address.to_string(),
+            originator_port,
+        });
         Ok(())
     }
 
@@ -392,13 +393,11 @@ impl client::Handler for InnerHandler {
             return Ok(());
         };
         reply.accept().await;
-        let _ = tx
-            .send(ReverseOpen::X11 {
-                channel,
-                originator_address: originator_address.to_string(),
-                originator_port,
-            })
-            .await;
+        let _ = tx.try_send(ReverseOpen::X11 {
+            channel,
+            originator_address: originator_address.to_string(),
+            originator_port,
+        });
         Ok(())
     }
 }

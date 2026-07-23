@@ -43,7 +43,7 @@ use crate::config::RecorderConfig;
 use crate::cpauth::CpAuthClient;
 use crate::pb::{
     BeginRecordingRequest, FileTransferAudit, FinalizeRecordingRequest, KeySealAlgorithm,
-    RecordingContext, RecordingStatus,
+    RecordingContext, RecordingStatus, TunnelAudit,
 };
 use crate::ssh::bridge::{
     RecChannelKind, RecorderError, RecorderFactory, RecorderTap, RecordingParams, SessionRecorder,
@@ -149,6 +149,10 @@ struct Capture<K: Eq + std::hash::Hash + Copy> {
     pending_pt: Zeroizing<Vec<u8>>,
     channels: HashMap<K, ChannelRec>,
     sftp_audit: Vec<FileTransferAudit>,
+    /// Per-tunnel (port-forward/X11) metadata audit, flushed into
+    /// `FinalizeRecordingRequest.tunnel_audit` at finalize — the cleartext CP-side
+    /// correlation copy (mirrors `sftp_audit`), alongside the sealed `m` markers.
+    tunnel_audit: Vec<TunnelAudit>,
     /// The first capture failure (operator reason). Set ⇒ capture stops.
     failed: Option<String>,
     finalized: bool,
@@ -162,6 +166,7 @@ struct FinalizedObject {
     content_digest: String,
     byte_len: i64,
     audits: Vec<FileTransferAudit>,
+    tunnel_audits: Vec<TunnelAudit>,
 }
 
 impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
@@ -192,6 +197,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
             pending_pt: Zeroizing::new(Vec::new()),
             channels: HashMap::new(),
             sftp_audit: Vec::new(),
+            tunnel_audit: Vec::new(),
             failed: None,
             finalized: false,
         })
@@ -385,6 +391,16 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                 let r =
                     self.push_asciicast(&asciicast::event_line(elapsed, EventCode::Marker, &label));
                 self.note_push(r);
+                // Cleartext CP-side correlation copy (Session 29) — the same
+                // metadata as the sealed marker, delivered via FinalizeRecording.
+                self.tunnel_audit.push(TunnelAudit {
+                    capability: direction.capability_label().to_string(),
+                    direction: direction.direction_label().to_string(),
+                    target,
+                    bytes_in: bytes_in as i64,
+                    bytes_out: bytes_out as i64,
+                    duration_seconds: duration as i64,
+                });
             }
         }
     }
@@ -414,6 +430,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
             content_digest: self.spool.content_digest_hex(),
             byte_len: self.spool.len() as i64,
             audits: std::mem::take(&mut self.sftp_audit),
+            tunnel_audits: std::mem::take(&mut self.tunnel_audit),
         }
     }
 
@@ -729,6 +746,7 @@ impl SessionRecorder for Recorder {
                 content_digest: prepared.content_digest,
                 byte_len: prepared.byte_len,
                 sftp_audit: prepared.audits,
+                tunnel_audit: prepared.tunnel_audits,
                 object_version_id: object_version_id.unwrap_or_default(),
             };
             match self.cpauth.finalize_recording(req).await {

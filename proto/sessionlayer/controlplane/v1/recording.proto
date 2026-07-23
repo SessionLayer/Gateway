@@ -200,6 +200,14 @@ message FinalizeRecordingRequest {
   // an older Gateway omits it → the CP stores null and replay falls back to the
   // unversioned GET (pre-fix behaviour) until both peers are upgraded.
   string object_version_id = 7;
+
+  // Per-tunnel (port-forward/X11) audit — target/direction/capability + byte
+  // counters, correlated into the audit_event stream (Session 29, FR-SESS-2).
+  // METADATA ONLY: forwarded bytes are arbitrary/binary with no universal
+  // decode (unlike SFTP's known wire format), so unlike `sftp_audit` there is no
+  // content digest here — just the open/close facts. Landing at finalize time
+  // (not live) mirrors the existing `sftp_audit` timing precedent.
+  repeated TunnelAudit tunnel_audit = 8;
 }
 
 // One decoded SFTP/SCP file-transfer operation (metadata only).
@@ -215,6 +223,23 @@ message FileTransferAudit {
   // Streaming SHA-256 of the transferred content, "sha256:<64-hex>" (never the
   // content itself).
   string sha256 = 5;
+}
+
+// One forwarded (port-forward or X11) tunnel channel's audit facts (metadata
+// only — no byte content, no decode of the forwarded protocol).
+message TunnelAudit {
+  // "port_forward_local" | "port_forward_remote" | "x11" — the capability that
+  // admitted this tunnel.
+  string capability = 1;
+  // "local" | "remote" | "x11".
+  string direction = 2;
+  // The forwarded target, e.g. "host:port". Empty for x11 (no client-supplied
+  // target).
+  string target = 3;
+  int64 bytes_in = 4;
+  int64 bytes_out = 5;
+  // How long the tunnel was open, in seconds.
+  int64 duration_seconds = 6;
 }
 
 message FinalizeRecordingResponse {

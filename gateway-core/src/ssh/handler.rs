@@ -24,7 +24,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -219,9 +219,16 @@ pub struct SshHandler {
     /// pump so ALL forwards from one connection share one concurrency cap
     /// (`max_channels_per_connection`); decremented when a tunnel ends.
     active_tunnels: Arc<AtomicUsize>,
-    /// Concurrent remote-forward (`ssh -R`) listeners bound on the node, capped at
-    /// `max_channels_per_connection` (bounds `tcpip_forward` fan-out per grant).
-    remote_forward_listeners: usize,
+    /// The remote-forward (`ssh -R`) listeners currently bound on the node, keyed by
+    /// `(bind_address, bound_port)`, capped at `max_channels_per_connection` (bounds
+    /// `tcpip_forward` fan-out per grant). Tracked as a set so `cancel-tcpip-forward`
+    /// decrements only on a real match (a spurious/duplicate cancel cannot under-
+    /// count the cap, F-reliability-4).
+    remote_forwards: std::collections::HashSet<(String, u32)>,
+    /// The session's signed `grant_expiry` (epoch seconds), shared with the reverse
+    /// dispatcher so it enforces the SAME time-box the local-forward path does; a
+    /// mid-session re-authorize updates it in place.
+    grant_expiry: Arc<AtomicI64>,
     /// The reverse-channel sink handed to the inner leg's client handler; `Some`
     /// once the inner leg is established (Session 29).
     reverse_tx: Option<tokio::sync::mpsc::Sender<ReverseOpen>>,
@@ -351,7 +358,8 @@ impl SshHandler {
             channels_opened: 0,
             x11_reqs: HashMap::new(),
             active_tunnels: Arc::new(AtomicUsize::new(0)),
-            remote_forward_listeners: 0,
+            remote_forwards: std::collections::HashSet::new(),
+            grant_expiry: Arc::new(AtomicI64::new(0)),
             reverse_tx: None,
             reverse_dispatcher: None,
             local_forward_pumps: Vec::new(),
@@ -906,6 +914,10 @@ impl SshHandler {
                         // rearm the expiry timer against the refreshed grant_expiry.
                         if let Some(control) = self.session_control.clone() {
                             control.update_bindings(fresh.bindings.clone());
+                            // Refresh the shared grant_expiry so the reverse dispatcher
+                            // enforces the re-authorized (extended/shortened) time-box.
+                            self.grant_expiry
+                                .store(fresh.context.grant_expiry_epoch_seconds, Ordering::SeqCst);
                             self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
                             self.arm_idle(fresh.context.idle_timeout_seconds);
                         }
@@ -977,6 +989,8 @@ impl SshHandler {
                 .register(self.session_id.clone(), control.clone()),
         );
         self.session_control = Some(control);
+        self.grant_expiry
+            .store(authz.context.grant_expiry_epoch_seconds, Ordering::SeqCst);
         self.arm_expiry(authz.context.grant_expiry_epoch_seconds);
         self.arm_idle(authz.context.idle_timeout_seconds);
         self.arm_lease_keeper(authz);
@@ -1104,38 +1118,50 @@ impl SshHandler {
         if let Some(o) = self.inner_failed {
             return Err(o);
         }
+        // Fail-closed per direction: relay a node-initiated reverse channel ONLY
+        // for a capability actually granted, so even a compromised node cannot push
+        // an unsolicited forwarded-tcpip/x11 at the client. When NEITHER is granted,
+        // hand the inner leg no reverse sink at all (it then REJECTS reverse opens
+        // at the source — never accepting+enqueuing them, F-reliability-2).
+        let allow_remote = authz
+            .capabilities
+            .contains(&(Capability::PortForwardRemote as i32));
+        let allow_x11 = authz.capabilities.contains(&(Capability::X11 as i32));
+        let reverse_capable = allow_remote || allow_x11;
+
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        match self.establish_inner(authz, Some(tx.clone())).await {
+        let reverse_tx = reverse_capable.then(|| tx.clone());
+        match self.establish_inner(authz, reverse_tx.clone()).await {
             Ok(c) => {
                 self.inner = Some(c);
-                self.reverse_tx = Some(tx);
-                let recorder = self.recorder.clone().expect("recorder begun before inner");
-                let abort = self
-                    .session_abort
-                    .clone()
-                    .expect("session registered before inner");
-                // Fail-closed per direction: relay a node-initiated reverse channel
-                // ONLY for a capability actually granted, so even a compromised node
-                // cannot push an unsolicited forwarded-tcpip/x11 at the client.
-                let allow_remote = authz
-                    .capabilities
-                    .contains(&(Capability::PortForwardRemote as i32));
-                let allow_x11 = authz.capabilities.contains(&(Capability::X11 as i32));
-                let dispatcher = ReverseDispatcher {
-                    rx,
-                    outer: session.handle(),
-                    recorder,
-                    lock_set: self.deps.lock_set.clone(),
-                    bindings: authz.bindings.clone(),
-                    abort,
-                    active_tunnels: self.active_tunnels.clone(),
-                    max_channels: self.deps.config.inner.max_channels_per_connection,
-                    allow_remote,
-                    allow_x11,
-                    session_id: self.session_id.clone(),
-                    source_ip: self.source_ip,
-                };
-                self.reverse_dispatcher = Some(tokio::spawn(dispatcher.run()));
+                self.reverse_tx = reverse_tx;
+                if reverse_capable {
+                    let recorder = self.recorder.clone().expect("recorder begun before inner");
+                    let abort = self
+                        .session_abort
+                        .clone()
+                        .expect("session registered before inner");
+                    let dispatcher = ReverseDispatcher {
+                        rx,
+                        outer: session.handle(),
+                        recorder,
+                        lock_set: self.deps.lock_set.clone(),
+                        bindings: authz.bindings.clone(),
+                        abort,
+                        active_tunnels: self.active_tunnels.clone(),
+                        max_channels: self.deps.config.inner.max_channels_per_connection,
+                        allow_remote,
+                        allow_x11,
+                        grant_expiry: self.grant_expiry.clone(),
+                        grant_expiry_skew_secs: self.deps.config.reeval.grant_expiry_skew_secs,
+                        op_timeout: Duration::from_secs(
+                            self.deps.config.inner.handshake_timeout_secs,
+                        ),
+                        session_id: self.session_id.clone(),
+                        source_ip: self.source_ip,
+                    };
+                    self.reverse_dispatcher = Some(tokio::spawn(dispatcher.run()));
+                }
                 Ok(())
             }
             Err(o) => {
@@ -2142,7 +2168,7 @@ impl Handler for SshHandler {
             }
         }
         // Bound concurrent remote-forward listeners per connection.
-        if self.remote_forward_listeners >= self.deps.config.inner.max_channels_per_connection {
+        if self.remote_forwards.len() >= self.deps.config.inner.max_channels_per_connection {
             tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection listener cap exceeded; refusing remote forward");
             return Ok(false);
         }
@@ -2153,7 +2179,7 @@ impl Handler for SshHandler {
                 if requested == 0 {
                     *port = bound;
                 }
-                self.remote_forward_listeners += 1;
+                self.remote_forwards.insert((address.to_string(), *port));
                 tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, bind = %sanitize(address), port = *port, capability = "port_forward_remote", outcome = "forward_bound", "remote port-forward listener bound on the node");
                 Ok(true)
             }
@@ -2177,7 +2203,9 @@ impl Handler for SshHandler {
         };
         match inner.cancel_remote_forward(address, port).await {
             Ok(()) => {
-                self.remote_forward_listeners = self.remote_forward_listeners.saturating_sub(1);
+                // Decrement only on a real match so a spurious/duplicate cancel cannot
+                // under-count the cap (F-reliability-4).
+                self.remote_forwards.remove(&(address.to_string(), port));
                 tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, bind = %sanitize(address), port, outcome = "forward_unbound", "remote port-forward listener unbound");
                 Ok(true)
             }
@@ -2414,7 +2442,7 @@ fn new_session_id() -> String {
 }
 
 /// The Gateway wall clock as Unix epoch seconds (for grant/lock expiry checks).
-fn now_epoch_secs() -> i64 {
+pub(crate) fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2428,7 +2456,7 @@ fn now_epoch_secs() -> i64 {
 /// new privileged channel past the real expiry. `grant_expiry == 0` means "no
 /// fixed expiry" and is handled by the caller (break-glass fail-closed vs
 /// standing/JIT decision-ttl+lock bounding), never expired here.
-fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64) -> bool {
+pub(crate) fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64) -> bool {
     grant_expiry != 0 && now_epoch.saturating_add(skew_secs) >= grant_expiry
 }
 
