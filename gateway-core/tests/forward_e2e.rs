@@ -9,9 +9,12 @@
 //!   its own sshd; the client reads the SSH banner back through the tunnel);
 //! - **-R** remote forward binds a listener ON THE NODE and relays a connection
 //!   back to the client; `ExitOnForwardFailure` makes the ungranted case fail;
+//!   `cancel-tcpip-forward` (ssh -O cancel) actually unbinds the node listener;
 //! - **-X** X11 request is relayed unchanged to the node (DISPLAY is set on the
 //!   node) when granted, refused otherwise;
 //! - **agent forwarding is always refused**, even with a maximal grant;
+//! - a **nested ProxyJump** direct-tcpip is refused even with a maximal grant
+//!   (one MITM hop only — the S16 structural invariant survives S29);
 //! - a mid-session **Lock** tears a live forward down like any channel;
 //! - the recording posture is **metadata-only** (tunnel open/close markers, no
 //!   forwarded byte content in the sealed WORM object).
@@ -386,9 +389,11 @@ async fn remote_forward_binds_on_node_only_when_granted() -> anyhow::Result<()> 
     );
 
     // ── Granted: the node binds 15222 and forwards a connection back to the client,
-    //    which dials the node's own sshd (via host network) — banner returns.
+    //    which dials the node's own sshd (via host network) — banner returns. A mux
+    //    master (-M) keeps a control socket so `-O cancel` can unbind it below.
     cp.set_capabilities(NODE_ID, &[Capability::Shell, Capability::PortForwardRemote]);
     let ok = client_container(&pin).await;
+    let fwd = format!("15222:127.0.0.1:{node_port}");
     let (code_ok, _o, _e) = exec(
         &ok,
         ssh_cmd(
@@ -398,8 +403,11 @@ async fn remote_forward_binds_on_node_only_when_granted() -> anyhow::Result<()> 
                 "ExitOnForwardFailure=yes",
                 "-f",
                 "-N",
+                "-M",
+                "-S",
+                "/tmp/cm",
                 "-R",
-                &format!("15222:127.0.0.1:{node_port}"),
+                &fwd,
             ],
             "",
         ),
@@ -425,6 +433,32 @@ async fn remote_forward_binds_on_node_only_when_granted() -> anyhow::Result<()> 
     assert!(
         out_ok.contains("SSH-2.0"),
         "a connection to the node-bound -R listener must relay back to the client (got {out_ok:?})"
+    );
+
+    // ── `cancel-tcpip-forward` (RFC 4254 §7.1) actually unbinds the node listener.
+    let (code_cancel, _o, cancel_err) = exec(
+        &ok,
+        ssh_cmd(gw_port, &["-S", "/tmp/cm", "-O", "cancel", "-R", &fwd], ""),
+    )
+    .await;
+    assert_eq!(
+        code_cancel,
+        Some(0),
+        "cancel-tcpip-forward must be honored: {cancel_err}"
+    );
+    let (_c, out_after, _e) = exec(
+        &node,
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "sleep 1; (exec 3<>/dev/tcp/127.0.0.1/15222; head -c 15 <&3) 2>/dev/null || true"
+                .into(),
+        ],
+    )
+    .await;
+    assert!(
+        !out_after.contains("SSH-2.0"),
+        "a cancelled remote forward must be unbound on the node (got {out_after:?})"
     );
 
     drop(denied);
@@ -537,6 +571,121 @@ async fn agent_forwarding_is_always_refused_even_with_full_grant() -> anyhow::Re
     assert!(
         out.contains("SOCK=[]"),
         "agent forwarding must never be established, even with a full grant (got {out:?})"
+    );
+
+    drop(client);
+    drop(node);
+    Ok(())
+}
+
+async fn write_client_file(container: &ContainerAsync<GenericImage>, path: &str, content: &str) {
+    let (code, _o, e) = exec(
+        container,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("printf '%s' '{content}' > {path}"),
+        ],
+    )
+    .await;
+    assert_eq!(code, Some(0), "write {path} failed: {e}");
+}
+
+fn cert_authority_line(cp: &MockCp) -> String {
+    let ca = ssh_key::PublicKey::from_bytes(&cp.host_ca_public_wire())
+        .unwrap()
+        .to_openssh()
+        .unwrap();
+    format!("@cert-authority * {ca}")
+}
+
+/// Client ssh_config for the ProxyJump path: `jump` is the Gateway (not the no-TOFU
+/// boundary), `node-e2e` is reached via ProxyJump and verified strictly against the
+/// `@cert-authority` line (as inner_leg_it's S16 MITM cases).
+fn nested_proxyjump_ssh_config(gw_port: u16) -> String {
+    format!(
+        "Host jump\n\
+         \tHostName 127.0.0.1\n\
+         \tPort {gw_port}\n\
+         \tUser deploy\n\
+         \tIdentityFile /root/pin_key\n\
+         \tIdentitiesOnly yes\n\
+         \tPreferredAuthentications publickey\n\
+         \tStrictHostKeyChecking no\n\
+         \tUserKnownHostsFile /dev/null\n\
+         \tBatchMode yes\n\
+         \n\
+         Host node-e2e\n\
+         \tProxyJump jump\n\
+         \tUser deploy\n\
+         \tIdentityFile /root/pin_key\n\
+         \tIdentitiesOnly yes\n\
+         \tPreferredAuthentications publickey\n\
+         \tUserKnownHostsFile /root/known_hosts_ca\n\
+         \tStrictHostKeyChecking yes\n\
+         \tBatchMode yes\n\
+         \tConnectTimeout 30\n"
+    )
+}
+
+/// A `direct-tcpip` from the already-terminated ProxyJump inner hop is refused
+/// UNCONDITIONALLY — a maximal grant (incl. `port_forward_local`) must never open a
+/// nested forward chain (one MITM hop only; S29 preserves S16's structural invariant).
+#[tokio::test]
+async fn nested_proxyjump_forward_refused_even_with_full_grant() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+    grant(&cp, &pin);
+    cp.set_capabilities(
+        NODE_ID,
+        &[
+            Capability::Shell,
+            Capability::Exec,
+            Capability::PortForwardLocal,
+            Capability::PortForwardRemote,
+            Capability::X11,
+        ],
+    );
+    let (node, node_port) = start_node(&cp, &host_key).await?;
+    wire_node(&cp, &host_key, node_port);
+    let mut cfg = gw_config(RecorderConfig::default());
+    cfg.proxy_jump = gateway_core::config::ProxyJumpConfig { enabled: true };
+    let (gw_port, _sd) = start_gateway(&cp, Arc::new(cfg), RecorderChoice::Null).await;
+
+    let client = client_container(&pin).await;
+    write_client_file(&client, "/root/known_hosts_ca", &cert_authority_line(&cp)).await;
+    write_client_file(
+        &client,
+        "/root/ssh_config",
+        &nested_proxyjump_ssh_config(gw_port),
+    )
+    .await;
+
+    // -L on the ProxyJump DESTINATION connection = a direct-tcpip on the terminated
+    // inner hop. The session itself runs; the nested forward must carry nothing.
+    let (_c, out, _e) = exec(
+        &client,
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "ssh -F /root/ssh_config -v -L 15622:127.0.0.1:22 node-e2e 'echo NESTED_OK; sleep 8' >/tmp/ssh.log 2>&1 & \
+             SSHPID=$!; sleep 5; \
+             (exec 3<>/dev/tcp/127.0.0.1/15622; head -c 15 <&3) 2>/dev/null || true; \
+             echo; echo '===SSHLOG==='; wait $SSHPID; cat /tmp/ssh.log"
+                .to_string(),
+        ],
+    )
+    .await;
+    let (probe, log) = out.split_once("===SSHLOG===").unwrap_or((out.as_str(), ""));
+    assert!(
+        log.contains("NESTED_OK"),
+        "the ProxyJump session itself still runs (out: {out})"
+    );
+    assert!(
+        !probe.contains("SSH-2.0"),
+        "a nested direct-tcpip must be refused despite a full grant (probe: {probe:?})"
     );
 
     drop(client);
