@@ -25,6 +25,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Real drift gate (unlike the old sibling-path sync, which was a silent
+      # no-op here): clone SessionLayer/Contracts at the tag pinned in
+      # contracts.lock, verify the resolved commit SHA, and diff the vendored
+      # proto + wire-conformance frames against the canonical copies.
+      - name: Contracts drift check
+        run: ./scripts/vendor-contracts.sh --check
+
       # Toolchain pinned to match rust-toolchain.toml (1.95.0). dtolnay's action
       # requires an explicit `toolchain` input (it does not read the toml), so
       # keep this in sync with rust-toolchain.toml.

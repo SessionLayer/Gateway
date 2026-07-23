@@ -4,7 +4,7 @@
 //! The authoritative proto lives in `ControlPlane-API/contracts/proto/` (Design
 //! §13). Because the parent `SessionLayer/` folder is not a git repo and CI
 //! checks out THIS repo alone, a committed copy is vendored under `proto/`
-//! (re-sync via `scripts/sync-contracts.sh`; see CLAUDE.md). We generate from
+//! (re-sync via `scripts/vendor-contracts.sh`; see CLAUDE.md). We generate from
 //! the vendored copy so the build is hermetic.
 
 use std::path::PathBuf;
