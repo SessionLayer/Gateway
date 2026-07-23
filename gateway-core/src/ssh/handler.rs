@@ -2235,6 +2235,15 @@ impl Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         match self.decide_capability(&[Capability::X11]).await {
             Ok(_) => {
+                // Too late to relay: the inner session channel already started
+                // (OpenSSH always sends x11-req pre-shell). A non-conforming client
+                // gets an honest channel_failure, not a false ack that never
+                // forwards anything (F-fwd-x11-late-ack-1).
+                if self.writers.contains_key(&channel) {
+                    tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "x11_late", "x11-req after session start refused (cannot be relayed)");
+                    session.channel_failure(channel)?;
+                    return Ok(());
+                }
                 // Cookie is a secret — stored to replay, NEVER logged.
                 self.x11_reqs.insert(
                     channel,
