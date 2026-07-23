@@ -292,6 +292,13 @@ impl SessionControl {
         *self.bindings.lock().unwrap() = bindings;
     }
 
+    /// The live, re-auth-updated bindings, for lock matching outside the registry
+    /// (the reverse dispatcher gates each reverse open on these — a frozen clone
+    /// would miss a mid-session relabel, F-fwd-reverse-stale-bindings-1).
+    pub fn shared_bindings(&self) -> Arc<Mutex<LockBindings>> {
+        self.bindings.clone()
+    }
+
     fn matches(&self, target: &LockTarget) -> bool {
         target_matches(target, &self.bindings.lock().unwrap())
     }

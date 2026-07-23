@@ -1148,7 +1148,14 @@ impl SshHandler {
                         outer: session.handle(),
                         recorder,
                         lock_set: self.deps.lock_set.clone(),
-                        bindings: authz.bindings.clone(),
+                        // The LIVE bindings (shared with SessionControl), not a
+                        // frozen clone — a mid-session re-auth relabel must gate
+                        // reverse opens too (F-fwd-reverse-stale-bindings-1).
+                        bindings: self
+                            .session_control
+                            .as_ref()
+                            .expect("session registered before inner")
+                            .shared_bindings(),
                         abort,
                         active_tunnels: self.active_tunnels.clone(),
                         max_channels: self.deps.config.inner.max_channels_per_connection,

@@ -21,7 +21,7 @@
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client::Msg as ClientMsg;
@@ -124,7 +124,11 @@ pub(crate) struct ReverseDispatcher {
     pub outer: ServerHandle,
     pub recorder: Arc<dyn SessionRecorder>,
     pub lock_set: Arc<LockSet>,
-    pub bindings: LockBindings,
+    /// The LIVE lock-matchable facts, shared with `SessionControl` so a
+    /// mid-session re-authorize (e.g. a node relabel) is seen here too — a frozen
+    /// clone would let a reverse open slip past a lock on the drifted facet
+    /// (F-fwd-reverse-stale-bindings-1).
+    pub bindings: Arc<Mutex<LockBindings>>,
     pub abort: Arc<AtomicBool>,
     /// Shared concurrent-tunnel count (local-forward + reverse channels) so a
     /// single connection's forward fan-out is bounded regardless of which side
@@ -176,8 +180,13 @@ impl ReverseDispatcher {
             return; // dropping `open` closes the inner channel
         }
         // Deny-wins: a lock or teardown in flight refuses new reverse channels (the
-        // same lock-set match every other channel-open runs, §8.4).
-        if self.abort.load(Ordering::SeqCst) || self.lock_set.matching(&self.bindings).is_some() {
+        // same lock-set match every other channel-open runs, §8.4), against the
+        // LIVE bindings (guard scoped: never held across an await).
+        let locked = {
+            let b = self.bindings.lock().unwrap();
+            self.lock_set.matching(&b).is_some()
+        };
+        if self.abort.load(Ordering::SeqCst) || locked {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "locked_or_torn", "reverse forward refused (lock/teardown)");
             return; // dropping `open` closes the inner channel
         }
