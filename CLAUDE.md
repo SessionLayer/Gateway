@@ -50,16 +50,22 @@ the SSH legs.
 
 ## Contract: vendoring, sync, and the N-1 policy
 
-The CP <-> Gateway gRPC contract is **frozen** upstream in
-`../ControlPlane-API/contracts/proto/`. **Do not edit the vendored proto to
-change the contract.**
+The CP <-> Gateway gRPC contract is **frozen** upstream in the public
+[SessionLayer/Contracts](https://github.com/SessionLayer/Contracts) repo (under
+its `contracts/` subdirectory). **Do not edit the vendored proto to change the
+contract.**
 
-- The parent `SessionLayer/` folder is not a git repo and **CI checks out this
-  repo alone**, so the proto is **vendored** (committed) under `proto/` and code
-  is generated from the vendored copy by `gateway-core/build.rs`
-  (`tonic-prost-build`, which shells out to `protoc`).
-- Re-sync after a *versioned* contract change with `scripts/sync-contracts.sh`
-  (no-op with a note when the source path is absent).
+- The proto (+ wire-conformance golden frames) is **vendored** (committed)
+  under `proto/` and code is generated from the vendored copy by
+  `gateway-core/build.rs` (`tonic-prost-build`, which shells out to `protoc`),
+  so the build is hermetic.
+- The vendored copy is pinned by `contracts.lock` (tag + resolved commit SHA)
+  and fetched by `scripts/vendor-contracts.sh`, which clones the pinned tag and
+  **verifies the resolved commit SHA** before copying — a moved/re-pushed tag
+  fails loudly. CI runs `scripts/vendor-contracts.sh --check` as a real drift
+  gate (the old sibling-checkout-path sync was a silent no-op in CI).
+- Re-sync after a *versioned* contract change by updating `contracts.lock` to
+  the new tag/SHA and running `scripts/vendor-contracts.sh`, then rebuild.
 - **Versioning / N-1 (FR-HA-9, D33):** the CP <-> Gateway protocol is explicitly
   versioned (`ProtocolVersion{major,minor}`) and negotiated at connect
   (`Handshake.Negotiate`). The platform commits to an **N-1 window**: a component
