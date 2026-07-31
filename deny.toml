@@ -1,0 +1,51 @@
+# cargo-deny configuration for the SessionLayer Gateway.
+#
+# Strict but passing. Run via `cargo deny check` (part of scripts/gate.sh and
+# CI). Four checks: advisories (RustSec), licenses, bans, sources.
+
+[graph]
+# Evaluate all targets so a Linux-only dependency (tokio-uring) can't smuggle in
+# an unaudited transitive crate on another platform.
+all-features = true
+
+[advisories]
+# Deny on any security advisory or unmaintained crate. `ignore` holds explicit,
+# justified exceptions (none today).
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+yanked = "deny"
+
+[licenses]
+# Allow-list only (exact SPDX ids). GPL-3.0-only is allowed because SessionLayer
+# itself is GPL-3.0; the rest are the permissive licenses actually present in the
+# pinned dependency graph. Anything not listed here (notably strong copyleft
+# other than our own, or unknown licenses) fails the check — a new dependency
+# with a new license is a deliberate, reviewed addition.
+allow = [
+    "GPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+# Per-crate license clarifications/exceptions go here as they arise (none today).
+exceptions = []
+
+[bans]
+# Warn (do not fail) on duplicate versions — common and low-risk in a large
+# transitive graph — but forbid wildcard version requirements in our manifests.
+multiple-versions = "warn"
+wildcards = "deny"
+allow = []
+deny = []
+
+[sources]
+# Only crates.io. No git or alternate-registry dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

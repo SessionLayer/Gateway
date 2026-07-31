@@ -1,0 +1,222 @@
+{
+  "schema": "sessionlayer.wire.conformance/v1",
+  "note": "Golden wire frames, generated from a known-correct codec (prost over the frozen proto + the frozen 6-byte framing) and self-checked. DO NOT hand-edit — regenerate via `cargo run` in gen/ when the contract changes. Consumed by both Rust repos' CI (see README.md).",
+  "wire_version": "1.0",
+  "header": "VER(1) | TYPE(1) | LENGTH(u32 big-endian) | PAYLOAD(LENGTH bytes)",
+  "frames": [
+    {
+      "name": "hello",
+      "profile": "shared",
+      "ver": 1,
+      "type": 1,
+      "type_name": "HELLO",
+      "message": "sessionlayer.agent.v1.AgentHello",
+      "fields": "component = {name:SessionLayer, semver:0.1.0, min:1.0, max:1.0}",
+      "payload_hex": "0a1d0a0c53657373696f6e4c617965721205302e312e301a02080122020801",
+      "frame_hex": "01010000001f0a1d0a0c53657373696f6e4c617965721205302e312e301a02080122020801"
+    },
+    {
+      "name": "hello_ack",
+      "profile": "shared",
+      "ver": 1,
+      "type": 2,
+      "type_name": "HELLO_ACK",
+      "message": "sessionlayer.agent.v1.GatewayHelloAck",
+      "fields": "component=…, selected=1.0, heartbeat_interval_secs=20, max_frame_bytes=65536",
+      "payload_hex": "0a1d0a0c53657373696f6e4c617965721205302e312e301a0208012202080112020801181420808004",
+      "frame_hex": "0102000000290a1d0a0c53657373696f6e4c617965721205302e312e301a0208012202080112020801181420808004"
+    },
+    {
+      "name": "version_reject",
+      "profile": "shared",
+      "ver": 1,
+      "type": 3,
+      "type_name": "VERSION_REJECT",
+      "message": "sessionlayer.agent.v1.VersionReject",
+      "fields": "gateway_min=1.0, gateway_max=1.0",
+      "payload_hex": "0a02080112020801",
+      "frame_hex": "0103000000080a02080112020801"
+    },
+    {
+      "name": "ping",
+      "profile": "agent",
+      "ver": 1,
+      "type": 16,
+      "type_name": "PING",
+      "message": "sessionlayer.agent.v1.Ping",
+      "fields": "nonce=42",
+      "payload_hex": "082a",
+      "frame_hex": "011000000002082a"
+    },
+    {
+      "name": "pong",
+      "profile": "agent",
+      "ver": 1,
+      "type": 17,
+      "type_name": "PONG",
+      "message": "sessionlayer.agent.v1.Pong",
+      "fields": "nonce=42",
+      "payload_hex": "082a",
+      "frame_hex": "011100000002082a"
+    },
+    {
+      "name": "dial_back_request",
+      "profile": "agent",
+      "ver": 1,
+      "type": 32,
+      "type_name": "DIAL_BACK_REQUEST",
+      "message": "sessionlayer.agent.v1.DialBackRequest",
+      "fields": "request_id=req-1, node_name=node-a, session_id=sess-1, principal=deploy, gateway_id=gw-a, dial_back_endpoint=wss://gw-a:9444, token=<opaque>, not_after=1700000000",
+      "payload_hex": "0a057265712d3112066e6f64652d611a06736573732d3122066465706c6f792a0467772d61320f7773733a2f2f67772d613a393434343a11534c4442312e5041594c4f41442e5349474080e2cfaa06",
+      "frame_hex": "01200000004f0a057265712d3112066e6f64652d611a06736573732d3122066465706c6f792a0467772d61320f7773733a2f2f67772d613a393434343a11534c4442312e5041594c4f41442e5349474080e2cfaa06"
+    },
+    {
+      "name": "dial_back_result",
+      "profile": "agent",
+      "ver": 1,
+      "type": 33,
+      "type_name": "DIAL_BACK_RESULT",
+      "message": "sessionlayer.agent.v1.DialBackResult",
+      "fields": "request_id=req-1, accepted=true, error=UNSPECIFIED",
+      "payload_hex": "0a057265712d311001",
+      "frame_hex": "0121000000090a057265712d311001"
+    },
+    {
+      "name": "dial_back_auth",
+      "profile": "agent",
+      "ver": 1,
+      "type": 34,
+      "type_name": "DIAL_BACK_AUTH",
+      "message": "sessionlayer.agent.v1.DialBackAuth",
+      "fields": "token=<opaque>, request_id=req-1",
+      "payload_hex": "0a11534c4442312e5041594c4f41442e53494712057265712d31",
+      "frame_hex": "01220000001a0a11534c4442312e5041594c4f41442e53494712057265712d31"
+    },
+    {
+      "name": "dial_back_accept",
+      "profile": "agent",
+      "ver": 1,
+      "type": 35,
+      "type_name": "DIAL_BACK_ACCEPT",
+      "message": "sessionlayer.agent.v1.DialBackAccept",
+      "fields": "(empty)",
+      "payload_hex": "",
+      "frame_hex": "012300000000"
+    },
+    {
+      "name": "relay_open",
+      "profile": "gateway-relay",
+      "ver": 1,
+      "type": 36,
+      "type_name": "RELAY_OPEN",
+      "message": "sessionlayer.gateway.v1.RelayOpen",
+      "fields": "token=<opaque SLGW1>",
+      "payload_hex": "0a11534c4757312e5041594c4f41442e534947",
+      "frame_hex": "0124000000130a11534c4757312e5041594c4f41442e534947"
+    },
+    {
+      "name": "relay_accept",
+      "profile": "gateway-relay",
+      "ver": 1,
+      "type": 37,
+      "type_name": "RELAY_ACCEPT",
+      "message": "sessionlayer.gateway.v1.RelayAccept",
+      "fields": "(empty)",
+      "payload_hex": "",
+      "frame_hex": "012500000000"
+    },
+    {
+      "name": "relay_reject",
+      "profile": "gateway-relay",
+      "ver": 1,
+      "type": 38,
+      "type_name": "RELAY_REJECT",
+      "message": "sessionlayer.gateway.v1.RelayReject",
+      "fields": "code=stale_nonce, message=owner superseded",
+      "payload_hex": "0a0b7374616c655f6e6f6e636512106f776e65722073757065727365646564",
+      "frame_hex": "01260000001f0a0b7374616c655f6e6f6e636512106f776e65722073757065727365646564"
+    },
+    {
+      "name": "stream_open",
+      "profile": "agent",
+      "ver": 1,
+      "type": 48,
+      "type_name": "STREAM_OPEN",
+      "message": "sessionlayer.agent.v1.StreamOpen",
+      "fields": "(empty)",
+      "payload_hex": "",
+      "frame_hex": "013000000000"
+    },
+    {
+      "name": "stream_data",
+      "profile": "shared",
+      "ver": 1,
+      "type": 49,
+      "type_name": "STREAM_DATA",
+      "message": null,
+      "fields": "raw opaque bytes (SSH-layer ciphertext); NOT protobuf",
+      "payload_hex": "00010203ff",
+      "frame_hex": "01310000000500010203ff"
+    },
+    {
+      "name": "stream_close",
+      "profile": "shared",
+      "ver": 1,
+      "type": 50,
+      "type_name": "STREAM_CLOSE",
+      "message": "sessionlayer.agent.v1.StreamClose",
+      "fields": "reason=EOF",
+      "payload_hex": "0801",
+      "frame_hex": "0132000000020801"
+    },
+    {
+      "name": "wire_error",
+      "profile": "shared",
+      "ver": 1,
+      "type": 126,
+      "type_name": "ERROR",
+      "message": "sessionlayer.agent.v1.WireError",
+      "fields": "code=PROTOCOL, message=protocol error",
+      "payload_hex": "0801120e70726f746f636f6c206572726f72",
+      "frame_hex": "017e000000120801120e70726f746f636f6c206572726f72"
+    }
+  ],
+  "decode_negatives": [
+    {
+      "name": "short_header",
+      "hex": "011000",
+      "expect": "Short",
+      "note": "fewer than the 6 header bytes"
+    },
+    {
+      "name": "length_gt_body",
+      "hex": "013100000004010203",
+      "expect": "LengthMismatch",
+      "note": "LENGTH exceeds the remaining message bytes"
+    },
+    {
+      "name": "trailing_garbage",
+      "hex": "01310000000401020304ff",
+      "expect": "LengthMismatch",
+      "note": "bytes beyond LENGTH"
+    },
+    {
+      "name": "oversized_by_header",
+      "hex": "013100010001",
+      "expect": "TooLarge",
+      "note": "LENGTH exceeds the negotiated max_frame_bytes (65536); rejected at the header"
+    },
+    {
+      "name": "unknown_type",
+      "hex": "014000000000",
+      "expect": "UnknownType",
+      "note": "0x40 is reserved (NODE_STATUS), not yet defined"
+    },
+    {
+      "name": "wrong_version",
+      "hex": "021000000000",
+      "expect": "BadVersion",
+      "note": "VER != the negotiated wire major (1)"
+    }
+  ]
+}

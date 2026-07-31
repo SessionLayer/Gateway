@@ -1,0 +1,139 @@
+name: fullstack-e2e
+
+# Cross-repo integration gate. Runs the REAL Control Plane jar +
+# REAL Gateway binary + REAL Agent binary + a real Debian-13 node + a real stock ssh
+# client together, driving a session through the real CP `Authorize` decision and
+# asserting the scenario matrix + the audit-dimension searches. This is the only
+# test that exercises the real CP end to end — every per-repo Docker E2E uses a MockCp,
+# which cannot surface a genuine cross-repo bug like the inner-leg cert
+# source-address one this harness catches. The harness itself lives in
+# `tests/fullstack/run.sh` (committed here so it is version-controlled + CI-runnable).
+#
+# All four SessionLayer repos are PUBLIC, so the default GITHUB_TOKEN checks out the
+# ControlPlane + Agent siblings with no org secret. This runs as an on-demand +
+# nightly integration gate on `main` (the standard cross-repo pattern: per-repo CI gates
+# each PR; this confirms the merged whole). To prove a pre-merge set, dispatch it with the
+# matching `cp_ref`/`agent_ref`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cp_ref:
+        description: ControlPlane ref to test against
+        default: main
+      agent_ref:
+        description: Agent ref to test against
+        default: main
+      topology:
+        description: "core | agent | all"
+        default: core
+      fs_hardening:
+        description: "off | log | seccomp | full (the real-data-path under the Tier-0 profile)"
+        default: full
+  # Run the hardened profile on PRs that touch the data plane / hardening / harness,
+  # so the seccomp/Landlock allow-list is verified against the REAL data path (russh,
+  # rustls-ring, tonic mTLS, hyper WORM, splice) continuously — not only in the
+  # subprocess canary (F-2). Repo-relative paths (CI checks this repo out into Gateway/).
+  pull_request:
+    paths:
+      - "gateway/**"
+      - "gateway-core/**"
+      - "tests/fullstack/**"
+      - "deploy/**"
+  schedule:
+    - cron: "0 6 * * *" # nightly integration on the merged main (FS_HARDENING=full)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fullstack-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fullstack-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Gateway (self, holds the harness)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: Gateway
+
+      - name: Checkout ControlPlane (real CP)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: SessionLayer/ControlPlane
+          ref: ${{ github.event.inputs.cp_ref || 'main' }}
+          path: ControlPlane
+
+      - name: Checkout Agent (real agent binary)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: SessionLayer/Agent
+          ref: ${{ github.event.inputs.agent_ref || 'main' }}
+          path: Agent
+
+      - name: Set up JDK 25 (CP jar)
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Install Rust toolchain (Gateway + Agent)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.95.0 pinned
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            Gateway
+            Agent
+
+      - name: Install protoc (Gateway/Agent build.rs)
+        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2
+        with:
+          tool: protoc
+
+      # `package -DskipTests` needs only JDK 25 — the ascopes protobuf plugin fetches its
+      # own protoc and the openapi-generator is pure Java (no Node/buf here; those gate the
+      # contract separately).
+      - name: Build the real CP boot jar
+        working-directory: ControlPlane
+        run: ./mvnw -B -ntp -DskipTests package
+
+      - name: Build the real Agent binary
+        working-directory: Agent
+        run: cargo build --release --bin sessionlayer-agent
+
+      - name: Build the real Gateway binary
+        working-directory: Gateway
+        run: cargo build --release --bin gateway
+
+      # The harness stands up its own infra (Postgres + MinIO via infra-compose.yml), builds
+      # the node/client fixture images, launches the real CP/Gateway/Agent, provisions via
+      # the REST APIs, and asserts the scenario matrix. No build lock needed on a fresh
+      # dedicated runner (the lock only matters on a shared box where a concurrent gate would
+      # starve the CP JVM). Exit 0 = every asserted scenario green.
+      - name: Run the full-stack cross-repo E2E
+        working-directory: Gateway
+        env:
+          TOPOLOGY: ${{ github.event.inputs.topology || 'core' }}
+          # The load-bearing hardening gate: the real session runs UNDER
+          # seccomp=enforce + Landlock. Non-dispatch runs (PR/nightly) default to full.
+          FS_HARDENING: ${{ github.event.inputs.fs_hardening || 'full' }}
+        run: |
+          set -euo pipefail
+          CP_JAR="$(ls "$GITHUB_WORKSPACE"/ControlPlane/target/*.jar | grep -vE 'sources|javadoc' | head -1)"
+          AGENT_BIN="$GITHUB_WORKSPACE/Agent/target/release/sessionlayer-agent"
+          GATEWAY_BIN="$GITHUB_WORKSPACE/Gateway/target/release/gateway"
+          test -f "$CP_JAR" || { echo "CP jar not found"; exit 1; }
+          test -x "$AGENT_BIN" || { echo "agent binary not found/executable"; exit 1; }
+          test -x "$GATEWAY_BIN" || { echo "gateway binary not found/executable"; exit 1; }
+          export CP_JAR AGENT_BIN GATEWAY_BIN
+          echo "CP_JAR=$CP_JAR"
+          echo "AGENT_BIN=$AGENT_BIN"
+          echo "GATEWAY_BIN=$GATEWAY_BIN"
+          bash tests/fullstack/run.sh

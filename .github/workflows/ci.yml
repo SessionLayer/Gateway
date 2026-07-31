@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: the gate only needs to read the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a hung/old build does not sit in the
+# queue or run to the 6h default.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The required status check is literally `gate`. Do NOT rename this job, add a
+  # matrix, or set a custom `name:` — a mismatch hangs branch-protection
+  # auto-merge. One job, one gate.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Real drift gate: clone SessionLayer/Contracts at the tag pinned in
+      # contracts.lock, verify the resolved commit SHA, and diff the vendored
+      # proto + wire-conformance frames against the canonical copies. A
+      # sibling-checkout-path sync would no-op here, since CI checks out one
+      # repo at a time and a sibling path never exists.
+      - name: Contracts drift check
+        run: ./scripts/vendor-contracts.sh --check
+
+      # Toolchain pinned to match rust-toolchain.toml (1.95.0). dtolnay's action
+      # requires an explicit `toolchain` input (it does not read the toml), so
+      # keep this in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (pinned)
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+          # arm64 std for the aarch64 cross-check below: the Tier-0 hardening
+          # constants are cfg-gated per arch, so aarch64 needs its own build proof.
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # protoc: needed by build.rs (tonic-prost-build shells out to protoc).
+      # nextest / cargo-deny / cargo-audit: used by scripts/gate.sh.
+      - name: Install gate tools (protoc, nextest, cargo-deny, cargo-audit)
+        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2
+        with:
+          tool: protoc,cargo-nextest,cargo-deny,cargo-audit
+
+      # hardening_e2e's coredump guard proves the RLIMIT_CORE=0 / PR_SET_DUMPABLE=0
+      # protection by crashing a canary WITHOUT it and confirming a core containing the
+      # marker really does appear -- the negative control. Runners default core_pattern
+      # to an apport/systemd-coredump pipe, which writes no local file, so that control
+      # cannot fire and the guard would pass identically whether the protection worked
+      # or had been deleted. Point it at a local file so the test is real coverage; the
+      # test hard-fails rather than passing vacuously if this is ever dropped.
+      - name: Make core dumps land locally (so the coredump guard is not vacuous)
+        run: sudo sysctl -w kernel.core_pattern=core
+
+      - name: Run gate
+        run: ./scripts/gate.sh
+
+      # aarch64 cross-check: aarch64 is a supported target, so it must actually
+      # compile. A `check` (not a full link) is enough to prove the cfg-gated hardening
+      # constants + every dep resolve on aarch64. ring/build scripts compile target
+      # asm, so the aarch64 cross-toolchain is required even for `check`.
+      - name: aarch64 cross-check
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          sudo apt-get update
+          # gcc-aarch64-linux-gnu is the cross compiler; libc6-dev-arm64-cross adds the
+          # target libc headers/objects in the cross sysroot (without it the cross-gcc
+          # falls back to the host /usr/include and ring's C build fails on
+          # bits/libc-header-start.h).
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
