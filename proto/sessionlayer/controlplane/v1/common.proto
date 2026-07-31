@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "CommonProto";
+
+// ProtocolVersion identifies a protocol revision using semantic major.minor
+// numbering. Patch is intentionally omitted: the compatibility contract (the
+// N-1 window, see contracts/VERSIONING.md) is expressed in terms of MINOR
+// versions within a MAJOR line. A change of MAJOR is a hard break; a bump of
+// MINOR is additive and backward compatible within the window.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// ComponentInfo describes a SessionLayer component instance for diagnostics and
+// version negotiation. It carries NO security-sensitive material: it is safe to
+// exchange before mutual authentication is established.
+message ComponentInfo {
+  // Formal component name, e.g. "SessionLayer Control Plane",
+  // "SessionLayer Gateway", "SessionLayer Agent".
+  string name = 1;
+
+  // Component build version (SemVer 2.0.0), e.g. "0.1.0". Distinct from the
+  // protocol version below: the build version identifies the artifact, the
+  // protocol version identifies the wire contract it speaks.
+  string semver = 2;
+
+  // Inclusive lowest protocol version this component can speak.
+  ProtocolVersion protocol_min = 3;
+
+  // Inclusive highest protocol version this component can speak.
+  ProtocolVersion protocol_max = 4;
+}

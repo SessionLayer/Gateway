@@ -1,0 +1,3 @@
+# Stable rustfmt defaults, pinned edition. Kept minimal so `cargo fmt --check`
+# is reproducible across contributor machines and CI.
+edition = "2021"

@@ -1,0 +1,269 @@
+syntax = "proto3";
+
+package sessionlayer.agent.v1;
+
+import "sessionlayer/controlplane/v1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.agent.wire.v1";
+option java_outer_classname = "WireProto";
+
+// The Agent<->Gateway wire protocol payloads (Design §9.2, §10.2; FR-CONN-2,
+// FR-HA-4/8/9). The Control Plane is NOT a party to this protocol: these
+// messages are exchanged directly between the SessionLayer Agent and the
+// SessionLayer Gateway. They live here because contracts/ is the canonical
+// cross-repo contract home; the CP generates (unused) Java for them.
+//
+// The normative protocol — framing, connection roles, negotiation, the dial-back
+// state machine and its security invariants — is contracts/wire/agent-gateway-v1.md.
+// This file fixes only the payload encodings referenced by that document.
+//
+// CARRIAGE. Each payload below is the PAYLOAD of one wire frame
+// (VER|TYPE|LENGTH|PAYLOAD), and one frame rides in one WebSocket binary
+// message. The sole exception is STREAM_DATA (0x31), whose payload is RAW
+// OPAQUE BYTES (SSH-layer ciphertext) and is deliberately NOT a protobuf
+// message — the session hot path pays no encoding cost and the Agent is
+// structurally unable to interpret what it splices.
+
+// AgentHello (0x01) opens the control channel. It carries NO identity claim:
+// the Agent's identity is the mTLS client certificate presented at the TLS
+// handshake (URI SAN sessionlayer://agent/<agent_id>, dNSName SAN = node name).
+// A Gateway MUST NOT trust any identity asserted in this message; there is
+// deliberately nowhere to assert one.
+message AgentHello {
+  sessionlayer.controlplane.v1.ComponentInfo component = 1;
+}
+
+// GatewayHelloAck (0x02) accepts the control channel and fixes the session's
+// negotiated parameters. The Agent MUST honour the returned bounds.
+message GatewayHelloAck {
+  sessionlayer.controlplane.v1.ComponentInfo component = 1;
+
+  // The highest protocol version common to both peers, resolved exactly as in
+  // contracts/VERSIONING.md §3. All subsequent frames carry selected.major in
+  // the frame VER byte.
+  sessionlayer.controlplane.v1.ProtocolVersion selected = 2;
+
+  // The interval at which the Gateway will send PING and expects PONG. The
+  // Agent treats 2 missed intervals as a dead channel and reconnects.
+  uint32 heartbeat_interval_secs = 3;
+
+  // The maximum frame payload the Gateway will accept or emit (DoS bound). Both
+  // peers MUST reject a larger frame as a protocol error and close.
+  uint32 max_frame_bytes = 4;
+}
+
+// VersionReject (0x03) is sent when no common protocol version exists, then the
+// connection closes. Fail closed (FR-HA-9): the Agent MUST NOT downgrade or
+// guess a version.
+message VersionReject {
+  sessionlayer.controlplane.v1.ProtocolVersion gateway_min = 1;
+  sessionlayer.controlplane.v1.ProtocolVersion gateway_max = 2;
+}
+
+// Ping (0x10) / Pong (0x11) are the application-level liveness probe, sent by
+// either peer. They are distinct from WebSocket control frames: a proxy may
+// answer a WebSocket ping on the peer's behalf, so liveness is proven at the
+// application layer instead.
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  // MUST echo the nonce of the Ping being answered.
+  uint64 nonce = 1;
+}
+
+// DialBackRequest (0x20, Gateway -> Agent, control channel) asks the Agent that
+// owns this node to open a dial-back connection for one session (FR-CONN-2).
+//
+// NOTE WHAT IS ABSENT: there is NO splice target. The Agent splices to its own
+// locally-configured loopback address (127.0.0.1:22) and nothing on this wire
+// can redirect it. A compromised or hostile Gateway therefore cannot turn an
+// Agent into a network pivot (the SSRF/confused-deputy defence).
+message DialBackRequest {
+  // Correlates this request with the DialBackResult and the DialBackAuth the
+  // Agent presents on the dial-back connection. Not a security token.
+  string request_id = 1;
+
+  // The node this dial-back is for. The Agent MUST refuse a request whose
+  // node_name is not the node it is bound to (the dNSName SAN of its own
+  // certificate) — a Gateway must not be able to task an Agent for another node.
+  string node_name = 2;
+
+  // The Gateway session this dial-back serves. Carried for binding + audit
+  // correlation; it also appears inside the token, where it is signed.
+  string session_id = 3;
+
+  // The resolved Linux principal for the session (audit + token binding). The
+  // Agent does not act on it: the principal is enforced by the inner-leg
+  // certificate the node's sshd validates, never by the Agent.
+  string principal = 4;
+
+  // The issuing Gateway's identity id.
+  string gateway_id = 5;
+
+  // The wss:// URL the Agent MUST dial back to (Design §10.2: the address is
+  // carried in the signal, so no service discovery is needed). In HA this is the
+  // owning Gateway's address; in single-Gateway mode it is the same Gateway.
+  string dial_back_endpoint = 6;
+
+  // The single-use, Gateway-signed dial-back token, bound to
+  // {node, session, gateway, principal, agent, exp} (FR-HA-8). Opaque to the
+  // Agent: it is presented verbatim and MUST NOT be logged or persisted.
+  // Format: contracts/wire/agent-gateway-v1.md §6.
+  string token = 7;
+
+  // Token expiry, Unix epoch seconds (UTC). Informational for the Agent (it may
+  // abandon a request it cannot serve in time); the Gateway re-checks it
+  // authoritatively against the signed token.
+  int64 not_after_epoch_seconds = 8;
+}
+
+// DialBackErrorCode explains a refused or failed dial-back. It is reported to
+// the Gateway for the operator log; the SSH user always sees the single generic
+// post-authorization outcome "target node is offline / unreachable" (§7.1).
+enum DialBackErrorCode {
+  DIAL_BACK_ERROR_CODE_UNSPECIFIED = 0;
+
+  // The Agent could not reach its own node's sshd on the configured loopback
+  // address (the node's sshd is down).
+  DIAL_BACK_ERROR_CODE_LOCAL_DIAL_FAILED = 1;
+
+  // The Agent could not establish the dial-back connection to the Gateway.
+  DIAL_BACK_ERROR_CODE_TRANSPORT_FAILED = 2;
+
+  // The Gateway refused the dial-back (bad/expired/replayed token, identity
+  // mismatch). Fail closed.
+  DIAL_BACK_ERROR_CODE_TOKEN_REJECTED = 3;
+
+  // The Agent declined the request itself (e.g. node_name is not this node, or
+  // the Agent is draining / at its concurrency limit).
+  DIAL_BACK_ERROR_CODE_REFUSED = 4;
+}
+
+// DialBackResult (0x21, Agent -> Gateway, control channel) is the Agent's
+// response to a DialBackRequest. It is a FAST-FAIL signal only: success is
+// proven by the dial-back connection itself reaching STREAM_OPEN, never by this
+// message. A Gateway MUST NOT treat accepted=true as readiness.
+message DialBackResult {
+  string request_id = 1;
+  bool accepted = 2;
+  DialBackErrorCode error = 3;
+}
+
+// DialBackAuth (0x22, Agent -> Gateway) is the FIRST frame on a dial-back
+// connection. The Gateway validates the token (signature, binding, expiry,
+// single-use) AND requires that the connection's mTLS client identity is the
+// agent the token was issued to. Any failure => WireError + close, fail closed.
+message DialBackAuth {
+  string token = 1;
+  string request_id = 2;
+}
+
+// DialBackAccept (0x23, Gateway -> Agent) confirms the token was accepted and
+// atomically consumed. It carries no secrets and echoes nothing back.
+message DialBackAccept {}
+
+// StreamOpen (0x30, Agent -> Gateway) signals that the Agent has connected to
+// its node's local sshd and the splice is live; the Gateway hands the connection
+// to the inner leg as a ByteStream at this point and not before.
+//
+// Direction note: the Session-One skeleton pencilled this type in as
+// Gateway->Agent. It is defined here as Agent->Gateway (the Agent is the only
+// party that knows when the loopback connection came up). The type number is
+// unchanged and was never implemented in the reserved direction.
+message StreamOpen {}
+
+// StreamCloseReason distinguishes an orderly end-of-stream from a fault, for the
+// operator log. The user-facing outcome is unchanged (§7.1).
+enum StreamCloseReason {
+  STREAM_CLOSE_REASON_UNSPECIFIED = 0;
+
+  // Orderly close: the spliced peer sent EOF / closed.
+  STREAM_CLOSE_REASON_EOF = 1;
+
+  // The Agent could not connect to the node's local sshd.
+  STREAM_CLOSE_REASON_LOCAL_DIAL_FAILED = 2;
+
+  // An I/O error on either half of the splice.
+  STREAM_CLOSE_REASON_IO_ERROR = 3;
+
+  // The sender is shutting down or draining.
+  STREAM_CLOSE_REASON_SHUTDOWN = 4;
+}
+
+// StreamClose (0x32, either direction) ends a spliced stream.
+message StreamClose {
+  StreamCloseReason reason = 1;
+}
+
+// WireErrorCode is the closed set of typed protocol errors. Codes are
+// deliberately coarse: an error sent to an Agent must not disclose whether a
+// node, session, or identity exists (the §7.1 non-disclosure rule applies to
+// this surface too).
+enum WireErrorCode {
+  WIRE_ERROR_CODE_UNSPECIFIED = 0;
+
+  // Malformed frame, unknown type, oversized payload, or a frame sent out of
+  // order for the connection's role.
+  WIRE_ERROR_CODE_PROTOCOL = 1;
+
+  // The peer is not authorized: invalid/locked identity, or a dial-back token
+  // that failed any binding check. Deliberately does not say which.
+  WIRE_ERROR_CODE_UNAUTHORIZED = 2;
+
+  // The Gateway is temporarily unable to serve the request.
+  WIRE_ERROR_CODE_UNAVAILABLE = 3;
+}
+
+// WireError (0x7E, either direction) reports a typed protocol error; the sender
+// closes the connection immediately afterwards.
+message WireError {
+  WireErrorCode code = 1;
+
+  // A short, non-sensitive diagnostic. MUST NOT carry secrets, tokens, or
+  // plaintext. A receiver MUST treat it as untrusted text: log it escaped, never
+  // interpolate it into an error chain that reaches a terminal print.
+  string message = 2;
+}
+
+// DialBackTokenPayload is the signed body of a dial-back token (FR-HA-8). It is
+// NOT sent as a frame: it is serialized, base64url-encoded, and carried as the
+// `token` string of DialBackRequest / DialBackAuth. See
+// contracts/wire/agent-gateway-v1.md §6 for the token envelope and the
+// verify-then-decode rule (the signature is checked over the transmitted bytes
+// BEFORE they are parsed as protobuf — an unverified attacker-supplied buffer is
+// never fed to the decoder).
+//
+// The token is issued by a Gateway and verified by the SAME Gateway on the
+// dial-back connection. It is a capability for exactly one dial-back.
+message DialBackTokenPayload {
+  // A random 128-bit id, hex-encoded. The single-use key: the Gateway holds it
+  // in a pending map from issue until presentation, and removal IS consumption.
+  // No token material is ever stored or logged — only this id and its binding.
+  string jti = 1;
+
+  // The five bindings mandated by FR-HA-8, plus the agent binding. Every one is
+  // re-checked on presentation against the Gateway's own pending state AND
+  // against the mTLS identity of the dial-back connection.
+  string gateway_id = 2;
+  string node_name = 3;
+  string session_id = 4;
+  string principal = 5;
+
+  // The agent identity (URI SAN sessionlayer://agent/<agent_id>) this token was
+  // issued to. The dial-back connection's client certificate MUST resolve to
+  // this exact agent, so a token captured by a different (even valid, unlocked)
+  // Agent cannot be redeemed.
+  string agent_id = 6;
+
+  int64 issued_at_epoch_seconds = 7;
+  int64 not_after_epoch_seconds = 8;
+
+  // SHA-256 of the issuing Gateway's dial-back signing SPKI (DER). The signing
+  // key is generated per Gateway process and never persisted, so a token from a
+  // previous boot — or from any other Gateway — fails this check before its
+  // signature is even considered.
+  bytes signer_key_fingerprint = 9;
+}

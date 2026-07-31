@@ -1,0 +1,136 @@
+# SessionLayer Gateway — release supply chain (NFR-7).
+#
+# On a `v*` tag: build the `gateway` binary REPRODUCIBLY, emit a CycloneDX SBOM,
+# a SLSA build-provenance attestation, and keyless (OIDC) cosign signatures —
+# no long-lived signing key. All third-party actions are SHA-pinned; the trailing
+# `# vX.Y.Z` is the human tag. Policy: inventory + integrity, NEVER an
+# NVD/OWASP scanner.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # gh release upload
+      id-token: write # keyless OIDC for cosign + provenance
+      attestations: write # build-provenance attestation
+    env:
+      BIN: gateway
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned commit
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install cargo-cyclonedx (SBOM)
+        run: cargo install --locked --version 0.5.9 cargo-cyclonedx
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # SOURCE_DATE_EPOCH (tagged commit) + remapping the workspace (incl. the
+      # vendored third_party/russh), the cargo registry, AND the double-build's
+      # alternate $RUNNER_TEMP/repro target dir (below) out of the binary make it
+      # byte-reproducible for an independent rebuilder. The third rule exists
+      # because build.rs (tonic-prost-build) generates code under OUT_DIR — which
+      # lives under the target dir, not under $PWD — and a panic/track_caller
+      # location in that generated code embeds OUT_DIR's absolute path; without
+      # this rule the two builds' target dirs diverge and the digests never match
+      # (the same build.rs pattern breaks reproducibility for the Agent release too,
+      # since it generates code under OUT_DIR the same way). (Residual: the std
+      # sysroot path — bounded by pinning the exact toolchain, documented.)
+      - name: Compute deterministic build env
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix=$PWD=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry=/registry --remap-path-prefix=$RUNNER_TEMP/repro=/build/target" >> "$GITHUB_ENV"
+
+      - name: Reproducible release build
+        run: cargo build --release --locked --bin "$BIN"
+
+      - name: Verify reproducibility (double-build digest match)
+        run: |
+          d1=$(sha256sum "target/release/$BIN" | awk '{print $1}')
+          CARGO_TARGET_DIR="$RUNNER_TEMP/repro" cargo build --release --locked --bin "$BIN"
+          d2=$(sha256sum "$RUNNER_TEMP/repro/release/$BIN" | awk '{print $1}')
+          echo "digest #1: $d1"; echo "digest #2: $d2"
+          if [ "$d1" != "$d2" ]; then echo "::error::release binary is not reproducible"; exit 1; fi
+          rm -rf "$RUNNER_TEMP/repro"
+
+      - name: Generate SBOM (CycloneDX 1.5, reproducible)
+        run: |
+          cargo cyclonedx -f json --spec-version 1.5 --all --describe binaries
+          # Strip the nondeterministic metadata.timestamp + random serialNumber so
+          # the SBOM is byte-reproducible (cargo-cyclonedx has no reproducible flag;
+          # 0.5.9 also caps at spec 1.5). The workspace emits per-package SBOMs.
+          jq -S 'del(.metadata.timestamp) | del(.serialNumber)' "gateway/${BIN}_bin.cdx.json" > "${BIN}.cdx.json"
+          jq -e '.bomFormat=="CycloneDX" and .specVersion=="1.5" and (.components|length>0)' "${BIN}.cdx.json" >/dev/null
+
+      - name: Attest build provenance (SLSA)
+        id: attest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            target/release/gateway
+            gateway.cdx.json
+
+      - name: Keyless cosign signatures (binary + SBOM)
+        run: |
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle "${BIN}.cosign.sigstore.json" "target/release/$BIN"
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle "${BIN}.cdx.json.cosign.sigstore.json" "${BIN}.cdx.json"
+
+      # A plain `cp target/release/$BIN "$BIN"` collides with this repo's own
+      # top-level gateway/ crate directory (same name as the binary): cp
+      # copies INTO an existing directory rather than creating a same-named
+      # file, so sha256sum then fails on "gateway: Is a directory". Stage
+      # every release asset under dist/ instead, which shares no name with
+      # anything in the checkout.
+      - name: Assemble release artifacts
+        run: |
+          mkdir -p dist
+          cp "target/release/$BIN" "dist/$BIN"
+          cp "${BIN}.cdx.json" "dist/${BIN}.cdx.json"
+          cp "${BIN}.cosign.sigstore.json" "dist/${BIN}.cosign.sigstore.json"
+          cp "${BIN}.cdx.json.cosign.sigstore.json" "dist/${BIN}.cdx.json.cosign.sigstore.json"
+          cp "${{ steps.attest.outputs.bundle-path }}" "dist/${BIN}.provenance.sigstore.json"
+          (cd dist && sha256sum "$BIN" "${BIN}.cdx.json" > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }} # via env — never interpolate a ref into the shell
+        run: |
+          # view-then-create, not create-then-swallow-any-error: a bare
+          # `gh release create || echo "already exists"` treats an auth/API
+          # failure identically to "already exists" and proceeds anyway,
+          # producing a confusing failure two steps later at upload instead.
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "Gateway $TAG" \
+            --notes "Signed, provenanced, reproducible release. Verify with cosign / gh attestation verify (NFR-7)."
+          gh release upload "$TAG" --clobber \
+            "dist/$BIN" \
+            "dist/${BIN}.cdx.json" \
+            "dist/${BIN}.cosign.sigstore.json" \
+            "dist/${BIN}.cdx.json.cosign.sigstore.json" \
+            "dist/${BIN}.provenance.sigstore.json" \
+            "dist/SHA256SUMS"

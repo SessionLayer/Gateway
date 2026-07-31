@@ -1,0 +1,28 @@
+# Dependabot keeps dependencies current and surfaces GitHub security advisories
+# as pull requests. It complements the in-CI `cargo audit` / `cargo deny` gate
+# (RustSec advisory DB, keyless) rather than replacing it. Update PRs run through
+# the normal `gate` CI check before auto-merge.
+version: 2
+updates:
+  # Cargo crates across the workspace (gateway + gateway-core).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: deps
+
+  # GitHub Actions used by .github/workflows (kept SHA-pinned).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: ci

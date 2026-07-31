@@ -1,0 +1,128 @@
+[package]
+name = "gateway-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SessionLayer Gateway core library: SSH proxy engine, session recording, Control Plane authorization client, and HA coordination."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Opt-in io_uring reactor for the byte-copy hot path (Linux only). The epoll
+# reactor stays the portable default and fallback. See src/asyncio.rs.
+io-uring = ["dep:tokio-uring"]
+# TEST-ONLY: builds `test-agent`, an independent client-side implementation of the
+# frozen Agent<->Gateway wire contract, used by the Docker agent-path E2E (it runs
+# INSIDE the node container as a non-root user and splices to 127.0.0.1:22). Never
+# enabled in a production build; the E2E test is `#[cfg]`-gated on the same feature.
+test-agent = ["dep:clap", "dep:anyhow"]
+
+# The E2E drives the test agent as a subprocess via CARGO_BIN_EXE_test-agent.
+[[bin]]
+name = "test-agent"
+path = "src/bin/test_agent.rs"
+required-features = ["test-agent"]
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+russh = { workspace = true }
+ssh-key = { workspace = true }
+rand_core = { workspace = true }
+fd-lock = { workspace = true }
+zeroize = { workspace = true }
+pem = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# OpenTelemetry (§14): the trace root spans + W3C context
+# injection into outbound CP gRPC metadata. Exporter OFF unless an OTLP endpoint
+# is configured (telemetry.rs). See the workspace manifest for the transport /
+# supply-chain rationale (tonic/ring, no openssl).
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+# Recorder: customer-held encryption (ECIES-P256 + AES-256-GCM) and
+# the direct WORM PUT of the ciphertext object. See the workspace manifest for the
+# supply-chain rationale (all RustCrypto / hyper, no rsa, no webpki-roots).
+p256 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+x509-parser = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = { workspace = true }
+
+# Agent transport: the WebSocket carriage over our own TLS stream,
+# Sink/Stream polling for the byte-stream hot path, and base64url for the dial-back
+# token envelope. `clap` is pulled in only by the test-agent feature.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+# Non-optional: `telemetry::init` installs the tracing subscriber (fmt +
+# optional OTLP layer) unconditionally.
+tracing-subscriber = { workspace = true }
+
+# tokio-uring is Linux-only; keep it target-gated so the crate still builds on
+# other platforms (the epoll fallback carries them).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { version = "0.5", optional = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+anyhow = { workspace = true }
+# The in-process mock CP (integration tests) reuses the crypto stack to be a
+# real internal mTLS CA (rcgen) and SSH session CA (ssh-key) signing genuine
+# certs, and serves them over real TLS (rustls pki-types). `x509-parser` is a
+# TEST-ONLY feature: the mock CA parses the Gateway's PKCS#10 CSR to issue a
+# leaf. It is NOT enabled for the production build (dev-deps don't affect it).
+rcgen = { workspace = true, features = ["x509-parser"] }
+ssh-key = { workspace = true }
+rand_core = { workspace = true }
+rustls = { workspace = true }
+# Raw TLS servers for the peer-rejection matrix (expired / TLS-1.2-only peers),
+# and cert validity dates. tokio-rustls is pinned to tonic's transitive version.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+time = "0.3"
+# Integration tests only: throwaway credential data-dirs, and the real Debian 13
+# OpenSSH node. testcontainers drives Docker; never host ssh.
+tempfile = "3"
+testcontainers = "0.27"
+# The in-process mock CP mints a REAL SigV4 presigned PUT to the
+# MinIO container (no aws-sdk in Rust) — a small test-only presigner over
+# hmac + sha2 (both already deps). NEVER used by the production build.
+hmac = "0.13"
+sha2 = { workspace = true }
+# The recorder E2E generates a customer P-256 keypair (seal to the public half,
+# decrypt with the private half to prove the platform cannot read the recording).
+p256 = { workspace = true }
+# The agent-transport IT drives the wire protocol directly (adversarial framing:
+# replayed tokens, oversized frames, an unknown path) against the real WSS server.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
