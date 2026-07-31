@@ -64,7 +64,7 @@ fd-lock = "4"
 # Scrub private-key / secret buffers (Tier-0 caution).
 zeroize = "1"
 # DER -> PEM for the tonic client Identity (enrollment returns cert DER).
-pem = "3"
+pem = "4"
 
 # Recorder crypto (§12/§15). All RustCrypto (MIT/Apache), already in
 # the dependency graph; `rsa` is deliberately NOT enabled (audit-ignored precisely
