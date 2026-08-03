@@ -177,6 +177,17 @@ unaffected: the Key Vault properties are passed to `start_cp` unconditionally,
 but a Control Plane without the feature simply ignores an unbound property,
 and the first session in row 1 still runs on the `local` backend regardless.
 
+**Row 14 has the same dependency, and it fails louder.** The AWS KMS leg needs a
+Control Plane carrying the `aws_kms` backend. Against one that does not, an
+unbound `sessionlayer.ca.aws.*` is ignored and the Control Plane boots happily
+— which is exactly what `assert_cp_refuses_insecure_kms_endpoint` refuses to
+accept, so the run fails there rather than further in. That is the check
+working: a Control Plane that starts with a plaintext KMS endpoint is
+indistinguishable, from this side, from one that has no KMS support at all, and
+neither is a Control Plane this leg can make a claim about. Dispatch the
+workflow with `cp_ref` pointed at the branch carrying the backend, or merge that
+branch first.
+
 The double now issues Key Vault's real `WWW-Authenticate` challenge, so the Control Plane
 needs a `TokenCredential` that can actually obtain a token in a harness with no real
 Entra tenant. Resolved: `--sessionlayer.ca.azure.credential=managed-identity` against the
