@@ -180,7 +180,7 @@ preserve_evidence() {
   mkdir -p "$EVIDENCE_DIR" 2>/dev/null || return 0
   cp -p "$WORKDIR"/cp.log "$WORKDIR"/gateway.log "$EVIDENCE_DIR/" 2>/dev/null || true
   cp -p "$WORKDIR"/keyvault/requests.log "$WORKDIR"/keyvault/double.log "$EVIDENCE_DIR/" 2>/dev/null || true
-  cp -p "$WORKDIR"/kms/kms.env "$WORKDIR"/kms/cp-insecure-endpoint.log "$WORKDIR"/kms/localstack-at-stop.log "$EVIDENCE_DIR/" 2>/dev/null || true
+  cp -p "$WORKDIR"/kms/kms.env "$WORKDIR"/kms/cp-insecure-endpoint.log "$WORKDIR"/kms/cp-endpoint-override-refused.log "$WORKDIR"/kms/localstack-at-stop.log "$EVIDENCE_DIR/" 2>/dev/null || true
   # KMS's request log — the counter every assertion in that leg is judged against — lives
   # inside the container, so it has to be pulled out before teardown removes it. The
   # explicit PATH is not decoration: a die() inside a rest-only operator step leaves the
@@ -669,15 +669,41 @@ kms_await_count() {  # $1=counter function $2=minimum -> the count reached (rc!=
   done
 }
 
-# An endpoint-override redirects every KMS call the Control Plane makes, so a plaintext one
-# is a downgrade of the whole CA seam rather than a local convenience, and it has to be an
-# explicit decision rather than a forgotten scheme. Booting the real jar is what makes this
-# a proof: the property binding, the validation and the context failure are all the real
-# ones, where a guard exercised only through a test's own ApplicationContextRunner passes
-# just as happily when the production wiring is absent. Cheap enough to run every time.
+# An endpoint-override redirects every KMS call the Control Plane makes — including the read
+# that establishes the CA's pinned public key, which is why the pinning verification cannot
+# bound a redirect it was itself bootstrapped through, and including the credentials SigV4
+# signs each request with. So it is a trust-root decision, not a local convenience, and it
+# is gated twice: setting one at all needs allow-endpoint-override, and a plaintext one
+# needs allow-insecure-endpoint on top of that.
+#
+# Both gates are exercised, in the order the Control Plane evaluates them, because they fail
+# for different reasons and one passing says nothing about the other: omitting both must be
+# refused for the override itself, and permitting the override with a plaintext URL must
+# still be refused for the scheme. A single case would leave whichever gate it did not reach
+# unproven while looking like full coverage.
+#
+# Booting the real jar is what makes this a proof: the property binding, the validation and
+# the context failure are all the real ones, where a guard exercised only through a test's
+# own ApplicationContextRunner passes just as happily when the production wiring is absent.
 assert_cp_refuses_insecure_kms_endpoint() {
-  log "boot guard: a plaintext KMS endpoint-override must fail the Control Plane's startup without the explicit opt-in"
-  local out="$WORKDIR/kms/cp-insecure-endpoint.log" rc=0
+  # Owned by ControlPlane's AwsKmsProperties, not by anything this repo controls, so both are
+  # known to drift: when one moves, re-read that class and update the string rather than the
+  # shape of this check. Matched on the property each gate names, never on a URL or an ARN.
+  kms_boot_must_fail "no allow-endpoint-override" \
+    "sessionlayer.ca.aws.allow-endpoint-override=true (dev/test only)" \
+    "cp-endpoint-override-refused.log"
+  kms_boot_must_fail "an override permitted but the endpoint plaintext" \
+    "must use https unless sessionlayer.ca.aws.allow-insecure-endpoint=true" \
+    "cp-insecure-endpoint.log" \
+    --sessionlayer.ca.aws.allow-endpoint-override=true
+}
+
+# $1=what is being withheld  $2=the message that proves the right gate refused  $3=log file
+# $4...=extra Control Plane flags for this case
+kms_boot_must_fail() {
+  local what="$1" expect="$2" out="$WORKDIR/kms/$3" rc=0
+  shift 3
+  log "boot guard: the Control Plane must refuse to start with $what"
   SESSIONLAYER_CA_LOCAL_ALLOW_DEV_KEK=true \
   SESSIONLAYER_MTLS_SERVER_PORT="$FS_CP_MTLS_PORT" \
   SERVER_PORT="$FS_CP_REST_PORT" \
@@ -692,22 +718,20 @@ assert_cp_refuses_insecure_kms_endpoint() {
       --sessionlayer.ca.aws.region="$KMS_REGION" \
       --sessionlayer.ca.aws.account-id="$KMS_ACCOUNT_ID" \
       --sessionlayer.ca.aws.endpoint-override="$KMS_ENDPOINT" \
+      "$@" \
       > "$out" 2>&1 || rc=$?
   [[ $rc -ne 0 ]] \
-    || die "the Control Plane started and exited cleanly with a plaintext KMS endpoint and no opt-in; see $out"
+    || die "the Control Plane started and exited cleanly with $what; see $out"
   # 124 is `timeout` killing a Control Plane that came up anyway — the exact failure this
   # guard exists to prevent. A bare rc!=0 check would read that kill as a refusal and pass,
   # which is the failure shape worth naming rather than simplifying away: a check that
   # cannot tell the outcome it wants from the outcome it fears does not stop passing when
   # the guard breaks, it just stops meaning anything. Do not collapse these two tests.
   [[ $rc -ne 124 ]] \
-    || die "the Control Plane neither refused the plaintext KMS endpoint nor exited — it was still running when the timeout killed it; see $out"
-  # Owned by ControlPlane's AwsKmsProperties, not by anything this repo controls, so it is
-  # known to drift: when it moves, re-read that class and update the string rather than the
-  # shape of this check.
-  grep -q "must use https unless sessionlayer.ca.aws.allow-insecure-endpoint=true" "$out" \
-    || die "the Control Plane exited (rc=$rc) but not visibly for the plaintext-endpoint reason; see $out"
-  ok "boot guard: a plaintext KMS endpoint-override with no allow-insecure-endpoint failed the application context (rc=$rc)"
+    || die "the Control Plane neither refused $what nor exited — it was still running when the timeout killed it; see $out"
+  grep -q "$expect" "$out" \
+    || die "the Control Plane exited (rc=$rc) but not visibly for '$what' — the gate that refused is not the one under test; see $out"
+  ok "boot guard: $what failed the application context (rc=$rc)"
 }
 
 # The escape-hatch password is a fresh per-run value, hashed with the very encoder the
@@ -788,6 +812,7 @@ start_cp() {
       --sessionlayer.ca.aws.region="$KMS_REGION" \
       --sessionlayer.ca.aws.account-id="$KMS_ACCOUNT_ID" \
       --sessionlayer.ca.aws.endpoint-override="$KMS_ENDPOINT" \
+      --sessionlayer.ca.aws.allow-endpoint-override=true \
       --sessionlayer.ca.aws.allow-insecure-endpoint=true \
       > "$WORKDIR/cp.log" 2>&1 &
   CP_PID=$!; PIDS+=("$CP_PID")   # CP_PID: the NFR-2 CP-down case kills it explicitly
@@ -1668,6 +1693,22 @@ assert_keyvault_fail_closed() {
 # than read off a log afterwards, because an eager future change (resolving a CA's public
 # key at startup for some new health probe, say) would move these counts and nothing else
 # in the suite would notice.
+# The redirect's only runtime trace. Once the process is up an endpoint override is
+# otherwise invisible — no field on the CA, nothing in the certificates it signs — so an
+# operator inspecting a running Control Plane has no other way to learn that its KMS calls,
+# and the credentials signing them, are going somewhere the region did not choose. A startup
+# line nobody ever checks is indistinguishable from one that was never emitted, which is why
+# this is asserted rather than left for a human to notice.
+assert_kms_endpoint_override_is_logged() {
+  grep -q "AWS KMS calls are redirected to $KMS_ENDPOINT by sessionlayer.ca.aws.endpoint-override" "$WORKDIR/cp.log" \
+    || die "the Control Plane logged no warning that its KMS endpoint is overridden — the redirect would leave no runtime trace at all; see $WORKDIR/cp.log"
+  # The harness runs with the plaintext opt-in, so the line must say so too: an override
+  # that is also unencrypted is a strictly larger disclosure than one that is not.
+  grep -q "Plaintext HTTP is permitted on it." "$WORKDIR/cp.log" \
+    || die "the endpoint-override warning does not record that plaintext HTTP is permitted, which this run has enabled; see $WORKDIR/cp.log"
+  ok "the Control Plane warned at startup that its KMS endpoint is overridden to $KMS_ENDPOINT, and that plaintext is permitted on it"
+}
+
 assert_kms_untouched_before_rotation() {
   local signs pubkeys
   signs="$(kms_sign_count)"
@@ -2033,6 +2074,7 @@ main() {
   # Rotate the session CA on again, to AWS KMS this time. The CA is on Key Vault when this
   # starts, so this is a key-service-to-key-service rotation rather than local -> KMS —
   # a stronger claim, since no signature below can be served by a database-held key.
+  assert_kms_endpoint_override_is_logged   # the redirect's only runtime trace
   assert_kms_untouched_before_rotation
   adopt_session_ca_onto_kms
   redistribute_trust_for_kms_ca
