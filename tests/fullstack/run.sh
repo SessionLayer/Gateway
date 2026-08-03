@@ -683,7 +683,10 @@ assert_cp_refuses_insecure_kms_endpoint() {
   [[ $rc -ne 0 ]] \
     || die "the Control Plane started and exited cleanly with a plaintext KMS endpoint and no opt-in; see $out"
   # 124 is `timeout` killing a Control Plane that came up anyway — the exact failure this
-  # guard exists to prevent, and one a bare rc!=0 check would have read as a pass.
+  # guard exists to prevent. A bare rc!=0 check would read that kill as a refusal and pass,
+  # which is the failure shape worth naming rather than simplifying away: a check that
+  # cannot tell the outcome it wants from the outcome it fears does not stop passing when
+  # the guard breaks, it just stops meaning anything. Do not collapse these two tests.
   [[ $rc -ne 124 ]] \
     || die "the Control Plane neither refused the plaintext KMS endpoint nor exited — it was still running when the timeout killed it; see $out"
   # Owned by ControlPlane's AwsKmsProperties, not by anything this repo controls, so it is
@@ -1732,9 +1735,14 @@ redistribute_trust_for_kms_ca() {
 # Success alone is not the proof — a Control Plane that quietly kept signing with a key it
 # already held would look identical from the client's side — so the load-bearing assertions
 # are two counters read from KMS's OWN request log: the adoption GetPublicKey (the single
-# read this seam performs) and a successful Sign across the session. Both are also
-# meaningfully independent of the Key Vault leg above, whose double assert_keyvault_fail_closed
-# has by now stopped: a session that runs at all here cannot be vault-signed either.
+# read this seam performs) and a successful Sign across the session.
+#
+# There is a second, weaker argument available here — the Key Vault double is already
+# stopped by the time this runs, so a session that succeeds cannot be vault-signed — and it
+# is deliberately NOT what this turns on. That argument is a property of the order the
+# scenarios happen to run in, which the next person to add a scenario is free to change
+# without ever reading this comment. The counters are a property of what KMS was actually
+# asked to do, so they keep meaning the same thing in any order.
 assert_kms_backed_session() {
   local before after pubkeys
   pubkeys="$(kms_await_count kms_get_public_key_count $((KMS_PUBKEYS_BEFORE_ADOPTION + 1)))" \
