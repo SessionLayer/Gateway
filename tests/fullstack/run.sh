@@ -100,6 +100,36 @@ KEYVAULT_HOSTS_REFS_DIR="/tmp/sl-fullstack-keyvault-hosts.refs"
 # partway through that scenario would otherwise skip the tail-end restore call, leaving
 # the double faulted for whatever runs next — KEEP_UP inspection or a later run entirely.
 KEYVAULT_FAULT_MODE_ARMED=""
+# LocalStack's KMS, which does real P-256 key generation and real ECDSA signing over the
+# real AWS protocol — so this leg exercises the Control Plane's actual SDK path (request
+# signing, endpoint resolution, the credential chain, DER responses) rather than a double
+# of our own interface. There is no hand-written KMS double anywhere in this repo.
+KMS_IMAGE="${KMS_IMAGE:-localstack/localstack:4}"
+KMS_CONTAINER="sl-fs-kms"
+# A FIXED port, unlike the Key Vault double's OS-assigned one. The Control Plane's
+# endpoint-override is bound at CP boot, and assert_kms_fail_closed stops and restarts
+# this container — which is exactly when docker hands a `0` host port a different number.
+FS_KMS_PORT="${FS_KMS_PORT:-14566}"
+KMS_REGION="${KMS_REGION:-us-east-1}"
+# LocalStack answers for the zero account. The Control Plane anchors every key ARN to the
+# partition/region/account it is configured with, so these two have to agree or adoption
+# is refused before a single KMS call is made.
+KMS_ACCOUNT_ID="${KMS_ACCOUNT_ID:-000000000000}"
+KMS_ENDPOINT="http://127.0.0.1:${FS_KMS_PORT}"
+# LocalStack accepts any credential, but the SDK's default chain has to resolve SOME
+# credential or the client refuses to build — which would fail the run for a reason that
+# has nothing to do with what is under test. These are LocalStack's own documented values.
+KMS_ACCESS_KEY_ID="${KMS_ACCESS_KEY_ID:-test}"
+KMS_SECRET_ACCESS_KEY="${KMS_SECRET_ACCESS_KEY:-test}"
+# The harness's own create-key/get-public-key calls land in the same container log the
+# sign counter is read from, so what "untouched" means for KMS is a baseline, not zero.
+KMS_BASELINE_GETPUBKEY=0
+# Captured by adopt_session_ca_onto_kms before its operator phase opens (docker is
+# deliberately unavailable inside one) and compared by assert_kms_backed_session after.
+KMS_PUBKEYS_BEFORE_ADOPTION=0
+# Where the KMS request log is copied when the container is stopped, so the counters
+# survive the container being pruned out from under them (see kms_request_log).
+KMS_LOG_SNAPSHOT=""
 # WORKDIR is a shared, fixed path (by default): a second run's preflight (rm -rf
 # "$WORKDIR") can delete a prior run's logs before anyone reads them, on a box where
 # more than one of these runs. The suffix makes this path unique per run regardless of
@@ -150,6 +180,12 @@ preserve_evidence() {
   mkdir -p "$EVIDENCE_DIR" 2>/dev/null || return 0
   cp -p "$WORKDIR"/cp.log "$WORKDIR"/gateway.log "$EVIDENCE_DIR/" 2>/dev/null || true
   cp -p "$WORKDIR"/keyvault/requests.log "$WORKDIR"/keyvault/double.log "$EVIDENCE_DIR/" 2>/dev/null || true
+  cp -p "$WORKDIR"/kms/kms.env "$WORKDIR"/kms/cp-insecure-endpoint.log "$WORKDIR"/kms/cp-endpoint-override-refused.log "$WORKDIR"/kms/localstack-at-stop.log "$EVIDENCE_DIR/" 2>/dev/null || true
+  # KMS's request log — the counter every assertion in that leg is judged against — lives
+  # inside the container, so it has to be pulled out before teardown removes it. The
+  # explicit PATH is not decoration: a die() inside a rest-only operator step leaves the
+  # docker stub on PATH, and this runs before cleanup restores it.
+  PATH="$PATH_ORIGINAL" docker logs "$KMS_CONTAINER" > "$EVIDENCE_DIR/localstack-kms.log" 2>&1 || true
   echo "$rc" > "$EVIDENCE_DIR/exit-code.txt"
   log "evidence preserved (rc=$rc): $EVIDENCE_DIR"
 }
@@ -171,7 +207,7 @@ cleanup() {
     return
   fi
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
-  docker rm -f "$NODE_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$NODE_CONTAINER" "$KMS_CONTAINER" >/dev/null 2>&1 || true
   "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
   release_keyvault_hostname
 }
@@ -491,6 +527,213 @@ start_keyvault_double() {
   ok "Key Vault double up: $KEYVAULT_URL (key=$KEY_ID); managed-identity endpoint: $MSI_ENDPOINT"
 }
 
+# Started BEFORE start_cp for the same reason the Key Vault double is: the Control Plane
+# boots with sessionlayer.ca.aws.* already pointing here, while every CA is still local,
+# so this leg can make the same claim — being configured for KMS changes nothing until a
+# CA is rotated onto it (assert_kms_untouched_before_rotation).
+start_kms_localstack() {
+  log "starting LocalStack KMS on 127.0.0.1:$FS_KMS_PORT (real P-256 key generation, real ECDSA signing, real AWS protocol)"
+  mkdir -p "$WORKDIR/kms"
+  kms_run_container
+  kms_wait_ready
+  kms_create_key
+  # Reading the baseline through kms_await_count also proves the counter mechanism itself
+  # on every run: the harness has just made a GetPublicKey call, so if LocalStack's
+  # request-log line ever stops matching, this dies here naming that, rather than every
+  # later assertion silently counting zero forever.
+  KMS_BASELINE_GETPUBKEY="$(kms_await_count kms_get_public_key_count 1)" \
+    || die "LocalStack's request log did not record the harness's own GetPublicKey — its log is not a usable call counter, so this leg cannot prove what signed anything"
+  # The same scraping discipline the Key Vault double's KEY=value banner gets: the three
+  # values every later assertion is judged against are written where the preserved
+  # evidence keeps them, not left in a shell variable that dies with the run.
+  ok "LocalStack KMS up with a P-256 SIGN_VERIFY CA key ($KMS_BASELINE_GETPUBKEY GetPublicKey baseline, all the harness's own)"
+}
+
+kms_run_container() {
+  docker rm -f "$KMS_CONTAINER" >/dev/null 2>&1 || true
+  # DNS_ADDRESS=0 / SKIP_SSL_CERT_DOWNLOAD=1 / DISABLE_EVENTS=1 turn off the three things
+  # LocalStack does on startup that reach the internet: its own DNS server, a certificate
+  # fetch from api.localstack.cloud, and telemetry. None is used by anything here, and on a
+  # host that cannot resolve those names they do not fail fast — startup went from 12
+  # seconds to over seven minutes waiting on them, which reads as a hung container rather
+  # than as a network the test was never entitled to.
+  docker run -d --name "$KMS_CONTAINER" -p "127.0.0.1:${FS_KMS_PORT}:4566" \
+    -e SERVICES=kms -e DNS_ADDRESS=0 -e SKIP_SSL_CERT_DOWNLOAD=1 -e DISABLE_EVENTS=1 \
+    "$KMS_IMAGE" >/dev/null \
+    || die "could not start the LocalStack KMS container ($KMS_IMAGE) on 127.0.0.1:$FS_KMS_PORT"
+}
+
+# Bring KMS back after a deliberate stop. `docker start` cannot revive a container that has
+# been removed, and one stopped on purpose is a prime candidate for a prune, so a fresh
+# container is the fallback. Either way the caller must re-create its key: a restarted
+# LocalStack has lost every key it was holding.
+kms_restart() {
+  docker start "$KMS_CONTAINER" >/dev/null 2>&1 \
+    || { log "the stopped KMS container no longer exists — re-creating it"; kms_run_container; }
+  kms_wait_ready
+}
+
+# Readiness is LocalStack's own health endpoint reporting the service, never a sleep: the
+# edge port answers well before KMS is loadable, and a create-key against it in that window
+# fails in a way that reads like a broken image. `available` is the loaded-on-demand state
+# and `running` is what it becomes after the first call, so a restart mid-run satisfies
+# either.
+kms_wait_ready() {
+  local deadline=$((SECONDS + WAIT_SECS)) state=""
+  until state="$(curl -s "$KMS_ENDPOINT/_localstack/health" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print((json.load(sys.stdin).get("services") or {}).get("kms", ""))
+except Exception:
+    print("")')"; [[ "$state" == available || "$state" == running ]]; do
+    docker ps -q --filter "name=$KMS_CONTAINER" | grep -q . \
+      || { docker logs "$KMS_CONTAINER" 2>&1 | tail -40 >&2; die "the LocalStack KMS container exited during startup"; }
+    [[ $SECONDS -lt $deadline ]] \
+      || { docker logs "$KMS_CONTAINER" 2>&1 | tail -40 >&2; die "LocalStack never reported kms ready (last state '$state')"; }
+    sleep 2
+  done
+}
+
+# The CA key is created with the awslocal bundled INSIDE the container, so no AWS CLI is
+# needed on the host or the CI runner. Sets the two values the whole leg is judged
+# against: the ARN, which is what the CA's key_reference must be, and the SPKI, which is
+# what the Control Plane must independently end up publishing as the session CA.
+#
+# $1, when given, forces the new key's id via LocalStack's `_custom_id_` tag, which is how
+# assert_kms_wrong_key_rejected makes one ARN resolve to a second, unrelated keypair.
+kms_create_key() {  # [$1 = key id to force]
+  local created public tag=()
+  [[ -n "${1:-}" ]] && tag=(--tags "TagKey=_custom_id_,TagValue=$1")
+  created="$(docker exec -e AWS_DEFAULT_REGION="$KMS_REGION" "$KMS_CONTAINER" \
+    awslocal kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY "${tag[@]}" 2>&1)" \
+    || die "kms create-key failed: $created"
+  KMS_KEY_ARN="$(printf %s "$created" | python3 -c 'import json,sys;print(json.load(sys.stdin)["KeyMetadata"]["Arn"])')" \
+    || die "could not read a key ARN out of the create-key response: $created"
+  public="$(docker exec -e AWS_DEFAULT_REGION="$KMS_REGION" "$KMS_CONTAINER" \
+    awslocal kms get-public-key --key-id "$KMS_KEY_ARN" 2>&1)" \
+    || die "kms get-public-key failed: $public"
+  KMS_PUBKEY_SPKI_B64="$(printf %s "$public" | python3 -c 'import json,sys;print(json.load(sys.stdin)["PublicKey"])')" \
+    || die "could not read a public key out of the get-public-key response: $public"
+  # The Control Plane refuses a key_reference outside its configured anchor, so a mismatch
+  # here would surface as a confusing rotation failure rather than as what it is.
+  [[ "$KMS_KEY_ARN" == "arn:aws:kms:$KMS_REGION:$KMS_ACCOUNT_ID:key/"* ]] \
+    || die "the created key's ARN is outside the region/account the Control Plane is anchored to: $KMS_KEY_ARN"
+  # The same scraping discipline the Key Vault double's KEY=value banner gets, written from
+  # here rather than from the caller so that EVERY key this run adopts is recorded: a run
+  # that recovers from a KMS outage adopts a second one, and which ARN each session was
+  # signed under is the whole point of keeping this.
+  printf 'KMS_ENDPOINT=%s\nKMS_KEY_ARN=%s\nKMS_PUBKEY_SPKI_B64=%s\n' \
+    "$KMS_ENDPOINT" "$KMS_KEY_ARN" "$KMS_PUBKEY_SPKI_B64" >> "$WORKDIR/kms/kms.env"
+  log "KMS_ENDPOINT=$KMS_ENDPOINT"
+  log "KMS_KEY_ARN=$KMS_KEY_ARN"
+  log "KMS_PUBKEY_SPKI_B64=$KMS_PUBKEY_SPKI_B64"
+}
+
+# `docker start` cannot revive a container that has been removed, and the one
+# assert_kms_fail_closed stopped is a prime candidate for a prune. Both branches reach the
+# same place: a restarted LocalStack has lost its keys either way, so the caller re-adopts
+# regardless of which one ran.
+kms_restart_with_fresh_key() {
+  kms_restart
+  kms_create_key
+}
+
+# LocalStack logs one line per AWS API call it serves, and `docker logs` keeps serving
+# those lines after the container is STOPPED — which is what makes this usable as the
+# independent counter assert_kms_fail_closed needs. The `=> 200` is not decoration: a
+# refused Sign (a wrong-length digest earns a ValidationException) logs the same operation
+# name with a 4xx, and counting it would read as a signature that never happened.
+#
+# A stopped container is not the same as a surviving one, though: pruning stopped
+# containers is routine on shared boxes and CI runners, and a pruned container serves no
+# log at all — every count would silently read zero, which is indistinguishable from "KMS
+# was never reached" and would turn the fail-closed scenario into a pass for the wrong
+# reason. assert_kms_fail_closed therefore snapshots the log to disk the moment it stops
+# the container, and these fall back to that snapshot.
+kms_request_log() { docker logs "$KMS_CONTAINER" 2>/dev/null || cat "${KMS_LOG_SNAPSHOT:-/dev/null}" 2>/dev/null; }
+kms_sign_count()           { kms_request_log | grep -cE 'AWS kms\.Sign => 200' || true; }
+kms_get_public_key_count() { kms_request_log | grep -cE 'AWS kms\.GetPublicKey => 200' || true; }
+
+# LocalStack appends its request-log line after the response is already on the wire, so a
+# count read the instant an API call returns can legitimately miss it. Poll to a deadline
+# rather than read once: a false negative here would be indistinguishable from the Control
+# Plane never having reached KMS at all, which is exactly the finding this leg exists to
+# make trustworthy.
+kms_await_count() {  # $1=counter function $2=minimum -> the count reached (rc!=0 if never)
+  local deadline=$((SECONDS + 20)) n
+  while :; do
+    n="$("$1")"
+    [[ "${n:-0}" -ge "$2" ]] && { printf %s "$n"; return 0; }
+    [[ $SECONDS -lt $deadline ]] || { printf %s "$n"; return 1; }
+    sleep 1
+  done
+}
+
+# An endpoint-override redirects every KMS call the Control Plane makes — including the read
+# that establishes the CA's pinned public key, which is why the pinning verification cannot
+# bound a redirect it was itself bootstrapped through, and including the credentials SigV4
+# signs each request with. So it is a trust-root decision, not a local convenience, and it
+# is gated twice: setting one at all needs allow-endpoint-override, and a plaintext one
+# needs allow-insecure-endpoint on top of that.
+#
+# Both gates are exercised, in the order the Control Plane evaluates them, because they fail
+# for different reasons and one passing says nothing about the other: omitting both must be
+# refused for the override itself, and permitting the override with a plaintext URL must
+# still be refused for the scheme. A single case would leave whichever gate it did not reach
+# unproven while looking like full coverage.
+#
+# Booting the real jar is what makes this a proof: the property binding, the validation and
+# the context failure are all the real ones, where a guard exercised only through a test's
+# own ApplicationContextRunner passes just as happily when the production wiring is absent.
+assert_cp_refuses_insecure_kms_endpoint() {
+  # Owned by ControlPlane's AwsKmsProperties, not by anything this repo controls, so both are
+  # known to drift: when one moves, re-read that class and update the string rather than the
+  # shape of this check. Matched on the property each gate names, never on a URL or an ARN.
+  kms_boot_must_fail "no allow-endpoint-override" \
+    "sessionlayer.ca.aws.allow-endpoint-override=true (dev/test only)" \
+    "cp-endpoint-override-refused.log"
+  kms_boot_must_fail "an override permitted but the endpoint plaintext" \
+    "must use https unless sessionlayer.ca.aws.allow-insecure-endpoint=true" \
+    "cp-insecure-endpoint.log" \
+    --sessionlayer.ca.aws.allow-endpoint-override=true
+}
+
+# $1=what is being withheld  $2=the message that proves the right gate refused  $3=log file
+# $4...=extra Control Plane flags for this case
+kms_boot_must_fail() {
+  local what="$1" expect="$2" out="$WORKDIR/kms/$3" rc=0
+  shift 3
+  log "boot guard: the Control Plane must refuse to start with $what"
+  SESSIONLAYER_CA_LOCAL_ALLOW_DEV_KEK=true \
+  SESSIONLAYER_MTLS_SERVER_PORT="$FS_CP_MTLS_PORT" \
+  SERVER_PORT="$FS_CP_REST_PORT" \
+  SESSIONLAYER_RECORDING_WORM_ENDPOINT="$MINIO_ENDPOINT" \
+  SPRING_R2DBC_URL="r2dbc:postgresql://localhost:${FS_PG_PORT}/sessionlayer" \
+  SPRING_R2DBC_USERNAME="sessionlayer" SPRING_R2DBC_PASSWORD="sessionlayer" \
+  SPRING_FLYWAY_URL="jdbc:postgresql://localhost:${FS_PG_PORT}/sessionlayer" \
+  SPRING_FLYWAY_USER="sessionlayer" SPRING_FLYWAY_PASSWORD="sessionlayer" \
+  AWS_ACCESS_KEY_ID="$KMS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$KMS_SECRET_ACCESS_KEY" AWS_REGION="$KMS_REGION" \
+    timeout "$WAIT_SECS" java -jar "$CP_JAR" \
+      --sessionlayer.ca.aws.enabled=true \
+      --sessionlayer.ca.aws.region="$KMS_REGION" \
+      --sessionlayer.ca.aws.account-id="$KMS_ACCOUNT_ID" \
+      --sessionlayer.ca.aws.endpoint-override="$KMS_ENDPOINT" \
+      "$@" \
+      > "$out" 2>&1 || rc=$?
+  [[ $rc -ne 0 ]] \
+    || die "the Control Plane started and exited cleanly with $what; see $out"
+  # 124 is `timeout` killing a Control Plane that came up anyway — the exact failure this
+  # guard exists to prevent. A bare rc!=0 check would read that kill as a refusal and pass,
+  # which is the failure shape worth naming rather than simplifying away: a check that
+  # cannot tell the outcome it wants from the outcome it fears does not stop passing when
+  # the guard breaks, it just stops meaning anything. Do not collapse these two tests.
+  [[ $rc -ne 124 ]] \
+    || die "the Control Plane neither refused $what nor exited — it was still running when the timeout killed it; see $out"
+  grep -q "$expect" "$out" \
+    || die "the Control Plane exited (rc=$rc) but not visibly for '$what' — the gate that refused is not the one under test; see $out"
+  ok "boot guard: $what failed the application context (rc=$rc)"
+}
+
 # The escape-hatch password is a fresh per-run value, hashed with the very encoder the
 # Control Plane verifies it against: spring-security-crypto is lifted out of CP_JAR and
 # the hash computed by a single-file JDK program. That keeps a bcrypt tool (`htpasswd`,
@@ -537,6 +780,12 @@ start_cp() {
   # validated OAuth2 path the other credential kinds would need. It is also the credential
   # documented as the production recommendation (no secret to leak or rotate), not a
   # test-only shortcut.
+  #
+  # aws.* is set unconditionally from boot for the same reason azure.* is, and there is no
+  # credential property to set: the SDK's default chain resolves the AWS_* variables below,
+  # which is the one place a credential belongs. allow-insecure-endpoint is the deliberate
+  # opt-in a plaintext LocalStack endpoint requires — assert_cp_refuses_insecure_kms_endpoint
+  # has already proven, against this same jar, that omitting it refuses the boot.
   arm_bootstrap_escape_hatch
   SESSIONLAYER_CA_LOCAL_ALLOW_DEV_KEK=true \
   SESSIONLAYER_MTLS_SERVER_PORT="$FS_CP_MTLS_PORT" \
@@ -547,6 +796,7 @@ start_cp() {
   SPRING_FLYWAY_URL="jdbc:postgresql://localhost:${FS_PG_PORT}/sessionlayer" \
   SPRING_FLYWAY_USER="sessionlayer" SPRING_FLYWAY_PASSWORD="sessionlayer" \
   IDENTITY_ENDPOINT="$MSI_ENDPOINT" IDENTITY_HEADER="fs-e2e-keyvault-double" \
+  AWS_ACCESS_KEY_ID="$KMS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$KMS_SECRET_ACCESS_KEY" AWS_REGION="$KMS_REGION" \
     java \
       -Djavax.net.ssl.trustStore="$KEYVAULT_TRUSTSTORE" \
       -Djavax.net.ssl.trustStorePassword=changeit \
@@ -558,6 +808,12 @@ start_cp() {
       --sessionlayer.ca.azure.enabled=true \
       --sessionlayer.ca.azure.vault-uri="$KEYVAULT_URL" \
       --sessionlayer.ca.azure.credential=managed-identity \
+      --sessionlayer.ca.aws.enabled=true \
+      --sessionlayer.ca.aws.region="$KMS_REGION" \
+      --sessionlayer.ca.aws.account-id="$KMS_ACCOUNT_ID" \
+      --sessionlayer.ca.aws.endpoint-override="$KMS_ENDPOINT" \
+      --sessionlayer.ca.aws.allow-endpoint-override=true \
+      --sessionlayer.ca.aws.allow-insecure-endpoint=true \
       > "$WORKDIR/cp.log" 2>&1 &
   CP_PID=$!; PIDS+=("$CP_PID")   # CP_PID: the NFR-2 CP-down case kills it explicitly
   local deadline=$((SECONDS + WAIT_SECS))
@@ -1183,7 +1439,7 @@ keyvault_sign_count() {
 # real Control Plane gap, reported and being fixed separately. Once that lands, a denied
 # event will appear where today there is none, and this check must keep passing rather
 # than start failing on what would then be a correct fix.
-keyvault_certificate_issued_for_session() {  # $1 = session id
+certificate_issued_for_session() {  # $1 = session id
   api_ok GET "/v1/audit-events?correlationId=$1&action=session.sign" \
     | python3 -c 'import json,sys
 d = json.load(sys.stdin)
@@ -1194,7 +1450,7 @@ print("yes" if any(i.get("outcome") == "success" for i in (d.get("items") or [])
 # captured baseline — mirrors assert_channel_revalidate's own idiom: session ids are
 # random v4 UUIDs, so there is no ordering to sort by, and asserting against the wrong
 # session would read as a check that never really ran.
-keyvault_new_session_id() {  # $1 = baseline session_ids() output, captured before the attempt
+new_session_id() {  # $1 = baseline session_ids() output, captured before the attempt
   local before="$1" after
   after="$(session_ids)"
   BEFORE="$before" AFTER="$after" python3 -c '
@@ -1335,9 +1591,9 @@ assert_keyvault_wrong_key_rejected() {
 
   mint_admin_token
   local sid
-  sid="$(keyvault_new_session_id "$before_sessions")"
+  sid="$(new_session_id "$before_sessions")"
   [[ -n "$sid" ]] || die "the wrong-key attempt produced no new session to check for an issued certificate"
-  [[ "$(keyvault_certificate_issued_for_session "$sid")" == no ]] \
+  [[ "$(certificate_issued_for_session "$sid")" == no ]] \
     || die "a certificate WAS issued for session $sid even though the vault signed with the wrong key — D-2 bypassed"
 
   curl -sk "$KEYVAULT_URL/_test/fault-mode?mode=none" >/dev/null \
@@ -1381,7 +1637,7 @@ assert_keyvault_credential_flow() {
 # two assertions below it are, because each is checked against a party other than the
 # SSH client itself: the vault's own counter (it cannot have been reached without moving)
 # and whether a certificate was actually issued for the new session (see
-# keyvault_certificate_issued_for_session — NOT "did a recording appear", which is created
+# certificate_issued_for_session — NOT "did a recording appear", which is created
 # regardless of inner-leg outcome and was this scenario's own bug the first time a real
 # jar exercised it). Fault-inject by pointing NODE_LOGIN/NODE_NAME at a login that was
 # never going to work: rc!=0 still holds, but both of those load-bearing checks then
@@ -1413,9 +1669,9 @@ assert_keyvault_fail_closed() {
   # of the vault's own counter and of why the ssh client failed.
   mint_admin_token
   local sid
-  sid="$(keyvault_new_session_id "$before_sessions")"
+  sid="$(new_session_id "$before_sessions")"
   [[ -n "$sid" ]] || die "the vault-down attempt produced no new session to check for an issued certificate"
-  [[ "$(keyvault_certificate_issued_for_session "$sid")" == no ]] \
+  [[ "$(certificate_issued_for_session "$sid")" == no ]] \
     || die "a certificate WAS issued for session $sid even though the Key Vault double was stopped — D-4 bypassed"
 
   # Corroborating only: names the failure as Key-Vault-specific rather than merely
@@ -1427,6 +1683,289 @@ assert_keyvault_fail_closed() {
   grep -q "Key Vault signing failed for key" "$WORKDIR/cp.log" \
     || die "cp.log shows no Key-Vault-specific signing failure (corroborating check) — the session failed, but not visibly for the Key Vault reason"
   ok "D-4: with the Key Vault double down, the new session failed closed (rc=$rc); sign count unchanged ($before_signs); no certificate issued for session $sid; the Control Plane never fell back to local"
+}
+
+# ── the AWS KMS leg ──────────────────────────────────────────────────────────
+# The same claim the Key Vault leg makes, for the other key service: the Control Plane has
+# been booted with sessionlayer.ca.aws.* set since start_cp, and everything above — the
+# whole first install, several real sessions, the audit searches, and an entire rotation
+# onto a DIFFERENT key service — has run without it making one KMS call. Asserted rather
+# than read off a log afterwards, because an eager future change (resolving a CA's public
+# key at startup for some new health probe, say) would move these counts and nothing else
+# in the suite would notice.
+# The redirect's only runtime trace. Once the process is up an endpoint override is
+# otherwise invisible — no field on the CA, nothing in the certificates it signs — so an
+# operator inspecting a running Control Plane has no other way to learn that its KMS calls,
+# and the credentials signing them, are going somewhere the region did not choose. A startup
+# line nobody ever checks is indistinguishable from one that was never emitted, which is why
+# this is asserted rather than left for a human to notice.
+assert_kms_endpoint_override_is_logged() {
+  grep -q "AWS KMS calls are redirected to $KMS_ENDPOINT by sessionlayer.ca.aws.endpoint-override" "$WORKDIR/cp.log" \
+    || die "the Control Plane logged no warning that its KMS endpoint is overridden — the redirect would leave no runtime trace at all; see $WORKDIR/cp.log"
+  # The harness runs with the plaintext opt-in, so the line must say so too: an override
+  # that is also unencrypted is a strictly larger disclosure than one that is not.
+  grep -q "Plaintext HTTP is permitted on it." "$WORKDIR/cp.log" \
+    || die "the endpoint-override warning does not record that plaintext HTTP is permitted, which this run has enabled; see $WORKDIR/cp.log"
+  ok "the Control Plane warned at startup that its KMS endpoint is overridden to $KMS_ENDPOINT, and that plaintext is permitted on it"
+}
+
+assert_kms_untouched_before_rotation() {
+  local signs pubkeys
+  signs="$(kms_sign_count)"
+  pubkeys="$(kms_get_public_key_count)"
+  [[ "$signs" -eq 0 ]] \
+    || die "KMS was asked to sign $signs time(s) before the session CA was ever rotated onto it"
+  [[ "$pubkeys" -eq "$KMS_BASELINE_GETPUBKEY" ]] \
+    || die "KMS served $((pubkeys - KMS_BASELINE_GETPUBKEY)) unexpected GetPublicKey call(s) before the session CA was rotated onto it (baseline $KMS_BASELINE_GETPUBKEY, now $pubkeys)"
+  ok "the Control Plane made zero KMS calls while configured for KMS but not yet rotated onto it (0 signatures; $KMS_BASELINE_GETPUBKEY GetPublicKey, all the harness's own)"
+}
+
+# Adoption is a ROTATION for the same reason it is on Key Vault: a KMS-held private key
+# cannot be imported, so the CA moves onto a new key rather than migrating its old one,
+# with the trust-distribution consequences that follow (redistribute_trust_for_kms_ca).
+#
+# The CA rotated here is already on Key Vault, so this is a key-service-to-key-service
+# rotation rather than local -> KMS, and that is the stronger claim: no part of the path
+# can be satisfied by a database-held private key that was simply left in place, because
+# there has not been one since the Key Vault rotation above.
+adopt_session_ca_onto_kms() {
+  # Read before the operator phase opens — docker is deliberately unavailable inside one,
+  # and this is a harness assertion rather than anything an operator does.
+  KMS_PUBKEYS_BEFORE_ADOPTION="$(kms_get_public_key_count)"
+  operator_step "rotate the session CA onto AWS KMS" rest-only
+  local D="$WORKDIR/kms" session_ca_id rotated backend state ref pubkey fp
+  mint_admin_token   # the token minted for the Key Vault leg may have aged out by now
+
+  session_ca_id="$(api_ok GET /v1/cas | python3 -c '
+import json, sys
+for ca in json.load(sys.stdin).get("items") or []:
+    if ca.get("caKind") == "session" and ca.get("rotationState") == "active":
+        print(ca["id"]); break')"
+  [[ -n "$session_ca_id" ]] || die "no active session CA found to rotate (GET /v1/cas)"
+
+  rotated="$(api_ok POST "/v1/cas/$session_ca_id/rotate" "$(json backend aws_kms keyReference "$KMS_KEY_ARN")")"
+  backend="$(json_get "$rotated" backend)"
+  state="$(json_get "$rotated" rotationState)"
+  ref="$(json_get "$rotated" keyReference)"
+  [[ "$backend" == aws_kms ]] || die "rotate did not move the backend to aws_kms: $rotated"
+  [[ "$state" == active ]] || die "the rotated CA is not active: $rotated"
+  [[ "$ref" == "$KMS_KEY_ARN" ]] || die "the rotated CA's keyReference is not the KMS key ARN: $ref vs $KMS_KEY_ARN"
+
+  # The Control Plane must now be publishing the key KMS generated — the public half no
+  # node will trust unless it genuinely came from there. Compared against what KMS itself
+  # reported at create time, and the fingerprint recomputed independently, exactly as
+  # export_trust_material does for the CA an operator installs by hand.
+  pubkey="$(api_ok GET /v1/cas/session/public-key)"
+  [[ "$(json_get "$pubkey" publicKeySpkiDer)" == "$KMS_PUBKEY_SPKI_B64" ]] \
+    || die "the CP is not publishing the KMS key's public half: $(json_get "$pubkey" publicKeySpkiDer) vs $KMS_PUBKEY_SPKI_B64"
+  KMS_SESSION_CA_LINE="$(json_get "$pubkey" opensshPublicKey)"
+  printf '%s\n' "$KMS_SESSION_CA_LINE" > "$D/session_ca.line"
+  fp="$(ssh-keygen -lf "$D/session_ca.line" | awk '{print $2}')"
+  [[ "$fp" == "$(json_get "$pubkey" fingerprint)" ]] \
+    || die "the served fingerprint does not match the served KMS-backed key: $fp vs $(json_get "$pubkey" fingerprint)"
+  ! grep -qi 'PRIVATE' <<<"$pubkey" || die "the CA public-key response contained private key material"
+  ok "session CA rotated onto AWS KMS over REST (backend=$backend keyReference=$ref, fingerprint $fp)"
+}
+
+# The documented rotation procedure, as for Key Vault: the node already trusts the CAs it
+# was given before, and the KMS-backed CA is a SEPARATE trusted line appended without
+# removing them, so both verify during the overlap window. TrustedUserCAKeys is re-read on
+# every authentication attempt regardless, so the SIGHUP is not what makes this take
+# effect; it is sent because it is what an operator's runbook does after editing the file.
+redistribute_trust_for_kms_ca() {
+  operator_step "redistribute trust for the KMS-backed session CA"
+  [[ -n "${KMS_SESSION_CA_LINE:-}" ]] \
+    || die "no KMS-backed session CA line was exported; the node would trust nothing new"
+  printf '%s\n' "$KMS_SESSION_CA_LINE" | docker exec -i "$NODE_CONTAINER" sh -c 'cat >> /etc/ssh/trusted_user_ca.pub' \
+    || die "could not append the KMS-backed CA to the node's TrustedUserCAKeys"
+  docker exec "$NODE_CONTAINER" sh -c 'kill -HUP 1' \
+    || die "could not SIGHUP the node's sshd after trust redistribution"
+  ok "node now trusts the KMS-backed session CA as well (appended; sshd SIGHUP'd)"
+}
+
+# The headline claim of this leg: a real SSH session, through the real Gateway, to the real
+# node, whose inner-leg certificate was signed by a CA key held in KMS.
+#
+# Success alone is not the proof — a Control Plane that quietly kept signing with a key it
+# already held would look identical from the client's side — so the load-bearing assertions
+# are two counters read from KMS's OWN request log: the adoption GetPublicKey (the single
+# read this seam performs) and a successful Sign across the session.
+#
+# There is a second, weaker argument available here — the Key Vault double is already
+# stopped by the time this runs, so a session that succeeds cannot be vault-signed — and it
+# is deliberately NOT what this turns on. That argument is a property of the order the
+# scenarios happen to run in, which the next person to add a scenario is free to change
+# without ever reading this comment. The counters are a property of what KMS was actually
+# asked to do, so they keep meaning the same thing in any order.
+assert_kms_backed_session() {
+  local before after pubkeys
+  pubkeys="$(kms_await_count kms_get_public_key_count $((KMS_PUBKEYS_BEFORE_ADOPTION + 1)))" \
+    || die "KMS records no GetPublicKey across the rotation (still $KMS_PUBKEYS_BEFORE_ADOPTION) — the adopted CA's public half came from somewhere other than KMS"
+  before="$(kms_sign_count)"
+  run_session
+  after="$(kms_await_count kms_sign_count $((before + 1)))" \
+    || die "KMS's own request log records no successful Sign across the session ($before -> $after) — the inner-leg certificate was not signed in KMS"
+  ok "KMS-backed session ran on the real node; KMS's sign count increased ($before -> $after) and its adoption read is recorded ($KMS_PUBKEYS_BEFORE_ADOPTION -> $pubkeys)"
+}
+
+# The guard the whole backend rests on: every signature KMS returns is verified locally
+# against the pinned public key before it is trusted, which is what turns "the KMS key is
+# pinned" from a documented intent into an enforced one. A permanent scenario, run every
+# time, so it is proven at the real network and JVM boundary rather than by a unit test
+# over a mocked client — the Azure backend's equivalent is permanent for the same reason,
+# and the two guards protect the same property.
+#
+# The fault is injected with LocalStack's `_custom_id_` tag: the pinned ARN is re-created
+# from a DIFFERENT keypair, so the reference the CA is anchored to resolves, and answers,
+# and signs — with the wrong key. Against real KMS this is the shape an alias repoint
+# produces, which is why the key-reference grammar refuses aliases outright; here it is the
+# nearest faithful reproduction, because KMS asymmetric key material never rotates in place.
+#
+# Note what is deliberately NOT the discriminator. The session fails, but so does an
+# ungranted login. KMS is reached and does sign, so an unchanged sign count would prove
+# nothing either — the count going UP is what separates this from the unreachable case
+# below. What identifies the pinned-key check as the thing that refused is the cp.log grep,
+# and here that grep is load-bearing rather than corroborating.
+assert_kms_wrong_key_rejected() {
+  log "flipping the pinned KMS ARN onto different key material; a NEW session must be refused and no certificate issued"
+  local pinned_arn="$KMS_KEY_ARN" pinned_spki="$KMS_PUBKEY_SPKI_B64" key_id="${KMS_KEY_ARN##*/}"
+
+  # Stopping is how LocalStack is made to forget the real key so the ARN can be rebuilt on
+  # top of it; the snapshot is taken for the same reason it is in assert_kms_fail_closed,
+  # since the container is a prune candidate for as long as it is down.
+  docker stop "$KMS_CONTAINER" >/dev/null || die "could not stop KMS to swap the key material"
+  KMS_LOG_SNAPSHOT="$WORKDIR/kms/localstack-at-keyswap.log"
+  docker logs "$KMS_CONTAINER" > "$KMS_LOG_SNAPSHOT" 2>&1 \
+    || die "could not snapshot KMS's request log before swapping the key material"
+  kms_restart
+  kms_create_key "$key_id"
+
+  # Prove the injection actually injected. If LocalStack ever returned the same ARN with the
+  # same material, every assertion below would pass while testing nothing at all.
+  [[ "$KMS_KEY_ARN" == "$pinned_arn" ]] \
+    || die "the impostor key did not take the pinned ARN ($KMS_KEY_ARN vs $pinned_arn) — the CA is no longer pointed at it, so this scenario would prove nothing"
+  [[ "$KMS_PUBKEY_SPKI_B64" != "$pinned_spki" ]] \
+    || die "the re-created key carries the SAME public key as the pinned one — no fault was injected and this scenario would prove nothing"
+
+  # Read after the restart so both counts are on the same log, whether the container was
+  # restarted or replaced.
+  local before_signs after_signs before_sessions out rc=0
+  before_signs="$(kms_sign_count)"
+  mint_admin_token
+  before_sessions="$(session_ids)"
+
+  out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo WRONGKEY_SHOULD_NOT_RUN')" || rc=$?
+  [[ $rc -ne 0 ]] || die "a session SUCCEEDED while KMS was signing with the WRONG key: $out"
+  grep -q WRONGKEY_SHOULD_NOT_RUN <<<"$out" && die "the command RAN while KMS was signing with the wrong key: $out"
+
+  # KMS was genuinely reached and genuinely signed — the refusal came from the verification,
+  # not from an unreachable key service. This is what makes the scenario distinct from
+  # assert_kms_fail_closed rather than a second copy of it.
+  after_signs="$(kms_await_count kms_sign_count $((before_signs + 1)))" \
+    || die "KMS was never asked to sign ($before_signs -> $after_signs) — the session failed before reaching it, so this run says nothing about the pinned-key check"
+
+  # LOAD-BEARING, unlike the same-shaped grep in assert_kms_fail_closed: there the container
+  # is stopped and the flat sign count independently proves KMS was never reached, so the log
+  # line only corroborates. Here the session genuinely fails AND KMS genuinely signs, so
+  # nothing else tells "the pinned-key check caught it" apart from "the session failed for an
+  # unrelated reason". The string is owned by ControlPlane's AwsKmsSigner and is known to
+  # drift; the message around it carries an account-redacted ARN
+  # (arn:aws:kms:<region>:***:key/<id>), so match the reason and never a full ARN. If this
+  # ever starts failing, re-read that class fresh before assuming the guard broke.
+  grep -q "returned signature does not verify against the pinned public key" "$WORKDIR/cp.log" \
+    || die "cp.log shows no pinned-key verification failure — the session failed, but this scenario cannot tell whether the guard caught it or something unrelated did"
+
+  mint_admin_token
+  local sid
+  sid="$(new_session_id "$before_sessions")"
+  [[ -n "$sid" ]] || die "the wrong-key attempt produced no new session to check for an issued certificate"
+  [[ "$(certificate_issued_for_session "$sid")" == no ]] \
+    || die "a certificate WAS issued for session $sid even though KMS signed with the wrong key"
+  ok "the wrong-key session was refused (KMS signed, $before_signs -> $after_signs; the pinned-key check rejected it; no certificate issued for session $sid)"
+
+  # Restoring is not optional: without a normal session immediately afterwards, "the session
+  # was refused" cannot be told apart from "the key swap broke the harness".
+  log "restoring KMS to a key the CA can be rotated onto, and proving a normal session still runs"
+  kms_create_key
+  adopt_session_ca_onto_kms
+  redistribute_trust_for_kms_ca
+  assert_kms_backed_session
+  ok "a normal session succeeded immediately after restoring KMS to a correctly-pinned key"
+}
+
+# The most important behavioural requirement of the KMS backend: an unreachable KMS must
+# NEVER fall back to local signing. The container is stopped outright, so the SDK gets a
+# connection refused rather than a slow timeout. A bare rc!=0 is not what this scenario
+# turns on — an ungranted login or a wrong node name produces one too — the two checks
+# below are, and each is judged against a party other than the ssh client: KMS's own
+# counter, which cannot move while its container is stopped, and whether a certificate was
+# actually issued for the session the attempt created (see certificate_issued_for_session;
+# NOT "did a recording appear", which happens regardless of the inner leg's outcome).
+assert_kms_fail_closed() {
+  log "stopping KMS; a NEW session on the KMS-backed CA must fail closed, never fall back to local"
+  local before_signs before_sessions out rc=0
+  before_signs="$(kms_sign_count)"
+  mint_admin_token
+  before_sessions="$(session_ids)"
+
+  docker stop "$KMS_CONTAINER" >/dev/null || die "could not stop the LocalStack KMS container"
+  # Snapshotted the instant it is stopped, because from here on nothing guarantees the
+  # container still exists: pruning stopped containers is routine, and it takes the request
+  # log — the thing this whole scenario is judged on — with it. Taken here, at a point where
+  # die() still ends the run, rather than lazily inside a counter, where a command
+  # substitution would swallow the exit.
+  KMS_LOG_SNAPSHOT="$WORKDIR/kms/localstack-at-stop.log"
+  docker logs "$KMS_CONTAINER" > "$KMS_LOG_SNAPSHOT" 2>&1 \
+    || die "could not snapshot KMS's request log before the fail-closed attempt — the counter below would have nothing to read"
+  [[ -s "$KMS_LOG_SNAPSHOT" ]] || die "the snapshotted KMS request log is empty"
+
+  out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo KMSDOWN_SHOULD_NOT_RUN')" || rc=$?
+  [[ $rc -ne 0 ]] || die "a session SUCCEEDED with KMS stopped (fail-OPEN): $out"
+  grep -q KMSDOWN_SHOULD_NOT_RUN <<<"$out" && die "the command RAN with KMS stopped — fail-open: $out"
+
+  # Load-bearing #1. `docker logs` keeps serving a stopped container's output, so this
+  # counter stays readable exactly when it matters most: any increase now would be
+  # impossible unless something other than this KMS produced a signature.
+  local after_signs
+  after_signs="$(kms_sign_count)"
+  [[ "$after_signs" -eq "$before_signs" ]] \
+    || die "KMS's sign count moved ($before_signs -> $after_signs) while its container was stopped — impossible unless something else is signing"
+
+  # Load-bearing #2: no certificate reached usable form for the new session, independent of
+  # KMS's own counter and of why the ssh client failed.
+  mint_admin_token
+  local sid
+  sid="$(new_session_id "$before_sessions")"
+  [[ -n "$sid" ]] || die "the KMS-down attempt produced no new session to check for an issued certificate"
+  [[ "$(certificate_issued_for_session "$sid")" == no ]] \
+    || die "a certificate WAS issued for session $sid even though KMS was stopped"
+
+  # Corroborating only: names the failure as KMS-specific rather than merely confirming the
+  # two checks above. Owned by ControlPlane's AwsKmsSigner, not by anything this repo
+  # controls, so when it moves, update the string rather than the shape of this check.
+  grep -q "KMS signing failed for key" "$WORKDIR/cp.log" \
+    || die "cp.log shows no KMS-specific signing failure (corroborating check) — the session failed, but not visibly for the KMS reason"
+  ok "with KMS stopped, the new session failed closed (rc=$rc); sign count unchanged ($before_signs); no certificate issued for session $sid; the Control Plane never fell back to local"
+
+  restore_kms_and_run_a_session
+}
+
+# Without this, "the session failed" cannot be told apart from "the harness broke", which
+# is the same reason the Key Vault leg restores its double and runs a session immediately
+# after faulting it.
+#
+# LocalStack community holds its keys in memory, so restarting the container necessarily
+# produces a DIFFERENT key: recovery here is a second adoption, which is also what the loss
+# of a real KMS key would force an operator to perform. Every assertion is the same
+# function the first adoption used, so a recovery that only half worked fails identically.
+restore_kms_and_run_a_session() {
+  log "restarting KMS and re-adopting: this leg has to end able to run a normal session, or the failure above proves nothing"
+  kms_restart_with_fresh_key
+  adopt_session_ca_onto_kms
+  redistribute_trust_for_kms_ca
+  assert_kms_backed_session
+  operator_flow_end
+  ok "KMS recovered: a fresh key was adopted over REST and a normal session ran on it"
 }
 
 # ── NFR-2: with the real CP DOWN, a new session must fail CLOSED — never fail-open. LAST case
@@ -1460,7 +1999,11 @@ $(printf '\033[32m========================================================\033[0
   Recording     : exported over REST and opened with the offline customer private key
   Key Vault     : session CA rotated onto $KEYVAULT_URL over REST; a second session was
                   signed there (fail-closed proven with the vault stopped)
-  Logs          : $WORKDIR/{cp,gateway}.log
+  AWS KMS       : session CA rotated on again, off Key Vault onto a key in LocalStack
+                  KMS at $KMS_ENDPOINT; a session ran on a certificate signed there;
+                  fail-closed proven with KMS stopped, then a fresh key adopted and a
+                  normal session proven on it ($KMS_KEY_ARN)
+  Logs          : $WORKDIR/{cp,gateway}.log, kms/kms.env
 EOF
 }
 
@@ -1490,6 +2033,8 @@ main() {
   build_artifacts
   start_infra
   start_keyvault_double      # before start_cp — the CP boots with azure.vault-uri already set
+  start_kms_localstack       # likewise: the CP boots with sessionlayer.ca.aws.* already set
+  assert_cp_refuses_insecure_kms_endpoint   # a boot that must fail, before the one that must not
   start_cp
 
   # ── the first install: every step below is an operator step, and the database is
@@ -1524,7 +2069,20 @@ main() {
   assert_keyvault_credential_flow
   operator_flow_end
 
-  assert_keyvault_fail_closed  # D-4 fail-closed — immediately before assert_cp_down
+  assert_keyvault_fail_closed  # D-4 fail-closed — the vault double stays down from here
+
+  # Rotate the session CA on again, to AWS KMS this time. The CA is on Key Vault when this
+  # starts, so this is a key-service-to-key-service rotation rather than local -> KMS —
+  # a stronger claim, since no signature below can be served by a database-held key.
+  assert_kms_endpoint_override_is_logged   # the redirect's only runtime trace
+  assert_kms_untouched_before_rotation
+  adopt_session_ca_onto_kms
+  redistribute_trust_for_kms_ca
+  assert_kms_backed_session
+  assert_kms_wrong_key_rejected  # the pinned-key check, at the real boundary, every run
+  operator_flow_end
+  assert_kms_fail_closed     # ends by restoring KMS and running a normal session
+
   assert_cp_down             # NFR-2 fail-closed — LAST (kills the CP)
   report
 }

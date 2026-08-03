@@ -198,7 +198,7 @@ adding one would be a Gateway code change outside this double's scope. The posit
 ("the session's certificate was signed in Key Vault") is proven by the vault's own sign
 count increasing. The negative claim ("no certificate was issued", needed by both
 `assert_keyvault_wrong_key_rejected` and `assert_keyvault_fail_closed`) is proven by
-`keyvault_certificate_issued_for_session` in `run.sh`: the absence of a `session.sign`
+`certificate_issued_for_session` in `run.sh`: the absence of a `session.sign`
 audit event with `outcome: success` for the specific new session, found by diffing
 `session_ids()` before/after the attempt.
 
@@ -218,7 +218,7 @@ or denied — `SessionCertificateService`'s error handling has explicit paths on
 `GatewayRequestException`/`NoSignerAvailable`, and an unmapped exception like a Key Vault
 signature-verification failure propagates without ever being audited. On a platform whose
 audit trail is a stated property, a CA signing failure that leaves no trace of itself is a
-real gap, not a rounding error. `keyvault_certificate_issued_for_session` checks for the
+real gap, not a rounding error. `certificate_issued_for_session` checks for the
 absence of a **success** event specifically, not the absence of any event, so it keeps
 working once that gap is closed and a denied event starts appearing where today there is
 nothing.

@@ -17,10 +17,23 @@ metadata:
   name: sessionlayer-gateway-config
   labels: { app.kubernetes.io/name: sessionlayer-gateway }
 data:
+  # `bootstrap` is optional in the config schema and absent means "already enrolled", so a
+  # manifest that omits it deploys a Gateway that can never obtain an identity and never
+  # says why. The three REPLACE_WITH_ values are what an operator substitutes: the token
+  # from `POST /v1/gateway-enrollment-tokens` (single-use, so it belongs in a Secret
+  # projected over this key rather than committed here), the name that token was minted
+  # for, and the path the CP trust anchor is mounted at. `server_name` must match the
+  # certificate the Control Plane presents, not merely the address dialled.
   gateway.json: |
     {
       "cp_mtls_endpoint": "https://controlplane.sessionlayer.svc:9443",
       "data_dir": "/var/lib/sessionlayer-gateway",
+      "bootstrap": {
+        "enrollment_token": "REPLACE_WITH_ENROLLMENT_TOKEN",
+        "ca_cert_path": "/etc/sessionlayer/ca.pem",
+        "gateway_name": "REPLACE_WITH_GATEWAY_NAME",
+        "server_name": "controlplane.sessionlayer.svc"
+      },
       "ssh": {
         "listen_addr": "0.0.0.0:2222",
         "host_key_path": "/var/lib/sessionlayer-gateway/host_ed25519",
@@ -67,6 +80,13 @@ spec:
       labels: { app.kubernetes.io/name: sessionlayer-gateway }
     spec:
       automountServiceAccountToken: false
+      # The drain budget is ha.drain.pre_drain_grace_secs (5) + deadline_secs (30) = 35s,
+      # during which the Gateway stops advertising ready, lets live sessions finish and
+      # finalizes their recordings. Kubernetes' 30s default SIGKILLs five seconds before
+      # that deadline, so the runbook's promise that recordings are finalized on a clean
+      # drain would be broken by the platform rather than by the code. Sized above the real
+      # budget with room for a slow WORM PUT; raise both together if the drain config moves.
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -81,6 +101,17 @@ spec:
           ports:
             - { name: ssh, containerPort: 2222 }
             - { name: agent, containerPort: 9444 }
+          # Without requests the Gateway lands in BestEffort and is the first thing the
+          # kubelet evicts under node memory pressure — which drops live sessions, since
+          # this is the process the session bytes flow through. Requests only: a CPU limit
+          # throttles the data path under exactly the load that earned it, and a memory
+          # limit turns a burst of concurrent sessions into an OOMKill mid-session. These
+          # are a scheduling and eviction-ranking floor, not a sizing exercise — size a
+          # real deployment from Capacity planning.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false # sets no_new_privs
             readOnlyRootFilesystem: true
@@ -112,6 +143,20 @@ spec:
           configMap: { name: sessionlayer-gateway-config }
         - name: tmp
           emptyDir: { medium: Memory }
+---
+# Without this, a drain of two nodes can evict both replicas at once and take the whole
+# data path with them — every live session, not merely a slower one, because the Gateway
+# is what carries the session bytes. Voluntary disruption only: a real outage still takes
+# what it takes, and the drain budget above is what makes each individual eviction clean.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sessionlayer-gateway
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: sessionlayer-gateway }
 ---
 apiVersion: v1
 kind: Service
