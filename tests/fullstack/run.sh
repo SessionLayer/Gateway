@@ -127,6 +127,9 @@ KMS_BASELINE_GETPUBKEY=0
 # Captured by adopt_session_ca_onto_kms before its operator phase opens (docker is
 # deliberately unavailable inside one) and compared by assert_kms_backed_session after.
 KMS_PUBKEYS_BEFORE_ADOPTION=0
+# Where the KMS request log is copied when the container is stopped, so the counters
+# survive the container being pruned out from under them (see kms_request_log).
+KMS_LOG_SNAPSHOT=""
 # WORKDIR is a shared, fixed path (by default): a second run's preflight (rm -rf
 # "$WORKDIR") can delete a prior run's logs before anyone reads them, on a box where
 # more than one of these runs. The suffix makes this path unique per run regardless of
@@ -177,7 +180,7 @@ preserve_evidence() {
   mkdir -p "$EVIDENCE_DIR" 2>/dev/null || return 0
   cp -p "$WORKDIR"/cp.log "$WORKDIR"/gateway.log "$EVIDENCE_DIR/" 2>/dev/null || true
   cp -p "$WORKDIR"/keyvault/requests.log "$WORKDIR"/keyvault/double.log "$EVIDENCE_DIR/" 2>/dev/null || true
-  cp -p "$WORKDIR"/kms/kms.env "$WORKDIR"/kms/cp-insecure-endpoint.log "$EVIDENCE_DIR/" 2>/dev/null || true
+  cp -p "$WORKDIR"/kms/kms.env "$WORKDIR"/kms/cp-insecure-endpoint.log "$WORKDIR"/kms/localstack-at-stop.log "$EVIDENCE_DIR/" 2>/dev/null || true
   # KMS's request log — the counter every assertion in that leg is judged against — lives
   # inside the container, so it has to be pulled out before teardown removes it. The
   # explicit PATH is not decoration: a die() inside a rest-only operator step leaves the
@@ -553,8 +556,10 @@ start_kms_localstack() {
   # The same scraping discipline the Key Vault double's KEY=value banner gets: the three
   # values every later assertion is judged against are written where the preserved
   # evidence keeps them, not left in a shell variable that dies with the run.
+  # Appended, not overwritten: a run that has to re-create the container adopts a second
+  # key, and which ARN each session was signed under is the point of keeping this at all.
   printf 'KMS_ENDPOINT=%s\nKMS_KEY_ARN=%s\nKMS_PUBKEY_SPKI_B64=%s\n' \
-    "$KMS_ENDPOINT" "$KMS_KEY_ARN" "$KMS_PUBKEY_SPKI_B64" > "$WORKDIR/kms/kms.env"
+    "$KMS_ENDPOINT" "$KMS_KEY_ARN" "$KMS_PUBKEY_SPKI_B64" >> "$WORKDIR/kms/kms.env"
   log "KMS_ENDPOINT=$KMS_ENDPOINT"
   log "KMS_KEY_ARN=$KMS_KEY_ARN"
   log "KMS_PUBKEY_SPKI_B64=$KMS_PUBKEY_SPKI_B64"
@@ -609,8 +614,16 @@ kms_create_key() {
 # independent counter assert_kms_fail_closed needs. The `=> 200` is not decoration: a
 # refused Sign (a wrong-length digest earns a ValidationException) logs the same operation
 # name with a 4xx, and counting it would read as a signature that never happened.
-kms_sign_count()           { docker logs "$KMS_CONTAINER" 2>&1 | grep -cE 'AWS kms\.Sign => 200' || true; }
-kms_get_public_key_count() { docker logs "$KMS_CONTAINER" 2>&1 | grep -cE 'AWS kms\.GetPublicKey => 200' || true; }
+#
+# A stopped container is not the same as a surviving one, though: pruning stopped
+# containers is routine on shared boxes and CI runners, and a pruned container serves no
+# log at all — every count would silently read zero, which is indistinguishable from "KMS
+# was never reached" and would turn the fail-closed scenario into a pass for the wrong
+# reason. assert_kms_fail_closed therefore snapshots the log to disk the moment it stops
+# the container, and these fall back to that snapshot.
+kms_request_log() { docker logs "$KMS_CONTAINER" 2>/dev/null || cat "${KMS_LOG_SNAPSHOT:-/dev/null}" 2>/dev/null; }
+kms_sign_count()           { kms_request_log | grep -cE 'AWS kms\.Sign => 200' || true; }
+kms_get_public_key_count() { kms_request_log | grep -cE 'AWS kms\.GetPublicKey => 200' || true; }
 
 # LocalStack appends its request-log line after the response is already on the wire, so a
 # count read the instant an API call returns can legitimately miss it. Poll to a deadline
@@ -1733,6 +1746,15 @@ assert_kms_fail_closed() {
   before_sessions="$(session_ids)"
 
   docker stop "$KMS_CONTAINER" >/dev/null || die "could not stop the LocalStack KMS container"
+  # Snapshotted the instant it is stopped, because from here on nothing guarantees the
+  # container still exists: pruning stopped containers is routine, and it takes the request
+  # log — the thing this whole scenario is judged on — with it. Taken here, at a point where
+  # die() still ends the run, rather than lazily inside a counter, where a command
+  # substitution would swallow the exit.
+  KMS_LOG_SNAPSHOT="$WORKDIR/kms/localstack-at-stop.log"
+  docker logs "$KMS_CONTAINER" > "$KMS_LOG_SNAPSHOT" 2>&1 \
+    || die "could not snapshot KMS's request log before the fail-closed attempt — the counter below would have nothing to read"
+  [[ -s "$KMS_LOG_SNAPSHOT" ]] || die "the snapshotted KMS request log is empty"
 
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo KMSDOWN_SHOULD_NOT_RUN')" || rc=$?
   [[ $rc -ne 0 ]] || die "a session SUCCEEDED with KMS stopped (fail-OPEN): $out"
@@ -1775,9 +1797,17 @@ assert_kms_fail_closed() {
 # function the first adoption used, so a recovery that only half worked fails identically.
 restore_kms_and_run_a_session() {
   log "restarting KMS and re-adopting: this leg has to end able to run a normal session, or the failure above proves nothing"
-  docker start "$KMS_CONTAINER" >/dev/null || die "could not restart the LocalStack KMS container"
-  kms_wait_ready
-  kms_create_key
+  if docker start "$KMS_CONTAINER" >/dev/null 2>&1; then
+    kms_wait_ready
+    kms_create_key
+  else
+    # `docker start` cannot revive a container that has been removed, and the one this
+    # scenario stopped is a prime candidate for a prune. Re-creating it reaches the same
+    # place: the recovery adopts a fresh key either way, because a restarted LocalStack has
+    # lost the old one regardless.
+    log "the stopped KMS container no longer exists — re-creating it"
+    start_kms_localstack
+  fi
   adopt_session_ca_onto_kms
   redistribute_trust_for_kms_ca
   assert_kms_backed_session
