@@ -29,7 +29,8 @@ real Gateway/Agent launch — the harness stands up itself.
 
 Ports default **high** and are all env-overridable, so a run coexists with a developer's
 already-running parent dev stack: `FS_PG_PORT` (55432), `FS_MINIO_PORT` (59000),
-`FS_CP_MTLS_PORT` (19443), `FS_CP_REST_PORT` (18080), `FS_GW_SSH_PORT` (12201). Scratch
+`FS_CP_MTLS_PORT` (19443), `FS_CP_REST_PORT` (18080), `FS_GW_SSH_PORT` (12201),
+`FS_KMS_PORT` (14566). Scratch
 lives in `SL_FS_WORKDIR` (`/tmp/sl-fullstack`) — a fixed, shared path, so a second run's
 `preflight` (`rm -rf "$WORKDIR"`) can delete a prior run's logs on a box where more than
 one of these runs. `cleanup` therefore copies `cp.log`, `gateway.log` and the Key Vault
@@ -67,6 +68,11 @@ in `/etc/hosts` if it is not already there, because the Key Vault double's TLS
 certificate and the real SDK's challenge-resource check both require it to be served
 from a hostname, never an IP — see `keyvault/README.md`. If `sudo -n` fails, the run
 dies naming that reason rather than silently degrading.
+
+The AWS KMS leg (row 14) needs no host tooling at all beyond `docker`: it runs
+`localstack/localstack:4` with `SERVICES=kms` and drives it with the `awslocal` bundled
+inside that image, so neither an AWS CLI nor an AWS account is involved. Set `KMS_IMAGE`
+to pin a different tag.
 
 ## The first install, and what the no-database guard actually proves
 
@@ -156,6 +162,8 @@ claimed here that `run.sh` does not assert would be worse than no table at all.
 | 12 | Wrong host key rejected (no TOFU) | referenced: `hostverify` + `inner_leg_it.rs` |
 | 13 | **Key Vault CA backend**: before rotation, the vault double receives zero requests despite the Control Plane booting fully configured for it (D-4's "configuring changes nothing until rotated", asserted, not just observed). The session CA is then rotated onto an Azure-Key-Vault-backed key over REST (no database credential; `POST /v1/cas/{id}/rotate`), authenticated via the App Service managed-identity credential (a real challenge/token round trip, verified to fetch the token exactly once), the CP is proven to be publishing the vault's own public key, trust is redistributed to the node, and a real session's certificate is signed there (the vault double's sign count increases). A session while the vault is signing with the WRONG key is refused and issues no certificate (D-2, checked via the absence of a successful `session.sign` audit event for that session — not "no recording appeared", which is created regardless of inner-leg outcome and was this scenario's own bug the first time it ran for real), and a normal session succeeds again immediately after restoring the double — a permanent scenario on every run, not a one-off manual exercise. With the vault stopped a new session fails closed by the same certificate-issuance check, with the vault's sign count staying flat as a second, independent signal — not by parsing the issued certificate (no seam puts one on disk without a Gateway code change) — and never falls back to `local` (D-4) | **LIVE (core)** — see the CI note below |
 
+| 14 | **AWS KMS CA backend**: the Control Plane refuses to start at all with a plaintext `endpoint-override` and no `allow-insecure-endpoint` (the real jar, booted once for that alone). Before rotation, KMS serves zero calls beyond the harness's own, despite the Control Plane booting fully configured for it. The session CA — by then on Key Vault — is rotated **on again** to a KMS-held key over REST with no database credential, the Control Plane is proven to publish the key KMS itself generated, trust is redistributed, and a real session's inner-leg certificate is signed there (KMS's own request log records the `Sign`; it recorded none before). With the KMS container stopped, a new session fails closed and issues no certificate, KMS's sign count staying flat as a second, independent signal — then KMS is restarted, a fresh key adopted and a normal session run, so "it failed" is distinguishable from "the harness broke" | **LIVE (core)** |
+
 Do not claim a row is LIVE unless `run.sh` asserts it.
 
 ### The Key Vault CA leg (row 13) depends on the Control Plane it is run against
@@ -175,6 +183,40 @@ Entra tenant. Resolved: `--sessionlayer.ca.azure.credential=managed-identity` ag
 double's own App Service managed-identity endpoint — no Control Plane code change, and
 the credential documented as the production recommendation. See `keyvault/README.md` for
 the verified transcript.
+
+### The AWS KMS CA leg (row 14) runs against LocalStack, not a double
+
+There is no hand-written KMS double in this repo. `localstack/localstack:4` performs real
+P-256 key generation and real ECDSA signing over the real AWS protocol, so the leg
+exercises the Control Plane's genuine SDK path — request signing, endpoint resolution, the
+credential chain, the DER `SEQUENCE{r,s}` response — rather than a double of our own
+interface. The key is created with the `awslocal` inside the container, and the ARN and
+SPKI it reports are what every later assertion is judged against.
+
+Three things about this leg are easy to get wrong:
+
+- **The counter is LocalStack's request log**, read with `docker logs` and matched as
+  `AWS kms.Sign => 200`. The `=> 200` is load-bearing: a refused `Sign` logs the same
+  operation name with a 4xx, and counting it would read as a signature that never
+  happened. `docker logs` keeps serving a **stopped** container's output, which is what
+  makes the counter usable in the fail-closed scenario. `start_kms_localstack` reads the
+  baseline through the same polling helper the assertions use, so a run where the log line
+  stops matching dies there naming it, instead of every later check silently counting zero.
+- **The port is fixed** (`FS_KMS_PORT`), unlike the Key Vault double's OS-assigned one.
+  The Control Plane's `endpoint-override` is bound at boot, and the fail-closed scenario
+  restarts the container — which is exactly when docker hands a `0` host port a different
+  number.
+- **Recovery is a second adoption, not a restart.** LocalStack community holds its keys in
+  memory, so a restarted container has lost the CA key; `restore_kms_and_run_a_session`
+  therefore creates a fresh key, rotates onto it and runs a real session, reusing the same
+  functions the first adoption used. That is also what the loss of a real KMS key would
+  force an operator to do.
+
+The rotation is deliberately sequenced **after** the Key Vault leg rather than instead of
+it: the session CA is already on Key Vault when this starts, so it is a
+key-service-to-key-service rotation and no signature in it can be served by a
+database-held private key. `assert_keyvault_fail_closed` has also stopped the vault double
+by then, so a session that runs at all here cannot have been vault-signed either.
 
 ## Cross-repo defects only this harness can surface
 
