@@ -198,10 +198,18 @@ Three things about this leg are easy to get wrong:
 - **The counter is LocalStack's request log**, read with `docker logs` and matched as
   `AWS kms.Sign => 200`. The `=> 200` is load-bearing: a refused `Sign` logs the same
   operation name with a 4xx, and counting it would read as a signature that never
-  happened. `docker logs` keeps serving a **stopped** container's output, which is what
-  makes the counter usable in the fail-closed scenario. `start_kms_localstack` reads the
-  baseline through the same polling helper the assertions use, so a run where the log line
-  stops matching dies there naming it, instead of every later check silently counting zero.
+  happened. `start_kms_localstack` reads the baseline through the same polling helper the
+  assertions use, so a run where the log line stops matching dies there naming it, instead
+  of every later check silently counting zero.
+- **A stopped container is not a surviving one.** `docker logs` keeps serving a stopped
+  container's output, but pruning stopped containers is routine on shared boxes and CI
+  runners, and a pruned container serves no log at all — every count would read zero,
+  which is indistinguishable from "KMS was never reached" and would turn the fail-closed
+  scenario into a pass for the wrong reason. `assert_kms_fail_closed` therefore snapshots
+  the log to disk the moment it stops the container and the counters fall back to that
+  snapshot, and the recovery re-creates the container when it cannot be restarted. Both
+  paths are exercised: the snapshot fallback was checked by pruning the container out from
+  under a live harness and confirming the counter still read its true value.
 - **The port is fixed** (`FS_KMS_PORT`), unlike the Key Vault double's OS-assigned one.
   The Control Plane's `endpoint-override` is bound at boot, and the fail-closed scenario
   restarts the container — which is exactly when docker hands a `0` host port a different
