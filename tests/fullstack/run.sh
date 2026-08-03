@@ -556,13 +556,6 @@ start_kms_localstack() {
   # The same scraping discipline the Key Vault double's KEY=value banner gets: the three
   # values every later assertion is judged against are written where the preserved
   # evidence keeps them, not left in a shell variable that dies with the run.
-  # Appended, not overwritten: a run that has to re-create the container adopts a second
-  # key, and which ARN each session was signed under is the point of keeping this at all.
-  printf 'KMS_ENDPOINT=%s\nKMS_KEY_ARN=%s\nKMS_PUBKEY_SPKI_B64=%s\n' \
-    "$KMS_ENDPOINT" "$KMS_KEY_ARN" "$KMS_PUBKEY_SPKI_B64" >> "$WORKDIR/kms/kms.env"
-  log "KMS_ENDPOINT=$KMS_ENDPOINT"
-  log "KMS_KEY_ARN=$KMS_KEY_ARN"
-  log "KMS_PUBKEY_SPKI_B64=$KMS_PUBKEY_SPKI_B64"
   ok "LocalStack KMS up with a P-256 SIGN_VERIFY CA key ($KMS_BASELINE_GETPUBKEY GetPublicKey baseline, all the harness's own)"
 }
 
@@ -607,6 +600,29 @@ kms_create_key() {
   # here would surface as a confusing rotation failure rather than as what it is.
   [[ "$KMS_KEY_ARN" == "arn:aws:kms:$KMS_REGION:$KMS_ACCOUNT_ID:key/"* ]] \
     || die "the created key's ARN is outside the region/account the Control Plane is anchored to: $KMS_KEY_ARN"
+  # The same scraping discipline the Key Vault double's KEY=value banner gets, written from
+  # here rather than from the caller so that EVERY key this run adopts is recorded: a run
+  # that recovers from a KMS outage adopts a second one, and which ARN each session was
+  # signed under is the whole point of keeping this.
+  printf 'KMS_ENDPOINT=%s\nKMS_KEY_ARN=%s\nKMS_PUBKEY_SPKI_B64=%s\n' \
+    "$KMS_ENDPOINT" "$KMS_KEY_ARN" "$KMS_PUBKEY_SPKI_B64" >> "$WORKDIR/kms/kms.env"
+  log "KMS_ENDPOINT=$KMS_ENDPOINT"
+  log "KMS_KEY_ARN=$KMS_KEY_ARN"
+  log "KMS_PUBKEY_SPKI_B64=$KMS_PUBKEY_SPKI_B64"
+}
+
+# `docker start` cannot revive a container that has been removed, and the one
+# assert_kms_fail_closed stopped is a prime candidate for a prune. Both branches reach the
+# same place: a restarted LocalStack has lost its keys either way, so the caller re-adopts
+# regardless of which one ran.
+kms_restart_with_fresh_key() {
+  if docker start "$KMS_CONTAINER" >/dev/null 2>&1; then
+    kms_wait_ready
+    kms_create_key
+    return
+  fi
+  log "the stopped KMS container no longer exists — re-creating it"
+  start_kms_localstack
 }
 
 # LocalStack logs one line per AWS API call it serves, and `docker logs` keeps serving
@@ -1797,17 +1813,7 @@ assert_kms_fail_closed() {
 # function the first adoption used, so a recovery that only half worked fails identically.
 restore_kms_and_run_a_session() {
   log "restarting KMS and re-adopting: this leg has to end able to run a normal session, or the failure above proves nothing"
-  if docker start "$KMS_CONTAINER" >/dev/null 2>&1; then
-    kms_wait_ready
-    kms_create_key
-  else
-    # `docker start` cannot revive a container that has been removed, and the one this
-    # scenario stopped is a prime candidate for a prune. Re-creating it reaches the same
-    # place: the recovery adopts a fresh key either way, because a restarted LocalStack has
-    # lost the old one regardless.
-    log "the stopped KMS container no longer exists — re-creating it"
-    start_kms_localstack
-  fi
+  kms_restart_with_fresh_key
   adopt_session_ca_onto_kms
   redistribute_trust_for_kms_ca
   assert_kms_backed_session
