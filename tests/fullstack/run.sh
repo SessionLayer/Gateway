@@ -645,7 +645,7 @@ assert_cp_refuses_insecure_kms_endpoint() {
   SPRING_FLYWAY_URL="jdbc:postgresql://localhost:${FS_PG_PORT}/sessionlayer" \
   SPRING_FLYWAY_USER="sessionlayer" SPRING_FLYWAY_PASSWORD="sessionlayer" \
   AWS_ACCESS_KEY_ID="$KMS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$KMS_SECRET_ACCESS_KEY" AWS_REGION="$KMS_REGION" \
-    timeout 180 java -jar "$CP_JAR" \
+    timeout "$WAIT_SECS" java -jar "$CP_JAR" \
       --sessionlayer.ca.aws.enabled=true \
       --sessionlayer.ca.aws.region="$KMS_REGION" \
       --sessionlayer.ca.aws.account-id="$KMS_ACCOUNT_ID" \
@@ -1816,9 +1816,10 @@ $(printf '\033[32m========================================================\033[0
   Recording     : exported over REST and opened with the offline customer private key
   Key Vault     : session CA rotated onto $KEYVAULT_URL over REST; a second session was
                   signed there (fail-closed proven with the vault stopped)
-  AWS KMS       : session CA rotated on again, off Key Vault onto $KMS_KEY_ARN
-                  (LocalStack at $KMS_ENDPOINT); a session ran on a certificate signed
-                  there, fail-closed proven with KMS stopped, and recovery re-adopted
+  AWS KMS       : session CA rotated on again, off Key Vault onto a key in LocalStack
+                  KMS at $KMS_ENDPOINT; a session ran on a certificate signed there;
+                  fail-closed proven with KMS stopped, then a fresh key adopted and a
+                  normal session proven on it ($KMS_KEY_ARN)
   Logs          : $WORKDIR/{cp,gateway}.log, kms/kms.env
 EOF
 }
