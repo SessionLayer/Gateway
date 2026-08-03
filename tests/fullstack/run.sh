@@ -534,17 +534,7 @@ start_keyvault_double() {
 start_kms_localstack() {
   log "starting LocalStack KMS on 127.0.0.1:$FS_KMS_PORT (real P-256 key generation, real ECDSA signing, real AWS protocol)"
   mkdir -p "$WORKDIR/kms"
-  docker rm -f "$KMS_CONTAINER" >/dev/null 2>&1 || true
-  # DNS_ADDRESS=0 / SKIP_SSL_CERT_DOWNLOAD=1 / DISABLE_EVENTS=1 turn off the three things
-  # LocalStack does on startup that reach the internet: its own DNS server, a certificate
-  # fetch from api.localstack.cloud, and telemetry. None is used by anything here, and on a
-  # host that cannot resolve those names they do not fail fast — startup went from 12
-  # seconds to over seven minutes waiting on them, which reads as a hung container rather
-  # than as a network the test was never entitled to.
-  docker run -d --name "$KMS_CONTAINER" -p "127.0.0.1:${FS_KMS_PORT}:4566" \
-    -e SERVICES=kms -e DNS_ADDRESS=0 -e SKIP_SSL_CERT_DOWNLOAD=1 -e DISABLE_EVENTS=1 \
-    "$KMS_IMAGE" >/dev/null \
-    || die "could not start the LocalStack KMS container ($KMS_IMAGE) on 127.0.0.1:$FS_KMS_PORT"
+  kms_run_container
   kms_wait_ready
   kms_create_key
   # Reading the baseline through kms_await_count also proves the counter mechanism itself
@@ -557,6 +547,30 @@ start_kms_localstack() {
   # values every later assertion is judged against are written where the preserved
   # evidence keeps them, not left in a shell variable that dies with the run.
   ok "LocalStack KMS up with a P-256 SIGN_VERIFY CA key ($KMS_BASELINE_GETPUBKEY GetPublicKey baseline, all the harness's own)"
+}
+
+kms_run_container() {
+  docker rm -f "$KMS_CONTAINER" >/dev/null 2>&1 || true
+  # DNS_ADDRESS=0 / SKIP_SSL_CERT_DOWNLOAD=1 / DISABLE_EVENTS=1 turn off the three things
+  # LocalStack does on startup that reach the internet: its own DNS server, a certificate
+  # fetch from api.localstack.cloud, and telemetry. None is used by anything here, and on a
+  # host that cannot resolve those names they do not fail fast — startup went from 12
+  # seconds to over seven minutes waiting on them, which reads as a hung container rather
+  # than as a network the test was never entitled to.
+  docker run -d --name "$KMS_CONTAINER" -p "127.0.0.1:${FS_KMS_PORT}:4566" \
+    -e SERVICES=kms -e DNS_ADDRESS=0 -e SKIP_SSL_CERT_DOWNLOAD=1 -e DISABLE_EVENTS=1 \
+    "$KMS_IMAGE" >/dev/null \
+    || die "could not start the LocalStack KMS container ($KMS_IMAGE) on 127.0.0.1:$FS_KMS_PORT"
+}
+
+# Bring KMS back after a deliberate stop. `docker start` cannot revive a container that has
+# been removed, and one stopped on purpose is a prime candidate for a prune, so a fresh
+# container is the fallback. Either way the caller must re-create its key: a restarted
+# LocalStack has lost every key it was holding.
+kms_restart() {
+  docker start "$KMS_CONTAINER" >/dev/null 2>&1 \
+    || { log "the stopped KMS container no longer exists — re-creating it"; kms_run_container; }
+  kms_wait_ready
 }
 
 # Readiness is LocalStack's own health endpoint reporting the service, never a sleep: the
@@ -584,10 +598,14 @@ except Exception:
 # needed on the host or the CI runner. Sets the two values the whole leg is judged
 # against: the ARN, which is what the CA's key_reference must be, and the SPKI, which is
 # what the Control Plane must independently end up publishing as the session CA.
-kms_create_key() {
-  local created public
+#
+# $1, when given, forces the new key's id via LocalStack's `_custom_id_` tag, which is how
+# assert_kms_wrong_key_rejected makes one ARN resolve to a second, unrelated keypair.
+kms_create_key() {  # [$1 = key id to force]
+  local created public tag=()
+  [[ -n "${1:-}" ]] && tag=(--tags "TagKey=_custom_id_,TagValue=$1")
   created="$(docker exec -e AWS_DEFAULT_REGION="$KMS_REGION" "$KMS_CONTAINER" \
-    awslocal kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY 2>&1)" \
+    awslocal kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY "${tag[@]}" 2>&1)" \
     || die "kms create-key failed: $created"
   KMS_KEY_ARN="$(printf %s "$created" | python3 -c 'import json,sys;print(json.load(sys.stdin)["KeyMetadata"]["Arn"])')" \
     || die "could not read a key ARN out of the create-key response: $created"
@@ -616,13 +634,8 @@ kms_create_key() {
 # same place: a restarted LocalStack has lost its keys either way, so the caller re-adopts
 # regardless of which one ran.
 kms_restart_with_fresh_key() {
-  if docker start "$KMS_CONTAINER" >/dev/null 2>&1; then
-    kms_wait_ready
-    kms_create_key
-    return
-  fi
-  log "the stopped KMS container no longer exists — re-creating it"
-  start_kms_localstack
+  kms_restart
+  kms_create_key
 }
 
 # LocalStack logs one line per AWS API call it serves, and `docker logs` keeps serving
@@ -1754,6 +1767,91 @@ assert_kms_backed_session() {
   ok "KMS-backed session ran on the real node; KMS's sign count increased ($before -> $after) and its adoption read is recorded ($KMS_PUBKEYS_BEFORE_ADOPTION -> $pubkeys)"
 }
 
+# The guard the whole backend rests on: every signature KMS returns is verified locally
+# against the pinned public key before it is trusted, which is what turns "the KMS key is
+# pinned" from a documented intent into an enforced one. A permanent scenario, run every
+# time, so it is proven at the real network and JVM boundary rather than by a unit test
+# over a mocked client — the Azure backend's equivalent is permanent for the same reason,
+# and the two guards protect the same property.
+#
+# The fault is injected with LocalStack's `_custom_id_` tag: the pinned ARN is re-created
+# from a DIFFERENT keypair, so the reference the CA is anchored to resolves, and answers,
+# and signs — with the wrong key. Against real KMS this is the shape an alias repoint
+# produces, which is why the key-reference grammar refuses aliases outright; here it is the
+# nearest faithful reproduction, because KMS asymmetric key material never rotates in place.
+#
+# Note what is deliberately NOT the discriminator. The session fails, but so does an
+# ungranted login. KMS is reached and does sign, so an unchanged sign count would prove
+# nothing either — the count going UP is what separates this from the unreachable case
+# below. What identifies the pinned-key check as the thing that refused is the cp.log grep,
+# and here that grep is load-bearing rather than corroborating.
+assert_kms_wrong_key_rejected() {
+  log "flipping the pinned KMS ARN onto different key material; a NEW session must be refused and no certificate issued"
+  local pinned_arn="$KMS_KEY_ARN" pinned_spki="$KMS_PUBKEY_SPKI_B64" key_id="${KMS_KEY_ARN##*/}"
+
+  # Stopping is how LocalStack is made to forget the real key so the ARN can be rebuilt on
+  # top of it; the snapshot is taken for the same reason it is in assert_kms_fail_closed,
+  # since the container is a prune candidate for as long as it is down.
+  docker stop "$KMS_CONTAINER" >/dev/null || die "could not stop KMS to swap the key material"
+  KMS_LOG_SNAPSHOT="$WORKDIR/kms/localstack-at-keyswap.log"
+  docker logs "$KMS_CONTAINER" > "$KMS_LOG_SNAPSHOT" 2>&1 \
+    || die "could not snapshot KMS's request log before swapping the key material"
+  kms_restart
+  kms_create_key "$key_id"
+
+  # Prove the injection actually injected. If LocalStack ever returned the same ARN with the
+  # same material, every assertion below would pass while testing nothing at all.
+  [[ "$KMS_KEY_ARN" == "$pinned_arn" ]] \
+    || die "the impostor key did not take the pinned ARN ($KMS_KEY_ARN vs $pinned_arn) — the CA is no longer pointed at it, so this scenario would prove nothing"
+  [[ "$KMS_PUBKEY_SPKI_B64" != "$pinned_spki" ]] \
+    || die "the re-created key carries the SAME public key as the pinned one — no fault was injected and this scenario would prove nothing"
+
+  # Read after the restart so both counts are on the same log, whether the container was
+  # restarted or replaced.
+  local before_signs after_signs before_sessions out rc=0
+  before_signs="$(kms_sign_count)"
+  mint_admin_token
+  before_sessions="$(session_ids)"
+
+  out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo WRONGKEY_SHOULD_NOT_RUN')" || rc=$?
+  [[ $rc -ne 0 ]] || die "a session SUCCEEDED while KMS was signing with the WRONG key: $out"
+  grep -q WRONGKEY_SHOULD_NOT_RUN <<<"$out" && die "the command RAN while KMS was signing with the wrong key: $out"
+
+  # KMS was genuinely reached and genuinely signed — the refusal came from the verification,
+  # not from an unreachable key service. This is what makes the scenario distinct from
+  # assert_kms_fail_closed rather than a second copy of it.
+  after_signs="$(kms_await_count kms_sign_count $((before_signs + 1)))" \
+    || die "KMS was never asked to sign ($before_signs -> $after_signs) — the session failed before reaching it, so this run says nothing about the pinned-key check"
+
+  # LOAD-BEARING, unlike the same-shaped grep in assert_kms_fail_closed: there the container
+  # is stopped and the flat sign count independently proves KMS was never reached, so the log
+  # line only corroborates. Here the session genuinely fails AND KMS genuinely signs, so
+  # nothing else tells "the pinned-key check caught it" apart from "the session failed for an
+  # unrelated reason". The string is owned by ControlPlane's AwsKmsSigner and is known to
+  # drift; the message around it carries an account-redacted ARN
+  # (arn:aws:kms:<region>:***:key/<id>), so match the reason and never a full ARN. If this
+  # ever starts failing, re-read that class fresh before assuming the guard broke.
+  grep -q "returned signature does not verify against the pinned public key" "$WORKDIR/cp.log" \
+    || die "cp.log shows no pinned-key verification failure — the session failed, but this scenario cannot tell whether the guard caught it or something unrelated did"
+
+  mint_admin_token
+  local sid
+  sid="$(new_session_id "$before_sessions")"
+  [[ -n "$sid" ]] || die "the wrong-key attempt produced no new session to check for an issued certificate"
+  [[ "$(certificate_issued_for_session "$sid")" == no ]] \
+    || die "a certificate WAS issued for session $sid even though KMS signed with the wrong key"
+  ok "the wrong-key session was refused (KMS signed, $before_signs -> $after_signs; the pinned-key check rejected it; no certificate issued for session $sid)"
+
+  # Restoring is not optional: without a normal session immediately afterwards, "the session
+  # was refused" cannot be told apart from "the key swap broke the harness".
+  log "restoring KMS to a key the CA can be rotated onto, and proving a normal session still runs"
+  kms_create_key
+  adopt_session_ca_onto_kms
+  redistribute_trust_for_kms_ca
+  assert_kms_backed_session
+  ok "a normal session succeeded immediately after restoring KMS to a correctly-pinned key"
+}
+
 # The most important behavioural requirement of the KMS backend: an unreachable KMS must
 # NEVER fall back to local signing. The container is stopped outright, so the SDK gets a
 # connection refused rather than a slow timeout. A bare rc!=0 is not what this scenario
@@ -1939,6 +2037,7 @@ main() {
   adopt_session_ca_onto_kms
   redistribute_trust_for_kms_ca
   assert_kms_backed_session
+  assert_kms_wrong_key_rejected  # the pinned-key check, at the real boundary, every run
   operator_flow_end
   assert_kms_fail_closed     # ends by restoring KMS and running a normal session
 
