@@ -532,7 +532,15 @@ start_kms_localstack() {
   log "starting LocalStack KMS on 127.0.0.1:$FS_KMS_PORT (real P-256 key generation, real ECDSA signing, real AWS protocol)"
   mkdir -p "$WORKDIR/kms"
   docker rm -f "$KMS_CONTAINER" >/dev/null 2>&1 || true
-  docker run -d --name "$KMS_CONTAINER" -p "127.0.0.1:${FS_KMS_PORT}:4566" -e SERVICES=kms "$KMS_IMAGE" >/dev/null \
+  # DNS_ADDRESS=0 / SKIP_SSL_CERT_DOWNLOAD=1 / DISABLE_EVENTS=1 turn off the three things
+  # LocalStack does on startup that reach the internet: its own DNS server, a certificate
+  # fetch from api.localstack.cloud, and telemetry. None is used by anything here, and on a
+  # host that cannot resolve those names they do not fail fast — startup went from 12
+  # seconds to over seven minutes waiting on them, which reads as a hung container rather
+  # than as a network the test was never entitled to.
+  docker run -d --name "$KMS_CONTAINER" -p "127.0.0.1:${FS_KMS_PORT}:4566" \
+    -e SERVICES=kms -e DNS_ADDRESS=0 -e SKIP_SSL_CERT_DOWNLOAD=1 -e DISABLE_EVENTS=1 \
+    "$KMS_IMAGE" >/dev/null \
     || die "could not start the LocalStack KMS container ($KMS_IMAGE) on 127.0.0.1:$FS_KMS_PORT"
   kms_wait_ready
   kms_create_key
@@ -559,7 +567,7 @@ start_kms_localstack() {
 # and `running` is what it becomes after the first call, so a restart mid-run satisfies
 # either.
 kms_wait_ready() {
-  local deadline=$((SECONDS + 180)) state=""
+  local deadline=$((SECONDS + WAIT_SECS)) state=""
   until state="$(curl -s "$KMS_ENDPOINT/_localstack/health" 2>/dev/null | python3 -c '
 import json, sys
 try:
