@@ -261,6 +261,30 @@ jobs:
           [ "$maps" = 0 ] \
             || { echo "::error::this chart renders $maps ConfigMap(s); the config carries a bearer token and must stay in a Secret"; exit 1; }
 
+          # One release is one Gateway, and nothing else in this job would
+          # notice the Deployment asking for more.
+          grep -q '^  replicas: 1$' "$RUNNER_TEMP/production-values.rendered.yaml" \
+            || { echo "::error::the production path does not render a single replica"; exit 1; }
+
+          # ssh.sourceIpAllowlist is the one control this chart will not render
+          # without, and Kubernetes' Cluster policy SNATs the client address to
+          # a node address before the Gateway ever sees it, which leaves the
+          # allowlist filtering on the wrong thing.
+          grep -q '^  externalTrafficPolicy: Local$' "$RUNNER_TEMP/production-values.rendered.yaml" \
+            || { echo "::error::the LoadBalancer Service does not preserve the client address"; exit 1; }
+          # The same field is rejected by the API server on a ClusterIP
+          # Service, and kubeconform validates against a schema that permits it.
+          if helm template chart-ci "$CHART" -f "$CHART"/ci/production-values.yaml \
+               --set service.type=ClusterIP | grep -q 'externalTrafficPolicy'; then
+            echo "::error::externalTrafficPolicy rendered onto a ClusterIP Service, which the API server refuses"
+            exit 1
+          fi
+
+          # The other way to recover the client address, which has to reach the
+          # Gateway's own config to do anything at all.
+          grep -q '"lb_cidrs"' "$RUNNER_TEMP/rendered-config-values.rendered.yaml" \
+            || { echo "::error::ssh.proxy.lbCidrs did not reach the rendered gateway.json"; exit 1; }
+
           # image.digest must win over image.tag, or pinning by digest is
           # decoration. Both are set here, and only one may survive.
           ref=$(helm template chart-ci "$CHART" -f "$CHART"/ci/production-values.yaml \
@@ -342,28 +366,41 @@ jobs:
           refuse "not above the drain budget" \
             helm template chart-ci "$CHART" -f "$rendered" --set ha.drain.deadlineSecs=60
 
+          # One release is one Gateway. Both replica counts above 1 were
+          # rendering happily until today: the token is single-use, so the
+          # second pod's enrollment is refused and it crash-loops. The
+          # production path is the one that has to be asserted, since that is
+          # where an operator sets a replica count and the chart can see least.
+          refuse "one release deploys one Gateway" \
+            helm template chart-ci "$CHART" -f "$prod" --set replicaCount=2
+          refuse "one release deploys one Gateway" \
+            helm template chart-ci "$CHART" -f "$rendered" --set replicaCount=3
+
           # The budget guard, over every input path. --set yields an int64 where a
           # values file yields a float64 and a percentage yields a string, and a
-          # guard written against one of those is blind to the others.
+          # guard written against one of those is blind to the others. The
+          # budget is off by default, so each of these turns it on: an
+          # assertion that a disabled template refuses nothing proves nothing.
+          pdb="--set podDisruptionBudget.enabled=true"
           refuse "is not below replicaCount" \
-            helm template chart-ci "$CHART" -f "$prod" --set podDisruptionBudget.minAvailable=99
-          # Kubernetes rounds a minAvailable percentage UP, so with 2 replicas
-          # the budget is already unsatisfiable at 51%, long before 100%.
+            helm template chart-ci "$CHART" -f "$prod" $pdb --set podDisruptionBudget.minAvailable=99
+          # Kubernetes rounds a minAvailable percentage UP, so at one replica
+          # every budget above 0% demands the only pod.
           refuse "leaves no room" \
-            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=100%'
+            helm template chart-ci "$CHART" -f "$prod" $pdb --set 'podDisruptionBudget.minAvailable=100%'
           refuse "leaves no room" \
-            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=51%'
+            helm template chart-ci "$CHART" -f "$prod" $pdb --set 'podDisruptionBudget.minAvailable=1%'
           refuse "neither a pod count nor a percentage" \
-            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=abc'
+            helm template chart-ci "$CHART" -f "$prod" $pdb --set 'podDisruptionBudget.minAvailable=abc'
           refuse "cannot be negative" \
-            helm template chart-ci "$CHART" -f "$prod" --set podDisruptionBudget.minAvailable=-1
+            helm template chart-ci "$CHART" -f "$prod" $pdb --set podDisruptionBudget.minAvailable=-1
 
           # The other direction. Without these, a guard that refused every value
           # would satisfy every refusal assertion above it.
-          renders "the largest percentage that still leaves room (50% of 2)" \
-            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=50%'
-          renders "a count below replicaCount" \
-            helm template chart-ci "$CHART" -f "$prod" --set podDisruptionBudget.minAvailable=1
+          renders "the only budget one replica can hold that still lets a drain finish" \
+            helm template chart-ci "$CHART" -f "$prod" $pdb --set podDisruptionBudget.minAvailable=0
+          renders "the same budget as a percentage" \
+            helm template chart-ci "$CHART" -f "$prod" $pdb --set 'podDisruptionBudget.minAvailable=0%'
 
           # values.schema.json must reject a malformed values file rather than
           # rendering something surprising.

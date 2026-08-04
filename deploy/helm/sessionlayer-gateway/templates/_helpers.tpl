@@ -90,6 +90,7 @@ whole file in a Secret of their own.
       "listen_addr" (printf "0.0.0.0:%d" (int .Values.ssh.listenPort))
       "host_key_path" .Values.ssh.hostKeyPath
       "source_ip_allowlist" .Values.ssh.sourceIpAllowlist
+      "proxy" (dict "lb_cidrs" .Values.ssh.proxy.lbCidrs)
       "agent" (dict
         "listen_addr" (printf "0.0.0.0:%d" (int .Values.ssh.agent.listenPort))
         "advertise_url" (include "sessionlayer-gateway.agentAdvertiseUrl" .))

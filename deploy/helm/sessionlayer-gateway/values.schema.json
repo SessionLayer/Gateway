@@ -79,6 +79,13 @@
         "listenPort": { "$ref": "#/definitions/port" },
         "hostKeyPath": { "type": "string", "pattern": "^/" },
         "sourceIpAllowlist": { "$ref": "#/definitions/cidrList" },
+        "proxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "lbCidrs": { "$ref": "#/definitions/cidrList" }
+          }
+        },
         "agent": {
           "type": "object",
           "additionalProperties": false,

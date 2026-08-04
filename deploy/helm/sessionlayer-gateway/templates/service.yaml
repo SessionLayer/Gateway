@@ -10,8 +10,9 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.service.type }}
-  {{- with .Values.service.externalTrafficPolicy }}
-  externalTrafficPolicy: {{ . }}
+  {{- /* Kubernetes rejects this field on a ClusterIP Service. */}}
+  {{- if and .Values.service.externalTrafficPolicy (ne .Values.service.type "ClusterIP") }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
   {{- end }}
   {{- with .Values.service.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:

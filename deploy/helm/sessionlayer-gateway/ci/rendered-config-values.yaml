@@ -27,6 +27,11 @@ ssh:
   listenPort: 2222
   sourceIpAllowlist:
     - 10.0.0.0/8
+  # The load balancer in front of this Gateway sends PROXY protocol v2, so the
+  # allowlist above compares against the client's own address.
+  proxy:
+    lbCidrs:
+      - 10.99.0.0/16
   agent:
     listenPort: 9444
     advertiseUrl: "wss://gw-a.example.com:9444"

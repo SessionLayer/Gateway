@@ -1,7 +1,7 @@
 # sessionlayer-gateway
 
-Deploys the SessionLayer Gateway as a Deployment, Service, Secret,
-ServiceAccount, PodDisruptionBudget and NetworkPolicy. The chart is a
+Deploys one Gateway as a Deployment, Service, Secret, ServiceAccount and
+NetworkPolicy, with an optional PodDisruptionBudget. The chart is a
 translation of `deploy/kubernetes/gateway.yaml` and
 `deploy/kubernetes/networkpolicy.yaml`; those manifests remain the reference
 for a deployment that does not use Helm.
@@ -87,8 +87,8 @@ schema-checked against.
 | `bootstrap.enabled` with no `gatewayName` | Identity in HA follows the Gateway's name. |
 | `bootstrap.enabled` with no `trustAnchor.existingConfigMap` | The Gateway pins the Control Plane's CA and performs no trust-on-first-use. |
 | `terminationGracePeriodSeconds` at or below the drain budget | The kubelet would SIGKILL mid-drain, and live sessions would lose their finalized recordings. |
-| `persistence.enabled` with more than one replica | The replicas would share one data dir. Each Gateway holds its own identity and generation counter, and a shared one reads to the Control Plane as a clone, which auto-locks it. |
-| `podDisruptionBudget.minAvailable` not below `replicaCount` | Such a budget refuses every voluntary eviction and hangs a node drain. |
+| `replicaCount` above 1 | One release deploys one Gateway. Every pod reads the same configuration, so they enroll with the same single-use token and all but the first crash-loop on `UNAUTHENTICATED`; with `persistence.enabled` they instead share one data dir, and one identity used twice reads to the Control Plane as a clone, which auto-locks it. |
+| `podDisruptionBudget.minAvailable` not below `replicaCount` | Such a budget refuses every voluntary eviction and hangs a node drain. At one replica that is every budget above 0. |
 
 ## Values
 
@@ -124,27 +124,53 @@ schema-checked against.
 |---|---|---|
 | `ssh.listenPort` | `2222` | uid 65532 cannot bind 22, so the container listens high and the Service maps 22 onto it. Nothing in the pod ever needs a privileged bind. For a bind-22 host deployment use `deploy/systemd/`, which drops privileges in-process after the bind. |
 | `ssh.hostKeyPath` | `/var/lib/sessionlayer-gateway/host_ed25519` | |
-| `ssh.sourceIpAllowlist` | `[]` | Required non-empty. |
+| `ssh.sourceIpAllowlist` | `[]` | Required non-empty. Compared against the address the Gateway sees, which is the client's only where the path preserves it. See below. |
+| `ssh.proxy.lbCidrs` | `[]` | The load balancer's own ranges, which turns PROXY protocol v2 on. See below. |
 | `ssh.agent.listenPort` | `9444` | Where Agents dial in and peer Gateways relay bytes. |
 | `ssh.agent.advertiseUrl` | `""` | Empty derives the in-cluster Service address, which is right only when your nodes are in this cluster. A fleet outside it needs the load balancer's address. |
 | `service.type` | `LoadBalancer` | |
 | `service.sshPort` | `22` | |
 | `service.agentPort` | `9444` | |
 | `service.loadBalancerSourceRanges` | `[]` | Narrows the front door at the load balancer as well as at the in-process source-IP gate. |
-| `service.externalTrafficPolicy` | `""` | |
+| `service.externalTrafficPolicy` | `Local` | Keeps the client's address. Omitted from a `ClusterIP` Service, which Kubernetes refuses the field on. See below. |
+
+#### What the source-IP allowlist compares against
+
+`ssh.sourceIpAllowlist` is the one control this chart refuses to render without,
+and three things decide whether it reads a client address or something else:
+
+| Path in | What the Gateway sees | What to set |
+|---|---|---|
+| `LoadBalancer` Service, `externalTrafficPolicy: Local` | the client's address | the default |
+| `LoadBalancer` Service, `externalTrafficPolicy: Cluster` | a node's address, because kube-proxy SNATs when it forwards to another node | `Local`, or PROXY v2 below |
+| any load balancer sending PROXY protocol v2 | the client's address from the v2 header | `ssh.proxy.lbCidrs` to that load balancer's ranges, and PROXY v2 enabled on it |
+
+`Local` costs you the health check on nodes with no pod, which is how a load
+balancer learns where to send traffic. A load balancer that targets pods
+directly rather than node ports keeps the client address under either policy.
+
+`ssh.proxy.lbCidrs` is fail-closed in both directions: a connection from one of
+those ranges must carry a PROXY v2 header or it is dropped, and a connection
+from outside them is dropped, so nothing reaches the SSH banner by going around
+the load balancer. Leave it empty and PROXY is off, which is right when nothing
+in front of the Gateway rewrites the address.
+
+The install notes name this combination when the rendered topology defeats the
+allowlist.
 
 ### High availability
 
 | Key | Default | Notes |
 |---|---|---|
 | `ha.mode` | `single_instance` | |
-| `ha.coordination` | `{backend: in_process}` | The Gateway's own schema. `in_process` cannot reach another pod, so a session landing on a Gateway that does not own the node's agent channel has no way to signal the owner. A multi-replica deployment serving agent-based nodes needs `{backend: nats, url: ..., subject_prefix: sl}`. The install notes say so when the combination appears. |
+| `ha.coordination` | `{backend: in_process}` | The Gateway's own schema. `in_process` reaches no other process, so a session landing on a Gateway that does not own the node's agent channel has no way to signal the owner. A fleet serving agent-based nodes needs `{backend: nats, url: ..., subject_prefix: sl}`. The install notes say so when `ha.mode` is `ha` without it. |
 | `ha.drain.preDrainGraceSecs` | `5` | |
 | `ha.drain.deadlineSecs` | `30` | |
 | `ha.drain.readyzPort` | `8081` | |
 | `terminationGracePeriodSeconds` | `45` | Above the 35s drain budget, with room for a slow object-store PUT. During the drain the Gateway stops advertising ready, lets live sessions finish and finalizes their recordings. Kubernetes' 30s default would SIGKILL five seconds before the deadline and break the promise that recordings are finalized on a clean drain. |
-| `podDisruptionBudget.enabled` | `true` | Without it, draining two nodes can evict both replicas at once and take every live session with it. Voluntary disruption only. |
-| `podDisruptionBudget.minAvailable` | `1` | |
+| `replicaCount` | `1` | Fixed at 1: one release deploys one Gateway. A second Gateway is a second release, with its own name and its own enrollment token. |
+| `podDisruptionBudget.enabled` | `false` | A budget over the single pod of one release has no middle setting: `minAvailable: 1` refuses every voluntary eviction and hangs a node drain, and `0` permits the eviction a budget exists to hold back. Session survival across a drain comes from running several Gateway releases. |
+| `podDisruptionBudget.minAvailable` | `0` | |
 
 ### Hardening
 

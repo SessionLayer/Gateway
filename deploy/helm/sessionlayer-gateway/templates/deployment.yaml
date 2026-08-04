@@ -5,8 +5,8 @@
 {{- if and .Values.bootstrap.enabled (not .Values.config.existingSecret) (not .Values.trustAnchor.existingConfigMap) }}
 {{- fail "sessionlayer-gateway: set trustAnchor.existingConfigMap to a ConfigMap holding the Control Plane's CA certificate. The Gateway pins this anchor and performs no trust-on-first-use, so enrollment cannot proceed without it." }}
 {{- end }}
-{{- if and .Values.persistence.enabled (gt (int .Values.replicaCount) 1) }}
-{{- fail "sessionlayer-gateway: persistence.enabled with more than one replica shares one data dir between Gateways. Each holds its own identity and generation counter, and a shared one reads to the Control Plane as a clone, which auto-locks it. Install one release per persistent Gateway, or leave persistence off and enroll on start." }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail (printf "sessionlayer-gateway: replicaCount is %d, and one release deploys one Gateway. Every pod here reads the same configuration, so with persistence off they all enroll with the same enrollment token: it is single-use, so the first pod to reach the Control Plane consumes it and the rest crash-loop on UNAUTHENTICATED. With persistence on they instead share one data dir, and one identity used twice reads to the Control Plane as a clone, which auto-locks it. Install one release per Gateway, each with its own bootstrap.gatewayName and its own token, and give them a coordination backend that spans pods." (int .Values.replicaCount)) }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment

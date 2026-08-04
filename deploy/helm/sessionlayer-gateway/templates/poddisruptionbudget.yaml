@@ -23,7 +23,7 @@ string, so the type is established before anything is compared.
 {{- end }}
 {{- $desired := div (add (mul $pct $replicas) 99) 100 }}
 {{- if ge $desired $replicas }}
-{{- fail (printf "%s is %q, which Kubernetes rounds up to %d of %d replicas and leaves no room: every voluntary eviction is refused and a node drain never finishes. Keep it at or below %d%%, or raise replicaCount." $at $min $desired $replicas (div (mul 100 (sub $replicas 1)) $replicas)) }}
+{{- fail (printf "%s is %q, which Kubernetes rounds up to %d of %d replicas and leaves no room: every voluntary eviction is refused and a node drain never finishes. Keep it at or below %d%%. replicaCount is fixed at 1 here, one release being one Gateway, so at this size the only budget that lets a drain finish is one that holds nothing back: turn podDisruptionBudget off instead." $at $min $desired $replicas (div (mul 100 (sub $replicas 1)) $replicas)) }}
 {{- end }}
 {{- else }}
 {{- $count := int $min }}
@@ -31,7 +31,7 @@ string, so the type is established before anything is compared.
 {{- fail (printf "%s is %d, and a budget cannot be negative." $at $count) }}
 {{- end }}
 {{- if ge $count $replicas }}
-{{- fail (printf "%s (%d) is not below replicaCount (%d), so every voluntary eviction is refused and a node drain never finishes. Raise replicaCount or lower minAvailable." $at $count $replicas) }}
+{{- fail (printf "%s (%d) is not below replicaCount (%d), so every voluntary eviction is refused and a node drain never finishes. Lower minAvailable, or turn podDisruptionBudget off: replicaCount is fixed at 1 here, one release being one Gateway, and a budget over a single pod either hangs the drain or holds nothing back." $at $count $replicas) }}
 {{- end }}
 {{- end }}
 apiVersion: policy/v1

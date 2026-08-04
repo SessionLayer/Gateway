@@ -35,11 +35,22 @@ persistence is off, so the data dir is an emptyDir and every restart re-enrolls
 against a single-use token that has already been spent. Turn persistence on for
 anything longer-lived than a test.
 {{ end }}
-{{- if and (gt (int .Values.replicaCount) 1) (eq (dig "backend" "in_process" .Values.ha.coordination) "in_process") }}
-{{ .Values.replicaCount }} replicas share no coordination backend: ha.coordination is in_process, which
-cannot reach another pod. A session landing on a Gateway that does not own the
-node's agent channel has no way to signal the owner. Set ha.coordination to the
-nats backend for a multi-replica deployment serving agent-based nodes.
+{{- if and (eq .Values.ha.mode "ha") (eq (dig "backend" "in_process" .Values.ha.coordination) "in_process") }}
+ha.mode is ha but ha.coordination is in_process, which reaches no other process.
+This release is one Gateway, so a second one is a second release, and a session
+landing on a Gateway that does not own the node's agent channel has no way to
+signal the owner. Set ha.coordination to the nats backend for a fleet serving
+agent-based nodes.
+{{- end }}
+{{- if and (eq .Values.service.type "LoadBalancer") (ne .Values.service.externalTrafficPolicy "Local") (or .Values.config.existingSecret (not .Values.ssh.proxy.lbCidrs)) }}
+service.externalTrafficPolicy is {{ .Values.service.externalTrafficPolicy | default "Cluster (the Kubernetes default)" }}, so a load balancer
+that forwards through a second node hands the Gateway that node's address, and
+ssh.sourceIpAllowlist then filters on the wrong thing. Set it to Local, or name
+the load balancer's ranges in ssh.proxy.lbCidrs and have it send PROXY protocol
+v2.
+{{- if .Values.config.existingSecret }}
+Your own Secret may already carry ssh.proxy.lb_cidrs; the chart cannot read it.
+{{- end }}
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 {{- if or (not .Values.networkPolicy.nodeCidrs) (not .Values.networkPolicy.wormCidrs) }}

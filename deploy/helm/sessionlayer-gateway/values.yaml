@@ -5,7 +5,11 @@
 # second path where you supply the whole file in a Secret you created yourself.
 # Both paths fail at render time when nothing is set.
 
-replicaCount: 2
+# One release deploys one Gateway. Each Gateway holds its own identity, enrolled
+# under its own name with its own single-use token, so a second pod in this
+# release has no credential of its own to present. Rendering fails above 1: run
+# a second release for a second Gateway.
+replicaCount: 1
 
 image:
   repository: ghcr.io/sessionlayer/gateway
@@ -75,7 +79,20 @@ ssh:
   hostKeyPath: "/var/lib/sessionlayer-gateway/host_ed25519"
   # An empty allowlist accepts SSH from every source address. Rendering fails
   # rather than shipping that, so name your client networks.
+  #
+  # The allowlist compares against the address the Gateway sees, which is the
+  # client's only where the path to it preserves that address. A LoadBalancer
+  # Service under Kubernetes' Cluster policy SNATs to a node address, at which
+  # point every client matches or none does; service.externalTrafficPolicy and
+  # proxy.lbCidrs below are the two ways out.
   sourceIpAllowlist: []
+  # The load balancer's own ranges, which turns PROXY protocol v2 on. A
+  # connection from one of these must then carry a v2 header and is dropped
+  # otherwise, and one from anywhere else is dropped as well, so this both
+  # recovers the client address behind a proxying load balancer and closes the
+  # path around it. Empty leaves PROXY off and the peer address is used as-is.
+  proxy:
+    lbCidrs: []
   agent:
     listenPort: 9444
     # Where Agents dial back. Empty derives the in-cluster Service address,
@@ -140,7 +157,14 @@ service:
   # Narrow the public SSH front door at the load balancer as well as at the
   # in-process source-IP gate.
   loadBalancerSourceRanges: []
-  externalTrafficPolicy: ""
+  # Local keeps the client's address, which is what ssh.sourceIpAllowlist reads.
+  # Cluster hands the packet on to another node first and SNATs it, so the
+  # Gateway sees a node address and the allowlist stops describing clients. The
+  # cost of Local is that only nodes running a pod pass the load balancer's
+  # health check. Load balancers that target pods directly, and any path that
+  # sets a PROXY v2 header, keep the client address under either policy.
+  # Ignored for a ClusterIP Service, which Kubernetes refuses the field on.
+  externalTrafficPolicy: Local
 
 # Requests only. A CPU limit throttles the data path under exactly the load
 # that earned it, and a memory limit turns a burst of concurrent sessions into
@@ -200,12 +224,14 @@ tmpVolume:
   medium: Memory
   sizeLimit: 64Mi
 
-# Without this, draining two nodes can evict both replicas at once and take
-# every live session with it, because the Gateway is what carries the session
-# bytes. Voluntary disruption only.
+# Off, because one release is one pod and a budget over a single pod has no
+# middle setting: minAvailable 1 refuses every voluntary eviction and hangs a
+# node drain, and 0 permits the eviction a budget exists to hold back. Session
+# survival across a drain comes from running several Gateway releases, which is
+# also what makes the load balancer's other backends useful.
 podDisruptionBudget:
-  enabled: true
-  minAvailable: 1
+  enabled: false
+  minAvailable: 0
 
 networkPolicy:
   # Default-deny both directions. The binary's own seccomp filter cannot scope
