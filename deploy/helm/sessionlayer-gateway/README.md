@@ -12,12 +12,13 @@ ConfigMap, and offers a second path where you supply the whole file yourself.
 
 ## The two configuration paths
 
-**You supply the file.** Set `config.existingSecret` to a Secret whose
-`gateway.json` key holds the complete configuration. The chart renders no
-configuration of its own, so the token never passes through a values file or
-through Helm's release storage. The chart still cannot read that file, so
-`ssh.listenPort`, `ssh.agent.listenPort` and `ha.drain.readyzPort` must match
-what it says, or the probes and the Service point at ports nothing listens on.
+**You supply the file. Use this in production.** Set `config.existingSecret` to
+a Secret whose `gateway.json` key holds the complete configuration. The chart
+renders no configuration of its own, so the enrollment token never passes
+through a values file, through your shell history, or through Helm's release
+storage. The chart still cannot read that file, so `ssh.listenPort`,
+`ssh.agent.listenPort` and `ha.drain.readyzPort` must match what it says, or the
+probes and the Service point at ports nothing listens on.
 
 **The chart renders the file.** Leave `config.existingSecret` empty and set
 `bootstrap.enrollmentToken`, `bootstrap.gatewayName`, `trustAnchor` and
@@ -30,6 +31,18 @@ rather than being ignored:
 Error: parsing gateway config /etc/sessionlayer/gateway.json: unknown field
 `source_ip_alowlist`, expected one of `listen_addr`, `host_key_path`, ...
 ```
+
+> **Warning:** `bootstrap.enrollmentToken` is the one value in any SessionLayer
+> chart that takes raw credential material, and this is the one chart that
+> creates a Secret. A token passed on the command line reaches three places you
+> did not intend: your shell history, Helm's release storage in the cluster, and
+> anything that reads it back, including `helm get values <release>`. What
+> limits the damage is that the token is single-use and short-lived, with a
+> default TTL of 10 minutes and a ceiling of 1 hour
+> (`sessionlayer.mtls.enrollment-token-ttl`), so a token that has already
+> enrolled a Gateway is spent. Treat an unconsumed one as live: use
+> `config.existingSecret`, or pass the token through `-f` with a values file you
+> delete, and rotate it if it lands anywhere durable.
 
 ## Install
 
@@ -47,7 +60,19 @@ helm install gw deploy/helm/sessionlayer-gateway \
 
 `$TOKEN` is one token from `POST /v1/gateway-enrollment-tokens`, minted for the
 name in `bootstrap.gatewayName`. Replace `<the digest you verified>` with the
-digest `cosign verify` reported for `ghcr.io/sessionlayer/gateway`.
+digest `cosign verify` reported for `ghcr.io/sessionlayer/gateway`. This form
+puts the token where the warning above says it goes; for a production install,
+build the Secret and use `config.existingSecret` instead:
+
+```bash
+kubectl -n sessionlayer create secret generic sessionlayer-gateway-config \
+  --from-file=gateway.json=./gateway.json
+
+helm install gw deploy/helm/sessionlayer-gateway \
+  --namespace sessionlayer \
+  --set config.existingSecret=sessionlayer-gateway-config \
+  --set image.digest=sha256:<the digest you verified>
+```
 
 `ci/production-values.yaml` and `ci/rendered-config-values.yaml` are the two
 paths above as complete values files, kept as what the chart is linted and
@@ -89,7 +114,7 @@ schema-checked against.
 | `controlPlane.mtlsEndpoint` | `""` | Empty derives `https://controlplane.<namespace>.svc:9443`, the Service the Control Plane chart creates. |
 | `controlPlane.serverName` | `""` | The name the Control Plane's certificate carries, which is not always the address dialled. Empty derives `controlplane.<namespace>.svc`. |
 | `bootstrap.enabled` | `true` | Off means this Gateway already holds an identity in a persistent data dir. |
-| `bootstrap.enrollmentToken` | `""` | Single-use. |
+| `bootstrap.enrollmentToken` | `""` | Single-use, 10-minute default TTL. Reaches Helm's release storage and `helm get values`; see the warning above. |
 | `bootstrap.gatewayName` | `""` | |
 | `dataDir` | `/var/lib/sessionlayer-gateway` | The only path the process writes. |
 

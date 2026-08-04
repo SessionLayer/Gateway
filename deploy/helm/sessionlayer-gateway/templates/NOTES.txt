@@ -19,7 +19,18 @@ SSH front door: allowed from {{ join ", " .Values.ssh.sourceIpAllowlist }}
 Watch enrollment finish:
 
   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "sessionlayer-gateway.fullname" . }}
-{{ if and .Values.bootstrap.enabled (not .Values.config.existingSecret) (not .Values.persistence.enabled) }}
+{{ if and .Values.bootstrap.enabled (not .Values.config.existingSecret) }}
+The enrollment token you supplied is now in this release's stored values, and
+comes back out of:
+
+  helm -n {{ .Release.Namespace }} get values {{ .Release.Name }}
+
+along with your shell history if you passed it with --set. The token is
+single-use with a 10-minute default TTL, so one that has already enrolled this
+Gateway is spent. Rotate it if it is still unconsumed and has landed anywhere
+durable, and use config.existingSecret for the next install.
+{{ end }}
+{{- if and .Values.bootstrap.enabled (not .Values.config.existingSecret) (not .Values.persistence.enabled) }}
 persistence is off, so the data dir is an emptyDir and every restart re-enrolls
 against a single-use token that has already been spent. Turn persistence on for
 anything longer-lived than a test.
