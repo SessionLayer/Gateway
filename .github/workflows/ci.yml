@@ -173,3 +173,155 @@ jobs:
           got_revision=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.revision"')
           [ "$got_version" = "$EXPECT_VERSION" ] || { echo "::error::version label is '$got_version', expected '$EXPECT_VERSION'"; exit 1; }
           [ "$got_revision" = "$EXPECT_REVISION" ] || { echo "::error::revision label is '$got_revision', expected '$EXPECT_REVISION'"; exit 1; }
+
+  # Not the required check — `gate` is. Without this the chart's only validation
+  # is whatever someone ran by hand, and the first values change that breaks a
+  # render lands green.
+  chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CHART: deploy/helm/sessionlayer-gateway
+      # Floating tool versions are the hazard a floating image tag is. Both
+      # downloads are checksum-verified below.
+      HELM_VERSION: 3.19.0
+      HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+      KUBECONFORM_VERSION: 0.7.0
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+      # Schemas are fetched per run, so the Kubernetes version is pinned too;
+      # otherwise the meaning of a green check moves under the chart.
+      KUBE_VERSION: 1.31.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install helm and kubeconform
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+
+          curl -fsSLO "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm-v${HELM_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf "helm-v${HELM_VERSION}-linux-amd64.tar.gz" linux-amd64/helm
+          mv linux-amd64/helm "$RUNNER_TEMP/bin/helm"
+
+          curl -fsSLO "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf kubeconform-linux-amd64.tar.gz -C "$RUNNER_TEMP/bin" kubeconform
+
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Lint, render and schema-check
+        run: |
+          set -euo pipefail
+          helm lint "$CHART"
+
+          # Both configuration paths: the operator-supplied Secret and the one
+          # the chart renders. Only the second exercises gateway.json.
+          for values in "$CHART"/ci/*.yaml; do
+            name=$(basename "$values" .yaml)
+            echo "::group::$name"
+            helm lint "$CHART" -f "$values"
+
+            out="$RUNNER_TEMP/$name.rendered.yaml"
+            helm template chart-ci "$CHART" -f "$values" > "$out"
+            [ -s "$out" ] || { echo "::error::$name rendered nothing"; exit 1; }
+
+            # A bare exit code cannot tell a clean run from an empty one:
+            # kubeconform exits 0 over zero resources, and a resource whose
+            # schema it never found is 'skipped', not failed.
+            report=$(kubeconform -strict -summary -output json \
+              -schema-location default -kubernetes-version "$KUBE_VERSION" "$out")
+            echo "$report" | jq -c '.summary'
+            echo "$report" | jq -e \
+              '.summary.valid > 0 and .summary.invalid == 0
+               and .summary.errors == 0 and .summary.skipped == 0' >/dev/null
+
+            # A template that silently stops rendering still schema-validates.
+            workloads=$(grep -c '^kind: Deployment$' "$out" || true)
+            [ "$workloads" = 1 ] || { echo "::error::$name rendered $workloads Deployments, expected 1"; exit 1; }
+            grep -qE '^          image: ghcr\.io/sessionlayer/gateway[@:]' "$out" \
+              || { echo "::error::$name rendered no gateway image reference"; exit 1; }
+            echo "::endgroup::"
+          done
+
+          # The generated config carries the enrollment token, so it belongs in a
+          # Secret. A ConfigMap here would be a regression nothing else catches.
+          rendered="$RUNNER_TEMP/rendered-config-values.rendered.yaml"
+          grep -q '^kind: Secret$' "$rendered" \
+            || { echo "::error::gateway.json is not rendered into a Secret"; exit 1; }
+          if grep -q 'enrollment_token' "$rendered" && grep -B40 'enrollment_token' "$rendered" | grep -q '^kind: ConfigMap$'; then
+            echo "::error::the enrollment token reached a ConfigMap"; exit 1
+          fi
+
+      # The half with teeth. Everything above would still pass if every
+      # `required` in the chart were deleted.
+      - name: Assert the chart refuses an install it must refuse
+        run: |
+          set -euo pipefail
+          prod="$CHART/ci/production-values.yaml"
+          rendered="$CHART/ci/rendered-config-values.yaml"
+
+          refuse() { # refuse <expected-substring> <command...>
+            local want="$1"; shift
+            local out rc
+            set +e
+            out=$("$@" 2>&1); rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::expected a refusal naming '$want', but this succeeded: $*"
+              exit 1
+            fi
+            case "$out" in
+              *"$want"*) printf 'refused on %s\n' "$want" ;;
+              *) echo "::error::refused, but not on '$want'. Actual output:"
+                 printf '%s\n' "$out"
+                 exit 1 ;;
+            esac
+          }
+
+          # Neither an operator-supplied config nor a token of its own.
+          refuse "set bootstrap.enrollmentToken" \
+            helm template chart-ci "$CHART" -f "$prod" --set config.existingSecret=null
+          refuse "set trustAnchor.existingConfigMap" \
+            helm template chart-ci "$CHART" -f "$rendered" --set trustAnchor.existingConfigMap=null
+
+          # An empty allowlist is not "no opinion": the binary warns and then
+          # accepts SSH from every source address. --set cannot express an empty
+          # list, so this goes through a values file, which is also the way an
+          # operator would reach it.
+          printf 'ssh:\n  sourceIpAllowlist: []\n' > "$RUNNER_TEMP/empty-allowlist.yaml"
+          refuse "sourceIpAllowlist is empty" \
+            helm template chart-ci "$CHART" -f "$rendered" -f "$RUNNER_TEMP/empty-allowlist.yaml"
+          # And the same guard reached through the raw-config escape hatch.
+          printf 'config:\n  overrides:\n    ssh:\n      source_ip_allowlist: []\n' > "$RUNNER_TEMP/empty-override.yaml"
+          refuse "sourceIpAllowlist is empty" \
+            helm template chart-ci "$CHART" -f "$rendered" -f "$RUNNER_TEMP/empty-override.yaml"
+
+          # A grace period under the drain budget SIGKILLs mid-drain and loses a
+          # live session's finalized recording.
+          refuse "not above the drain budget" \
+            helm template chart-ci "$CHART" -f "$rendered" --set ha.drain.deadlineSecs=60
+
+          # A budget that refuses every voluntary eviction hangs a node drain.
+          # Asserted through --set, which yields an int64 where a values file
+          # yields a float64; a guard that tests only one of those is blind to
+          # the other.
+          refuse "not below replicaCount" \
+            helm template chart-ci "$CHART" -f "$prod" --set podDisruptionBudget.minAvailable=99
+
+          # values.schema.json must reject a malformed values file rather than
+          # rendering something surprising.
+          refuse "/hardening/seccomp/mode" \
+            helm lint "$CHART" -f "$prod" --set hardening.seccomp.mode=permissive
+          refuse "/image/digest" \
+            helm lint "$CHART" -f "$prod" --set image.digest=sha256:abc
+
+      - name: helm package
+        run: |
+          set -euo pipefail
+          helm package "$CHART" -d "$RUNNER_TEMP/packaged"
+          ls -l "$RUNNER_TEMP/packaged"

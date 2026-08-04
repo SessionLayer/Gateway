@@ -128,7 +128,7 @@ accepts SSH from every source address.
 */ -}}
 {{- $allow := dig "ssh" "source_ip_allowlist" (list) $cfg -}}
 {{- if not (kindIs "slice" $allow) -}}
-{{- fail (printf "sessionlayer-gateway: ssh.source_ip_allowlist came out as %s, not a list of CIDRs. The Gateway would refuse the file at start; the likely cause is --set with a bracket literal, which Helm reads as a string." (kindOf $allow)) -}}
+{{- fail (printf "sessionlayer-gateway: ssh.source_ip_allowlist came out as %s, not a list of CIDRs, and the Gateway would refuse the file at start. --set reads a bracket literal as a string and =null as no value at all; give the list in a values file, or as --set 'ssh.sourceIpAllowlist={10.0.0.0/8}'." (kindOf $allow)) -}}
 {{- end -}}
 {{- if not $allow -}}
 {{- fail "sessionlayer-gateway: ssh.sourceIpAllowlist is empty, which accepts SSH from every source address. Name the client networks that may reach the front door." -}}

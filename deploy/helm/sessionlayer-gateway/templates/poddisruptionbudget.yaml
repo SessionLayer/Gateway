@@ -1,6 +1,6 @@
 {{- if .Values.podDisruptionBudget.enabled }}
 {{- $min := .Values.podDisruptionBudget.minAvailable }}
-{{- if and (kindIs "float64" $min) (ge (int $min) (int .Values.replicaCount)) }}
+{{- if and (not (kindIs "string" $min)) (ge (int $min) (int .Values.replicaCount)) }}
 {{- fail (printf "sessionlayer-gateway: podDisruptionBudget.minAvailable (%v) is not below replicaCount (%v), so every voluntary eviction is refused and a node drain never finishes. Raise replicaCount or lower minAvailable." $min .Values.replicaCount) }}
 {{- end }}
 apiVersion: policy/v1
