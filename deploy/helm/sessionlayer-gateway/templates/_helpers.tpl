@@ -126,7 +126,11 @@ Checked after the overrides, so the guard cannot be walked around by accident.
 An empty allowlist is not "no opinion": the Gateway logs a warning and then
 accepts SSH from every source address.
 */ -}}
-{{- if not (dig "ssh" "source_ip_allowlist" (list) $cfg) -}}
+{{- $allow := dig "ssh" "source_ip_allowlist" (list) $cfg -}}
+{{- if not (kindIs "slice" $allow) -}}
+{{- fail (printf "sessionlayer-gateway: ssh.source_ip_allowlist came out as %s, not a list of CIDRs. The Gateway would refuse the file at start; the likely cause is --set with a bracket literal, which Helm reads as a string." (kindOf $allow)) -}}
+{{- end -}}
+{{- if not $allow -}}
 {{- fail "sessionlayer-gateway: ssh.sourceIpAllowlist is empty, which accepts SSH from every source address. Name the client networks that may reach the front door." -}}
 {{- end -}}
 {{- toPrettyJson $cfg -}}
