@@ -46,9 +46,21 @@ pub fn confine(cfg: &LandlockConfig, log_status: bool) -> anyhow::Result<()> {
                     "Landlock filesystem confinement fully enforced"
                 );
             }
+            // Deliberately does not name a cause. Best-effort compatibility
+            // downgrades for more than an old kernel: the same kernel reports
+            // partial or full depending only on the shape of the configured
+            // paths, because a directory-only access right applied to a regular
+            // file is downgraded too. Blaming the kernel sends the reader to
+            // check a kernel version and stop, which is worse than saying less.
             RulesetStatus::PartiallyEnforced => {
                 tracing::warn!(
-                    "Landlock partially enforced (older kernel ABI subset); filesystem confinement is active"
+                    read_only = cfg.read_only_paths.len(),
+                    read_write = cfg.read_write_paths.len(),
+                    abi_target = ?LANDLOCK_ABI,
+                    "Landlock partially enforced: some requested access rights were downgraded. \
+                     Filesystem confinement is active but narrower than configured — check both \
+                     the kernel's Landlock ABI and whether any configured path is a regular file \
+                     rather than a directory"
                 );
             }
             RulesetStatus::NotEnforced => {
