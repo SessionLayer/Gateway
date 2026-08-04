@@ -295,7 +295,14 @@ jobs:
           	|| { echo "::error::${IMAGE}:${GITHUB_REF_NAME} resolves to $TAG_DIGEST, not the verified $DIGEST"; exit 1; }
           echo "tag ${GITHUB_REF_NAME} -> $TAG_DIGEST"
 
-          # 6. And an operator holding no credential can obtain it. A GHCR package
+
+          # 6. The arm64 child manifest, actually executed. Everything above reads
+          #    index metadata; this is the only step that proves the platform we
+          #    publish for runs at all.
+          docker run --rm --platform linux/arm64 "$REF" --version
+          echo "arm64 entrypoint ran"
+
+          # 7. And an operator holding no credential can obtain it. A GHCR package
           #    created by a workflow is private until its visibility is set, and nothing
           #    in this pipeline sets it — so without this check the whole release goes
           #    green over an image no one can pull, while the installation guides open
@@ -330,9 +337,3 @@ jobs:
           	401|403) echo "::error::${IMAGE} is not anonymously pullable (HTTP $CODE) — the GHCR package is private"; exit 1 ;;
           	*) echo "::error::anonymous resolve of ${IMAGE}@${DIGEST} returned HTTP $CODE"; exit 1 ;;
           esac
-
-          # The arm64 child manifest, actually executed. Everything above reads
-          # index metadata; this is the only step that proves the platform we
-          # publish for runs at all.
-          docker run --rm --platform linux/arm64 "$REF" --version
-          echo "arm64 entrypoint ran"
