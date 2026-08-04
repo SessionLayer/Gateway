@@ -16,6 +16,18 @@ updates:
     commit-message:
       prefix: deps
 
+  # Base images in deploy/Dockerfile (builder + distroless nonroot runtime),
+  # which are pinned by digest and so never move on their own.
+  - package-ecosystem: docker
+    directory: "/deploy"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: deps
+
   # GitHub Actions used by .github/workflows (kept SHA-pinned).
   - package-ecosystem: github-actions
     directory: "/"

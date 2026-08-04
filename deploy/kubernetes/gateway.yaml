@@ -1,7 +1,7 @@
 # SessionLayer Gateway — hardened Kubernetes deployment (NFR-5).
 #
 # The security-context here is the OUTER layer; the binary applies its own
-# in-process seccomp + Landlock at startup (hardening.* in the ConfigMap below).
+# in-process seccomp + Landlock at startup (hardening.* in the Secret below).
 # Together: a non-root, read-only-rootfs, all-capabilities-dropped, no-privilege-
 # escalation, seccomp-confined process whose egress is restricted by the
 # NetworkPolicy in networkpolicy.yaml.
@@ -12,11 +12,12 @@
 # which exercises the in-process privilege-drop-after-bind instead.
 ---
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
   name: sessionlayer-gateway-config
   labels: { app.kubernetes.io/name: sessionlayer-gateway }
-data:
+type: Opaque
+stringData:
   # `bootstrap` is optional in the config schema and absent means "already enrolled", so a
   # manifest that omits it deploys a Gateway that can never obtain an identity and never
   # says why. The three REPLACE_WITH_ values are what an operator substitutes: the token
@@ -55,7 +56,6 @@ data:
             "/etc/resolv.conf",
             "/etc/hosts",
             "/etc/nsswitch.conf",
-            "/run/systemd/resolve",
             "/usr/local/bin/gateway",
             "/lib", "/lib64", "/usr/lib",
             "/dev", "/proc"
@@ -66,12 +66,31 @@ data:
       }
     }
 ---
+# The anchor `bootstrap.ca_cert_path` names. Without it enrollment fails the
+# no-TOFU check, and the manifest previously mounted only the config over that
+# directory — so the path resolved to nothing and the failure looked like a
+# Control Plane problem. Fill it with the CA served by
+# `GET /v1/cas/mtls/public-key`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sessionlayer-gateway-trust
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+data:
+  ca.pem: |
+    REPLACE_WITH_CONTROL_PLANE_MTLS_CA_PEM
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: sessionlayer-gateway
   labels: { app.kubernetes.io/name: sessionlayer-gateway }
 spec:
+  # Two replicas without an `ha.coordination` block leaves the in-process
+  # backend, which cannot signal a peer pod: each Gateway is unaware of the
+  # other, so a session whose Agent channel is owned by the sibling is not
+  # relayed to it. `ha.mode` does not change that — it is only logged. Set
+  # `ha.coordination.backend` in the config above before running more than one.
   replicas: 2
   selector:
     matchLabels: { app.kubernetes.io/name: sessionlayer-gateway }
@@ -96,7 +115,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: ghcr.io/sessionlayer/gateway:latest # pin by digest in production
+          image: ghcr.io/sessionlayer/gateway:v0.0.2 # pin by digest in production
           args: ["--config", "/etc/sessionlayer/gateway.json"]
           ports:
             - { name: ssh, containerPort: 2222 }
@@ -139,8 +158,13 @@ spec:
         # PVC (or a StatefulSet) to persist the enrolled identity + generation.
         - name: data
           emptyDir: {}
+        # Both files land in /etc/sessionlayer: the config carries the
+        # enrollment token, the anchor is public.
         - name: config
-          configMap: { name: sessionlayer-gateway-config }
+          projected:
+            sources:
+              - secret: { name: sessionlayer-gateway-config }
+              - configMap: { name: sessionlayer-gateway-trust }
         - name: tmp
           emptyDir: { medium: Memory }
 ---

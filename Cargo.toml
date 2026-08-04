@@ -3,7 +3,7 @@ resolver = "2"
 members = ["gateway", "gateway-core"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.95"
 license = "GPL-3.0-only"
@@ -17,7 +17,7 @@ authors = ["SessionLayer"]
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-gateway-core = { path = "gateway-core", version = "0.0.1" }
+gateway-core = { path = "gateway-core", version = "0.0.2" }
 
 # Async runtime. Multi-threaded tokio is the process base; the io_uring reactor
 # (behind gateway-core's `io-uring` feature) is a per-connection concern behind

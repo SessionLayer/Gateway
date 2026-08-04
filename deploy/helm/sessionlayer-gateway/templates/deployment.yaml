@@ -1,0 +1,167 @@
+{{- $drainBudget := add (int .Values.ha.drain.preDrainGraceSecs) (int .Values.ha.drain.deadlineSecs) }}
+{{- if le (int .Values.terminationGracePeriodSeconds) $drainBudget }}
+{{- fail (printf "sessionlayer-gateway: terminationGracePeriodSeconds (%d) is not above the drain budget of ha.drain.preDrainGraceSecs + ha.drain.deadlineSecs (%d), so the kubelet SIGKILLs mid-drain and live sessions lose their finalized recordings." (int .Values.terminationGracePeriodSeconds) $drainBudget) }}
+{{- end }}
+{{- if and .Values.bootstrap.enabled (not .Values.config.existingSecret) (not .Values.trustAnchor.existingConfigMap) }}
+{{- fail "sessionlayer-gateway: set trustAnchor.existingConfigMap to a ConfigMap holding the Control Plane's CA certificate. The Gateway pins this anchor and performs no trust-on-first-use, so enrollment cannot proceed without it." }}
+{{- end }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail (printf "sessionlayer-gateway: replicaCount is %d, and one release deploys one Gateway. Every pod here reads the same configuration, so with persistence off they all enroll with the same enrollment token: it is single-use, so the first pod to reach the Control Plane consumes it and the rest crash-loop on UNAUTHENTICATED. With persistence on they instead share one data dir, and one identity used twice reads to the Control Plane as a clone, which auto-locks it. Install one release per Gateway, each with its own bootstrap.gatewayName and its own token, and give them a coordination backend that spans pods." (int .Values.replicaCount)) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sessionlayer-gateway.fullname" . }}
+  labels:
+    {{- include "sessionlayer-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sessionlayer-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sessionlayer-gateway.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or .Values.podAnnotations (not .Values.config.existingSecret) }}
+      annotations:
+        {{- if not .Values.config.existingSecret }}
+        checksum/config: {{ include "sessionlayer-gateway.config" . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "sessionlayer-gateway.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "sessionlayer-gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/sessionlayer/{{ include "sessionlayer-gateway.configSecretKey" . }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: ssh
+              containerPort: {{ .Values.ssh.listenPort }}
+              protocol: TCP
+            - name: agent
+              containerPort: {{ .Values.ssh.agent.listenPort }}
+              protocol: TCP
+            - name: readyz
+              containerPort: {{ .Values.ha.drain.readyzPort }}
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: readyz
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: ssh
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            tcpSocket:
+              port: ssh
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.dataDir }}
+            - name: config
+              mountPath: /etc/sessionlayer
+              readOnly: true
+            {{- if .Values.tmpVolume.enabled }}
+            - name: tmp
+              mountPath: /tmp
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" (include "sessionlayer-gateway.fullname" .)) .Values.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          projected:
+            # Readable by the runtime group only, which fsGroup owns.
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: {{ include "sessionlayer-gateway.configSecretName" . }}
+                  items:
+                    - key: {{ include "sessionlayer-gateway.configSecretKey" . }}
+                      path: {{ include "sessionlayer-gateway.configSecretKey" . }}
+              {{- with .Values.trustAnchor.existingConfigMap }}
+              - configMap:
+                  name: {{ . }}
+                  items:
+                    - key: {{ $.Values.trustAnchor.key }}
+                      path: {{ $.Values.trustAnchor.key }}
+              {{- end }}
+        {{- if .Values.tmpVolume.enabled }}
+        - name: tmp
+          emptyDir:
+            medium: {{ .Values.tmpVolume.medium | quote }}
+            sizeLimit: {{ .Values.tmpVolume.sizeLimit }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

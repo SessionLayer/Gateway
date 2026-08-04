@@ -1,0 +1,65 @@
+# A complete, realistic production configuration, used to lint and schema-check
+# the chart. The whole gateway.json comes from a Secret created out of band, so
+# the enrollment token never reaches a values file or Helm's release storage.
+#
+# One release is one Gateway, so a second Gateway is a second release of this
+# chart with its own name, its own token and its own values file.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/sessionlayer/gateway
+  tag: "v0.0.2"
+  digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-pull
+
+config:
+  existingSecret: sessionlayer-gateway-config
+  existingSecretKey: gateway.json
+
+trustAnchor:
+  existingConfigMap: sessionlayer-bootstrap-ca
+  key: ca.pem
+
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  sshPort: 22
+  agentPort: 9444
+  loadBalancerSourceRanges:
+    - 10.0.0.0/8
+  externalTrafficPolicy: Local
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+# A budget over the single pod of one release either hangs a node drain or holds
+# nothing back, so availability comes from the other Gateway releases instead.
+podDisruptionBudget:
+  enabled: false
+
+networkPolicy:
+  enabled: true
+  nodeCidrs:
+    - 10.20.0.0/16
+  wormCidrs:
+    - 10.30.0.0/16
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: sessionlayer-gateway
+
+priorityClassName: system-cluster-critical
+
+extraEnv:
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: https://otel-collector.observability:4317
