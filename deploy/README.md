@@ -37,6 +37,17 @@ $ docker run --rm sessionlayer/gateway:dev --version
 gateway 0.0.1 (SessionLayer Gateway; CP<->GW protocol 1.0-1.1)
 ```
 
+Log output carries ANSI colour escapes whether or not stderr is a terminal, and
+`docker compose logs --no-color` strips only Compose's own service prefix. An
+escape sits between every field name and its `=`, so a grep for `path=` over a
+raw `docker logs` matches nothing and reads as if the event never happened.
+Strip the escapes first:
+
+```console
+$ docker logs sessionlayer-gateway 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 'path='
+2026-08-04T11:32:22.355826Z  WARN Landlock allow-path does not exist; skipping path=/run/systemd/resolve
+```
+
 The release workflow publishes both platforms on a `v*` tag, signs the index and
 every platform manifest with keyless cosign, and attaches an SPDX SBOM and SLSA
 provenance. Verify an image before you run it, substituting the tag you intend
