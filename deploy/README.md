@@ -48,14 +48,26 @@ $ docker logs sessionlayer-gateway 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 'semv
 2026-08-04T11:44:42.380809Z  INFO SessionLayer Gateway starting component=SessionLayer Gateway semver=0.0.2 protocol_range=1.0-1.1 io_backend=Epoll cp_mtls_endpoint=https://127.0.0.1:9443
 ```
 
+### Running the published image
+
 The release workflow publishes both platforms on a `v*` tag, signs the index and
 every platform manifest with keyless cosign, and attaches an SPDX SBOM and SLSA
-provenance. Verify an image before you run it, substituting the tag you intend
-to deploy:
+provenance. Verify before you pull, substituting the tag you intend to deploy:
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/SessionLayer/Gateway/\.github/workflows/release\.yml@refs/tags/' \
+  --certificate-identity-regexp '^https://github\.com/SessionLayer/Gateway/\.github/workflows/release\.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/sessionlayer/gateway:v0.0.2
+
+gh attestation verify oci://ghcr.io/sessionlayer/gateway:v0.0.2 \
+  --repo SessionLayer/Gateway \
+  --signer-workflow SessionLayer/Gateway/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.0.2
+
+docker pull ghcr.io/sessionlayer/gateway:v0.0.2
 ```
+
+`--signer-workflow` and `--source-ref` are not optional. Without them
+`gh attestation verify` accepts an attestation from any workflow in the
+repository, which is a weaker claim than the one `cosign verify` above makes.
