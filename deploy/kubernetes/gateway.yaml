@@ -1,7 +1,7 @@
 # SessionLayer Gateway — hardened Kubernetes deployment (NFR-5).
 #
 # The security-context here is the OUTER layer; the binary applies its own
-# in-process seccomp + Landlock at startup (hardening.* in the ConfigMap below).
+# in-process seccomp + Landlock at startup (hardening.* in the Secret below).
 # Together: a non-root, read-only-rootfs, all-capabilities-dropped, no-privilege-
 # escalation, seccomp-confined process whose egress is restricted by the
 # NetworkPolicy in networkpolicy.yaml.
