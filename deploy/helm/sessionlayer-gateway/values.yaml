@@ -1,0 +1,239 @@
+# Default values for sessionlayer-gateway.
+#
+# The Gateway reads one JSON file. That file carries the enrollment token, so
+# the chart renders it into a Secret rather than a ConfigMap, and offers a
+# second path where you supply the whole file in a Secret you created yourself.
+# Both paths fail at render time when nothing is set.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/sessionlayer/gateway
+  # Empty resolves to the chart's appVersion.
+  tag: ""
+  # A tag is mutable and a digest is not. Set this in production; it wins over
+  # tag when both are present.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # The Gateway never calls the Kubernetes API.
+  automountServiceAccountToken: false
+
+config:
+  # Name of a Secret holding the complete gateway.json. Set this and the chart
+  # renders no configuration of its own, so the enrollment token never passes
+  # through a values file or through Helm's release storage.
+  existingSecret: ""
+  existingSecretKey: "gateway.json"
+  # Merged over the generated configuration, using the Gateway's own key names.
+  # The Gateway rejects unknown keys, so a typo here fails the process at start
+  # rather than being ignored.
+  overrides: {}
+
+# The Control Plane's certificate authority, pinned. The Gateway performs no
+# trust-on-first-use, so enrollment needs this anchor mounted next to the
+# config. Create the ConfigMap from your CA PEM and name it here.
+trustAnchor:
+  existingConfigMap: ""
+  key: "ca.pem"
+
+controlPlane:
+  # Empty derives controlplane.<namespace>.svc, which is the Service name the
+  # Control Plane chart creates.
+  mtlsEndpoint: ""
+  # The name the Control Plane's certificate carries, which is not always the
+  # address dialled.
+  serverName: ""
+
+bootstrap:
+  # Off means this Gateway already holds an identity in a persistent data dir.
+  # A Gateway with neither an identity nor a bootstrap block can never obtain
+  # one and never says why, so the chart demands one or the other.
+  enabled: true
+  # Single-use, minted by POST /v1/gateway-enrollment-tokens. Prefer
+  # config.existingSecret over putting it here.
+  enrollmentToken: ""
+  # The name the token was minted for. Identity in HA follows this name.
+  gatewayName: ""
+
+dataDir: "/var/lib/sessionlayer-gateway"
+
+ssh:
+  # uid 65532 cannot bind 22, so the container listens high and the Service
+  # maps 22 onto this port. For a bind-22 host deployment use deploy/systemd/,
+  # which drops privileges in-process after the bind instead.
+  listenPort: 2222
+  hostKeyPath: "/var/lib/sessionlayer-gateway/host_ed25519"
+  # An empty allowlist accepts SSH from every source address. Rendering fails
+  # rather than shipping that, so name your client networks.
+  sourceIpAllowlist: []
+  agent:
+    listenPort: 9444
+    # Where Agents dial back. Empty derives the in-cluster Service address,
+    # which is only right when your nodes are in this cluster; a fleet outside
+    # it needs the load balancer's address here.
+    advertiseUrl: ""
+
+ha:
+  mode: single_instance
+  # The Gateway's own coordination schema. in_process cannot span pods, so a
+  # multi-replica deployment serving agent-based nodes needs the nats backend:
+  # {backend: nats, url: "nats://...", subject_prefix: sl}.
+  coordination:
+    backend: in_process
+  drain:
+    preDrainGraceSecs: 5
+    deadlineSecs: 30
+    readyzPort: 8081
+
+hardening:
+  landlock:
+    enabled: true
+    # On means the process refuses to start where the kernel cannot fully
+    # enforce Landlock, instead of degrading to the container's read-only root
+    # filesystem and dropped capabilities alone.
+    required: false
+    # The systemd-resolved path the host unit lists is absent from the
+    # container image, so it is not repeated here; a listed path that does not
+    # exist is skipped with a startup warning and confines nothing.
+    readOnlyPaths:
+      - /etc/sessionlayer
+      - /etc/ssl/certs
+      - /etc/resolv.conf
+      - /etc/hosts
+      - /etc/nsswitch.conf
+      - /usr/local/bin/gateway
+      - /lib
+      - /lib64
+      - /usr/lib
+      - /dev
+      - /proc
+    readWritePaths:
+      - /var/lib/sessionlayer-gateway
+  seccomp:
+    mode: enforce
+
+persistence:
+  # Off re-enrolls on every restart, which needs a fresh single-use token each
+  # time. Turn it on to keep the enrolled identity and its generation counter.
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+service:
+  type: LoadBalancer
+  annotations: {}
+  sshPort: 22
+  agentPort: 9444
+  # Narrow the public SSH front door at the load balancer as well as at the
+  # in-process source-IP gate.
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+
+# Requests only. A CPU limit throttles the data path under exactly the load
+# that earned it, and a memory limit turns a burst of concurrent sessions into
+# an OOMKill mid-session. Without requests the Gateway lands in BestEffort and
+# is the first thing the kubelet evicts under node memory pressure, which drops
+# live sessions, since this is the process the session bytes flow through.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+probes:
+  # /readyz reports the drain state, so a draining Gateway leaves the load
+  # balancer's rotation before its sessions end.
+  readiness:
+    enabled: true
+    periodSeconds: 5
+    timeoutSeconds: 1
+    failureThreshold: 3
+  # On the SSH port, to restart a Gateway that has wedged and accepts nothing.
+  liveness:
+    enabled: true
+    periodSeconds: 15
+    timeoutSeconds: 1
+    failureThreshold: 3
+  # Slack for enrollment, where the mTLS bootstrap round trip can be slow.
+  startup:
+    enabled: true
+    periodSeconds: 5
+    timeoutSeconds: 1
+    failureThreshold: 30
+
+# The drain budget is preDrainGraceSecs + deadlineSecs, during which the
+# Gateway stops advertising ready, lets live sessions finish and finalizes
+# their recordings. Kubernetes' 30s default would SIGKILL before that deadline
+# and break the promise that recordings are finalized on a clean drain. Sized
+# above the real budget with room for a slow object-store PUT; rendering fails
+# if you move the drain config past it.
+terminationGracePeriodSeconds: 45
+
+tmpVolume:
+  enabled: true
+  medium: Memory
+  sizeLimit: 64Mi
+
+# Without this, draining two nodes can evict both replicas at once and take
+# every live session with it, because the Gateway is what carries the session
+# bytes. Voluntary disruption only.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  # Default-deny both directions. The binary's own seccomp filter cannot scope
+  # a destination, so egress confinement is the network layer's job.
+  enabled: true
+  controlPlanePodSelector:
+    app.kubernetes.io/name: sessionlayer-controlplane
+  # Must match the port inside controlPlane.mtlsEndpoint.
+  controlPlaneGrpcPort: 9443
+  dnsPodSelector:
+    k8s-app: kube-dns
+  # The SSH nodes this Gateway bridges to, and the object store recordings go
+  # to. Both start empty: a placeholder range permits egress to hosts that are
+  # not yours, which is worse than no rule, so name the ranges you use.
+  nodeCidrs: []
+  wormCidrs: []
+  extraIngress: []
+  extraEgress: []
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []

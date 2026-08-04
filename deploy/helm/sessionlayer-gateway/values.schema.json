@@ -1,0 +1,236 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "sessionlayer-gateway values",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "global": { "type": "object" },
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": { "type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "nameOverride": { "type": "string", "maxLength": 63 },
+    "fullnameOverride": { "type": "string", "maxLength": 63 },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" },
+        "automountServiceAccountToken": { "type": "boolean" }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "existingSecretKey": { "type": "string", "minLength": 1 },
+        "overrides": { "type": "object" }
+      }
+    },
+    "trustAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingConfigMap": { "type": "string" },
+        "key": { "type": "string", "minLength": 1 }
+      }
+    },
+    "controlPlane": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mtlsEndpoint": { "type": "string", "pattern": "^$|^https://" },
+        "serverName": { "type": "string" }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "enrollmentToken": { "type": "string" },
+        "gatewayName": { "type": "string", "maxLength": 253 }
+      }
+    },
+    "dataDir": { "type": "string", "pattern": "^/" },
+    "ssh": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listenPort": { "$ref": "#/definitions/port" },
+        "hostKeyPath": { "type": "string", "pattern": "^/" },
+        "sourceIpAllowlist": { "$ref": "#/definitions/cidrList" },
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "listenPort": { "$ref": "#/definitions/port" },
+            "advertiseUrl": { "type": "string", "pattern": "^$|^wss://" }
+          }
+        }
+      }
+    },
+    "ha": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["single_instance", "ha"] },
+        "coordination": {
+          "type": "object",
+          "required": ["backend"],
+          "properties": { "backend": { "enum": ["in_process", "nats"] } }
+        },
+        "drain": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "preDrainGraceSecs": { "type": "integer", "minimum": 0 },
+            "deadlineSecs": { "type": "integer", "minimum": 1 },
+            "readyzPort": { "$ref": "#/definitions/port" }
+          }
+        }
+      }
+    },
+    "hardening": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "landlock": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "required": { "type": "boolean" },
+            "readOnlyPaths": { "type": "array", "items": { "type": "string", "pattern": "^/" } },
+            "readWritePaths": { "type": "array", "items": { "type": "string", "pattern": "^/" } }
+          }
+        },
+        "seccomp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "mode": { "enum": ["off", "log", "enforce"] } }
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "existingClaim": { "type": "string" },
+        "storageClass": { "type": "string" },
+        "accessModes": {
+          "type": "array",
+          "items": { "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadWriteOncePod"] }
+        },
+        "size": { "type": "string", "minLength": 1 }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "annotations": { "type": "object" },
+        "sshPort": { "$ref": "#/definitions/port" },
+        "agentPort": { "$ref": "#/definitions/port" },
+        "loadBalancerSourceRanges": { "$ref": "#/definitions/cidrList" },
+        "externalTrafficPolicy": { "enum": ["", "Cluster", "Local"] }
+      }
+    },
+    "resources": { "type": "object" },
+    "podSecurityContext": { "type": "object" },
+    "containerSecurityContext": { "type": "object" },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" },
+        "startup": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+    "tmpVolume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "medium": { "enum": ["", "Memory"] },
+        "sizeLimit": { "type": "string", "minLength": 1 }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "controlPlanePodSelector": { "type": "object" },
+        "controlPlaneGrpcPort": { "$ref": "#/definitions/port" },
+        "dnsPodSelector": { "type": "object" },
+        "nodeCidrs": { "$ref": "#/definitions/cidrList" },
+        "wormCidrs": { "$ref": "#/definitions/cidrList" },
+        "extraIngress": { "type": "array", "items": { "type": "object" } },
+        "extraEgress": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } },
+    "priorityClassName": { "type": "string" },
+    "extraEnv": { "type": "array", "items": { "type": "object" } },
+    "extraEnvFrom": { "type": "array", "items": { "type": "object" } },
+    "extraVolumes": { "type": "array", "items": { "type": "object" } },
+    "extraVolumeMounts": { "type": "array", "items": { "type": "object" } }
+  },
+  "definitions": {
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "cidrList": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$"
+      }
+    }
+  }
+}
