@@ -39,13 +39,13 @@ gateway 0.0.2 (SessionLayer Gateway; CP<->GW protocol 1.0-1.1)
 
 Log output carries ANSI colour escapes whether or not stderr is a terminal, and
 `docker compose logs --no-color` strips only Compose's own service prefix. An
-escape sits between every field name and its `=`, so a grep for `path=` over a
+escape sits between every field name and its `=`, so a grep for `semver=` over a
 raw `docker logs` matches nothing and reads as if the event never happened.
 Strip the escapes first:
 
 ```console
-$ docker logs sessionlayer-gateway 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 'path='
-2026-08-04T11:32:22.355826Z  WARN Landlock allow-path does not exist; skipping path=/run/systemd/resolve
+$ docker logs sessionlayer-gateway 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 'semver='
+2026-08-04T11:44:42.380809Z  INFO SessionLayer Gateway starting component=SessionLayer Gateway semver=0.0.2 protocol_range=1.0-1.1 io_backend=Epoll cp_mtls_endpoint=https://127.0.0.1:9443
 ```
 
 The release workflow publishes both platforms on a `v*` tag, signs the index and
