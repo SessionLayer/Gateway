@@ -34,7 +34,7 @@ Build from the repository root, not from `deploy/`:
 ```console
 $ docker build -f deploy/Dockerfile -t sessionlayer/gateway:dev .
 $ docker run --rm sessionlayer/gateway:dev --version
-gateway 0.0.1 (SessionLayer Gateway; CP<->GW protocol 1.0-1.1)
+gateway 0.0.2 (SessionLayer Gateway; CP<->GW protocol 1.0-1.1)
 ```
 
 Log output carries ANSI colour escapes whether or not stderr is a terminal, and
