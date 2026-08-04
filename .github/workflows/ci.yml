@@ -250,12 +250,27 @@ jobs:
 
           # The generated config carries the enrollment token, so it belongs in a
           # Secret. A ConfigMap here would be a regression nothing else catches.
+          # Counted rather than window-matched: a `grep -B<n>` around the token
+          # silently misses a ConfigMap header further away than n lines.
           rendered="$RUNNER_TEMP/rendered-config-values.rendered.yaml"
           grep -q '^kind: Secret$' "$rendered" \
             || { echo "::error::gateway.json is not rendered into a Secret"; exit 1; }
-          if grep -q 'enrollment_token' "$rendered" && grep -B40 'enrollment_token' "$rendered" | grep -q '^kind: ConfigMap$'; then
-            echo "::error::the enrollment token reached a ConfigMap"; exit 1
-          fi
+          grep -q 'enrollment_token' "$rendered" \
+            || { echo "::error::the rendered config carries no enrollment token"; exit 1; }
+          maps=$(grep -c '^kind: ConfigMap$' "$rendered" || true)
+          [ "$maps" = 0 ] \
+            || { echo "::error::this chart renders $maps ConfigMap(s); the config carries a bearer token and must stay in a Secret"; exit 1; }
+
+          # image.digest must win over image.tag, or pinning by digest is
+          # decoration. Both are set here, and only one may survive.
+          ref=$(helm template chart-ci "$CHART" -f "$CHART"/ci/production-values.yaml \
+                  --set image.tag=v9.9.9 --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+                | grep -m1 -oE 'image: ghcr\.io/sessionlayer/gateway[@:][^ ]+')
+          echo "$ref"
+          case "$ref" in
+            *"@sha256:0000000000000000000000000000000000000000000000000000000000000000") ;;
+            *) echo "::error::image.digest did not win over image.tag: $ref"; exit 1 ;;
+          esac
 
       # The half with teeth. Everything above would still pass if every
       # `required` in the chart were deleted.
@@ -283,6 +298,27 @@ jobs:
             esac
           }
 
+          renders() { # renders <why> <command...>
+            local why="$1"; shift
+            local out rc
+            set +e
+            out=$("$@" 2>&1); rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$why should render, but was refused. A guard that says no to everything passes every refusal assertion above:"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            printf 'renders as required: %s\n' "$why"
+          }
+
+          # An install with nothing configured must not render at all. Which
+          # guard fires first depends on template ordering, so this asserts only
+          # that the refusal is one of this chart's own, named ones.
+          refuse "sessionlayer-gateway:" \
+            helm template chart-ci "$CHART"
+
+
           # Neither an operator-supplied config nor a token of its own.
           refuse "set bootstrap.enrollmentToken" \
             helm template chart-ci "$CHART" -f "$prod" --set config.existingSecret=null
@@ -306,12 +342,28 @@ jobs:
           refuse "not above the drain budget" \
             helm template chart-ci "$CHART" -f "$rendered" --set ha.drain.deadlineSecs=60
 
-          # A budget that refuses every voluntary eviction hangs a node drain.
-          # Asserted through --set, which yields an int64 where a values file
-          # yields a float64; a guard that tests only one of those is blind to
-          # the other.
-          refuse "not below replicaCount" \
+          # The budget guard, over every input path. --set yields an int64 where a
+          # values file yields a float64 and a percentage yields a string, and a
+          # guard written against one of those is blind to the others.
+          refuse "is not below replicaCount" \
             helm template chart-ci "$CHART" -f "$prod" --set podDisruptionBudget.minAvailable=99
+          # Kubernetes rounds a minAvailable percentage UP, so with 2 replicas
+          # the budget is already unsatisfiable at 51%, long before 100%.
+          refuse "leaves no room" \
+            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=100%'
+          refuse "leaves no room" \
+            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=51%'
+          refuse "neither a pod count nor a percentage" \
+            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=abc'
+          refuse "cannot be negative" \
+            helm template chart-ci "$CHART" -f "$prod" --set podDisruptionBudget.minAvailable=-1
+
+          # The other direction. Without these, a guard that refused every value
+          # would satisfy every refusal assertion above it.
+          renders "the largest percentage that still leaves room (50% of 2)" \
+            helm template chart-ci "$CHART" -f "$prod" --set 'podDisruptionBudget.minAvailable=50%'
+          renders "a count below replicaCount" \
+            helm template chart-ci "$CHART" -f "$prod" --set podDisruptionBudget.minAvailable=1
 
           # values.schema.json must reject a malformed values file rather than
           # rendering something surprising.
