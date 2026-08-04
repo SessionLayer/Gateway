@@ -152,7 +152,7 @@ schema-checked against.
 |---|---|---|
 | `hardening.landlock.enabled` | `true` | |
 | `hardening.landlock.required` | `false` | On means the process refuses to start where the kernel cannot fully enforce Landlock, rather than degrading to the container's read-only root filesystem and dropped capabilities alone. Turn it on where you control the kernel version. |
-| `hardening.landlock.readOnlyPaths` | see `values.yaml` | The systemd-resolved path the host unit lists is absent from the container image and is not repeated here. A listed path that does not exist is skipped with a startup warning and confines nothing. |
+| `hardening.landlock.readOnlyPaths` | see `values.yaml` | `/run/systemd/resolve` is deliberately absent: it is a systemd-resolved runtime directory, and no distroless image has one. A listed path that does not exist is skipped with a startup warning and confines nothing. |
 | `hardening.landlock.readWritePaths` | `[/var/lib/sessionlayer-gateway]` | |
 | `hardening.seccomp.mode` | `enforce` | The binary's own filter. The pod's `seccompProfile: RuntimeDefault` is the kernel floor beneath it. |
 | `podSecurityContext` | `runAsNonRoot`, uid/gid/fsGroup `65532`, `RuntimeDefault` | |

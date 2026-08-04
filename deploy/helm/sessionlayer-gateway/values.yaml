@@ -102,9 +102,9 @@ hardening:
     # enforce Landlock, instead of degrading to the container's read-only root
     # filesystem and dropped capabilities alone.
     required: false
-    # The systemd-resolved path the host unit lists is absent from the
-    # container image, so it is not repeated here; a listed path that does not
-    # exist is skipped with a startup warning and confines nothing.
+    # /run/systemd/resolve is deliberately absent: it is a systemd-resolved
+    # runtime directory, and no distroless image has one. A listed path that
+    # does not exist is skipped with a startup warning and confines nothing.
     readOnlyPaths:
       - /etc/sessionlayer
       - /etc/ssl/certs
