@@ -207,24 +207,101 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+
           REF="${IMAGE}@${DIGEST}"
+          NAME="${IMAGE#ghcr.io/}"
+          IDENTITY="^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/"
 
-          cosign verify \
-            --certificate-identity-regexp "^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "$REF" --output json > cosign-verify.json
-          n=$(jq 'length' cosign-verify.json)
-          echo "cosign verified signatures: $n"
-          [ "$n" -ge 1 ] || { echo "::error::cosign verify returned no signatures"; exit 1; }
+          verify_signature() {
+          	local target="$1" n
+          	cosign verify \
+          		--certificate-identity-regexp "$IDENTITY" \
+          		--certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          		"$target" >/tmp/cosign.json
+          	n=$(jq 'length' /tmp/cosign.json)
+          	[ "$n" -ge 1 ] || { echo "::error::cosign verify returned no signatures for $target"; exit 1; }
+          	echo "signature verified: $target ($n)"
+          }
 
-          gh attestation verify "oci://${REF}" --repo "$REPO"
+          # 1. The index, and then every platform manifest under it. `cosign sign` runs
+          #    with --recursive precisely so the children are signed; verifying only the
+          #    index would stay green if --recursive ever stopped doing that, and the
+          #    child is what a node actually resolves the index to.
+          verify_signature "$REF"
 
-          platforms=$(docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' \
-            | jq -r '[.manifests[].platform | select(.os == "linux" and .architecture != "unknown") | .architecture] | unique | join(",")')
-          echo "index platforms: $platforms"
-          [ "$platforms" = "amd64,arm64" ] || { echo "::error::index platforms are '$platforms', expected 'amd64,arm64'"; exit 1; }
+          INDEX=$(docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}')
+          CHILDREN=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture != "unknown") | .digest' <<<"$INDEX")
+          [ -n "$CHILDREN" ] || { echo "::error::the index lists no linux platform manifests"; exit 1; }
+          for child in $CHILDREN; do verify_signature "${IMAGE}@${child}"; done
 
-          docker buildx imagetools inspect "$REF" --format '{{json .SBOM}}' > sbom.json
-          pkgs=$(jq '[.. | objects | select(has("packages")) | .packages | length] | add // 0' sbom.json)
-          echo "SBOM packages across platforms: $pkgs"
-          [ "$pkgs" -gt 0 ] || { echo "::error::no SBOM attestation, or it lists no components"; exit 1; }
+          # 2. Exactly the platforms the release claims — not "at least". An unexpected
+          #    third platform means something published that nobody reviewed.
+          PLATFORMS=$(jq -r '[.manifests[].platform | select(.os == "linux" and .architecture != "unknown") | .architecture] | sort | unique | join(",")' <<<"$INDEX")
+          [ "$PLATFORMS" = "amd64,arm64" ] || { echo "::error::index platforms are '$PLATFORMS', expected exactly 'amd64,arm64'"; exit 1; }
+          echo "platforms: $PLATFORMS"
+
+          # 3. Provenance, pinned to this workflow on this tag. The bare
+          #    `gh attestation verify --repo` form accepts an attestation from any
+          #    workflow in the repository, which is the weaker form our own supply-chain
+          #    guide tells operators not to rely on.
+          gh attestation verify "oci://${REF}" \
+          	--repo "$GITHUB_REPOSITORY" \
+          	--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+          	--source-ref "refs/tags/${GITHUB_REF_NAME}"
+
+          # 4. Every platform's SBOM carries components. Summing the counts and testing
+          #    the sum passes when one platform's document is empty, and the platform
+          #    whose SBOM silently empties is the one nobody looks at.
+          #    Match on an SPDX *document* rather than on any object carrying a
+          #    `packages` key: a nested empty array inside one document would otherwise
+          #    fail the release for no reason.
+          docker buildx imagetools inspect "$REF" --format '{{json .SBOM}}' >sbom.json
+          SBOM_COUNTS='[.. | objects | select(has("spdxVersion") and has("packages")) | .packages | length]'
+          jq -e "$SBOM_COUNTS | (length > 0) and (map(. > 0) | all)" sbom.json >/dev/null \
+          	|| { echo "::error::an SBOM attestation is missing or lists no components"; exit 1; }
+          echo "SBOM packages per platform: $(jq -c "$SBOM_COUNTS" sbom.json)"
+
+          # 5. The tag an operator is told to pull resolves to the digest just verified.
+          #    Everything above addresses the image by digest, so a tag that never landed
+          #    or that a concurrent push moved would go unnoticed — and the tag is the
+          #    first hop of the procedure the installation guides document.
+          TAG_DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${GITHUB_REF_NAME}" --format '{{json .Manifest}}' | jq -r '.digest')
+          [ "$TAG_DIGEST" = "$DIGEST" ] \
+          	|| { echo "::error::${IMAGE}:${GITHUB_REF_NAME} resolves to $TAG_DIGEST, not the verified $DIGEST"; exit 1; }
+          echo "tag ${GITHUB_REF_NAME} -> $TAG_DIGEST"
+
+          # 6. And an operator holding no credential can obtain it. A GHCR package
+          #    created by a workflow is private until its visibility is set, and nothing
+          #    in this pipeline sets it — so without this check the whole release goes
+          #    green over an image no one can pull, while the installation guides open
+          #    with `docker pull`. Use the registry's own anonymous token endpoint rather
+          #    than `docker logout`, which does not account for credentials buildx may
+          #    hold elsewhere.
+          #
+          #    "Unreachable" and "refused" must not collapse into one message. A blamed
+          #    cause the check cannot actually distinguish is the same defect this whole
+          #    step exists to remove, one level down: a transient network failure would
+          #    otherwise be reported as a private package, sending someone to fix a
+          #    permission that was never wrong.
+          TOKEN_HTTP=$(curl -sSL --retry 3 --retry-connrefused --max-time 30 \
+          	-o /tmp/ghcr-token.json -w '%{http_code}' \
+          	"https://ghcr.io/token?scope=repository:${NAME}:pull&service=ghcr.io" || echo 000)
+          case "$TOKEN_HTTP" in
+          	200) ;;
+          	000) echo "::error::could not reach ghcr.io's token endpoint — this check is INCONCLUSIVE, not a pass"; exit 1 ;;
+          	*) echo "::error::ghcr.io refused an anonymous pull token for ${NAME} (HTTP $TOKEN_HTTP) — the package is private, so no operator can pull what this release published"; exit 1 ;;
+          esac
+          TOKEN=$(jq -r '.token // empty' /tmp/ghcr-token.json)
+          [ -n "$TOKEN" ] \
+          	|| { echo "::error::ghcr.io returned 200 with no token for ${NAME} — INCONCLUSIVE"; exit 1; }
+
+          CODE=$(curl -sSL --retry 3 --retry-connrefused --max-time 30 -o /dev/null -w '%{http_code}' \
+          	-H "Authorization: Bearer $TOKEN" \
+          	-H "Accept: application/vnd.oci.image.index.v1+json" \
+          	"https://ghcr.io/v2/${NAME}/manifests/${DIGEST}" || echo 000)
+          case "$CODE" in
+          	200) echo "anonymous pull: 200" ;;
+          	000) echo "::error::could not reach ghcr.io to resolve ${IMAGE}@${DIGEST} — INCONCLUSIVE, not a pass"; exit 1 ;;
+          	401|403) echo "::error::${IMAGE} is not anonymously pullable (HTTP $CODE) — the GHCR package is private"; exit 1 ;;
+          	*) echo "::error::anonymous resolve of ${IMAGE}@${DIGEST} returned HTTP $CODE"; exit 1 ;;
+          esac
