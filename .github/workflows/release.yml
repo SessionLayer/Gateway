@@ -32,6 +32,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The tag is what every artifact is named and labelled after; the manifest
+      # is what the binary reports about itself. Nothing forced them to agree, so
+      # a tag on an unbumped tree would publish artifacts whose contents disagree
+      # with their names — and for the Agent that is the anti-rollback floor, not
+      # a cosmetic mismatch.
+      - name: Assert the manifest version matches the tag
+        run: |
+          set -euo pipefail
+          manifest=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$manifest" ] || { echo "::error::could not read a version from Cargo.toml"; exit 1; }
+          echo "Cargo.toml: $manifest    tag: $GITHUB_REF_NAME"
+          [ "v$manifest" = "$GITHUB_REF_NAME" ] || {
+            echo "::error::Cargo.toml says $manifest, which does not match the tag $GITHUB_REF_NAME"
+            exit 1
+          }
+
       - name: Install protoc
         run: |
           sudo apt-get update
