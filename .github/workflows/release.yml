@@ -153,6 +153,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Registering binfmt lets the arm64 child manifest be executed on this
+      # amd64 runner. Without it the arm64 half of every published index would be
+      # a platform nobody has ever run — a manifest that claims more than was
+      # checked.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -305,3 +314,9 @@ jobs:
           	401|403) echo "::error::${IMAGE} is not anonymously pullable (HTTP $CODE) — the GHCR package is private"; exit 1 ;;
           	*) echo "::error::anonymous resolve of ${IMAGE}@${DIGEST} returned HTTP $CODE"; exit 1 ;;
           esac
+
+          # The arm64 child manifest, actually executed. Everything above reads
+          # index metadata; this is the only step that proves the platform we
+          # publish for runs at all.
+          docker run --rm --platform linux/arm64 "$REF" --version
+          echo "arm64 entrypoint ran"
