@@ -96,3 +96,80 @@ jobs:
           # bits/libc-header-start.h).
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
+
+  # Deliberately NOT the required check — `gate` is. This runs on every push and
+  # pull request so the image cannot rot into something nobody builds, and it
+  # asserts the runtime posture the Kubernetes manifests depend on.
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMG: sessionlayer/gateway:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build linux/amd64
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.IMG }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+
+      # Compile proof only: nothing needs to execute, and the cross-compiled
+      # arm64 binary cannot run on the runner anyway.
+      - name: Build linux/arm64
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/arm64
+          push: false
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+
+      - name: Assert the runtime posture
+        env:
+          EXPECT_VERSION: ${{ github.ref_name }}
+          EXPECT_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          user=$(docker image inspect -f '{{.Config.User}}' "$IMG")
+          echo "USER: ${user:-<empty>}"
+          case "$user" in
+            ""|root|0|root:*|0:*) echo "::error::image runs as ${user:-<empty>}; runAsNonRoot cannot enforce this"; exit 1 ;;
+          esac
+
+          # The positive control: the entrypoint itself must run. Without it, a
+          # container runtime broken for any unrelated reason would make the
+          # no-shell assertion below pass for the wrong reason.
+          docker run --rm "$IMG" --version
+
+          if docker run --rm --entrypoint /bin/sh "$IMG" -c true 2>/dev/null; then
+            echo "::error::/bin/sh exists in the final layer"; exit 1
+          fi
+          echo "no shell in the final layer"
+
+          labels=$(docker image inspect -f '{{json .Config.Labels}}' "$IMG")
+          for key in title description source licenses version revision; do
+            value=$(printf '%s' "$labels" | jq -r --arg k "org.opencontainers.image.$key" '.[$k] // ""')
+            echo "org.opencontainers.image.$key = ${value:-<empty>}"
+            [ -n "$value" ] || { echo "::error::label org.opencontainers.image.$key is unset"; exit 1; }
+          done
+
+          # version/revision must come from the build args, not a baked constant.
+          got_version=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.version"')
+          got_revision=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.revision"')
+          [ "$got_version" = "$EXPECT_VERSION" ] || { echo "::error::version label is '$got_version', expected '$EXPECT_VERSION'"; exit 1; }
+          [ "$got_revision" = "$EXPECT_REVISION" ] || { echo "::error::revision label is '$got_revision', expected '$EXPECT_REVISION'"; exit 1; }

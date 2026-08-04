@@ -96,7 +96,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: ghcr.io/sessionlayer/gateway:latest # pin by digest in production
+          image: ghcr.io/sessionlayer/gateway:v0.0.2 # pin by digest in production
           args: ["--config", "/etc/sessionlayer/gateway.json"]
           ports:
             - { name: ssh, containerPort: 2222 }
