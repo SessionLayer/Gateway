@@ -51,7 +51,7 @@ jobs:
       # protoc: needed by build.rs (tonic-prost-build shells out to protoc).
       # nextest / cargo-deny / cargo-audit: used by the gate steps below.
       - name: Install gate tools (protoc, nextest, cargo-deny, cargo-audit)
-        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2
         with:
           tool: protoc,cargo-nextest,cargo-deny,cargo-audit
 
