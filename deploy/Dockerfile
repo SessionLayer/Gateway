@@ -11,7 +11,7 @@
 # Pinned to $BUILDPLATFORM and cross-compiled: a QEMU-emulated release build of
 # this workspace costs hours per architecture, and aarch64 is a target CI already
 # compiles on every push.
-FROM --platform=$BUILDPLATFORM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
+FROM --platform=$BUILDPLATFORM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
 
 # protoc: build.rs generates the CP<->GW gRPC stubs via tonic-prost-build.
 # The aarch64 cross toolchain is installed unconditionally so both target builds
