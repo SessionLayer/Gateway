@@ -368,8 +368,8 @@ mod tests {
         );
     }
 
-    /// The two native saturation gauges (CARRYFORWARDS B5) emit the
-    /// live state on export: a session raises `live_sessions`, and an unhealthy
+    /// The two native saturation gauges emit the live state on export: a
+    /// session raises `live_sessions`, and an unhealthy
     /// lock feed drops `lock_feed_healthy` to 0. Drive a real [`LockSet`] as the
     /// health source (exactly what `register_gateway_gauges` wires) and read the
     /// values back through an in-memory exporter.

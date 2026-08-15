@@ -41,7 +41,7 @@ pub(crate) struct ReverseAllowed {
     // `single_connection` (RFC 4254 §6.3.2) is relayed to the node in the x11-req, but
     // the node is the least-trusted party here, same as every other reverse-open check
     // in this file -- trusting it to police its own single-use promise would let a
-    // compromised node ride the forwarded cookie past its first use (M2). Claimed
+    // compromised node ride the forwarded cookie past its first use. Claimed
     // exactly once via `compare_exchange` so two near-simultaneous opens can't both win.
     x11_consumed: AtomicBool,
 }
@@ -327,7 +327,7 @@ impl InnerClient {
     /// request -- RFC 4254 has no way to retract an in-flight global request once
     /// sent, so a stalling node would otherwise let the caller's per-connection
     /// listener-count bookkeeping hold this slot for the rest of the connection no
-    /// matter how many times the operator asks to cancel it (M3). The caller uses
+    /// matter how many times the operator asks to cancel it. The caller uses
     /// this to release that bookkeeping on timeout specifically, without treating an
     /// explicit node rejection the same way.
     pub async fn cancel_remote_forward(
@@ -419,7 +419,7 @@ impl client::Handler for InnerHandler {
             return Ok(());
         };
         // `try_admit_x11` enforces `single_connection` here rather than trusting the
-        // node's own compliance with the flag we relayed to it (M2): refuses both an
+        // node's own compliance with the flag we relayed to it: refuses both an
         // unsolicited open and a second one past a claimed single-connection grant.
         if !self.reverse_allowed.try_admit_x11() {
             tracing::warn!(
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn x11_single_connection_admits_exactly_once() {
-        // M2: `single_connection` must be enforced here, not merely relayed to the
+        // `single_connection` must be enforced here, not merely relayed to the
         // node and trusted -- a compromised node must not be able to ride the
         // forwarded cookie past its first use by simply ignoring the flag.
         let a = ReverseAllowed::default();

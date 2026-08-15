@@ -653,7 +653,7 @@ where
 
     let outcome = loop {
         tokio::select! {
-            // Begin-drain (L5): close the control channel so the agent fails over promptly.
+            // Begin-drain: close the control channel so the agent fails over promptly.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
                     tracing::info!(node = %sanitize(&peer.node_name), "gateway draining; closing the agent control channel so it fails over");

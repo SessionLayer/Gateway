@@ -150,7 +150,7 @@ impl ReverseDispatcher {
         // (server/session.rs `channel_open_generic`), well before this future
         // would resolve. Dropping the future here would abandon the receiver
         // that is the only way we ever learn that id, orphaning the entry for
-        // the life of the connection (M5). `race_with_reclaim` below is the
+        // the life of the connection. `race_with_reclaim` below is the
         // reusable shape that keeps it alive across the timeout.
         let (inner, direction, target, open_task) = match open {
             ReverseOpen::ForwardedTcpip {
@@ -267,7 +267,7 @@ enum RaceOutcome<T> {
 ///
 /// A bare `tokio::time::timeout(dur, future).await` drops `future` the instant
 /// it elapses. For `handle_open`'s outer channel-open call that is
-/// catastrophic (M5): the vendored server has already allocated a `ChannelId`
+/// catastrophic: the vendored server has already allocated a `ChannelId`
 /// and wired it into its own session-scoped channel table before this could
 /// ever resolve, so dropping the future here abandons the only receiver that
 /// would ever learn that id -- a real, permanently leaked resource, not a
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(TunnelDirection::X11.audit_family(), "x11_forward");
     }
 
-    /// M5: this is the exact function `handle_open` races the real
+    /// This is the exact function `handle_open` races the real
     /// `channel_open_forwarded_tcpip`/`channel_open_x11` calls through (typed
     /// here over a plain `u32` rather than the vendored `Channel<Msg>`, which
     /// only a live session can construct -- the mechanism under test doesn't

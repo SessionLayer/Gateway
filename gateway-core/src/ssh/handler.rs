@@ -2327,7 +2327,7 @@ fn effective_idle_secs(static_secs: u64, context_secs: i64) -> u64 {
 
 /// Apply a `cancel-tcpip-forward` round-trip to the per-connection listener-count
 /// bookkeeping. An explicit node ack releases the slot (existing behavior). A
-/// TIMEOUT also releases it (M3): RFC 4254 gives no way to retract the request
+/// TIMEOUT also releases it: RFC 4254 gives no way to retract the request
 /// once sent, so a stalling node must not be able to pin this slot for the rest of
 /// the connection no matter how many times the operator asks. An explicit
 /// rejection is left alone — unlike a stalling node, this one is demonstrably
@@ -2634,7 +2634,7 @@ mod tests {
         assert!(!cleaned.contains('\u{202E}'));
     }
 
-    /// M3: a stalling node must not pin a `cancel-tcpip-forward` bookkeeping slot for
+    /// A stalling node must not pin a `cancel-tcpip-forward` bookkeeping slot for
     /// the rest of the connection just because it never answers, but an explicit
     /// rejection (the node IS there and answering) is left alone.
     #[test]
