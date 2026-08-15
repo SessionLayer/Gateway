@@ -1166,10 +1166,10 @@ impl SshHandler {
         )));
     }
 
-    /// Resolve the target, apply the credential reducer, call `Authorize`, and on ALLOW
-    /// build the [`Authorized`] hand-off. Pre-authorization failures collapse to the
-    /// generic denial (no existence disclosure); missing host-verification material
-    /// aborts (never TOFU).
+    /// Resolve the target, call `Authorize`, and on ALLOW re-check the credential
+    /// reducer against the signed context and build the [`Authorized`] hand-off.
+    /// Pre-authorization failures collapse to the generic denial (no existence
+    /// disclosure); missing host-verification material aborts (never TOFU).
     async fn decide(&self) -> Result<Authorized, SshOutcome> {
         let Some(auth) = &self.authenticated else {
             return Err(SshOutcome::AuthFailed);
@@ -1193,26 +1193,28 @@ impl SshHandler {
             target
         };
 
-        // Credential-principal reducer (deny-only): a login-scoped credential may
-        // only be used for a login it is scoped to.
-        if !auth.principals.is_empty() && !auth.principals.iter().any(|p| p == &target.login) {
-            tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "credential_principal_scope", "generic denial");
-            return Err(SshOutcome::PolicyDenied);
-        }
-
-        let Some(node_id) = self.deps.resolver.resolve_node_id(&target) else {
-            tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "unknown_node", "generic denial");
-            return Err(SshOutcome::PolicyDenied);
-        };
+        // An unresolvable target is NOT pre-empted here: the CP resolves node_name
+        // server-side and audits its own no-match, and a local refusal would leave a
+        // name-probing user with no decision record anywhere.
+        let node_id = self
+            .deps
+            .resolver
+            .resolve_node_id(&target)
+            .unwrap_or_default();
 
         let req = AuthorizeRequest {
             identity: auth.identity.clone(),
             identity_groups: auth.groups.clone(),
             // The CP resolves the node NAME to runtime.node.id via findByName —
             // authoritative, server-side. node_id is kept only for back-compat (the CP
-            // ignores it when node_name is set).
+            // ignores it when node_name is set, so an unresolved empty id is fine).
             node_name: target.node.clone(),
             node_id: node_id.clone(),
+            // The credential's login scope, deny-only. Sending it is what makes an
+            // out-of-scope refusal AUDITABLE: the CP is the sole decision authority and
+            // the only writer of the decision log, so a refusal it never sees is a
+            // refusal no auditor can see. It can never widen a decision.
+            credential_principals: auth.principals.clone(),
             requested_principal: target.login.clone(),
             source_ip: self.source_ip(),
             session_id: self.session_id.clone(),
@@ -1238,30 +1240,6 @@ impl SshHandler {
         }
         match resp {
             resp if resp.decision == Decision::Allow as i32 && !resp.session_token.is_empty() => {
-                let Some(nc) = resp.node_connection else {
-                    let m = metrics::node_unreachable(UnreachableReason::NoNodeConnection);
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "authorized but the CP returned no node connection; failing closed");
-                    return Err(SshOutcome::NodeUnreachable(m));
-                };
-                let trust = host_trust_from(nc.host_verification);
-                if trust.is_empty() {
-                    // No enrollment anchor → the node cannot be verified → NEVER
-                    // TOFU. Abort.
-                    let m =
-                        metrics::node_unreachable(UnreachableReason::NoHostVerificationMaterial);
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "aborting: node has no host-verification anchor (never TOFU)");
-                    return Err(SshOutcome::NodeUnreachable(m));
-                }
-                // Per-node connector selection. An OUTBOUND_AGENT node is joined
-                // to its Agent by the CP-stamped enrollment NAME; without one there is no
-                // join key, so fail closed to node-offline rather than dial anything.
-                if nc.connector_kind == ConnectorKind::OutboundAgent as i32
-                    && nc.node_name.is_empty()
-                {
-                    let m = metrics::node_unreachable(UnreachableReason::AgentNodeWithoutName);
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "outbound-agent node has no enrollment name; failing closed");
-                    return Err(SshOutcome::NodeUnreachable(m));
-                }
                 // Trust the decision context only because its signature verifies (chain to
                 // the pinned internal mTLS CA + signer marker + codeSigning EKU +
                 // ECDSA-P256/SHA-256). Fail closed on any doubt. EVERY security field the
@@ -1295,6 +1273,44 @@ impl SshHandler {
                         return Err(o);
                     }
                 };
+                // Credential-principal reducer, backstop half: sending the scope to the CP
+                // is what makes the refusal auditable, but re-checking it here is what makes
+                // it unforgeable — a CP older than the contract field, or one that ignores
+                // it, still cannot hand this Gateway an out-of-scope allow. Checked against
+                // the SIGNED principal, the login everything downstream actually runs as.
+                // Its own reason: a CP allow the Gateway then refuses is an anomaly, not the
+                // ordinary deny.
+                if !credential_scope_permits(&auth.principals, &principal) {
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "credential_principal_scope_backstop", "authorized login is outside the credential's scope; refusing (generic denial)");
+                    return Err(SshOutcome::PolicyDenied);
+                }
+                // Reachability is decided AFTER the signed context: a session policy refuses
+                // must be refused as such, not reported as an offline node, and the anomaly
+                // above has to reach the operator log even when the node is unreachable.
+                let Some(nc) = resp.node_connection else {
+                    let m = metrics::node_unreachable(UnreachableReason::NoNodeConnection);
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "authorized but the CP returned no node connection; failing closed");
+                    return Err(SshOutcome::NodeUnreachable(m));
+                };
+                let trust = host_trust_from(nc.host_verification);
+                if trust.is_empty() {
+                    // No enrollment anchor → the node cannot be verified → NEVER
+                    // TOFU. Abort.
+                    let m =
+                        metrics::node_unreachable(UnreachableReason::NoHostVerificationMaterial);
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "aborting: node has no host-verification anchor (never TOFU)");
+                    return Err(SshOutcome::NodeUnreachable(m));
+                }
+                // Per-node connector selection. An OUTBOUND_AGENT node is joined
+                // to its Agent by the CP-stamped enrollment NAME; without one there is no
+                // join key, so fail closed to node-offline rather than dial anything.
+                if nc.connector_kind == ConnectorKind::OutboundAgent as i32
+                    && nc.node_name.is_empty()
+                {
+                    let m = metrics::node_unreachable(UnreachableReason::AgentNodeWithoutName);
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "outbound-agent node has no enrollment name; failing closed");
+                    return Err(SshOutcome::NodeUnreachable(m));
+                }
                 // A break-glass auth should always come back access_model=BREAKGLASS. A
                 // mismatch signals token mis-binding / contract drift (the local flag still
                 // forces strict, so it is not a downgrade). Not user-facing.
@@ -2215,6 +2231,12 @@ fn inner_leg_principal(context: &DecisionContext, requested: &str) -> Result<Str
     Ok(context.principal.clone())
 }
 
+/// Deny-only: an unscoped credential (empty `principals`) permits any login; a scoped
+/// one permits only a login it names. Never widens — it can only refuse.
+fn credential_scope_permits(principals: &[String], login: &str) -> bool {
+    principals.is_empty() || principals.iter().any(|p| p == login)
+}
+
 fn host_trust_from(hv: Option<crate::pb::HostVerification>) -> HostTrust {
     match hv {
         Some(h) => HostTrust {
@@ -2700,6 +2722,26 @@ mod tests {
             inner_leg_principal(&DecisionContext::default(), "root"),
             Err(SshOutcome::PolicyDenied)
         ));
+    }
+
+    /// The reducer half the Gateway keeps after the CP's answer. Deny-only: it must
+    /// refuse an out-of-scope login and be incapable of granting anything.
+    #[test]
+    fn the_credential_scope_reducer_only_ever_denies() {
+        let scoped = vec!["deploy".to_string(), "ops".to_string()];
+        assert!(credential_scope_permits(&scoped, "deploy"));
+        assert!(credential_scope_permits(&scoped, "ops"));
+        for outside in ["root", "", "Deploy", "deploy "] {
+            assert!(
+                !credential_scope_permits(&scoped, outside),
+                "{outside:?} is outside the credential's scope"
+            );
+        }
+        // Unscoped credentials are untouched — the reducer never widens, and never
+        // narrows a credential that carried no scope to begin with.
+        for login in ["root", "deploy", ""] {
+            assert!(credential_scope_permits(&[], login));
+        }
     }
 
     /// The break-glass FIDO2 publickey path: ONLY sk-ecdsa is a candidate.
