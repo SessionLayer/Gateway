@@ -177,7 +177,7 @@ impl AgentRegistry {
 }
 
 /// Deregisters a control channel when its connection ends (heartbeat loss, close,
-/// or supersession). The node then has no owner and is simply offline (§7.1).
+/// or supersession). The node then has no owner and is simply offline.
 #[derive(Debug)]
 pub struct Registration {
     registry: Arc<AgentRegistry>,

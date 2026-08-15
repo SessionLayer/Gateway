@@ -69,7 +69,7 @@ pub struct AgentTransportDeps {
     pub registry: Arc<AgentRegistry>,
     pub pending: Arc<PendingDialBacks>,
     pub signer: Arc<DialBackSigner>,
-    /// The actively-pushed lock deny-set (§8.4) — consulted at registration and at
+    /// The actively-pushed lock deny-set — consulted at registration and at
     /// every dial-back.
     pub lock_set: Arc<LockSet>,
     /// HA peer-relay machinery. `Some` enables the `/peer/v1/relay` path — the ingress side
@@ -119,7 +119,7 @@ impl BoundAgentTransport {
         // has delivered its first snapshot. This makes the boot race structurally
         // impossible rather than merely denied — a locked agent that reconnects during boot
         // is not even handshaked until we can evaluate the deny-set. A feed that never
-        // connects means we serve no agent nodes (they are "offline", §7.1) — the correct
+        // connects means we serve no agent nodes (they are "offline") — the correct
         // deny-wins trade. `refuse_if_locked` then keeps failing closed if the feed later
         // drops mid-life.
         tokio::select! {
@@ -380,8 +380,8 @@ fn spawn_relay_pending_gc(
     });
 }
 
-/// Why an agent connection was refused. Reported to the peer as a coarse code only
-/// (§7.1 non-disclosure); the specific reason stays in the operator log.
+/// Why an agent connection was refused. Reported to the peer as a coarse code only,
+/// disclosing nothing about which check failed; the specific reason stays in the operator log.
 #[derive(Debug, thiserror::Error)]
 enum ConnError {
     #[error("TLS handshake failed: {0}")]
@@ -510,12 +510,12 @@ async fn handshake(
 /// The agent-surface Lock gate (contract §1/§6 check 7/§8). Used at registration, on every
 /// heartbeat tick, and at dial-back redemption.
 ///
-/// **Deny fails closed (§8.4).** An unhealthy deny-feed — before the
+/// **Deny fails closed.** An unhealthy deny-feed — before the
 /// first snapshot at boot, or after the CP stream drops — cannot confirm the ABSENCE of a
 /// lock, and an empty `LockSet` is indistinguishable from "no lock applies". So an
 /// unconfirmable deny-set is treated as a deny, exactly as the session path does
 /// (`handler.rs` local_recheck). The availability cost is deliberate: while the feed is down
-/// this Gateway serves NO agent nodes — they are simply "offline" (§7.1), the correct
+/// this Gateway serves NO agent nodes — they are simply "offline", the correct
 /// deny-wins trade. In practice the cost is small: a down lock stream usually means the CP is
 /// down, and `Authorize` already fails closed, so few new sessions were possible anyway.
 fn refuse_if_locked(inner: &Inner, peer: &AgentPeer) -> Result<(), ConnError> {
@@ -614,7 +614,7 @@ async fn run_control<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // Deny wins (§8.4): a locked agent identity cannot register — and, re-checked at
+    // Deny wins: a locked agent identity cannot register — and, re-checked at
     // every dial-back and on every heartbeat, cannot stay registered either.
     if let Err(e) = refuse_if_locked(&inner, &peer) {
         let _ = send_error(&mut ws, ver, &e).await;

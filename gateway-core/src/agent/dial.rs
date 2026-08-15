@@ -51,7 +51,7 @@ impl NodeConnector for AgentDial {
     fn connect<'a>(&'a self, dial: &'a NodeDial) -> ConnectFuture<'a> {
         Box::pin(async move {
             // Without the CP-supplied enrollment name there is no join key to an
-            // Agent — fail closed rather than guess (FR-CONN-3).
+            // Agent — fail closed rather than guess.
             if dial.node_name.is_empty() {
                 return Err(NodeConnectError::NoNodeName);
             }
@@ -64,7 +64,7 @@ impl NodeConnector for AgentDial {
                 }
             };
 
-            // Deny wins, and deny fails CLOSED (§8.4). An unhealthy lock feed
+            // Deny wins, and deny fails CLOSED. An unhealthy lock feed
             // cannot confirm the ABSENCE of a lock, so an empty deny-set is NOT evidence the
             // agent is unlocked — refuse rather than mint a single-use dial-back capability
             // for a peer we cannot vouch for. The session path reaches the

@@ -1,5 +1,5 @@
 //! Decision-context verification (Rust port of CP's DecisionContextVerifier).
-//! Trust cached context ONLY if signature verifies (SESSION §2.3): PKIX-validate CONTEXT_SIGNER leaf to pinned mTLS CA,
+//! Trust cached context ONLY if the signature verifies: PKIX-validate CONTEXT_SIGNER leaf to pinned mTLS CA,
 //! require SAN URI + codeSigning EKU (reject CA certs), verify ECDSA-P256/SHA-256 signature. Fail-closed on any failure.
 
 use p256::ecdsa::signature::Verifier;
