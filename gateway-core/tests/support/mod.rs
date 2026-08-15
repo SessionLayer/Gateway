@@ -376,6 +376,15 @@ struct MockState {
     node_name_to_id: Mutex<HashMap<String, String>>,
     authorize_requests: Mutex<Vec<AuthorizeRequest>>,
 
+    /// Every credential scope this mock has handed out, keyed by identity. Ground
+    /// truth for the Authorize-side assertion that the Gateway forwarded the scope of
+    /// the credential the client actually authenticated with.
+    resolved_scopes: Mutex<HashMap<String, Vec<Vec<String>>>>,
+    /// Models a CP that predates `credential_principals`, or ignores it: the mock skips
+    /// the reduction and can ALLOW an out-of-scope login. The Gateway's backstop is the
+    /// only thing that refuses then.
+    ignore_credential_scope: Mutex<bool>,
+
     // ---- concurrency-lease lifecycle -----------------------------
     /// Concurrency leases taken on a standing/JIT ALLOW (break-glass takes none),
     /// keyed by session_id. NotifySessionEnd releases; ExtendSessionLease re-stamps.
@@ -788,6 +797,52 @@ fn resolved(rec: &ResolvedRecord) -> ResolvedIdentity {
     }
 }
 
+impl MockState {
+    /// Remember what scope this identity was just handed, then pass the resolution
+    /// through. Every outer-leg resolve path funnels through here so Authorize can
+    /// check the Gateway forwarded THIS credential's scope.
+    fn remember_scope(&self, id: ResolvedIdentity) -> ResolvedIdentity {
+        if id.resolved {
+            self.resolved_scopes
+                .lock()
+                .unwrap()
+                .entry(id.identity.clone())
+                .or_default()
+                .push(id.principals.clone());
+        }
+        id
+    }
+
+    /// The mock-side assertion the fix exists for: the credential's login scope must
+    /// REACH the CP, because the CP is the only writer of the decision log. Forwarding
+    /// nothing, or some other credential's scope, is a Gateway defect rather than a
+    /// policy question, so it surfaces as an RPC error — distinct from every deny.
+    fn check_credential_scope_forwarded(&self, r: &AuthorizeRequest) -> Result<(), Status> {
+        let scopes = self.resolved_scopes.lock().unwrap();
+        let Some(handed_out) = scopes.get(&r.identity) else {
+            return Ok(()); // an identity this mock never resolved: nothing to check against
+        };
+        if handed_out.contains(&r.credential_principals) {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "AuthorizeRequest.credential_principals {:?} matches no credential resolved for {:?} (handed out: {handed_out:?})",
+            r.credential_principals, r.identity
+        )))
+    }
+
+    /// The CP-side credential-principal reduction: deny-only, applied after the
+    /// node-status gate and before any grant / JIT / break-glass evaluation, exactly
+    /// where the real CP applies it.
+    fn credential_scope_denies(&self, r: &AuthorizeRequest) -> bool {
+        if *self.ignore_credential_scope.lock().unwrap() {
+            return false;
+        }
+        !r.credential_principals.is_empty()
+            && !r.credential_principals.contains(&r.requested_principal)
+    }
+}
+
 /// Enforce the mTLS tier: every OuterLegAuth/Authorize RPC requires the caller's
 /// Gateway client certificate; resolve it to a known gateway_id.
 fn require_gateway<T>(request: &Request<T>, state: &MockState) -> Result<String, Status> {
@@ -805,10 +860,11 @@ fn require_gateway<T>(request: &Request<T>, state: &MockState) -> Result<String,
 impl MockState {
     /// Resolve a pin/OTP record honouring the optional deny-only source binding.
     fn resolve_map(&self, rec: Option<&ResolvedRecord>, source_ip: &str) -> ResolvedIdentity {
-        match rec {
+        let id = match rec {
             Some(r) if r.source_ip.as_deref().is_none_or(|s| s == source_ip) => resolved(r),
             _ => not_resolved(),
-        }
+        };
+        self.remember_scope(id)
     }
 
     /// Validate a presented OpenSSH user certificate against the user-facing CA
@@ -826,12 +882,12 @@ impl MockState {
         if cert.validate_at(unix_now(), [&ca_fp]).is_err() {
             return not_resolved();
         }
-        ResolvedIdentity {
+        self.remember_scope(ResolvedIdentity {
             resolved: true,
             identity: cert.key_id().to_string(),
             principals: cert.valid_principals().to_vec(),
             groups: Vec::new(),
-        }
+        })
     }
 
     /// Sign an OpenSSH user certificate with the user-facing CA (for the
@@ -978,7 +1034,7 @@ impl OuterLegAuth for MockSvc {
             match otps.get(&r.otp) {
                 Some(rec) if rec.source_ip.as_deref().is_none_or(|s| s == r.source_ip) => {
                     let rec = otps.remove(&r.otp).unwrap();
-                    resolved(&rec)
+                    self.remember_scope(resolved(&rec))
                 }
                 _ => not_resolved(),
             }
@@ -1048,12 +1104,12 @@ impl OuterLegAuth for MockSvc {
                 DeviceFlowStatus::Approved,
                 // Real CP: device-flow APPROVED carries identity only; RBAC
                 // decides the logins, so principals/groups are empty.
-                ResolvedIdentity {
+                self.remember_scope(ResolvedIdentity {
                     resolved: true,
                     identity: rec.template.identity.clone(),
                     principals: Vec::new(),
                     groups: Vec::new(),
-                },
+                }),
             )
         } else {
             (DeviceFlowStatus::Pending, not_resolved())
@@ -1142,7 +1198,7 @@ impl MockState {
             },
         );
         BreakglassResolution {
-            identity: Some(resolved(rec)),
+            identity: Some(self.remember_scope(resolved(rec))),
             breakglass_token: token,
         }
     }
@@ -1341,6 +1397,11 @@ impl MockState {
         if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
             return deny_response();
         }
+        // The reduction precedes break-glass too: an emergency credential scoped to a
+        // login does not become unscoped by being an emergency credential.
+        if self.credential_scope_denies(r) {
+            return deny_response();
+        }
         let context = self.context_for(gid, r, AccessModel::Breakglass);
         // Deny wins: a top-tier Lock refuses break-glass on a locked target.
         if self.lock_denies(&context) {
@@ -1363,6 +1424,7 @@ impl Authorization for MockSvc {
         }
         let mut r = request.into_inner();
         self.authorize_requests.lock().unwrap().push(r.clone());
+        self.check_credential_scope_forwarded(&r)?;
         // Name resolution is server-side authoritative: resolve
         // node_name to the node's id/key and IGNORE the client-asserted node_id, so a
         // client cannot smuggle an id past the resolved name. Empty node_name falls
@@ -1381,6 +1443,12 @@ impl Authorization for MockSvc {
 
         // Unknown node → generic DENY (no existence disclosure).
         if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
+            return Ok(Response::new(deny_response()));
+        }
+        // Deny-only credential scope, before any grant evaluation. The DENY is
+        // indistinguishable to the client and fully recorded server-side — which is the
+        // whole point of the Gateway forwarding the scope instead of pre-empting.
+        if self.credential_scope_denies(&r) {
             return Ok(Response::new(deny_response()));
         }
         let allowed = self.allow_rules.lock().unwrap().iter().any(|rule| {
@@ -1966,6 +2034,8 @@ impl MockCpBuilder {
             presence_staleness: self.presence_staleness,
             node_name_to_id: Mutex::new(HashMap::new()),
             authorize_requests: Mutex::new(Vec::new()),
+            resolved_scopes: Mutex::new(HashMap::new()),
+            ignore_credential_scope: Mutex::new(false),
             leases: Mutex::new(HashMap::new()),
             session_end_notifications: Mutex::new(Vec::new()),
             lease_extensions: Mutex::new(Vec::new()),
@@ -2216,6 +2286,13 @@ impl MockCp {
             .lock()
             .unwrap()
             .insert(name.to_string(), id.to_string());
+    }
+
+    /// Make the mock ignore `credential_principals` — a CP older than the field, or one
+    /// that drops it — so it can ALLOW an out-of-scope login. The Gateway's backstop is
+    /// then the only thing standing between that allow and the node.
+    pub fn set_ignores_credential_scope(&self) {
+        *self.state.ignore_credential_scope.lock().unwrap() = true;
     }
 
     /// The most recent `AuthorizeRequest` the mock received (assertions:

@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::support::MockCp;
 use gateway_core::config::{DeviceFlowConfig, SshServerConfig};
 use gateway_core::ssh;
+use gateway_core::ssh::target::{Target, TargetResolver};
 use rand_core::OsRng;
 use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey};
 use testcontainers::core::ExecCommand;
@@ -85,6 +86,36 @@ async fn start_server(
     (port, tx)
 }
 
+/// Like [`start_server`] but with an explicit target resolver.
+async fn start_server_with_resolver(
+    cp: &MockCp,
+    config: Arc<SshServerConfig>,
+    resolver: Arc<dyn TargetResolver>,
+) -> (u16, tokio::sync::oneshot::Sender<()>) {
+    let mut deps = crate::support::outer_leg_deps(cp, config.clone()).await;
+    deps.resolver = resolver;
+    let server = ssh::bind(config, deps).await.unwrap();
+    let port = server.local_addr().port();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(server.run(async move {
+        let _ = rx.await;
+    }));
+    (port, tx)
+}
+
+/// A resolver that knows a fixed inventory and returns `None` for everything else —
+/// the shape the shipped `IdentityResolver` (which echoes any non-empty name back)
+/// cannot produce.
+struct KnownNodesOnly(&'static [&'static str]);
+
+impl TargetResolver for KnownNodesOnly {
+    fn resolve_node_id(&self, target: &Target) -> Option<String> {
+        self.0
+            .contains(&target.node.as_str())
+            .then(|| target.node.clone())
+    }
+}
+
 fn base_config() -> SshServerConfig {
     SshServerConfig {
         listen_addr: "127.0.0.1:0".to_string(),
@@ -111,6 +142,25 @@ async fn ssh_exec(
     let stderr = String::from_utf8_lossy(&res.stderr_to_vec().await.unwrap()).into_owned();
     let code = res.exit_code().await.unwrap();
     (code, stdout, stderr)
+}
+
+/// `ssh -i <key> <target> true`, publickey-only and non-interactive.
+fn pubkey_args(port: u16, key_path: &str, target: &str) -> Vec<String> {
+    ssh_args(
+        port,
+        &[
+            "-i",
+            key_path,
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "BatchMode=yes",
+        ],
+        target,
+        "true",
+    )
 }
 
 fn ssh_args(port: u16, extra: &[&str], target: &str, command: &str) -> Vec<String> {
@@ -780,6 +830,232 @@ async fn a_long_lived_key_offered_as_a_standing_path_is_refused() -> anyhow::Res
     assert!(
         stderr.contains(NODE_OFFLINE),
         "the same key WITH an active pin authenticates (short-TTL, not standing); stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+/// A credential-scope refusal must be a CP DECISION, not a Gateway pre-empt. The client
+/// cannot tell the denials apart — that is intended — but the CP is the sole writer of
+/// the decision log, so a refusal it never sees is a refusal no auditor can see either.
+/// What these assertions pin is that the RPC happened and carried the scope.
+#[tokio::test]
+async fn a_credential_scope_denial_reaches_the_control_plane() -> anyhow::Result<()> {
+    build_client_image().await?;
+
+    let cp = MockCp::start().await;
+    let scoped = generate_key();
+    let unscoped = generate_key();
+    let cert_line = cp.sign_user_cert(&generate_key().public_line, "unused", &["x"], 300);
+
+    cp.register_pin(&scoped.fingerprint, "alice", &["deploy"]);
+    cp.register_pin(&unscoped.fingerprint, "bob", &[]);
+    // RBAC allows alice BOTH logins, so a `root` denial can only be the credential
+    // scope — never the grant evaluation in disguise.
+    cp.allow("alice", "web-01", "deploy");
+    cp.allow("alice", "web-01", "root");
+    cp.allow("bob", "web-01", "root");
+
+    let (port, _shutdown) = start_server(&cp, Arc::new(base_config())).await;
+    let container = client_container(&scoped, &unscoped, &cert_line).await;
+
+    // In scope: authorized, and the inner leg then finds no node — NODE_OFFLINE is how
+    // this suite spells "authentication and authorization both passed".
+    let (_code, _stdout, stderr) = ssh_exec(
+        &container,
+        pubkey_args(port, "/root/pin_key", "deploy%web-01"),
+        vec![],
+    )
+    .await;
+    assert!(
+        stderr.contains(NODE_OFFLINE),
+        "an in-scope login is unaffected; stderr={stderr:?}"
+    );
+    let req = cp
+        .last_authorize_request()
+        .expect("an in-scope connect must call Authorize");
+    assert_eq!(
+        req.credential_principals,
+        vec!["deploy".to_string()],
+        "the credential's scope must reach the CP on every call, not only the denials"
+    );
+
+    // Out of scope: the same generic denial as before, but now the CP made it.
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        pubkey_args(port, "/root/pin_key", "root%web-01"),
+        vec![],
+    )
+    .await;
+    assert_ne!(code, Some(0), "an out-of-scope login must not exit clean");
+    assert!(
+        stderr.contains(ACCESS_DENIED),
+        "the client-facing outcome is unchanged: one generic denial; stderr={stderr:?}"
+    );
+    let req = cp
+        .last_authorize_request()
+        .expect("the out-of-scope connect must have called Authorize");
+    assert_eq!(req.requested_principal, "root");
+    assert_eq!(
+        req.credential_principals,
+        vec!["deploy".to_string()],
+        "the CP cannot write the decision record without the scope that produced it"
+    );
+
+    // An unscoped credential is untouched by the reducer.
+    let (_code, _stdout, stderr) = ssh_exec(
+        &container,
+        pubkey_args(port, "/root/cert_key", "root%web-01"),
+        vec![],
+    )
+    .await;
+    assert!(
+        stderr.contains(NODE_OFFLINE),
+        "an unscoped credential authorizes any RBAC-allowed login; stderr={stderr:?}"
+    );
+    let req = cp.last_authorize_request().expect("Authorize was called");
+    assert!(
+        req.credential_principals.is_empty(),
+        "unscoped must travel as empty, not as a one-element scope; got {:?}",
+        req.credential_principals
+    );
+    Ok(())
+}
+
+/// The backstop half. Forwarding the scope is what makes the refusal auditable; keeping
+/// the local check is what makes it unforgeable. A CP older than the contract field, or
+/// one that ignores it, must still not be able to hand this Gateway an out-of-scope
+/// allow.
+#[tokio::test]
+async fn the_gateway_refuses_an_out_of_scope_login_the_control_plane_allowed() -> anyhow::Result<()>
+{
+    build_client_image().await?;
+
+    let cp = MockCp::start().await;
+    cp.set_ignores_credential_scope();
+    let scoped = generate_key();
+    let unscoped = generate_key();
+    let cert_line = cp.sign_user_cert(&generate_key().public_line, "unused", &["x"], 300);
+
+    cp.register_pin(&scoped.fingerprint, "alice", &["deploy"]);
+    cp.register_pin(&unscoped.fingerprint, "bob", &[]);
+    cp.allow("alice", "web-01", "root");
+    cp.allow("bob", "web-01", "root");
+
+    let (port, _shutdown) = start_server(&cp, Arc::new(base_config())).await;
+    let container = client_container(&scoped, &unscoped, &cert_line).await;
+
+    // The control: an unscoped credential on the SAME allow rule reaches the inner leg,
+    // so NODE_OFFLINE is what this CP's allow looks like from the client.
+    let (_code, _stdout, stderr) = ssh_exec(
+        &container,
+        pubkey_args(port, "/root/cert_key", "root%web-01"),
+        vec![],
+    )
+    .await;
+    assert!(
+        stderr.contains(NODE_OFFLINE),
+        "the mock must be allowing `root` for the backstop to be under test; stderr={stderr:?}"
+    );
+
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        pubkey_args(port, "/root/pin_key", "root%web-01"),
+        vec![],
+    )
+    .await;
+    assert_ne!(code, Some(0), "the backstop must not exit clean");
+    assert!(
+        stderr.contains(ACCESS_DENIED),
+        "a scoped credential must be refused even on an allow; stderr={stderr:?}"
+    );
+
+    // The CP really did ALLOW: it took a concurrency lease, which only the ALLOW path
+    // mints and which the refused session then released on teardown.
+    let session_id = cp
+        .last_authorize_request()
+        .expect("the refused connect must still have called Authorize")
+        .session_id;
+    let mut released = false;
+    for _ in 0..200 {
+        if cp
+            .session_end_notifications()
+            .iter()
+            .any(|n| n.session_id == session_id)
+        {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        released,
+        "no lease was released for {session_id}, so the CP denied rather than allowed — \
+         the refusal under test was the ordinary deny, not the backstop"
+    );
+    Ok(())
+}
+
+/// An unresolvable target is the CP's decision too: it resolves `node_name` server-side
+/// and audits its own no-match, so a local pre-empt would leave a user probing for node
+/// names with no record anywhere. A MALFORMED username stays local by contrast — it
+/// never names a target, so there is no decision to record.
+#[tokio::test]
+async fn an_unresolvable_target_reaches_the_control_plane() -> anyhow::Result<()> {
+    build_client_image().await?;
+
+    let cp = MockCp::start().await;
+    let pin_key = generate_key();
+    let spare = generate_key();
+    let cert_line = cp.sign_user_cert(&generate_key().public_line, "unused", &["x"], 300);
+
+    cp.register_pin(&pin_key.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", "web-01", "deploy");
+
+    let (port, _shutdown) = start_server_with_resolver(
+        &cp,
+        Arc::new(base_config()),
+        Arc::new(KnownNodesOnly(&["web-01"])),
+    )
+    .await;
+    let container = client_container(&pin_key, &spare, &cert_line).await;
+
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        pubkey_args(port, "/root/pin_key", "deploy%ghost-node"),
+        vec![],
+    )
+    .await;
+    assert_ne!(code, Some(0), "an unknown node must not exit clean");
+    assert!(
+        stderr.contains(ACCESS_DENIED) && !stderr.contains("ghost-node"),
+        "the generic denial, with no existence disclosure; stderr={stderr:?}"
+    );
+    let req = cp
+        .last_authorize_request()
+        .expect("an unresolvable target must still call Authorize — the CP writes the record");
+    assert_eq!(req.node_name, "ghost-node");
+    assert!(
+        req.node_id.is_empty(),
+        "an unresolved id travels empty; node_name is authoritative server-side, got {:?}",
+        req.node_id
+    );
+
+    // A username with no target in it never reaches the CP: there is nothing to decide.
+    let (code, _stdout, stderr) = ssh_exec(
+        &container,
+        pubkey_args(port, "/root/pin_key", "nodelimiter"),
+        vec![],
+    )
+    .await;
+    assert_ne!(code, Some(0), "a malformed username must not exit clean");
+    assert!(
+        stderr.contains(ACCESS_DENIED),
+        "malformed → the same generic denial; stderr={stderr:?}"
+    );
+    assert_eq!(
+        cp.last_authorize_request().map(|r| r.node_name),
+        Some("ghost-node".to_string()),
+        "a malformed username names no target, so it must NOT produce an Authorize call"
     );
     Ok(())
 }
