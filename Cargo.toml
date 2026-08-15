@@ -40,7 +40,7 @@ prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 
 # X.509 identity: local ECDSA P-256 keypair + PKCS#10 CSR generation (the
-# Gateway sends only a CSR; its mTLS private key never leaves — D2/§15). Also the
+# Gateway sends only a CSR; its mTLS private key never leaves the process). Also the
 # mock-CP internal CA in tests. `ring` backend (NOT aws_lc_rs); `pem` for the
 # tonic client-identity PEM.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
@@ -58,7 +58,7 @@ ssh-key = { version = "0.6", default-features = false, features = ["ecdsa", "ed2
 # version ssh-key 0.6 speaks — kept aligned deliberately).
 rand_core = { version = "0.6", features = ["getrandom"] }
 
-# Single-writer advisory lock on the credential data-dir (§8.2): two Gateway
+# Single-writer advisory lock on the credential data-dir: two Gateway
 # processes must not race the generation counter.
 fd-lock = "4"
 # Scrub private-key / secret buffers (Tier-0 caution).
@@ -66,7 +66,7 @@ zeroize = "1"
 # DER -> PEM for the tonic client Identity (enrollment returns cert DER).
 pem = "3"
 
-# Recorder crypto (§12/§15). All RustCrypto (MIT/Apache), already in
+# Recorder crypto. All RustCrypto (MIT/Apache), already in
 # the dependency graph; `rsa` is deliberately NOT enabled (audit-ignored precisely
 # because it is never compiled). ECIES-P256 seals the per-recording AES-256-GCM
 # data key to the customer-held public key so no platform key can unwrap it.
@@ -97,7 +97,7 @@ http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
-# The agent-facing WebSocket transport (Design §9.2/§10.2). The
+# The agent-facing WebSocket transport. The
 # Agent dials OUT; the Gateway is the TLS+WS server. No TLS features here: the TLS
 # is our own `tokio_rustls` (ring) stream, handed to tungstenite already
 # established, so tungstenite never selects a crypto stack of its own.
@@ -112,8 +112,8 @@ base64 = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-# OpenTelemetry (§14). ONE distributed trace client -> GW ->
-# CP -> node, carrying correlation IDs, NEVER plaintext (OTEL-CONTRACT §5). The
+# OpenTelemetry. ONE distributed trace client -> GW ->
+# CP -> node, carrying correlation IDs, NEVER plaintext. The
 # OTLP exporter is compiled in but INERT unless `OTEL_EXPORTER_OTLP_ENDPOINT` is
 # set (telemetry.rs); local `tracing`/fmt logging is otherwise unchanged. The
 # exporter's gRPC transport is **tonic/ring** (`grpc-tonic`, no `openssl` — the
@@ -138,7 +138,7 @@ clap = { version = "4", features = ["derive"] }
 # byte-shoveling proxy must not silently wrap a length/offset. Cheap insurance.
 overflow-checks = true
 
-# ProxyJump host-cert MITM (§9.3/§11): russh 0.62 cannot present an SSH host
+# ProxyJump host-cert MITM: russh 0.62 cannot present an SSH host
 # CERTIFICATE as a server, yet ProxyJump requires one so a stock client with one
 # `@cert-authority` line verifies the Gateway with no TOFU. Hence the vendored
 # russh 0.62.2 + minimal gated patch; the plain-key path is byte-identical when

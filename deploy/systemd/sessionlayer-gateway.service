@@ -1,4 +1,4 @@
-# SessionLayer Gateway — hardened systemd unit (NFR-5).
+# SessionLayer Gateway — hardened systemd unit.
 #
 # The bare-metal / VM deployment model: the daemon starts as root ONLY long enough
 # to bind the privileged SSH port (:22), then drops to an unprivileged user via the

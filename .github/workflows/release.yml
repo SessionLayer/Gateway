@@ -1,4 +1,4 @@
-# SessionLayer Gateway — release supply chain (NFR-7).
+# SessionLayer Gateway — release supply chain.
 #
 # On a `v*` tag: build the `gateway` binary REPRODUCIBLY, emit a CycloneDX SBOM,
 # a SLSA build-provenance attestation, and keyless (OIDC) cosign signatures —
@@ -142,7 +142,7 @@ jobs:
           # producing a confusing failure two steps later at upload instead.
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
             --title "Gateway $TAG" \
-            --notes "Signed, provenanced, reproducible release. Verify with cosign / gh attestation verify (NFR-7)."
+            --notes "Signed, provenanced, reproducible release. Verify with cosign / gh attestation verify."
           gh release upload "$TAG" --clobber \
             "dist/$BIN" \
             "dist/${BIN}.cdx.json" \

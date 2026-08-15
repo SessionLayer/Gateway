@@ -1,4 +1,4 @@
-//! Port-forward + X11 (FR-SESS-2): -L/-R/-X per-capability, ProxyJump MITM cap, lock teardown.
+//! Port-forward + X11: -L/-R/-X per-capability, ProxyJump MITM cap, lock teardown.
 
 use std::sync::Arc;
 use std::time::Duration;

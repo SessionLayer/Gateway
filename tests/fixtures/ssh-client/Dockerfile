@@ -9,7 +9,7 @@
 # Stage 1 builds the OpenSSH **software SK provider** (`sk-dummy.so`) — a virtual
 # FIDO2 authenticator — from the matching openssh-portable source, so the Session
 # Thirteen break-glass `sk-ecdsa` path can be driven end-to-end with a REAL FIDO
-# signature and no hardware token (Design §7, FR-ACC-6). The stock Debian
+# signature and no hardware token. The stock Debian
 # openssh-client ships no middleware, so `ssh-keygen -t ecdsa-sk` fails "device
 # not found" without this. Only `config.h` (./configure) + the openbsd-compat
 # shims are needed to link it — the full openssh build is not.

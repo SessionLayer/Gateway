@@ -19,7 +19,7 @@
 # avoid, so the receiver, the pipelines and this comment are one unit — change one and
 # check the other two.
 #
-# Span inventory (OTEL-CONTRACT), spelled exactly as emitted, because the name is
+# Span inventory, spelled exactly as emitted, because the name is
 # carried verbatim as the `span_name` label value and a selector that drops the
 # prefix matches nothing: gateway.session / gateway.outer_leg.auth /
 # gateway.node.connect / gateway.host_verify / gateway.bridge_setup (Gateway root)
@@ -39,12 +39,12 @@ connectors:
   spanmetrics:
     histogram:
       explicit:
-        # Buckets straddle the NFR-4 250 ms establishment budget so the data-path
+        # Buckets straddle the 250 ms session-establishment budget so the data-path
         # legs (host_verify, node.connect, bridge_setup) are queryable against it.
         buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]
     dimensions:
       # Low-cardinality closed enums only (never session_id/correlation_id/node_id —
-      # those stay on the trace per OTEL-CONTRACT §7).
+      # those stay on the trace, never on a metric dimension).
       - name: sessionlayer.outcome
       - name: sessionlayer.access_model
     exemplars:

@@ -524,7 +524,7 @@ async fn device_flow_timeout_e2e() -> anyhow::Result<()> {
     );
     assert!(
         stderr.contains("authentication timed out"),
-        "device-flow timeout must surface the §7.1 message; stderr={stderr:?}"
+        "device-flow timeout must surface the message; stderr={stderr:?}"
     );
 
     Ok(())
@@ -545,7 +545,7 @@ async fn cp_down_during_resolution_e2e() -> anyhow::Result<()> {
     let container = client_container(&pin_key, &cert_key, &cert_line).await;
 
     // CP-down during resolution: the pin resolve returns UNAVAILABLE; the
-    // publickey attempt degrades to keyboard-interactive, which surfaces the §7.1
+    // publickey attempt degrades to keyboard-interactive, which surfaces the generic
     // "service temporarily unavailable" — NOT a plain auth failure. Fail closed.
     cp.set_resolve_unavailable(true);
     let (code, _stdout, stderr) = ssh_exec(

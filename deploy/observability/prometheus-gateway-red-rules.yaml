@@ -55,7 +55,7 @@ groups:
         labels: { severity: critical }
         annotations:
           summary: "Gateway session error ratio > 25%"
-          description: "{{ $value | humanizePercentage }} of session attempts end in an error span. Deny is expected policy; a broad ERROR spike points at CP-unreachable fail-closed (NFR-2), CA-signer down, or host-verify failures — check cp.authorize / cp.cert_sign / host_verify child spans."
+          description: "{{ $value | humanizePercentage }} of session attempts end in an error span. Deny is expected policy; a broad ERROR spike points at CP-unreachable fail-closed, CA-signer down, or host-verify failures — check cp.authorize / cp.cert_sign / host_verify child spans."
           runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/gateway-runbook.md#session-and-lock-feed-reasons"
 
       # ERRORS — host-identity verification failures (no-TOFU aborts). A spike is
@@ -67,10 +67,10 @@ groups:
         labels: { severity: critical, security: host-identity }
         annotations:
           summary: "Gateway node host-identity verification is failing (no-TOFU abort)"
-          description: "host_verify spans are erroring ({{ $value | humanize }}/s). Either a node presented an unenrolled host key (possible MITM — investigate) or a node was re-keyed without re-enrollment. The Gateway correctly aborts (§9.3); sessions to that node are down until trust is reconciled."
+          description: "host_verify spans are erroring ({{ $value | humanize }}/s). Either a node presented an unenrolled host key (possible MITM — investigate) or a node was re-keyed without re-enrollment. The Gateway correctly aborts; sessions to that node are down until trust is reconciled."
           runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/troubleshooting.md#host-identity-verification-failures"
 
-      # DURATION — inner-leg reach + bridge setup p95 against the NFR-4 budget.
+      # DURATION — inner-leg reach + bridge setup p95 against the establishment budget.
       - alert: GatewayNodeConnectP95High
         expr: >
           histogram_quantile(0.95,
@@ -84,7 +84,7 @@ groups:
           runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/troubleshooting.md#the-target-node-is-offline-or-unavailable"
 
       # SATURATION — Agent dial-back leg erroring (the outbound-agent connectivity
-      # model losing its control channels degrades to node-unreachable, §10.3).
+      # model losing its control channels degrades to node-unreachable).
       - alert: AgentDialBackErrorSpike
         expr: >
           sum(rate(calls_total{service_name="sessionlayer-agent",span_name="agent.dial_back",status_code="STATUS_CODE_ERROR"}[10m])) > 0
@@ -92,5 +92,5 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Agent dial-back leg erroring"
-          description: "Outbound-agent nodes may be losing Gateway control channels ({{ $value | humanize }}/s dial-back errors). If an agent loses ALL its Gateways the node is correctly 'unreachable' and degrades to out-of-band tooling — verify the ≥2 failure-domain-diverse channels (FR-HA-6)."
+          description: "Outbound-agent nodes may be losing Gateway control channels ({{ $value | humanize }}/s dial-back errors). If an agent loses ALL its Gateways the node is correctly 'unreachable' and degrades to out-of-band tooling — verify the ≥2 failure-domain-diverse channels."
           runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/gateway-runbook.md#agent-transport-reasons"

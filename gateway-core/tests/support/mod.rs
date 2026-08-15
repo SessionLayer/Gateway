@@ -376,7 +376,7 @@ struct MockState {
     node_name_to_id: Mutex<HashMap<String, String>>,
     authorize_requests: Mutex<Vec<AuthorizeRequest>>,
 
-    // ---- FR-SESS-3 lease lifecycle -------------------------------
+    // ---- concurrency-lease lifecycle -----------------------------
     /// Concurrency leases taken on a standing/JIT ALLOW (break-glass takes none),
     /// keyed by session_id. NotifySessionEnd releases; ExtendSessionLease re-stamps.
     leases: Mutex<HashMap<String, LeaseRecord>>,
@@ -424,7 +424,7 @@ impl MockState {
             .map_err(|_| Status::internal("session CA unavailable"))?;
 
         let now = unix_now();
-        let valid_after = now.saturating_sub(60); // backdate for skew (FR-CA-5)
+        let valid_after = now.saturating_sub(60); // backdate for clock skew
         let valid_before = now + 300; // ~5-minute handshake-scoped TTL
         let key_id = format!("{session_id}+{principal}");
 
@@ -711,7 +711,7 @@ impl SessionSigning for MockSvc {
                 .get_mut(&r.session_token)
                 .ok_or_else(|| Status::permission_denied("access denied by policy"))?;
             // Single-use, bound-to-this-gateway, unexpired — every failure is the
-            // same generic denial (Design §15, §7.1).
+            // same generic denial, disclosing nothing about which check failed.
             if rec.used || rec.exp <= SystemTime::now() || rec.gateway_id != gid {
                 return Err(Status::permission_denied("access denied by policy"));
             }
@@ -758,7 +758,7 @@ impl SessionSigning for MockSvc {
         }
 
         let resp = self.sign_inner(&r.subject_public_key, &principal, &session_id, &extensions)?;
-        // FR-AUD-4: the key-id the node's own sshd will log on this certificate — the
+        // The key-id the node's own sshd will log on this certificate — the
         // join between the CP's trail and the node-local one.
         self.signed_key_ids
             .lock()
@@ -1300,7 +1300,7 @@ impl MockState {
     }
 
     /// Whether any active lock matches this context's bindings — deny wins even in
-    /// break-glass (Design §8.4, FR-ACC-6: a locked target refuses break-glass).
+    /// break-glass: a locked target refuses break-glass too.
     fn lock_denies(&self, context: &DecisionContext) -> bool {
         let bindings = LockBindings::from_context(context);
         self.locks.lock().unwrap().iter().any(|l| {
@@ -1363,7 +1363,7 @@ impl Authorization for MockSvc {
         }
         let mut r = request.into_inner();
         self.authorize_requests.lock().unwrap().push(r.clone());
-        // Name resolution is server-side authoritative (§11, FR-ADDR-1): resolve
+        // Name resolution is server-side authoritative: resolve
         // node_name to the node's id/key and IGNORE the client-asserted node_id, so a
         // client cannot smuggle an id past the resolved name. Empty node_name falls
         // back to node_id (a direct-id caller). Everything below keys on the resolved
@@ -1379,7 +1379,7 @@ impl Authorization for MockSvc {
             return Ok(Response::new(self.authorize_break_glass(&gid, &r)));
         }
 
-        // Unknown node → generic DENY (§7.1, no existence disclosure).
+        // Unknown node → generic DENY (no existence disclosure).
         if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
             return Ok(Response::new(deny_response()));
         }
@@ -1394,7 +1394,7 @@ impl Authorization for MockSvc {
 
         // ALLOW (standing): mint the single-use session + recording tokens + the
         // SIGNED decision context (node connection attached if registered).
-        // The concurrency lease is taken inside the ALLOW (FR-SESS-3);
+        // The concurrency lease is taken inside the ALLOW;
         // break-glass (above) is cap-exempt and takes none.
         let resp = self.allow_response(&gid, &r, AccessModel::Standing);
         self.create_lease(&r.session_id, &gid);
@@ -1674,7 +1674,7 @@ impl Recording for MockSvc {
             .insert(recording_id.clone(), (gid, object_key.clone()));
 
         // BeginRecording does NOT return an upload credential — that is issued
-        // short-lived at upload time via RequestUpload (§12.2).
+        // short-lived at upload time via RequestUpload.
         Ok(Response::new(BeginRecordingResponse {
             recording_id,
             object_key,
@@ -1897,7 +1897,7 @@ impl MockCpBuilder {
             .unwrap()
             .to_string();
 
-        // Host CA (SSH) for signing node host certs (Design §9.3).
+        // Host CA (SSH) for signing node host certs.
         let host_ca = ssh_key::PrivateKey::random(
             &mut rng,
             ssh_key::Algorithm::Ecdsa {
@@ -2131,7 +2131,7 @@ impl MockCp {
     }
 
     /// Register a pin **bound to a source IP** (the pin's `{fingerprint, identity,
-    /// source-cidr, …}` binding, FR-AUTH-10). It resolves ONLY when the connection's
+    /// source-cidr, …}` binding). It resolves ONLY when the connection's
     /// source matches; from any other source it does not resolve, so the outer leg
     /// falls through to the next method (the source-change fallback).
     pub fn register_pin_source_bound(
@@ -2195,7 +2195,7 @@ impl MockCp {
         });
     }
 
-    /// Mark a node as existing in inventory (so `Authorize` doesn't §7.1-DENY it
+    /// Mark a node as existing in inventory (so `Authorize` doesn't DENY it
     /// for non-existence) without granting any access.
     pub fn register_node(&self, node_id: &str) {
         self.state
@@ -2255,7 +2255,7 @@ impl MockCp {
         );
     }
 
-    /// Declare `node_id` an **outbound-agent** node (FR-CONN-3):
+    /// Declare `node_id` an **outbound-agent** node:
     /// no dial address, and the enrollment `node_name` the Gateway joins to the
     /// agent's control channel by (its certificate's dNSName SAN).
     pub fn set_agent_node_connection(
@@ -2296,7 +2296,7 @@ impl MockCp {
     /// The key-ids (`session_id + principal`) of every inner-leg certificate this CP
     /// has signed. The node's own `sshd` VERBOSE log records the same value on every
     /// accepted certificate, which is what makes the node-local trail an independent
-    /// second record (FR-AUD-4).
+    /// second record.
     pub fn signed_key_ids(&self) -> Vec<String> {
         self.state.signed_key_ids.lock().unwrap().clone()
     }
@@ -2393,8 +2393,8 @@ impl MockCp {
         self.state.host_ca_public_wire.clone()
     }
 
-    /// Sign a node **host** certificate over `host_pubkey_wire` with the host CA
-    /// (Design §9.3), carrying `principals`. Returns `(cert_line, cert_wire)`.
+    /// Sign a node **host** certificate over `host_pubkey_wire` with the host CA,
+    /// carrying `principals`. Returns `(cert_line, cert_wire)`.
     pub fn sign_host_cert(
         &self,
         host_pubkey_wire: &[u8],
@@ -2515,7 +2515,7 @@ impl MockCp {
         *self.state.grant_expiry_override.lock().unwrap() = Some(epoch_seconds);
     }
 
-    /// FR-SESS-3: sign a per-identity idle timeout into every
+    /// Sign a per-identity idle timeout into every
     /// decision context (0 = no per-identity idle policy).
     pub fn set_idle_timeout(&self, secs: i64) {
         *self.state.idle_timeout_secs.lock().unwrap() = secs;

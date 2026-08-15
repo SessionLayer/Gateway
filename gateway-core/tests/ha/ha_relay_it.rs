@@ -209,7 +209,7 @@ async fn a_remote_owned_node_is_relayed_and_the_bus_carries_no_session_bytes() {
 
 #[tokio::test]
 async fn a_superseded_owner_refuses_and_the_ingress_fails_closed() {
-    // R1 (FR-HA-5): gw-B still holds the node's agent channel but its heartbeat loop no longer
+    // R1: gw-B still holds the node's agent channel but its heartbeat loop no longer
     // believes it OWNS the node (ownership migrated to a peer). It MUST refuse to serve the
     // relay; gw-A then fails closed WITHIN relay_timeout rather than relaying a stale channel.
     let cp = MockCp::start().await;

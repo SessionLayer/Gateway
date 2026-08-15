@@ -3,7 +3,7 @@
 # join token against the real CP) then hand off to the sshd entrypoint. The agent binary + the
 # bootstrap CA are docker-cp'd into /agent by run.sh; the join token + endpoints come from env.
 #
-# The agent runs as `deploy` (non-root, FR-CONN-6 / Design §9.3): it therefore CANNOT read the
+# The agent runs as `deploy` (non-root): it therefore CANNOT read the
 # node host key, so host identity is anchored out-of-band (run.sh ssh-keyscans the node's own key
 # and registers it as the pinned host anchor). It dials OUT to the Gateway's agent transport and
 # splices each dial-back to THIS container's own 127.0.0.1:22 (an address it reads from its own

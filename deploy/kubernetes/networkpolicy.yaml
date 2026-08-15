@@ -1,4 +1,4 @@
-# SessionLayer Gateway — egress restriction (NFR-5).
+# SessionLayer Gateway — egress restriction.
 #
 # "Restricted egress (node + CP only)". seccomp cannot filter by destination, so
 # egress confinement is enforced at the network layer: this default-deny-egress

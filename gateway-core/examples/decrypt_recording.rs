@@ -1,4 +1,4 @@
-//! Full-stack harness helper (SEC-LOW-1): ECIES-open a finalized SLREC1 recording object with
+//! Full-stack harness helper: ECIES-open a finalized SLREC1 recording object with
 //! the customer PRIVATE key and write the decrypted asciicast to stdout, so `tests/fullstack/
 //! run.sh` can assert the real session bytes are PRESENT and recoverable — turning "no plaintext
 //! in the ciphertext" into a positive capture+seal+recoverability proof (an empty/header-only
@@ -7,8 +7,8 @@
 //!
 //! Usage: decrypt_recording <customer_key.pkcs8.der> <object.bin>
 //! Output: a first line `CHAIN_HEAD=sha256:<hex>` (the hash-chain recomputed from the decrypted
-//! asciicast — SEC-LOW-2, compare to the finalized hash_chain_head), followed by the raw
-//! decrypted plaintext (grep the session marker — SEC-LOW-1).
+//! asciicast; compare it to the finalized hash_chain_head), followed by the raw
+//! decrypted plaintext (grep it for the session marker).
 
 use gateway_core::ssh::recorder::{chain::HashChain, seal};
 use p256::pkcs8::DecodePrivateKey;

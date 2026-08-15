@@ -1,4 +1,4 @@
-//! Break-glass (Design §7): FIDO2 + offline code, idempotent recording, deny wins, lock teardown.
+//! Break-glass: FIDO2 + offline code, idempotent recording, deny wins, lock teardown.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -506,7 +506,7 @@ async fn await_finalized(cp: &MockCp) -> gateway_core::pb::FinalizeRecordingRequ
 // — so a genuine `ecdsa-sk` key is enrolled and the stock `ssh` client produces a
 // REAL FIDO possession signature. russh verifies that signature server-side before
 // `auth_publickey`, which then resolves the key as a break-glass credential. This
-// is the primary break-glass auth path (Design §7, FR-ACC-6) end-to-end.
+// is the primary break-glass auth path end-to-end.
 
 const SK_PROVIDER: &str = "/usr/local/lib/sk-dummy.so";
 
@@ -981,7 +981,7 @@ async fn break_glass_refused_when_lock_feed_unhealthy() -> anyhow::Result<()> {
     );
     // The lock feed is DOWN so the Gateway's deny-set is never healthy: a break-glass
     // session cannot confirm the absence of a Lock, so it must refuse NEW privileged
-    // channels (fail closed, §8.4). A REAL node → without the fix the session would run.
+    // channels (fail closed). A REAL node → without the fix the session would run.
     cp.set_lock_feed_down(true);
     cp.register_offline_code("bg-feeddown", "breakglass-admin", &["deploy"]);
 

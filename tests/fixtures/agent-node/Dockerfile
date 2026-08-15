@@ -1,4 +1,4 @@
-# A SessionLayer node in the OUTBOUND-AGENT model (Design §9.2).
+# A SessionLayer node in the OUTBOUND-AGENT model.
 #
 # It is the ordinary test node (real Debian 13 sshd) plus a **non-root Agent** that
 # dials OUT to the Gateway and splices each dial-back to this container's own
