@@ -454,11 +454,7 @@ async fn ssh_runs_on_a_real_node_through_the_agent_path_in_a_mixed_fleet() -> an
     )
     .await;
     assert_eq!(code, Some(0));
-    assert_eq!(
-        whoami.trim(),
-        "deploy",
-        "the Agent must not run as root"
-    );
+    assert_eq!(whoami.trim(), "deploy", "the Agent must not run as root");
 
     drop(direct_node);
     drop(agent_node);

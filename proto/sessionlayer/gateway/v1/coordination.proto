@@ -6,20 +6,20 @@ option java_multiple_files = true;
 option java_package = "io.sessionlayer.gateway.coordination.v1";
 option java_outer_classname = "CoordinationProto";
 
-// Gateway<->Gateway HA coordination + relay payloads (Design §10.2/§10.3;
-// FR-HA-3/4/5/8). The Control Plane is NOT a party to this protocol: these
-// messages are exchanged Gateway-to-Gateway. They live here because contracts/
-// is the canonical cross-repo contract home; the CP generates (unused) Java.
+// Gateway<->Gateway HA coordination + relay payloads. The Control Plane is NOT
+// a party to this protocol: these messages are exchanged Gateway-to-Gateway.
+// They live here because contracts/ is the canonical cross-repo contract home;
+// the CP generates (unused) Java.
 //
 // The normative protocol — the CoordinationBackend signalling contract, the
 // direct peer-relay handshake, and their security invariants — is
 // contracts/wire/gateway-relay-v1.md.
 //
-// ANTI-REQUIREMENT (Design §10.2, FR-HA-3): session bytes MUST NEVER traverse
-// the coordination bus. The bus carries ONLY the DialBackSignal below (ids +
-// the ingress address + a signed single-use token). The node byte stream flows
-// over the direct on-demand Gateway<->Gateway relay connection whose frames are
-// RAW OPAQUE BYTES, exactly as with the Agent splice.
+// ANTI-REQUIREMENT: session bytes MUST NEVER traverse the coordination bus. The
+// bus carries ONLY the DialBackSignal below (ids + the ingress address + a
+// signed single-use token). The node byte stream flows over the direct
+// on-demand Gateway<->Gateway relay connection whose frames are RAW OPAQUE
+// BYTES, exactly as with the Agent splice.
 
 // DialBackSignal is published by an INGRESS Gateway (the one holding the client's
 // SSH connection) onto the CoordinationBackend, addressed to the Gateway that
@@ -38,15 +38,15 @@ message DialBackSignal {
   string session_id = 3;
 
   // The ingress Gateway's id (gateway_identity.name) and the peer-relay address
-  // (host:port) the owner MUST dial back to for the direct byte relay. "the
-  // address carried in the signal" (Design §10.2).
+  // (host:port) the owner MUST dial back to for the direct byte relay. The owner
+  // dials the address carried in this signal, never one it resolves for itself.
   string ingress_gateway_id = 4;
   string ingress_relay_addr = 5;
 
   // The owner this signal is addressed to (must match the subscriber's own id)
   // and the presence nonce the ingress saw at decision time. The owner re-checks
-  // it still owns the node with this exact nonce before serving (stale-ownership
-  // reject, FR-HA-5).
+  // it still owns the node with this exact nonce before serving, rejecting a
+  // stale-ownership claim.
   string owner_gateway_id = 6;
   uint64 owner_nonce = 7;
 

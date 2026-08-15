@@ -44,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if is_root() {
-        anyhow::bail!("refusing to run as root: the agent must not be able to read the node host key");
+        anyhow::bail!(
+            "refusing to run as root: the agent must not be able to read the node host key"
+        );
     }
     let addr: std::net::SocketAddr = cli.splice_addr.parse()?;
     anyhow::ensure!(

@@ -8,11 +8,11 @@ option java_multiple_files = true;
 option java_package = "io.sessionlayer.agent.wire.v1";
 option java_outer_classname = "WireProto";
 
-// The Agent<->Gateway wire protocol payloads (Design §9.2, §10.2; FR-CONN-2,
-// FR-HA-4/8/9). The Control Plane is NOT a party to this protocol: these
-// messages are exchanged directly between the SessionLayer Agent and the
-// SessionLayer Gateway. They live here because contracts/ is the canonical
-// cross-repo contract home; the CP generates (unused) Java for them.
+// The Agent<->Gateway wire protocol payloads. The Control Plane is NOT a party
+// to this protocol: these messages are exchanged directly between the
+// SessionLayer Agent and the SessionLayer Gateway. They live here because
+// contracts/ is the canonical cross-repo contract home; the CP generates
+// (unused) Java for them.
 //
 // The normative protocol — framing, connection roles, negotiation, the dial-back
 // state machine and its security invariants — is contracts/wire/agent-gateway-v1.md.
@@ -54,8 +54,8 @@ message GatewayHelloAck {
 }
 
 // VersionReject (0x03) is sent when no common protocol version exists, then the
-// connection closes. Fail closed (FR-HA-9): the Agent MUST NOT downgrade or
-// guess a version.
+// connection closes. Fail closed: the Agent MUST NOT downgrade or guess a
+// version.
 message VersionReject {
   sessionlayer.controlplane.v1.ProtocolVersion gateway_min = 1;
   sessionlayer.controlplane.v1.ProtocolVersion gateway_max = 2;
@@ -75,7 +75,7 @@ message Pong {
 }
 
 // DialBackRequest (0x20, Gateway -> Agent, control channel) asks the Agent that
-// owns this node to open a dial-back connection for one session (FR-CONN-2).
+// owns this node to open a dial-back connection for one session.
 //
 // NOTE WHAT IS ABSENT: there is NO splice target. The Agent splices to its own
 // locally-configured loopback address (127.0.0.1:22) and nothing on this wire
@@ -103,14 +103,14 @@ message DialBackRequest {
   // The issuing Gateway's identity id.
   string gateway_id = 5;
 
-  // The wss:// URL the Agent MUST dial back to (Design §10.2: the address is
-  // carried in the signal, so no service discovery is needed). In HA this is the
-  // owning Gateway's address; in single-Gateway mode it is the same Gateway.
+  // The wss:// URL the Agent MUST dial back to. The address travels in this
+  // request, so the Agent needs no service discovery. In HA this is the owning
+  // Gateway's address; in single-Gateway mode it is the same Gateway.
   string dial_back_endpoint = 6;
 
   // The single-use, Gateway-signed dial-back token, bound to
-  // {node, session, gateway, principal, agent, exp} (FR-HA-8). Opaque to the
-  // Agent: it is presented verbatim and MUST NOT be logged or persisted.
+  // {node, session, gateway, principal, agent, exp}. Opaque to the Agent: it is
+  // presented verbatim and MUST NOT be logged or persisted.
   // Format: contracts/wire/agent-gateway-v1.md §6.
   string token = 7;
 
@@ -122,7 +122,7 @@ message DialBackRequest {
 
 // DialBackErrorCode explains a refused or failed dial-back. It is reported to
 // the Gateway for the operator log; the SSH user always sees the single generic
-// post-authorization outcome "target node is offline / unreachable" (§7.1).
+// post-authorization outcome "target node is offline / unreachable".
 enum DialBackErrorCode {
   DIAL_BACK_ERROR_CODE_UNSPECIFIED = 0;
 
@@ -169,14 +169,12 @@ message DialBackAccept {}
 // its node's local sshd and the splice is live; the Gateway hands the connection
 // to the inner leg as a ByteStream at this point and not before.
 //
-// Direction note: the Session-One skeleton pencilled this type in as
-// Gateway->Agent. It is defined here as Agent->Gateway (the Agent is the only
-// party that knows when the loopback connection came up). The type number is
-// unchanged and was never implemented in the reserved direction.
+// Direction note: this type travels Agent->Gateway only, never the reverse —
+// the Agent is the only party that knows when the loopback connection came up.
 message StreamOpen {}
 
 // StreamCloseReason distinguishes an orderly end-of-stream from a fault, for the
-// operator log. The user-facing outcome is unchanged (§7.1).
+// operator log. The user-facing outcome is unchanged.
 enum StreamCloseReason {
   STREAM_CLOSE_REASON_UNSPECIFIED = 0;
 
@@ -200,8 +198,8 @@ message StreamClose {
 
 // WireErrorCode is the closed set of typed protocol errors. Codes are
 // deliberately coarse: an error sent to an Agent must not disclose whether a
-// node, session, or identity exists (the §7.1 non-disclosure rule applies to
-// this surface too).
+// node, session, or identity exists — the same non-disclosure rule that governs
+// user-facing denials applies to this surface too.
 enum WireErrorCode {
   WIRE_ERROR_CODE_UNSPECIFIED = 0;
 
@@ -228,8 +226,8 @@ message WireError {
   string message = 2;
 }
 
-// DialBackTokenPayload is the signed body of a dial-back token (FR-HA-8). It is
-// NOT sent as a frame: it is serialized, base64url-encoded, and carried as the
+// DialBackTokenPayload is the signed body of a dial-back token. It is NOT sent
+// as a frame: it is serialized, base64url-encoded, and carried as the
 // `token` string of DialBackRequest / DialBackAuth. See
 // contracts/wire/agent-gateway-v1.md §6 for the token envelope and the
 // verify-then-decode rule (the signature is checked over the transmitted bytes
@@ -244,9 +242,9 @@ message DialBackTokenPayload {
   // No token material is ever stored or logged — only this id and its binding.
   string jti = 1;
 
-  // The five bindings mandated by FR-HA-8, plus the agent binding. Every one is
-  // re-checked on presentation against the Gateway's own pending state AND
-  // against the mTLS identity of the dial-back connection.
+  // The five bindings the wire contract requires, plus the agent binding. Every
+  // one is re-checked on presentation against the Gateway's own pending state
+  // AND against the mTLS identity of the dial-back connection.
   string gateway_id = 2;
   string node_name = 3;
   string session_id = 4;
