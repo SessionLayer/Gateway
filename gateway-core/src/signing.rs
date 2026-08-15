@@ -1,6 +1,6 @@
 //! Session-bound inner-leg signer client: obtain short-lived SSH cert via SessionSigning.SignSessionCertificate over mTLS.
-//! Key custody (D2/§15): local ECDSA P-256 keypair generation; public key sent only, private key never leaves Gateway.
-//! Per-RPC authorization (§15): session_token authorizes specific request (single-use, bound to gateway/session/node/principal/exp).
+//! Key custody: local ECDSA P-256 keypair generation; public key sent only, private key never leaves Gateway.
+//! Per-RPC authorization: session_token authorizes specific request (single-use, bound to gateway/session/node/principal/exp).
 
 use crate::pb::session_signing_client::SessionSigningClient;
 use crate::pb::{SignContext, SignSessionCertificateRequest};
@@ -24,7 +24,7 @@ pub enum SigningError {
     Rpc(#[from] tonic::Status),
 
     /// The signing RPC did not complete within its deadline — a hung CP must
-    /// never hang the Gateway (fail closed, §10.3).
+    /// never hang the Gateway (fail closed).
     #[error("SignSessionCertificate timed out after {0:?}")]
     Timeout(Duration),
 
@@ -32,7 +32,7 @@ pub enum SigningError {
     EmptyCertificate,
 
     /// The mTLS channel to the CP could not be established for the signing call
-    /// (CP down) — fail closed as "service temporarily unavailable" (§7.1), not
+    /// (CP down) — fail closed as "service temporarily unavailable", not
     /// as a node fault.
     #[error("Control Plane unreachable for SignSessionCertificate")]
     Unavailable,
@@ -112,13 +112,13 @@ pub struct SignedInnerCert {
     pub certificate_line: String,
     pub certificate_blob: Vec<u8>,
     pub key_id: String,
-    /// Certificate validity window (backdated for skew, FR-CA-5).
+    /// Certificate validity window (backdated for skew).
     pub valid_after: SystemTime,
     pub valid_before: SystemTime,
 }
 
 /// Build the signing request from the inner public key + session token.
-/// Kept separate so tests can assert it carries only public key and token (D2/§15), never private-key material.
+/// Kept separate so tests can assert it carries only public key and token, never private-key material.
 fn build_request(
     session_token: &str,
     subject_public_key: &[u8],
@@ -133,7 +133,7 @@ fn build_request(
 
 /// Call SignSessionCertificate with session_token and inner public key (only).
 /// Private key stays on the Gateway. Any CP refusal fails closed (no certificate).
-/// `timeout` prevents hung CP from hanging the SSH handshake (§10.3).
+/// `timeout` prevents hung CP from hanging the SSH handshake.
 pub async fn sign_session_certificate(
     channel: Channel,
     session_token: &str,
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn request_carries_only_the_public_key_and_token() {
-        // Key-custody proof (D2/§15): what we would transmit contains the token
+        // Key-custody proof: what we would transmit contains the token
         // and the public wire blob — and NO fragment of the private key.
         let kp = InnerKeyPair::generate().unwrap();
         let priv_pem = kp.private_key_openssh_pem().unwrap();

@@ -1,5 +1,5 @@
-//! OpenTelemetry tracing (Design §14, OTEL-CONTRACT): Gateway is trace root; mints root span on accept; injects W3C context to CP RPCs.
-//! Off by default (OTEL_EXPORTER_OTLP_ENDPOINT enables it); uses tonic/ring transport. Carries correlation only, never content (OTEL-CONTRACT §5).
+//! OpenTelemetry tracing: Gateway is trace root; mints root span on accept; injects W3C context to CP RPCs.
+//! Off by default (OTEL_EXPORTER_OTLP_ENDPOINT enables it); uses tonic/ring transport. Carries correlation only, never content.
 //! Plaintext/keys/OTP/tokens never enter spans (test greps for secret markers).
 
 pub mod metrics;
@@ -12,7 +12,7 @@ use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-/// Standard, non-content span attribute keys (OTEL-CONTRACT §4). Only IDs, enums,
+/// Standard, non-content span attribute keys. Only IDs, enums,
 /// outcomes — never secret content.
 pub mod attr {
     pub const SESSION_ID: &str = "sessionlayer.session_id";
@@ -302,7 +302,7 @@ mod tests {
         );
     }
 
-    /// SEC-F2: a CP outage at the AUTH phase (`note_cp_down`, before any channel) is a
+    /// A CP outage at the AUTH phase (`note_cp_down`, before any channel) is a
     /// genuine fail-closed fault and MUST error the span so a CP-down storm shows in
     /// the RED error-rate; an ordinary auth rejection (`AuthFailed`, never passed to
     /// `record_span_fail_closed`) must NOT error the span, or the rate pegs on
