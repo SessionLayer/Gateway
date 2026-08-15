@@ -149,6 +149,17 @@ message AuthorizeRequest {
   // disclosure). Empty ⇒ the CP falls back to node_id (UUID) for direct-id callers
   // (additive; protocol stays 1.1).
   string node_name = 9;
+
+  // The logins the presented outer-leg credential is scoped to, as OuterLegAuth
+  // resolved them. Empty ⇒ the credential is unscoped. A DENY-ONLY reducer like
+  // source_ip: a scoped credential presented for a login outside its scope is
+  // denied, and that denial is written to the decision log like every other deny.
+  // It can never widen a decision — a login the RBAC evaluation did not already
+  // allow does not become allowable by appearing here. The Gateway ALSO applies
+  // the same reduction locally, so a Gateway that omits the field cannot obtain
+  // an out-of-scope allow; sending it is what makes the refusal auditable
+  // (additive; protocol stays 1.1).
+  repeated string credential_principals = 10;
 }
 
 // AuthorizeResponse carries the generic decision and, on ALLOW, the signed
