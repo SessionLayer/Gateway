@@ -1240,30 +1240,6 @@ impl SshHandler {
         }
         match resp {
             resp if resp.decision == Decision::Allow as i32 && !resp.session_token.is_empty() => {
-                let Some(nc) = resp.node_connection else {
-                    let m = metrics::node_unreachable(UnreachableReason::NoNodeConnection);
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "authorized but the CP returned no node connection; failing closed");
-                    return Err(SshOutcome::NodeUnreachable(m));
-                };
-                let trust = host_trust_from(nc.host_verification);
-                if trust.is_empty() {
-                    // No enrollment anchor → the node cannot be verified → NEVER
-                    // TOFU. Abort.
-                    let m =
-                        metrics::node_unreachable(UnreachableReason::NoHostVerificationMaterial);
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "aborting: node has no host-verification anchor (never TOFU)");
-                    return Err(SshOutcome::NodeUnreachable(m));
-                }
-                // Per-node connector selection. An OUTBOUND_AGENT node is joined
-                // to its Agent by the CP-stamped enrollment NAME; without one there is no
-                // join key, so fail closed to node-offline rather than dial anything.
-                if nc.connector_kind == ConnectorKind::OutboundAgent as i32
-                    && nc.node_name.is_empty()
-                {
-                    let m = metrics::node_unreachable(UnreachableReason::AgentNodeWithoutName);
-                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "outbound-agent node has no enrollment name; failing closed");
-                    return Err(SshOutcome::NodeUnreachable(m));
-                }
                 // Trust the decision context only because its signature verifies (chain to
                 // the pinned internal mTLS CA + signer marker + codeSigning EKU +
                 // ECDSA-P256/SHA-256). Fail closed on any doubt. EVERY security field the
@@ -1307,6 +1283,33 @@ impl SshHandler {
                 if !credential_scope_permits(&auth.principals, &principal) {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "credential_principal_scope_backstop", "authorized login is outside the credential's scope; refusing (generic denial)");
                     return Err(SshOutcome::PolicyDenied);
+                }
+                // Reachability is decided AFTER the signed context: a session policy refuses
+                // must be refused as such, not reported as an offline node, and the anomaly
+                // above has to reach the operator log even when the node is unreachable.
+                let Some(nc) = resp.node_connection else {
+                    let m = metrics::node_unreachable(UnreachableReason::NoNodeConnection);
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "authorized but the CP returned no node connection; failing closed");
+                    return Err(SshOutcome::NodeUnreachable(m));
+                };
+                let trust = host_trust_from(nc.host_verification);
+                if trust.is_empty() {
+                    // No enrollment anchor → the node cannot be verified → NEVER
+                    // TOFU. Abort.
+                    let m =
+                        metrics::node_unreachable(UnreachableReason::NoHostVerificationMaterial);
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "aborting: node has no host-verification anchor (never TOFU)");
+                    return Err(SshOutcome::NodeUnreachable(m));
+                }
+                // Per-node connector selection. An OUTBOUND_AGENT node is joined
+                // to its Agent by the CP-stamped enrollment NAME; without one there is no
+                // join key, so fail closed to node-offline rather than dial anything.
+                if nc.connector_kind == ConnectorKind::OutboundAgent as i32
+                    && nc.node_name.is_empty()
+                {
+                    let m = metrics::node_unreachable(UnreachableReason::AgentNodeWithoutName);
+                    tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "outbound-agent node has no enrollment name; failing closed");
+                    return Err(SshOutcome::NodeUnreachable(m));
                 }
                 // A break-glass auth should always come back access_model=BREAKGLASS. A
                 // mismatch signals token mis-binding / contract drift (the local flag still

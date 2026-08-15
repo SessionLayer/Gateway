@@ -963,6 +963,20 @@ async fn the_gateway_refuses_an_out_of_scope_login_the_control_plane_allowed() -
         vec![],
     )
     .await;
+    // Pin what the CP saw before judging the client's outcome: if the scoped credential
+    // is not the one that authenticated, the refusal below would prove nothing.
+    let req = cp
+        .last_authorize_request()
+        .expect("the scoped connect must have called Authorize");
+    assert_eq!(
+        (
+            req.identity.as_str(),
+            req.requested_principal.as_str(),
+            req.credential_principals.clone()
+        ),
+        ("alice", "root", vec!["deploy".to_string()]),
+        "the scoped pin must be the credential under test"
+    );
     assert_ne!(code, Some(0), "the backstop must not exit clean");
     assert!(
         stderr.contains(ACCESS_DENIED),
