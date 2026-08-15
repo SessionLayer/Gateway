@@ -1,4 +1,5 @@
-//! Port-forwarding + X11 data plane (FR-SESS-2): default-deny, lock-aware, resource-bounded.
+//! Port-forwarding + X11 data plane: default-deny, lock-aware, resource-bounded — a forward
+//! is permitted only when the session's grant carries the matching capability.
 //! Local forward (`-L`): dialled from node (no Gateway-side SSRF). Remote (`-R`): node binds listener.
 //! X11 (`-Y`): request relayed unchanged; bytes opaque, metadata-only audit (open/close + counts/duration).
 
@@ -122,7 +123,7 @@ impl ReverseDispatcher {
             return; // dropping `open` closes the inner channel
         }
         // Deny-wins: a lock or teardown in flight refuses new reverse channels (the
-        // same lock-set match every other channel-open runs, §8.4), against the
+        // same lock-set match every other channel-open runs), against the
         // LIVE bindings (guard scoped: never held across an await).
         let locked = {
             let b = self.bindings.lock().unwrap();
@@ -149,7 +150,7 @@ impl ReverseDispatcher {
         // (server/session.rs `channel_open_generic`), well before this future
         // would resolve. Dropping the future here would abandon the receiver
         // that is the only way we ever learn that id, orphaning the entry for
-        // the life of the connection (M5). `race_with_reclaim` below is the
+        // the life of the connection. `race_with_reclaim` below is the
         // reusable shape that keeps it alive across the timeout.
         let (inner, direction, target, open_task) = match open {
             ReverseOpen::ForwardedTcpip {
@@ -266,7 +267,7 @@ enum RaceOutcome<T> {
 ///
 /// A bare `tokio::time::timeout(dur, future).await` drops `future` the instant
 /// it elapses. For `handle_open`'s outer channel-open call that is
-/// catastrophic (M5): the vendored server has already allocated a `ChannelId`
+/// catastrophic: the vendored server has already allocated a `ChannelId`
 /// and wired it into its own session-scoped channel table before this could
 /// ever resolve, so dropping the future here abandons the only receiver that
 /// would ever learn that id -- a real, permanently leaked resource, not a
@@ -331,7 +332,7 @@ mod tests {
         assert_eq!(TunnelDirection::X11.audit_family(), "x11_forward");
     }
 
-    /// M5: this is the exact function `handle_open` races the real
+    /// This is the exact function `handle_open` races the real
     /// `channel_open_forwarded_tcpip`/`channel_open_x11` calls through (typed
     /// here over a plain `u32` rather than the vendored `Channel<Msg>`, which
     /// only a live session can construct -- the mechanism under test doesn't

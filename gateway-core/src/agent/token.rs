@@ -21,7 +21,7 @@ const ENVELOPE: &str = "SLDB1";
 const DOMAIN: &[u8] = b"sessionlayer-dialback-v1:";
 const ISSUED_AT_SKEW_SECS: i64 = 5;
 
-/// The five FR-HA-8 bindings (plus the agent binding) a dial-back is tied to. Held
+/// The five bindings (plus the agent binding) a dial-back is tied to. Held
 /// in the pending map at issue and compared against the presented token's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialBackBinding {
@@ -34,8 +34,8 @@ pub struct DialBackBinding {
 }
 
 /// A dial-back token rejection. Every variant is reported to the peer as the single
-/// coarse `UNAUTHORIZED` (§7.1 non-disclosure); the specific reason is operator-log
-/// only.
+/// coarse `UNAUTHORIZED`, disclosing nothing about which check failed; the specific
+/// reason is operator-log only.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TokenError {
     #[error("malformed dial-back token envelope")]

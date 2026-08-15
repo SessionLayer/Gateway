@@ -19,7 +19,7 @@ const CHANNEL_CAPACITY: usize = 256;
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Bounds a single connect attempt so a wedged/black-holed broker cannot pin the
-/// reconnect loop open indefinitely (M11: every other connect call in the fleet
+/// reconnect loop open indefinitely (every other connect call in the fleet
 /// is timeout-wrapped; this one was the exception).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -152,7 +152,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// ±50% jitter (matches the Agent's and the agent-control-channel's reconnect
-/// jitter; M11) so a broker/CP restart doesn't resync every Gateway's retry timer.
+/// jitter) so a broker/CP restart doesn't resync every Gateway's retry timer.
 /// `sample` is `[-1, 1]`; split out from the RNG draw so the bound is unit-testable.
 fn jittered_backoff(base: Duration, sample: f64) -> Duration {
     base.mul_f64(1.0 + 0.5 * sample.clamp(-1.0, 1.0))
@@ -210,7 +210,7 @@ async fn connection_manager(
                 tracing::info!(addr = %addr, timeout = ?CONNECT_TIMEOUT, "NATS connect timed out; retrying");
             }
         }
-        // Jittered (M11): a CP/broker restart must not resync the whole fleet's
+        // Jittered: a CP/broker restart must not resync the whole fleet's
         // reconnects in lockstep, the same ±50% convention as the fleet's other
         // reconnect loops (identity renew uses a smaller ±10% for a different reason).
         tokio::time::sleep(jittered_backoff(RECONNECT_BACKOFF, random_sample())).await;
@@ -441,7 +441,7 @@ mod tests {
         assert!(NatsBackend::connect("nats://", "sl").is_err());
     }
 
-    /// M11: reconnect jitter stays within ±50% of the base backoff.
+    /// Reconnect jitter stays within ±50% of the base backoff.
     #[test]
     fn jittered_backoff_stays_within_half_bounds() {
         let base = Duration::from_secs(1);
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn control_lines_are_classified() {
-        // The PING/PONG/MSG parse gated without a live broker (F2 regression guard).
+        // The PING/PONG/MSG parse gated without a live broker.
         assert_eq!(classify_line("PING"), LineKind::Ping);
         assert_eq!(classify_line("PING\r"), LineKind::Ping);
         assert_eq!(classify_line("PONG"), LineKind::Pong);
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn info_flags_tls_and_auth_requirements_as_fatal() {
-        // F8: the plaintext client must fail loud, not loop, when the broker demands TLS/auth.
+        // The plaintext client must fail loud, not loop, when the broker demands TLS/auth.
         assert!(
             info_requires_unsupported("INFO {\"server_id\":\"a\",\"tls_required\":true}").is_some()
         );
@@ -479,7 +479,7 @@ mod tests {
         );
     }
 
-    /// An oversized, unterminated control line errors at the bound (F1) rather than growing.
+    /// An oversized, unterminated control line errors at the bound rather than growing.
     #[tokio::test]
     async fn an_unterminated_control_line_is_bounded() {
         let flood = vec![b'x'; MAX_CONTROL_LINE + 4096];

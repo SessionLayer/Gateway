@@ -18,11 +18,11 @@ use testcontainers::{ContainerAsync, CopyTargetOptions, GenericImage, ImageExt};
 
 const CLIENT_IMAGE: &str = "sessionlayer-gw-sshclient:test";
 const NODE_IMAGE: &str = "sessionlayer-gw-testnode:test";
-const NODE_A: &str = "node-nfr1";
-const NODE_B: &str = "owned-nfr1";
-const TARGET: &str = "deploy%node-nfr1@127.0.0.1";
-const GW2_NAME: &str = "gw-b-nfr1";
-const SOCK: &str = "/root/nfr1.sock";
+const NODE_A: &str = "node-instkill";
+const NODE_B: &str = "owned-instkill";
+const TARGET: &str = "deploy%node-instkill@127.0.0.1";
+const GW2_NAME: &str = "gw-b-instkill";
+const SOCK: &str = "/root/instkill.sock";
 
 struct KeyMat {
     private_openssh: String,
@@ -191,7 +191,7 @@ async fn losing_one_instance_the_fleet_survives_io_ownership_failover_and_new_se
     let trust = cp.host_ca_verification(cert_wire, &[NODE_A]);
     cp.set_node_connection(NODE_A, &format!("127.0.0.1:{node_port}"), trust);
 
-    let gw1 = start_gateway(&cp, "gw-a-nfr1").await;
+    let gw1 = start_gateway(&cp, "gw-a-instkill").await;
     let gw2 = start_gateway(&cp, GW2_NAME).await;
 
     let gw2_registry = Arc::new(AgentRegistry::new(16));
@@ -301,12 +301,12 @@ async fn losing_one_instance_the_fleet_survives_io_ownership_failover_and_new_se
     let (code, _o, _e) = exec(&client, &["ssh", "-S", SOCK, "-O", "check", TARGET]).await;
     assert_eq!(code, Some(0), "GW-1's master lives on past the peer kill");
 
-    let standby = enroll(&cp, "gw-standby-nfr1").await;
+    let standby = enroll(&cp, "gw-standby-instkill").await;
     let standby_store = CpPresenceStore::new(cpauth_for(&cp, &standby));
     let mut failed_over = false;
     for _ in 0..80 {
         let _ = standby_store.heartbeat(NODE_B, "127.0.0.1:9445").await;
-        if cp.presence_owner(NODE_B).as_deref() == Some("gw-standby-nfr1") {
+        if cp.presence_owner(NODE_B).as_deref() == Some("gw-standby-instkill") {
             failed_over = true;
             break;
         }

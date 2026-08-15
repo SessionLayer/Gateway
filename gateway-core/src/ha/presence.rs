@@ -333,7 +333,7 @@ mod tests {
     }
 
     /// An in-memory presence store recording heartbeats + releases, with a self-owner knob and
-    /// an optional per-RPC delay (to exercise the M1 concurrency budget).
+    /// an optional per-RPC delay (to exercise the concurrency budget).
     struct FakeStore {
         heartbeats: Mutex<Vec<(String, String)>>,
         releases: Mutex<Vec<String>>,
@@ -399,7 +399,7 @@ mod tests {
     }
 
     fn registry_with(nodes: &[&str]) -> Arc<AgentRegistry> {
-        // Size the registry to the node count (the M1 fleet test registers 100).
+        // Size the registry to the node count (the large-fleet test registers 100).
         let reg = Arc::new(AgentRegistry::new(nodes.len().max(16)));
         // Leak the receivers so the registrations stay live for the test's lifetime.
         for n in nodes {
@@ -552,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_large_fleet_refreshes_concurrently_within_the_ttl_budget() {
-        // M1: a Gateway holding many nodes must refresh them within the staleness TTL. With a
+        // A Gateway holding many nodes must refresh them within the staleness TTL. With a
         // per-RPC delay a SERIAL loop would take node_count * delay (well past any TTL); the
         // bounded fan-out completes in ~ceil(node_count / K) * delay. 100 nodes @ 20ms serial is
         // 2s; concurrent (~16-wide) is ~140ms — assert we are comfortably under a 1s budget AND

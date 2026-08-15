@@ -18,7 +18,7 @@ pub enum TapDirection {
     Output,
 }
 
-/// The recording tap seam (Design §12.1). Implementations MUST be cheap and
+/// The recording tap seam. Implementations MUST be cheap and
 /// non-blocking (the bridge is the Tier-0 hot path) and MUST NOT log plaintext.
 pub trait RecorderTap: Send + Sync {
     fn tap(&self, channel: ChannelId, direction: TapDirection, ext: Option<u32>, data: &[u8]);
@@ -111,7 +111,7 @@ pub struct RecordingParams {
     pub principal: String,
     pub teardown: Option<Handle>,
     pub abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Force strict recording for THIS session regardless of the recorder config (FR-ACC-6): it can only tighten, never loosen, the configured strict mode.
+    /// Force strict recording for THIS session regardless of the recorder config: it can only tighten, never loosen, the configured strict mode.
     pub force_strict: bool,
 }
 

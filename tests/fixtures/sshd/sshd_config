@@ -15,7 +15,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 
-# The crux (Design §3.2): the node trusts ONLY the session CA. The presented user
+# The crux: the node trusts ONLY the session CA. The presented user
 # certificate must be signed by this CA and carry a principal == the login user.
 TrustedUserCAKeys /etc/ssh/trusted_user_ca.pub
 AuthorizedKeysFile .ssh/authorized_keys

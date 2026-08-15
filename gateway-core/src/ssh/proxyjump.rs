@@ -1,4 +1,5 @@
-//! ProxyJump host-cert MITM: client verifies no-TOFU, inner hop runs full seam (D2: key custody).
+//! ProxyJump host-cert MITM: client verifies no-TOFU, inner hop runs full seam (the inner
+//! private key is generated on the Gateway and never leaves it).
 
 use std::collections::HashMap;
 use std::net::IpAddr;

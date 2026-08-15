@@ -6,7 +6,7 @@
 # every repo (canonical source lives in testing/docker/sshd/; repos vendor it)
 # and by the local docker-compose dev stack.
 #
-# Cert auth model (Design §3): node sshd trusts ONLY the session CA via
+# Cert auth model: node sshd trusts ONLY the session CA via
 # TrustedUserCAKeys. Inject the CA public key at runtime with -e TRUSTED_USER_CA=
 # "<openssh public key line>" (or bind-mount /etc/ssh/trusted_user_ca.pub). The
 # presented user cert must carry a principal matching the login user (deploy|dba).
@@ -38,5 +38,5 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
 
 EXPOSE 22
 # sshd -D -e keeps it foreground and logs to stderr (VERBOSE → cert key-id shows,
-# giving the node-local audit trail the design relies on).
+# giving an independent node-local audit trail).
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

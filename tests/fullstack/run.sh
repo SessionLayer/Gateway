@@ -483,7 +483,7 @@ release_keyvault_hostname() {
   ) 9>"$KEYVAULT_HOSTS_LOCK" 2>/dev/null || true
 }
 
-# D-4/D-9: start the double BEFORE the CP, so the CP's azure.vault-uri and the
+# Start the double BEFORE the CP, so the CP's azure.vault-uri and the
 # truststore that must trust it are both ready at CP boot. These CP properties are
 # passed unconditionally, while the active session CA is still 'local' (see start_cp) —
 # proving that merely configuring Key Vault changes nothing until a CA is rotated onto
@@ -771,7 +771,7 @@ start_cp() {
   log "starting the real Control Plane jar (mTLS :$FS_CP_MTLS_PORT, REST :$FS_CP_REST_PORT)"
   # azure.enabled/vault-uri are set unconditionally, from boot, while every CA is
   # still 'local' — the first session below (still local) is the proof that configuring
-  # Key Vault support changes nothing until a CA is actually rotated onto it (D-4).
+  # Key Vault support changes nothing until a CA is actually rotated onto it.
   #
   # credential=managed-identity + IDENTITY_ENDPOINT/IDENTITY_HEADER: the vault's own
   # WWW-Authenticate challenge means the CP's credential must actually obtain a token, and
@@ -815,7 +815,7 @@ start_cp() {
       --sessionlayer.ca.aws.allow-endpoint-override=true \
       --sessionlayer.ca.aws.allow-insecure-endpoint=true \
       > "$WORKDIR/cp.log" 2>&1 &
-  CP_PID=$!; PIDS+=("$CP_PID")   # CP_PID: the NFR-2 CP-down case kills it explicitly
+  CP_PID=$!; PIDS+=("$CP_PID")   # CP_PID: the CP-down case kills it explicitly
   local deadline=$((SECONDS + WAIT_SECS))
   until curl -sf "$CP_REST/v1/healthz" >/dev/null 2>&1; do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { tail -60 "$WORKDIR/cp.log" >&2; die "CP process exited during startup"; }
@@ -1067,7 +1067,7 @@ start_node() {
   #     SNAT (172.17.0.1) — a DISTINCT IP from the client's 127.0.0.1. This is BOTH the multi-host
   #     proof AND the regression guard for it: the CP OMITS source-address on the inner-leg
   #     session cert (unit guard SessionSigningIT.mintedInnerCertOmitsSourceAddress), so a node
-  #     reached over a distinct IP accepts the cert — the D2 inner key, which never leaves the
+  #     reached over a distinct IP accepts the cert — the inner key, which never leaves the
   #     Gateway, is what actually binds the cert. A client-IP source-address pin would match 127.0.0.1
   #     in loopback (a false-pass) but FAIL here — exactly the MockCp-style blind spot this harness
   #     exists to remove. (Pre-fix, bridge was the finding's repro: the node rejected the cert with
@@ -1123,7 +1123,7 @@ print(json.dumps({"name": os.environ["NODE_NAME"], "address": "127.0.0.1:" + os.
   ok "node registered via REST (id=$NODE_ID, agentless, active)"
 }
 
-# Tier-0 hardening profile for the real-binary run (NFR-5).
+# Tier-0 hardening profile for the real-binary run.
 # FS_HARDENING: off (the default, and the unhardened baseline) | log | seccomp | full.
 # The Gateway runs here as an unprivileged user on a high port, so the privilege
 # drop is naturally a no-op; seccomp + Landlock are the live-exercised layers,
@@ -1140,7 +1140,7 @@ gw_hardening_json() {
 
 # Under a hardened profile use a SMALL ciphertext-spool threshold so a large
 # session spills to disk — exercising that the spool lands in the Landlock-allowed
-# data-dir, not /tmp (F-1). Default is the 8 MiB production value.
+# data-dir, not /tmp. Default is the 8 MiB production value.
 gw_spool_threshold() {
   case "${FS_HARDENING:-off}" in
     full | seccomp) printf '65536' ;;
@@ -1168,7 +1168,7 @@ launch_gateway() {
   RUST_LOG="${GW_RUST_LOG:-info}" "$GATEWAY_BIN" --config "$WORKDIR/gateway.json" > "$WORKDIR/gateway.log" 2>&1 &
   GW_PID=$!; PIDS+=("$GW_PID")
   local deadline=$((SECONDS + 180))
-  # Wait for the accept loop to be up — which, post-R3, is AFTER hardening is
+  # Wait for the accept loop to be up — which is AFTER hardening is
   # applied (bind→apply→serve), so this proves a session runs under the profile.
   until grep -q "outer SSH leg listening" "$WORKDIR/gateway.log" 2>/dev/null; do
     kill -0 "$GW_PID" 2>/dev/null || { tail -40 "$WORKDIR/gateway.log" >&2; die "Gateway exited during startup (enrollment?)"; }
@@ -1299,7 +1299,7 @@ assert_recording_store_integrity() {
 }
 
 # ── The connect/authorize audit event carries + is searchable by all 5 dimensions ──
-# The substantive FR-AUD-8/9 proof is SEARCHABILITY (an auditor finds the event by each
+# The substantive proof is SEARCHABILITY (an auditor finds the event by each
 # dimension) + the single-correlationId correlated chain. The AuditEventResource response
 # projects source_ip + correlation_id (top-level) and access_model (in `detail`); capabilities
 # and node_labels are searchable but not projected (the schema omits them — by design).
@@ -1349,7 +1349,7 @@ print(",".join(acts))')" || die "correlated-path chain incomplete for correlatio
   ok "correlated path: correlationId=$sid returns the chain [$chain]"
 }
 
-# ── FR-CHAN-2: the per-channel re-Authorize past decision_ttl, against a REAL CP ──
+# ── The per-channel re-Authorize past decision_ttl, against a REAL CP ──
 # A one-shot `ssh <cmd>` opens its only channel immediately, so it can never cross the
 # TTL boundary; only a multiplexed master can, and the per-repo suites drive a MockCp
 # with no ssh_session table, which is the shape that cannot exhibit a re-Authorize
@@ -1367,7 +1367,7 @@ assert_channel_revalidate() {
   local wait_secs="${FS_REVALIDATE_WAIT_SECS:-$((GW_MAX_DECISION_TTL_SECS + 5))}"
   local opts="-p $FS_GW_SSH_PORT -i /root/k -o IdentitiesOnly=yes -o PreferredAuthentications=publickey"
   opts="$opts -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
-  log "FR-CHAN-2: a multiplexed channel opened ${wait_secs}s into a connection, past a ${ttl}s decision_ttl cap, must re-Authorize at the real CP"
+  log "per-channel re-Authorize: a multiplexed channel opened ${wait_secs}s into a connection, past a ${ttl}s decision_ttl cap, must re-Authorize at the real CP"
   mint_admin_token
   # Identify the multiplexed connection's session by set difference rather than by
   # ordering: session ids are the Gateway's random v4 UUIDs, so no sort over them means
@@ -1400,18 +1400,19 @@ print(new[0] if new else "")')"
     | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("items") or []))')"
   [[ "${decisions:-0}" -ge 2 ]] \
     || die "session $sid recorded only ${decisions:-0} authz.decision event(s): the second channel was served from the cached decision, so the re-validate never ran"
-  ok "FR-CHAN-2: the second channel re-Authorized against the real CP ($decisions decisions for session $sid) and ran"
+  ok "per-channel re-Authorize: the second channel re-Authorized against the real CP ($decisions decisions for session $sid) and ran"
 }
 
 # ── deny-wins at the REAL-CP integration layer, not just against the MockCp double ──
-# An ungranted login must be refused by the real CP Authorize — fail closed, generic §7.1.
+# An ungranted login must be refused by the real CP Authorize — fail closed, and the
+# client is told only that the node is offline or unavailable.
 assert_deny_closed() {
   log "deny-path: an UNGRANTED login ($DENY_LOGIN%$NODE_NAME) must be refused by the real CP (fail closed)"
   local out rc=0
   out="$(ssh_attempt "$DENY_LOGIN" "$NODE_NAME" 'echo DENIED_SHOULD_NOT_RUN')" || rc=$?
   [[ $rc -ne 0 ]] || die "an ungranted login was NOT refused (fail-OPEN): $out"
   grep -q DENIED_SHOULD_NOT_RUN <<<"$out" && die "the command RAN on an ungranted login — deny bypassed: $out"
-  ok "deny-path: the ungranted login was refused by the real CP (rc=$rc, generic §7.1, no command ran)"
+  ok "deny-path: the ungranted login was refused by the real CP (rc=$rc, generic denial, no command ran)"
 }
 
 # The `bearer=true` filter is NOT decorative — do not drop it as a simplification. The
@@ -1460,7 +1461,7 @@ new = [s for s in os.environ["AFTER"].split() if s not in before]
 print(new[0] if new else "")'
 }
 
-# D-4's "configuring Key Vault changes nothing until a CA is rotated onto it" is worth
+# "Configuring Key Vault changes nothing until a CA is rotated onto it" is worth
 # more than a log a human happens to read afterward: an eager future change (e.g.
 # resolving the CA's public key at startup for some new health probe) would move this
 # count and nothing else in the suite would notice. Asserted, not merely observed — the
@@ -1475,7 +1476,7 @@ assert_keyvault_untouched_before_rotation() {
 }
 
 # ── rotate the session CA onto Key Vault, over the API, no database credential ──
-# D-7: a Key Vault CA's private key never leaves the vault, so adoption is necessarily a
+# A Key Vault CA's private key never leaves the vault, so adoption is necessarily a
 # ROTATION onto a new key (POST /v1/cas is refused once a kind has an active CA), with
 # the trust-distribution consequences that follow (redistribute_trust_for_keyvault_ca).
 adopt_session_ca_onto_keyvault() {
@@ -1499,7 +1500,7 @@ for ca in json.load(sys.stdin).get("items") or []:
   [[ "$ref" == "$KEY_ID" ]] || die "the rotated CA's keyReference is not the vault key: $ref vs $KEY_ID"
 
   # The CP must be serving the VAULT's public key now, not a database one — the point
-  # of D-2/D-8. Recompute the fingerprint independently, the same way export_trust_material
+  # of moving the CA. Recompute the fingerprint independently, the same way export_trust_material
   # already does for the original local CA.
   pubkey="$(api_ok GET /v1/cas/session/public-key)"
   [[ "$(json_get "$pubkey" publicKeySpkiDer)" == "$PUBKEY_SPKI_B64" ]] \
@@ -1518,7 +1519,7 @@ for ca in json.load(sys.stdin).get("items") or []:
   ok "session CA rotated onto Key Vault over REST (backend=$backend keyReference=$ref, fingerprint $fp); the vault's request log recorded the read"
 }
 
-# The documented rotation procedure (D-7's overlap window): the node already trusts the
+# The documented rotation procedure (the overlap window): the node already trusts the
 # OLD local session CA (export_trust_material/start_node); the Key-Vault-backed CA is a
 # SEPARATE trusted line, appended without removing the old one, so both verify during the
 # overlap — this IS the operational step a real rotation runbook performs, so the harness
@@ -1555,7 +1556,7 @@ assert_keyvault_backed_session() {
 }
 
 # This is a permanent scenario, run every time rather than exercised manually, so it
-# proves D-2 "at the real network/JVM boundary, not only in a CP unit test" on every
+# proves the signature check "at the real network/JVM boundary, not only in a CP unit test" on every
 # execution. The runtime fault-mode toggle exists exactly so this can run on every
 # execution without restarting the double or changing its port (see keyvault/README.md).
 #
@@ -1564,7 +1565,7 @@ assert_keyvault_backed_session() {
 # proving the guard fired requires also proving the double is still capable of a normal
 # session immediately afterward.
 assert_keyvault_wrong_key_rejected() {
-  log "D-2: flipping the vault double to sign with a different key; a NEW session must be refused and no certificate issued"
+  log "wrong-key vault: flipping the vault double to sign with a different key; a NEW session must be refused and no certificate issued"
   curl -sk "$KEYVAULT_URL/_test/fault-mode?mode=wrong_key" >/dev/null \
     || die "could not arm the wrong-key fault mode on the Key Vault double"
   KEYVAULT_FAULT_MODE_ARMED=1
@@ -1573,34 +1574,35 @@ assert_keyvault_wrong_key_rejected() {
   local before_sessions out rc=0
   before_sessions="$(session_ids)"
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo WRONGKEY_SHOULD_NOT_RUN')" || rc=$?
-  [[ $rc -ne 0 ]] || die "a session SUCCEEDED while the vault was signing with the WRONG key (D-2 bypassed): $out"
-  grep -q WRONGKEY_SHOULD_NOT_RUN <<<"$out" && die "the command RAN while the vault was signing with the wrong key — D-2 bypassed: $out"
+  [[ $rc -ne 0 ]] || die "a session SUCCEEDED while the vault was signing with the WRONG key: $out"
+  grep -q WRONGKEY_SHOULD_NOT_RUN <<<"$out" && die "the command RAN while the vault was signing with the wrong key: $out"
 
   # LOAD-BEARING here, unlike the analogous string in assert_keyvault_fail_closed: there
   # the vault is stopped, so the sign-count-unchanged check independently proves it was
   # never reached, and the log line is only corroborating. Here the session genuinely
   # fails AND the vault genuinely gets called (it signs, just with the wrong key), so
-  # nothing else in this scenario tells apart "D-2 caught it" from "the session failed
-  # for some unrelated reason" — this grep is that discriminator. The string is owned by
-  # ControlPlane's io.sessionlayer.controlplane.ca.backend.azure.AzureKeyVaultSigner
-  # (the D-2 verify-failure reason) — it is known to drift (a "(D-2)" suffix has already
-  # been removed from it upstream once), so if this grep ever starts failing, re-read
+  # nothing else in this scenario tells apart "the signature check caught it" from "the
+  # session failed for some unrelated reason" — this grep is that discriminator. The
+  # string is owned by ControlPlane's
+  # io.sessionlayer.controlplane.ca.backend.azure.AzureKeyVaultSigner (its verify-failure
+  # reason) — it is known to drift (a citation suffix has already been
+  # removed from it upstream once), so if this grep ever starts failing, re-read
   # that class fresh before assuming the guard broke.
   grep -q "returned signature does not verify against the pinned public key" "$WORKDIR/cp.log" \
-    || die "cp.log shows no D-2 signature-verification failure — the session failed, but this scenario cannot tell whether D-2 caught it or something unrelated did"
+    || die "cp.log shows no signature-verification failure — the session failed, but this scenario cannot tell whether the signature check caught it or something unrelated did"
 
   mint_admin_token
   local sid
   sid="$(new_session_id "$before_sessions")"
   [[ -n "$sid" ]] || die "the wrong-key attempt produced no new session to check for an issued certificate"
   [[ "$(certificate_issued_for_session "$sid")" == no ]] \
-    || die "a certificate WAS issued for session $sid even though the vault signed with the wrong key — D-2 bypassed"
+    || die "a certificate WAS issued for session $sid even though the vault signed with the wrong key"
 
   curl -sk "$KEYVAULT_URL/_test/fault-mode?mode=none" >/dev/null \
     || die "could not restore the Key Vault double to normal signing"
   KEYVAULT_FAULT_MODE_ARMED=""
   run_session
-  ok "D-2: the wrong-key session was refused (no certificate issued for session $sid), and a normal session succeeded immediately after restoring the double"
+  ok "wrong-key vault: the wrong-key session was refused (no certificate issued for session $sid), and a normal session succeeded immediately after restoring the double"
 }
 
 # The credential-acquisition chain (App Service managed identity — see the credential=
@@ -1630,7 +1632,7 @@ assert_keyvault_credential_flow() {
   ok "credential flow: the Control Plane's first vault request carried no Authorization, and the managed-identity token was fetched exactly once and reused for every operation since"
 }
 
-# ── D-4, the single most important behavioral requirement of the Key Vault CA backend: an
+# ── The single most important behavioral requirement of the Key Vault CA backend: an
 # unreachable vault must NEVER fall back to local signing. Stop the double (the CP stays
 # up) and attempt a session. A bare rc!=0 also holds for an unrelated failure (e.g. an
 # ungranted login or the wrong node), so that is not what this scenario turns on — the
@@ -1644,7 +1646,7 @@ assert_keyvault_credential_flow() {
 # correctly find nothing wrong, exposing that a bare rc!=0 check would have passed for
 # the wrong reason.
 assert_keyvault_fail_closed() {
-  log "D-4: stopping the Key Vault double; a NEW session on the Key-Vault-backed CA must fail closed, never fall back to local"
+  log "fail-closed: stopping the Key Vault double; a NEW session on the Key-Vault-backed CA must fail closed, never fall back to local"
   local before_signs before_sessions out rc=0
   before_signs="$(keyvault_sign_count)"
   mint_admin_token
@@ -1655,7 +1657,7 @@ assert_keyvault_fail_closed() {
   while kill -0 "$KV_PID" 2>/dev/null && [[ $SECONDS -lt $d ]]; do sleep 1; done
 
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo KVDOWN_SHOULD_NOT_RUN')" || rc=$?
-  [[ $rc -ne 0 ]] || die "a session SUCCEEDED with the Key Vault double down (fail-OPEN — D-4 violated): $out"
+  [[ $rc -ne 0 ]] || die "a session SUCCEEDED with the Key Vault double down (fail-OPEN): $out"
   grep -q KVDOWN_SHOULD_NOT_RUN <<<"$out" && die "the command RAN with the Key Vault double down — fail-open: $out"
 
   # Load-bearing #1: the vault's OWN counter proves the Control Plane never reached it —
@@ -1672,7 +1674,7 @@ assert_keyvault_fail_closed() {
   sid="$(new_session_id "$before_sessions")"
   [[ -n "$sid" ]] || die "the vault-down attempt produced no new session to check for an issued certificate"
   [[ "$(certificate_issued_for_session "$sid")" == no ]] \
-    || die "a certificate WAS issued for session $sid even though the Key Vault double was stopped — D-4 bypassed"
+    || die "a certificate WAS issued for session $sid even though the Key Vault double was stopped"
 
   # Corroborating only: names the failure as Key-Vault-specific rather than merely
   # confirming the two checks above. Not what the scenario turns on — this string is owned
@@ -1682,7 +1684,7 @@ assert_keyvault_fail_closed() {
   # scenario's verdict — update the string, not the check's shape, when it moves.
   grep -q "Key Vault signing failed for key" "$WORKDIR/cp.log" \
     || die "cp.log shows no Key-Vault-specific signing failure (corroborating check) — the session failed, but not visibly for the Key Vault reason"
-  ok "D-4: with the Key Vault double down, the new session failed closed (rc=$rc); sign count unchanged ($before_signs); no certificate issued for session $sid; the Control Plane never fell back to local"
+  ok "fail-closed: with the Key Vault double down, the new session failed closed (rc=$rc); sign count unchanged ($before_signs); no certificate issued for session $sid; the Control Plane never fell back to local"
 }
 
 # ── the AWS KMS leg ──────────────────────────────────────────────────────────
@@ -1968,19 +1970,19 @@ restore_kms_and_run_a_session() {
   ok "KMS recovered: a fresh key was adopted over REST and a normal session ran on it"
 }
 
-# ── NFR-2: with the real CP DOWN, a new session must fail CLOSED — never fail-open. LAST case
+# ── With the real CP DOWN, a new session must fail CLOSED — never fail-open. LAST case
 # (it kills the CP). The full-stack proves this in a way MockCp cannot: a real dead decision plane.
 assert_cp_down() {
-  log "NFR-2: killing the real CP; a NEW session MUST fail closed (never fail-open)"
+  log "CP-down: killing the real CP; a NEW session MUST fail closed (never fail-open)"
   kill "$CP_PID" 2>/dev/null || true
   local d=$((SECONDS + 25))
   while kill -0 "$CP_PID" 2>/dev/null && [[ $SECONDS -lt $d ]]; do sleep 1; done
   ! curl -sf "$CP_REST/v1/healthz" >/dev/null 2>&1 || die "CP still healthy after kill; cannot prove CP-down"
   local out rc=0
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'echo CPDOWN_SHOULD_NOT_RUN')" || rc=$?
-  [[ $rc -ne 0 ]] || die "a session SUCCEEDED with the CP DOWN (fail-OPEN — NFR-2 violated): $out"
+  [[ $rc -ne 0 ]] || die "a session SUCCEEDED with the CP DOWN (fail-OPEN): $out"
   grep -q CPDOWN_SHOULD_NOT_RUN <<<"$out" && die "the command RAN with the CP down — fail-open: $out"
-  ok "NFR-2: with the real CP down, the new session failed closed (rc=$rc); the Gateway never fails open"
+  ok "CP-down: with the real CP down, the new session failed closed (rc=$rc); the Gateway never fails open"
 }
 
 report() {
@@ -2007,7 +2009,7 @@ $(printf '\033[32m========================================================\033[0
 EOF
 }
 
-# F-1: under a hardened profile the recorder spills ciphertext to disk once a
+# Under a hardened profile the recorder spills ciphertext to disk once a
 # session exceeds the (deliberately small) spool threshold. That spool MUST land in
 # a Landlock-allowed path (the data-dir), not /tmp — a /tmp spool would EACCES and,
 # in strict mode, tear the session down mid-flight. Force a spill with a large-output
@@ -2017,7 +2019,7 @@ assert_spill() {
     full | seccomp) : ;;
     *) return 0 ;;
   esac
-  log "F-1: forcing a recorder spill (>64KiB output) under hardening=$FS_HARDENING — must NOT tear down"
+  log "recorder spill: forcing a spill (>64KiB output) under hardening=$FS_HARDENING — must NOT tear down"
   local out rc=0
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'head -c 300000 /dev/zero | base64; echo SPILL_OK')" || rc=$?
   { [[ $rc -eq 0 ]] && grep -q SPILL_OK <<<"$out"; } \
@@ -2025,7 +2027,7 @@ assert_spill() {
   # Spool file lives under the data-dir (created + removed there), never /tmp.
   [[ -d "$WORKDIR/gw-data/recording-spool" ]] \
     || die "expected the spool dir under the data-dir (gw-data/recording-spool)"
-  ok "recorder spill under hardening=$FS_HARDENING succeeded — spool in the data-dir, strict session intact (F-1)"
+  ok "recorder spill under hardening=$FS_HARDENING succeeded — spool in the data-dir, strict session intact"
 }
 
 main() {
@@ -2055,21 +2057,21 @@ main() {
 
   assert_recording_store_integrity
   assert_audit_dimensions    # 5 dims searchable + correlated chain
-  assert_channel_revalidate  # FR-CHAN-2: multiplexed re-Authorize past decision_ttl
-  assert_spill               # F-1: recorder spill lands in the Landlock-allowed data-dir
+  assert_channel_revalidate  # multiplexed re-Authorize past decision_ttl
+  assert_spill               # recorder spill lands in the Landlock-allowed data-dir
   assert_deny_closed         # deny-wins at the real CP
 
-  assert_keyvault_untouched_before_rotation  # D-4: proof, not just an after-the-fact read
+  assert_keyvault_untouched_before_rotation  # proof, not just an after-the-fact read
   # Rotate the session CA onto Key Vault (still over REST, no database credential),
   # redistribute trust to the node, and prove the resulting session is Key-Vault-signed.
   adopt_session_ca_onto_keyvault
   redistribute_trust_for_keyvault_ca
   assert_keyvault_backed_session
-  assert_keyvault_wrong_key_rejected  # D-2, permanent (was a manual-only cycle)
+  assert_keyvault_wrong_key_rejected  # permanent (was a manual-only cycle)
   assert_keyvault_credential_flow
   operator_flow_end
 
-  assert_keyvault_fail_closed  # D-4 fail-closed — the vault double stays down from here
+  assert_keyvault_fail_closed  # the vault double stays down from here
 
   # Rotate the session CA on again, to AWS KMS this time. The CA is on Key Vault when this
   # starts, so this is a key-service-to-key-service rotation rather than local -> KMS —
@@ -2083,7 +2085,7 @@ main() {
   operator_flow_end
   assert_kms_fail_closed     # ends by restoring KMS and running a normal session
 
-  assert_cp_down             # NFR-2 fail-closed — LAST (kills the CP)
+  assert_cp_down             # fail-closed — LAST (kills the CP)
   report
 }
 main "$@"

@@ -7,12 +7,11 @@
 # container stays alive (sleep) so tests `exec` ssh commands into it.
 #
 # Stage 1 builds the OpenSSH **software SK provider** (`sk-dummy.so`) — a virtual
-# FIDO2 authenticator — from the matching openssh-portable source, so the Session
-# Thirteen break-glass `sk-ecdsa` path can be driven end-to-end with a REAL FIDO
-# signature and no hardware token (Design §7, FR-ACC-6). The stock Debian
-# openssh-client ships no middleware, so `ssh-keygen -t ecdsa-sk` fails "device
-# not found" without this. Only `config.h` (./configure) + the openbsd-compat
-# shims are needed to link it — the full openssh build is not.
+# FIDO2 authenticator — from the matching openssh-portable source, so the break-glass
+# `sk-ecdsa` path can be driven end-to-end with a REAL FIDO signature and no hardware
+# token. The stock Debian openssh-client ships no middleware, so `ssh-keygen -t
+# ecdsa-sk` fails "device not found" without this. Only `config.h` (./configure) + the
+# openbsd-compat shims are needed to link it — the full openssh build is not.
 ARG OPENSSH_VERSION=10.0p1
 # Pinned tarball digest (reproducible; no floating fetch). Verified against the
 # OpenBSD OpenSSH portable release for OPENSSH_VERSION above.

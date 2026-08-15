@@ -33,7 +33,7 @@ on:
   # Run the hardened profile on PRs that touch the data plane / hardening / harness,
   # so the seccomp/Landlock allow-list is verified against the REAL data path (russh,
   # rustls-ring, tonic mTLS, hyper WORM, splice) continuously — not only in the
-  # subprocess canary (F-2). Repo-relative paths (CI checks this repo out into Gateway/).
+  # subprocess canary. Repo-relative paths (CI checks this repo out into Gateway/).
   pull_request:
     paths:
       - "gateway/**"

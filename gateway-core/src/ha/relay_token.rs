@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn the_ledger_is_bounded_and_fails_closed_at_capacity() {
-        // R5: a signal storm cannot grow the ledger without limit.
+        // A signal storm cannot grow the ledger without limit.
         let pending = PendingRelays::new(2);
         pending_with(&pending, "a", binding());
         pending_with(&pending, "b", binding());

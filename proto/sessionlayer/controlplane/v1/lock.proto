@@ -8,8 +8,8 @@ option java_multiple_files = true;
 option java_package = "io.sessionlayer.controlplane.grpc.v1";
 option java_outer_classname = "LockProto";
 
-// LockFeed is the CP -> Gateway actively-pushed lock deny-list (Design §6.3,
-// §8.3, §8.4; FR-CHAN-3, FR-LOCK-1/2) (additive; protocol stays 1.1).
+// LockFeed is the CP -> Gateway actively-pushed lock deny-list (additive;
+// protocol stays 1.1).
 //
 // It realises the asymmetric-degradation invariant (the safety spine): a lock
 // lives on this INDEPENDENT push feed — never a poll that can go stale-open — so
@@ -48,7 +48,7 @@ message LockEvent {
     LockSnapshot snapshot = 1;
 
     // A lock created (or updated) — the Gateway adds it and immediately tears
-    // down any matching live session (FR-LOCK-1).
+    // down any matching live session.
     Lock added = 2;
 
     // A lock removed (deleted or expired) — the Gateway drops it by id. Removal
@@ -81,8 +81,8 @@ message Heartbeat {
   int64 sent_at_epoch_seconds = 1;
 }
 
-// Lock enforcement mode (Design §8.3) (additive; the wire previously
-// carried no mode so the Gateway treated every pushed lock as a teardown).
+// Lock enforcement mode (additive; the wire previously carried no mode so the
+// Gateway treated every pushed lock as a teardown).
 enum LockMode {
   // Unset — an older CP that predates this field. The Gateway MUST treat this as
   // STRICT (fail safe): the prior wire had no mode and every lock tore down, so
@@ -97,10 +97,10 @@ enum LockMode {
   LOCK_MODE_BEST_EFFORT = 2;
 }
 
-// A Lock is an incident-response deny (Design §8.3; FR-LOCK-1): it blocks new
-// issuance / session start AND tears down existing matching sessions, INDEPENDENT
-// of TTL and CA rotation. The Gateway matches `target` against a live session's
-// SIGNED decision context locally (LockMatching, ported to Rust).
+// A Lock is an incident-response deny: it blocks new issuance / session start
+// AND tears down existing matching sessions, INDEPENDENT of TTL and CA rotation.
+// The Gateway matches `target` against a live session's SIGNED decision context
+// locally (LockMatching, ported to Rust).
 message Lock {
   // The lock's stable id (UUID). The Gateway keys its local set on this.
   string lock_id = 1;
@@ -117,9 +117,9 @@ message Lock {
   // When the lock was created (Unix epoch seconds, UTC). Diagnostics/ordering.
   int64 created_at_epoch_seconds = 4;
 
-  // The operator/audit reason. NEVER disclosed to the SSH user (§7.1 — a lock
-  // produces the SAME generic denial as any authorization failure); it may
-  // appear only in the Gateway's OPERATOR-facing log.
+  // The operator/audit reason. NEVER disclosed to the SSH user (a lock produces
+  // the SAME generic denial as any authorization failure); it may appear only in
+  // the Gateway's OPERATOR-facing log.
   string reason = 5;
 
   // The enforcement mode. UNSPECIFIED (an older CP) MUST be treated as STRICT by

@@ -112,7 +112,7 @@ impl AgentClient {
                     max_frame_bytes: ack.max_frame_bytes as usize,
                 })
             }
-            // Fail closed: never retry with a guessed version (FR-HA-9).
+            // Fail closed: never retry with a guessed version.
             MsgType::VersionReject => anyhow::bail!("gateway rejected our protocol version"),
             other => anyhow::bail!("unexpected preface frame {other:?}"),
         }

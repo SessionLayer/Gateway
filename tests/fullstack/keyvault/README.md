@@ -132,20 +132,20 @@ matching "any token satisfies the double" for the vault side too.
 Both were verified with a standalone signature-verification round-trip (JWK → EC public
 key → verify the double's own P1363 output) before this double was wired into `run.sh`.
 
-## The fault-mode toggle (D-2, `assert_keyvault_wrong_key_rejected`, a permanent scenario)
+## The fault-mode toggle (`assert_keyvault_wrong_key_rejected`, a permanent scenario)
 
 `GET /_test/fault-mode?mode=wrong_key|none` is not part of the Key Vault REST API — it
 is this double's only admin surface, deliberately exempt from the challenge above (the
 harness drives it directly with `curl`, not through the SDK). `run.sh`'s
 `assert_keyvault_wrong_key_rejected` calls it directly, on every run, proving the Control
-Plane's D-2 guard (every signature is verified locally against the pinned public key
+Plane's guard (every signature is verified locally against the pinned public key
 before being trusted) holds at the real network/JVM boundary, not only in a CP unit
 test — it is not a one-off manual exercise or a claim resting on a transcript captured
 once. In `wrong_key` mode, `POST .../sign` signs with an unrelated keypair generated at
 startup instead of the real CA key, while `GET .../{version}` keeps reporting the real
 CA key's coordinates honestly — the fault this double injects is a vault that signs with
-the wrong key while still describing itself correctly, which is the failure shape D-2
-exists to catch. The scenario restores `mode=none` and asserts a normal session succeeds
+the wrong key while still describing itself correctly, which is the failure shape that
+guard exists to catch. The scenario restores `mode=none` and asserts a normal session succeeds
 immediately after — without that, "the session failed" cannot be told apart from "the
 fault-mode toggle broke the double". The restore is unconditional (checked in
 `cleanup()`, not only at the end of the happy path): a `die()` partway through this
@@ -153,10 +153,10 @@ scenario must not leave the double faulted for whatever inspects or reuses it ne
 
 In this scenario, unlike `assert_keyvault_fail_closed`, the session genuinely fails *and*
 the vault genuinely gets called (it signs — just with the wrong key), so the cp.log grep
-for the D-2 signature-verification-failure message is **load-bearing, not corroborating**:
-nothing else here distinguishes "D-2 caught it" from "the session failed for some
+for the signature-verification-failure message is **load-bearing, not corroborating**:
+nothing else here distinguishes "the guard caught it" from "the session failed for some
 unrelated reason". That string is owned by `ControlPlane`'s `AzureKeyVaultSigner`, and it
-is known to drift — a `"(D-2)"` suffix has already been removed from it upstream once —
+is known to drift — a citation suffix has already been removed from it upstream once —
 so if this grep ever starts failing, re-read that class fresh rather than assume the
 guard broke.
 
@@ -210,7 +210,7 @@ whether its inner-leg certificate was ever obtained, because recording is gated 
 correctly-rejected wrong-key attempt still shows `recording finalized ... byte_len=217`.
 "No new recording" therefore proved nothing about certificate issuance — it happened to
 look right in a design review, but the first real run showed it asserting a real security
-control (D-2) had failed when it had, in fact, fired exactly as intended.
+control had failed when it had, in fact, fired exactly as intended.
 
 One more thing this surfaced, reported and being fixed on the Control Plane side rather
 than here: a rejected sign today leaves **no `session.sign` audit event at all**, success

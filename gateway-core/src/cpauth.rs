@@ -171,7 +171,7 @@ impl CpAuthClient {
         *self.channel.lock().await = None;
     }
 
-    /// W3C trace context injected into gRPC metadata (OTEL-CONTRACT §2.1).
+    /// W3C trace context injected into gRPC metadata.
     async fn call<T, F, Fut>(&self, f: F) -> Result<T, CpError>
     where
         F: FnOnce(crate::telemetry::TracedChannel) -> Fut,
@@ -359,7 +359,7 @@ impl CpAuthClient {
         .await
     }
 
-    /// Only CSR sent; server key generated locally and never leaves (D2).
+    /// Only CSR sent; server key generated locally and never leaves.
     pub async fn issue_gateway_server_certificate(
         &self,
         pkcs10_csr: Vec<u8>,
@@ -409,7 +409,7 @@ impl CpAuthClient {
             .await
     }
 
-    /// Release concurrency lease at teardown (FR-SESS-3). Best-effort: never block on error.
+    /// Release concurrency lease at teardown. Best-effort: never block on error.
     pub async fn notify_session_end(
         &self,
         session_id: &str,
@@ -426,7 +426,7 @@ impl CpAuthClient {
         .await
     }
 
-    /// Extend lease (FR-SESS-3). Window is SERVER-authoritative; failure never affects session.
+    /// Extend lease. Window is SERVER-authoritative; failure never affects session.
     pub async fn extend_session_lease(
         &self,
         session_id: &str,
@@ -439,7 +439,7 @@ impl CpAuthClient {
         .await
     }
 
-    /// Send pubkey + token only (D2). CP-down → fail-closed.
+    /// Send pubkey + token only. CP-down → fail-closed.
     pub async fn sign_session_certificate(
         &self,
         session_token: &str,
@@ -464,7 +464,7 @@ impl CpAuthClient {
         result
     }
 
-    /// Authenticated by mTLS (not session-bound). CP signs key; private key never leaves (D2).
+    /// Authenticated by mTLS (not session-bound). CP signs key; private key never leaves.
     pub async fn sign_gateway_host_certificate(
         &self,
         host_public_key: Vec<u8>,

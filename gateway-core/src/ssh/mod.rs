@@ -194,10 +194,10 @@ pub async fn bind(
     let gate_cidrs = netmatch::parse_cidrs(&config.source_ip_allowlist)?;
 
     if config.source_ip_allowlist.is_empty() {
-        tracing::warn!("outer SSH leg enabled with an EMPTY source-IP gate (allow-all); set ssh.source_ip_allowlist to restrict access (FR-AUTH-13)");
+        tracing::warn!("outer SSH leg enabled with an EMPTY source-IP gate (allow-all); set ssh.source_ip_allowlist to restrict access");
     }
     if config.proxy.lb_cidrs.is_empty() {
-        tracing::warn!("PROXY protocol is OFF (ssh.proxy.lb_cidrs empty); behind an L4 LB the LB address would become the source IP for every client — set lb_cidrs (FR-AUTH-14)");
+        tracing::warn!("PROXY protocol is OFF (ssh.proxy.lb_cidrs empty); behind an L4 LB the LB address would become the source IP for every client — set lb_cidrs");
     }
 
     let host_key = load_or_generate_host_key(&config.host_key_path)?;

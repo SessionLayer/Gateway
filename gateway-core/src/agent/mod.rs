@@ -1,4 +1,5 @@
-//! Outbound-agent transport and mTLS WebSocket server; the seam is invariant (D21/D23).
+//! Outbound-agent transport and mTLS WebSocket server. The recording, host-verification and
+//! inner-certificate seam is identical over this path and the direct one.
 
 pub mod dial;
 pub mod registry;
@@ -39,7 +40,7 @@ pub const MAX_FRAME_BYTES_RANGE: std::ops::RangeInclusive<usize> = 4096..=1_048_
 /// the `ProtocolVersion`/`ComponentInfo` *concept* and the N-1 resolver, but it has its own
 /// version line, and the Control Plane is not a party to it (contract §1). Baseline **1.0**
 /// (contract §3) — do NOT couple it to the gRPC version, which is already at 1.1; advertising
-/// the gRPC max here would offer Agents a wire minor that does not exist and violate §3.
+/// the gRPC max here would offer Agents a wire minor that does not exist and violate contract §3.
 pub const WIRE_PROTOCOL_MIN: (u32, u32) = (1, 0);
 
 /// Highest Agent <-> Gateway wire protocol this build speaks. Bump only when the framed

@@ -454,11 +454,7 @@ async fn ssh_runs_on_a_real_node_through_the_agent_path_in_a_mixed_fleet() -> an
     )
     .await;
     assert_eq!(code, Some(0));
-    assert_eq!(
-        whoami.trim(),
-        "deploy",
-        "the Agent must not run as root (FR-CONN-6)"
-    );
+    assert_eq!(whoami.trim(), "deploy", "the Agent must not run as root");
 
     drop(direct_node);
     drop(agent_node);
@@ -510,7 +506,7 @@ async fn an_untrusted_node_host_key_aborts_over_the_agent_path() -> anyhow::Resu
     );
     assert!(
         stderr.contains("offline or unavailable"),
-        "the user sees the generic §7.1 outcome; stderr={stderr:?}"
+        "the user sees the generic outcome; stderr={stderr:?}"
     );
 
     drop(agent_node);
@@ -543,7 +539,7 @@ async fn a_node_whose_agent_is_disconnected_is_offline() -> anyhow::Result<()> {
     assert_ne!(code, Some(0), "a node with no Agent must fail closed");
     assert!(
         stderr.contains("offline or unavailable"),
-        "§7.1 / FR-SESS-5 node-offline; stderr={stderr:?}"
+        "node-offline; stderr={stderr:?}"
     );
     Ok(())
 }

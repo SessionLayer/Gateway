@@ -1,5 +1,5 @@
 //! Per-PR proof that the Tier-0 hardening profile is CORRECT and does not break
-//! the SSH data path (NFR-5). It spawns the `hardening-canary`
+//! the SSH data path. It spawns the `hardening-canary`
 //! binary — which applies the REAL `gateway::hardening` seccomp/Landlock/coredump
 //! code to itself in a fresh process — and asserts on the outcome, so nothing
 //! sandboxes the test runner. The authoritative full-session proof (real CP + node

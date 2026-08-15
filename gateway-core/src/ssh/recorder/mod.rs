@@ -206,7 +206,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                 target,
                 counters,
             } => {
-                // Metadata-only (FR-SESS-2): emit a `<family>.opened` marker into the
+                // Metadata-only: emit a `<family>.opened` marker into the
                 // sealed stream — target, direction, capability, correlation id — but
                 // NEVER the forwarded bytes (arbitrary/binary, no universal decode).
                 self.ensure_header(0, 0)?;
@@ -661,7 +661,7 @@ impl SessionRecorder for Recorder {
             // Upload the (possibly partial but hash-chained) ciphertext object with
             // a FRESH short-lived credential fetched now (at session end) — a
             // session-long begin-time credential would expire before a long
-            // session's PUT (§12.2). Bounded retry with backoff (#4). Bytes never
+            // session's PUT. Bounded retry with backoff. Bytes never
             // traverse the CP.
             let (upload_ok, object_version_id, spooled) = match prepared.source.resolve().await {
                 Ok(source) => {
@@ -713,7 +713,7 @@ impl SessionRecorder for Recorder {
                     "recording finalized"
                 ),
                 // A non-final status is committed (never silently dropped) but logged
-                // loudly at warn so the incomplete recording is visible (#16).
+                // loudly at warn so the incomplete recording is visible.
                 Ok(_) => tracing::warn!(
                     session_id = %self.session_id,
                     recording_id = %self.recording_id,
@@ -801,7 +801,7 @@ impl RecorderFactory for RecorderFactoryImpl {
 
             Ok(Arc::new(Recorder {
                 cap: Mutex::new(cap),
-                // A break-glass session forces strict regardless of config (FR-ACC-6);
+                // A break-glass session forces strict regardless of config;
                 // `force_strict` can only tighten the configured strict mode.
                 strict: self.config.strict || params.force_strict,
                 teardown: params.teardown,
@@ -1315,7 +1315,7 @@ mod tests {
         assert_eq!(fin.audits[0].sha256, chain::sha256_hex(content));
 
         // The object decrypts to an asciicast whose only event is the `m` marker
-        // for the transfer (no terminal I/O), and the head recomputes from it (#7).
+        // for the transfer (no terminal I/O), and the head recomputes from it.
         let object = object_bytes(fin.source).await;
         let header = seal::parse_header(&object).unwrap();
         let key = seal::unseal_data_key(&header, &secret).unwrap();

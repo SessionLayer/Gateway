@@ -69,7 +69,7 @@ pub enum NodeConnectError {
     NoNodeName,
     #[error("no agent is connected for this node")]
     NoAgent,
-    /// The Agent is covered by a Lock (deny wins, §8.4).
+    /// The Agent is covered by a Lock (deny wins).
     #[error("the node's agent is locked")]
     AgentLocked,
     #[error("the agent refused or could not serve the dial-back")]

@@ -1,4 +1,4 @@
-# SessionLayer Gateway — hardened production image (NFR-5).
+# SessionLayer Gateway — hardened production image.
 #
 # Both base images are pinned to their multi-arch INDEX digest. A per-platform
 # manifest digest would resolve on one architecture and fail the build on the

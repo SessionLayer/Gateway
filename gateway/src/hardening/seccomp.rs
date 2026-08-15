@@ -279,7 +279,7 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         // Legacy setrlimit (glibc routes through prlimit64, but keep it for the
         // sibling coredump-disable path that may call setrlimit directly).
         libc::SYS_setrlimit,
-        // F-hardening-aarch64-1: libc names SYS_sendfile/SYS_fadvise64 only on
+        // libc names SYS_sendfile/SYS_fadvise64 only on
         // x86_64-gnu, not aarch64-gnu — keeping them in the common list breaks the
         // arm64 build (E0425). The Gateway uses `splice` for the byte bridge (never
         // sendfile) and issues no posix_fadvise, so on aarch64 they are simply

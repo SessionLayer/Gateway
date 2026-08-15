@@ -1,4 +1,4 @@
-//! Break-glass (Design §7): FIDO2 + offline code, idempotent recording, deny wins, lock teardown.
+//! Break-glass: FIDO2 + offline code, idempotent recording, deny wins, lock teardown.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,7 +136,7 @@ async fn break_glass_probe_costs_the_same_rpcs_whether_or_not_the_key_is_registe
     );
 }
 
-/// Divergence D6: a normal sk-ecdsa USER key (registered as a PIN, not a break-glass
+/// A normal sk-ecdsa USER key (registered as a PIN, not a break-glass
 /// credential) must FALL THROUGH the break-glass resolver to the ordinary pin path
 /// and authenticate — never a hard reject. sk-ed25519 and every other algorithm skip
 /// the break-glass branch entirely and go straight to the pin path.
@@ -506,7 +506,7 @@ async fn await_finalized(cp: &MockCp) -> gateway_core::pb::FinalizeRecordingRequ
 // — so a genuine `ecdsa-sk` key is enrolled and the stock `ssh` client produces a
 // REAL FIDO possession signature. russh verifies that signature server-side before
 // `auth_publickey`, which then resolves the key as a break-glass credential. This
-// is the primary break-glass auth path (Design §7, FR-ACC-6) end-to-end.
+// is the primary break-glass auth path end-to-end.
 
 const SK_PROVIDER: &str = "/usr/local/lib/sk-dummy.so";
 
@@ -578,7 +578,7 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
     );
     cp.register_break_glass_key(sk_pub.to_bytes()?, "breakglass-admin", &["deploy"]);
 
-    // F1 NEGATIVE: the registered break-glass PUBLIC key is listable, so possession
+    // NEGATIVE: the registered break-glass PUBLIC key is listable, so possession
     // of the FIDO private key must be REQUIRED. Offer the same key but with a BROKEN
     // provider so the client cannot produce a FIDO assertion → russh never receives a
     // valid signature → auth fails → NO break-glass session, NO activation. (Possession
@@ -924,7 +924,7 @@ async fn gw_enforces_signed_access_model_not_unsigned_context() -> anyhow::Resul
     Ok(())
 }
 
-// ── G1: a break-glass ALLOW with grant_expiry==0 is refused (must be time-boxed) ─
+// ── A break-glass ALLOW with grant_expiry==0 is refused (must be time-boxed) ─
 
 #[tokio::test]
 async fn break_glass_without_grant_expiry_is_refused() -> anyhow::Result<()> {
@@ -981,7 +981,7 @@ async fn break_glass_refused_when_lock_feed_unhealthy() -> anyhow::Result<()> {
     );
     // The lock feed is DOWN so the Gateway's deny-set is never healthy: a break-glass
     // session cannot confirm the absence of a Lock, so it must refuse NEW privileged
-    // channels (fail closed, §8.4). A REAL node → without the fix the session would run.
+    // channels (fail closed). A REAL node → without the fix the session would run.
     cp.set_lock_feed_down(true);
     cp.register_offline_code("bg-feeddown", "breakglass-admin", &["deploy"]);
 

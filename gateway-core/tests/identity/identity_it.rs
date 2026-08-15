@@ -337,7 +337,7 @@ async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past()
 /// cap collapsed the floor to zero and the loop renewed at RPC rate — 40 generations in 2s
 /// in the reliability repro. The RPC keeps *succeeding* (the CP validates against its own
 /// clock), so nothing self-limits, and each iteration churns the generation counter, which
-/// is the §8.2 clone-detection primitive.
+/// is the clone-detection primitive.
 ///
 /// This drives the real LOOP (not the helper) with `cert_ttl(0)` — `validity_window()` then
 /// returns not_after = now, i.e. "the certificate the CP issued is already expired at us".

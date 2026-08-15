@@ -1,4 +1,4 @@
-//! Target resolution: username encoding `login%node` into login + node identifier (FR-ADDR-1).
+//! Target resolution: username encoding `login%node` into login + node identifier.
 //! Parser never decides access; malformed/unknown targets yield generic pre-auth denial (no disclosure).
 
 #[derive(Debug, Clone, PartialEq, Eq)]

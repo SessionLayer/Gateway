@@ -13,9 +13,8 @@ option java_outer_classname = "HandshakeProto";
 // wiring end to end (CP implements the server; the Gateway generates and calls
 // the client).
 //
-// Per FR-HA-9 / Design D33 / Design §16A, the CP<->Gateway gRPC contract MUST
-// be explicitly versioned and MUST negotiate a common version at connect. This
-// service is that negotiation.
+// The CP<->Gateway gRPC contract MUST be explicitly versioned and MUST
+// negotiate a common version at connect. This service is that negotiation.
 //
 // SECURITY: this RPC runs over PLAINTEXT localhost for the smoke test only,
 // insecure-by-design and dev-only; every other RPC on this plane requires the

@@ -6,13 +6,13 @@ option java_multiple_files = true;
 option java_package = "io.sessionlayer.controlplane.grpc.v1";
 option java_outer_classname = "PresenceProto";
 
-// Presence is the CP-owned authority for node ownership in HA (Design §10.2/§10.3;
-// FR-HA-2). runtime.presence (node -> owning_gateway, addr, monotonic nonce) is
-// authoritative in Postgres in BOTH single-instance and HA modes (mode-symmetry —
-// only the signalling transport differs). The Gateway has no database access; it
-// heartbeats and releases ownership through this service so the datastore boundary
-// (Design D11: the CP is the sole Postgres owner) is preserved. `LISTEN/NOTIFY` is
-// NOT used (global commit-lock) (additive; protocol 1.1).
+// Presence is the CP-owned authority for node ownership in HA. runtime.presence
+// (node -> owning_gateway, addr, monotonic nonce) is authoritative in Postgres in
+// BOTH single-instance and HA modes (mode-symmetry — only the signalling
+// transport differs). The Gateway has no database access; it heartbeats and
+// releases ownership through this service so the datastore boundary — the CP is
+// the sole Postgres owner — is preserved. `LISTEN/NOTIFY` is NOT used (global
+// commit-lock) (additive; protocol 1.1).
 //
 // TIER. mTLS-required (gateway-identity): the OWNER is the authenticated mTLS peer
 // (gateway_id), NEVER a request field — a Gateway can only claim/refresh/release
@@ -30,8 +30,8 @@ service Presence {
   //   * caller is the current owner -> REFRESH: last_seen := now (nonce unchanged).
   //   * caller is not owner and the owner is fresh -> STANDBY: no write.
   // The response always returns the authoritative post-state so a warm standby
-  // learns it is not the owner. A lower-nonce write is rejected (stale ownership,
-  // FR-HA-5) and surfaces as a failed RPC; the Gateway treats that as "not owner".
+  // learns it is not the owner. A lower-nonce write is rejected (stale ownership)
+  // and surfaces as a failed RPC; the Gateway treats that as "not owner".
   rpc Heartbeat(PresenceHeartbeatRequest) returns (PresenceHeartbeatResponse);
 
   // Release relinquishes ownership on graceful drain or control-channel loss so a

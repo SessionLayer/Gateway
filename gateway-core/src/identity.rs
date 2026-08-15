@@ -19,7 +19,7 @@ pub enum IdentityError {
     #[error("identity store I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Generation counter must never race; refuse to start (§8.2).
+    /// Generation counter must never race; refuse to start.
     #[error("data-dir {path} is locked by another Gateway process")]
     AlreadyLocked { path: PathBuf },
 
@@ -38,7 +38,7 @@ pub enum IdentityError {
     #[error("Control Plane refused the identity RPC (gRPC status {:?})", .0.code())]
     Rpc(#[from] tonic::Status),
 
-    /// Cloned credential forks the counter (§8.2); refuse + flag (security event).
+    /// Cloned credential forks the counter; refuse + flag (security event).
     #[error("generation mismatch: expected {expected}, Control Plane returned {got} (security event, refusing to adopt)")]
     GenerationMismatch { expected: u64, got: u64 },
 }
@@ -54,7 +54,7 @@ struct CredentialManifest {
     manifest_version: u32,
     gateway_id: String,
     gateway_name: String,
-    /// Monotonic generation counter (§8.2). Enrollment is 0; each renewal +1.
+    /// Monotonic generation counter. Enrollment is 0; each renewal +1.
     generation: u64,
     not_before_epoch_seconds: i64,
     not_after_epoch_seconds: i64,
@@ -69,7 +69,7 @@ struct CredentialManifest {
 pub struct Credential {
     pub gateway_id: String,
     pub gateway_name: String,
-    /// Monotonic generation counter (§8.2).
+    /// Monotonic generation counter.
     pub generation: u64,
     pub not_before: SystemTime,
     pub not_after: SystemTime,
@@ -144,7 +144,7 @@ impl std::fmt::Debug for KeypairCsr {
     }
 }
 
-/// Private key stays local; only CSR sent (D2/§15). CN must be explicit (CP rejects blank).
+/// Private key stays local; only CSR sent. CN must be explicit (CP rejects blank).
 pub fn generate_keypair_and_csr(gateway_name: &str) -> Result<KeypairCsr, IdentityError> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let mut params = rcgen::CertificateParams::new(vec![gateway_name.to_string()])?;
@@ -159,7 +159,7 @@ pub fn generate_keypair_and_csr(gateway_name: &str) -> Result<KeypairCsr, Identi
     })
 }
 
-/// Owns the credential data-dir and the process-wide single-writer lock (§8.2).
+/// Owns the credential data-dir and the process-wide single-writer lock.
 ///
 /// The advisory lock is held for the lifetime of the process: the underlying
 /// `RwLock<File>` is intentionally leaked to obtain a `'static` write guard (one
@@ -224,12 +224,12 @@ impl IdentityStore {
         Ok(Some(Credential::from_manifest(manifest)?))
     }
 
-    /// Atomically persist, then adopt (persist-before-adopt point, §8.2): crash-safe.
+    /// Atomically persist, then adopt (the persist-before-adopt point): crash-safe.
     fn persist_issued(&self, issued: IssuedCredential) -> Result<Credential, IdentityError> {
         // Persist-AFTER-validate: reject a bad CP-supplied validity window BEFORE
         // it can reach disk. Otherwise a hostile/corrupt epoch would be written,
         // and every subsequent restart `load()` would fail — a permanent
-        // crash-loop brick (NFR-2). Validating here keeps the bad value off disk.
+        // crash-loop brick. Validating here keeps the bad value off disk.
         validated_window(
             issued.not_before_epoch_seconds,
             issued.not_after_epoch_seconds,
@@ -310,7 +310,7 @@ pub async fn enroll(
     })
 }
 
-/// Verify generation is exactly `current + 1` (§8.2, security event if not); persist-before-adopt.
+/// Verify generation is exactly `current + 1` (security event if not); persist-before-adopt.
 pub async fn renew(
     store: &IdentityStore,
     params: &ChannelParams,
@@ -453,7 +453,7 @@ pub fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), Id
 ///
 /// After a renewal the loop re-derives its schedule from the NEW certificate. If that
 /// certificate is already past its renew trigger — a short TTL with a clock-skew
-/// backdate (FR-BOOT-4) or a CP clock ahead of ours — [`compute_renew_delay`] returns
+/// backdate, or a CP clock ahead of ours — [`compute_renew_delay`] returns
 /// `ZERO` and the loop would renew back-to-back, hammering the CP and burning
 /// generations. Flooring the *post-renewal* wait bounds that. (The Agent hit this
 /// bug too.)
@@ -469,7 +469,7 @@ const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// TTL config, common to the whole fleet — a terminal exit here would make every Gateway and
 /// Agent stop simultaneously on one central misconfig (fail-deadly). So the loop keeps
 /// renewing, bounded to ≈1/min, and logs the condition loudly instead; the generation
-/// counter (a §8.2 clone-detection signal) stays usable rather than being churned or frozen.
+/// counter (a clone-detection signal) stays usable rather than being churned or frozen.
 fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
     let floor = if remaining.is_zero() {
         RENEW_MIN_INTERVAL
@@ -624,7 +624,7 @@ impl RenewAhead {
                     just_renewed = true;
                 }
                 Err(IdentityError::GenerationMismatch { expected, got }) => {
-                    // Security event (§8.2): refuse + flag + stop. Do NOT keep
+                    // Security event: refuse + flag + stop. Do NOT keep
                     // retrying — a mismatch means a possible credential clone.
                     tracing::error!(
                         expected,
@@ -638,11 +638,11 @@ impl RenewAhead {
                     // unknown/rotated client cert, or a stale generation the CP
                     // has already advanced past (a persist/commit desync). Not a
                     // transient blip — retrying forever would spin. Stop + flag
-                    // for operator/automated **re-enrollment** (§8.1 token-join
+                    // for operator/automated **re-enrollment** (a token-join
                     // re-provision). Fail-closed: the old credential is kept.
                     tracing::error!(
                         error = %e,
-                        "REPAIR-NEEDED: renewal rejected by the Control Plane (locked / unknown cert / stale generation) — stopping renew-ahead; re-enrollment required (§8.1)"
+                        "REPAIR-NEEDED: renewal rejected by the Control Plane (locked / unknown cert / stale generation) — stopping renew-ahead; re-enrollment required"
                     );
                     return;
                 }
@@ -662,7 +662,7 @@ impl RenewAhead {
     }
 }
 
-/// Locked / unknown-cert / stale-generation → stop, require re-enrollment (§8.1).
+/// Locked / unknown-cert / stale-generation → stop, require re-enrollment.
 /// `GenerationMismatch` is separate clone-detection security event.
 fn is_repair_needed(err: &IdentityError) -> bool {
     matches!(

@@ -2,7 +2,7 @@
 # Test-node sshd entrypoint.
 #  - Injects the session-CA public key (TRUSTED_USER_CA env) into TrustedUserCAKeys.
 #  - Optionally installs a host certificate (HOST_CERT env) for host-identity
-#    verification tests (Design §9.3); host keys are generated if absent.
+#    verification tests; host keys are generated if absent.
 set -eu
 
 if [ -n "${TRUSTED_USER_CA:-}" ]; then

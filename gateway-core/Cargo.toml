@@ -46,7 +46,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-# OpenTelemetry (§14): the trace root spans + W3C context
+# OpenTelemetry: the trace root spans + W3C context
 # injection into outbound CP gRPC metadata. Exporter OFF unless an OTLP endpoint
 # is configured (telemetry.rs). See the workspace manifest for the transport /
 # supply-chain rationale (tonic/ring, no openssl).
