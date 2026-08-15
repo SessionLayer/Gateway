@@ -1,4 +1,4 @@
-//! Tamper-evident hash-chain over recording's records (Design §12.2, FR-AUD-3).
+//! Tamper-evident hash-chain over recording's records.
 //! Each record extends chain: `record_hash = SHA-256(prev_hash ‖ record)` from zero seed.
 //! hash_chain_head commits to whole content and order.
 

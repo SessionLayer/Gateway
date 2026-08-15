@@ -1,5 +1,5 @@
-//! asciicast v2 encoding (Design §12.1); UTF-8-clean via Utf8Chunker (split multi-byte handled, malformed lossily replaced).
-//! Tier-0 zeroization (F-recorder-plaintext-zeroize/NFR-5): event lines + chunker buffer in scrub-on-drop Zeroizing.
+//! asciicast v2 encoding; UTF-8-clean via Utf8Chunker (split multi-byte handled, malformed lossily replaced).
+//! Tier-0 zeroization: event lines + chunker buffer in scrub-on-drop Zeroizing.
 
 use zeroize::Zeroizing;
 
@@ -39,7 +39,7 @@ pub fn header_line(width: u16, height: u16, timestamp: u64) -> Vec<u8> {
 ///
 /// The returned line contains live plaintext (keystrokes/output), so it is a
 /// [`Zeroizing`] buffer: the recorder folds it into the hash-chain + sealed frame
-/// stream and drops it, scrubbing the transient copy (F-recorder-plaintext-zeroize).
+/// stream and drops it, scrubbing the transient copy.
 pub fn event_line(elapsed_secs: f64, code: EventCode, data: &str) -> Zeroizing<Vec<u8>> {
     // serde_json renders the tuple as a JSON array with correct string escaping.
     let mut line =
@@ -47,7 +47,7 @@ pub fn event_line(elapsed_secs: f64, code: EventCode, data: &str) -> Zeroizing<V
     line.push('\n');
     // `into_bytes` reuses the String's buffer (no copy); wrapping it scrubs that
     // buffer on drop. (serde_json's own growth scratch is a coredump/swap-only
-    // residual, covered by the process coredump-disable + mlock hygiene, NFR-5.)
+    // residual, covered by the process coredump-disable + mlock hygiene.)
     Zeroizing::new(line.into_bytes())
 }
 

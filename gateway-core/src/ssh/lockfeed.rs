@@ -1,4 +1,4 @@
-//! CP → Gateway lock-feed stream client (FR-CHAN-3, §8.4): deny wins, never clears locks on disconnect.
+//! CP → Gateway lock-feed stream client: deny wins, never clears locks on disconnect.
 
 use std::sync::Arc;
 use std::time::Duration;

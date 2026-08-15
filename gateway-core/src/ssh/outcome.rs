@@ -19,7 +19,7 @@ pub const RECORDING_UNAVAILABLE: &str = "session cannot start: recording unavail
 
 use crate::telemetry::metrics::Counted;
 
-/// SSH outcome (§7.1): channel-level outcomes carry a user message + exit code; pre-banner outcomes carry neither.
+/// SSH outcome: channel-level outcomes carry a user message + exit code; pre-banner outcomes carry neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshOutcome {
     /// Source IP outside global gate — dropped at TCP, no banner.

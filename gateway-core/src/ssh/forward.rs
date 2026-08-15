@@ -1,4 +1,5 @@
-//! Port-forwarding + X11 data plane (FR-SESS-2): default-deny, lock-aware, resource-bounded.
+//! Port-forwarding + X11 data plane: default-deny, lock-aware, resource-bounded — a forward
+//! is permitted only when the session's grant carries the matching capability.
 //! Local forward (`-L`): dialled from node (no Gateway-side SSRF). Remote (`-R`): node binds listener.
 //! X11 (`-Y`): request relayed unchanged; bytes opaque, metadata-only audit (open/close + counts/duration).
 
@@ -122,7 +123,7 @@ impl ReverseDispatcher {
             return; // dropping `open` closes the inner channel
         }
         // Deny-wins: a lock or teardown in flight refuses new reverse channels (the
-        // same lock-set match every other channel-open runs, §8.4), against the
+        // same lock-set match every other channel-open runs), against the
         // LIVE bindings (guard scoped: never held across an await).
         let locked = {
             let b = self.bindings.lock().unwrap();

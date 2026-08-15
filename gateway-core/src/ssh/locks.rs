@@ -1,4 +1,4 @@
-//! Lock deny-list and session teardown: push-fed, fail-closed, deny wins (§8.4).
+//! Lock deny-list and session teardown: push-fed, fail-closed, deny wins.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};

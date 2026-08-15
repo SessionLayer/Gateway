@@ -1,4 +1,4 @@
-//! Inner-leg SSH client (no TOFU, D2 zeroized key, per-channel split).
+//! Inner-leg SSH client (no TOFU, zeroized key that never leaves the Gateway, per-channel split).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -211,7 +211,7 @@ impl InnerClient {
         // transient encode/decode scratch across the ssh_key 0.6↔0.7 PEM hand-off —
         // is library-internal, reachable only via a coredump/swap, and covered by
         // the process hardening (PR_SET_DUMPABLE=0 + RLIMIT_CORE=0,
-        // `hardening::coredump`, NFR-5).
+        // `hardening::coredump`).
         drop(key);
         if !auth?.success() {
             return Err(InnerLegError::AuthRejected);
