@@ -2019,7 +2019,7 @@ assert_spill() {
     full | seccomp) : ;;
     *) return 0 ;;
   esac
-  log "recorder spill: forcing a recorder spill (>64KiB output) under hardening=$FS_HARDENING — must NOT tear down"
+  log "recorder spill: forcing a spill (>64KiB output) under hardening=$FS_HARDENING — must NOT tear down"
   local out rc=0
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'head -c 300000 /dev/zero | base64; echo SPILL_OK')" || rc=$?
   { [[ $rc -eq 0 ]] && grep -q SPILL_OK <<<"$out"; } \
