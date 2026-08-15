@@ -308,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn writes_apply_backpressure_instead_of_buffering() {
         // A peer that never reads must NOT let the Gateway buffer without bound: once
-        // the socket is full, poll_write is Pending (F-bridge-backpressure).
+        // the socket is full, poll_write is Pending.
         let (a, _b) = tokio::io::duplex(512);
         let ws =
             WebSocketStream::from_raw_socket(a, Role::Server, Some(super::super::ws_config(MAX)))

@@ -171,7 +171,7 @@ pub async fn bind(
     let issued = issue_server_config(&deps).await?;
     let (tls_tx, tls_rx) = watch::channel(issued.config);
     spawn_server_cert_renewal(deps.clone(), tls_tx, issued.not_after, shutdown.clone());
-    // R5: sweep signalled-but-never-redeemed relay tokens so the (bounded) ledger drains.
+    // Sweep signalled-but-never-redeemed relay tokens so the (bounded) ledger drains.
     if let Some(pr) = &deps.peer_relay {
         spawn_relay_pending_gc(pr.pending_relays.clone(), shutdown.clone());
     }

@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn control_lines_are_classified() {
-        // The PING/PONG/MSG parse gated without a live broker (F2 regression guard).
+        // The PING/PONG/MSG parse gated without a live broker.
         assert_eq!(classify_line("PING"), LineKind::Ping);
         assert_eq!(classify_line("PING\r"), LineKind::Ping);
         assert_eq!(classify_line("PONG"), LineKind::Pong);
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn info_flags_tls_and_auth_requirements_as_fatal() {
-        // F8: the plaintext client must fail loud, not loop, when the broker demands TLS/auth.
+        // The plaintext client must fail loud, not loop, when the broker demands TLS/auth.
         assert!(
             info_requires_unsupported("INFO {\"server_id\":\"a\",\"tls_required\":true}").is_some()
         );
@@ -479,7 +479,7 @@ mod tests {
         );
     }
 
-    /// An oversized, unterminated control line errors at the bound (F1) rather than growing.
+    /// An oversized, unterminated control line errors at the bound rather than growing.
     #[tokio::test]
     async fn an_unterminated_control_line_is_bounded() {
         let flood = vec![b'x'; MAX_CONTROL_LINE + 4096];

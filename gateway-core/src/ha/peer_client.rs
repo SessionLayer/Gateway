@@ -449,7 +449,7 @@ mod tests {
         rx
     }
 
-    /// F4: even when the owner STILL believes it owns the node (`is_self_owner == true`) and holds
+    /// Even when the owner STILL believes it owns the node (`is_self_owner == true`) and holds
     /// a live agent channel, a `DialBackSignal` whose `owner_nonce` is OLDER than the observed
     /// ownership epoch is a stale/replay and must be dropped with `StaleNonce` — and, crucially,
     /// WITHOUT any local node dial-back (no `AgentDial` fires).
