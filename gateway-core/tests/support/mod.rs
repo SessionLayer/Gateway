@@ -797,6 +797,20 @@ fn resolved(rec: &ResolvedRecord) -> ResolvedIdentity {
     }
 }
 
+/// Enforce the mTLS tier: every OuterLegAuth/Authorize RPC requires the caller's
+/// Gateway client certificate; resolve it to a known gateway_id.
+fn require_gateway<T>(request: &Request<T>, state: &MockState) -> Result<String, Status> {
+    let peer = request
+        .peer_certs()
+        .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+    let leaf = peer
+        .first()
+        .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+        .as_ref()
+        .to_vec();
+    state.resolve_gateway_id(&leaf)
+}
+
 impl MockState {
     /// Remember what scope this identity was just handed, then pass the resolution
     /// through. Every outer-leg resolve path funnels through here so Authorize can
@@ -841,23 +855,7 @@ impl MockState {
         !r.credential_principals.is_empty()
             && !r.credential_principals.contains(&r.requested_principal)
     }
-}
 
-/// Enforce the mTLS tier: every OuterLegAuth/Authorize RPC requires the caller's
-/// Gateway client certificate; resolve it to a known gateway_id.
-fn require_gateway<T>(request: &Request<T>, state: &MockState) -> Result<String, Status> {
-    let peer = request
-        .peer_certs()
-        .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
-    let leaf = peer
-        .first()
-        .ok_or_else(|| Status::unauthenticated("client certificate required"))?
-        .as_ref()
-        .to_vec();
-    state.resolve_gateway_id(&leaf)
-}
-
-impl MockState {
     /// Resolve a pin/OTP record honouring the optional deny-only source binding.
     fn resolve_map(&self, rec: Option<&ResolvedRecord>, source_ip: &str) -> ResolvedIdentity {
         let id = match rec {
