@@ -2,7 +2,7 @@
 //! thin PEP: every authentication and authorization decision is delegated to the CP.
 //! On ALLOW it dials the node, mints the inner cert, verifies the node host identity
 //! (no TOFU) and bridges the two legs per channel under the granted capability set.
-//! Every SSH-surface outcome follows the §7.1 taxonomy ([`SshOutcome`]); no
+//! Every SSH-surface outcome goes through the [`SshOutcome`] taxonomy; no
 //! secret/OTP/token/plaintext is ever logged.
 
 use std::borrow::Cow;
@@ -46,7 +46,7 @@ use crate::version;
 #[derive(Default)]
 pub struct ConnState {
     pub authenticated: AtomicBool,
-    /// Set when any CP call failed as CP-down (§7.1 fail-closed).
+    /// Set when any CP call failed as CP-down (fail-closed).
     pub cp_unavailable: AtomicBool,
     /// Coarse method labels attempted (no secrets), for the auth-failed record.
     pub methods_tried: Mutex<Vec<&'static str>>,
@@ -67,7 +67,7 @@ enum AuthMethod {
     Pin,
     Otp,
     DeviceFlow,
-    /// Break-glass (Design §7, FR-ACC-6): a FIDO2 `sk-ecdsa` key or a single-use
+    /// Break-glass: a FIDO2 `sk-ecdsa` key or a single-use
     /// offline code, resolved by the CP independent of the primary OIDC IdP.
     BreakGlass,
 }
@@ -101,7 +101,7 @@ pub struct HandlerDeps {
     /// The actively-pushed lock deny-set: consulted per channel-open
     /// (deny wins, datastore-independent) and carrying the feed-health signal.
     pub lock_set: Arc<LockSet>,
-    /// Live sessions, so a pushed lock tears down matching ones (FR-LOCK-1).
+    /// Live sessions, so a pushed lock tears down matching ones.
     pub live_sessions: Arc<LiveSessionRegistry>,
     pub config: Arc<SshServerConfig>,
     /// ProxyJump host-cert MITM state. `Some` only when `ssh.proxy_jump.enabled`;
@@ -114,8 +114,8 @@ pub struct SshHandler {
     /// The real client source IP (PROXY-derived, gate-checked before this exists).
     source_ip: IpAddr,
     session_id: String,
-    /// The root OTel span for this connection (OTEL-CONTRACT §3). Carries
-    /// IDs/enums/outcomes only — never plaintext/keys/tokens (§5).
+    /// The root OTel span for this connection. Carries
+    /// IDs/enums/outcomes only — never plaintext/keys/tokens.
     session_span: tracing::Span,
     /// The SSH username (client-supplied; parsed as `login%node`, never trusted
     /// as a principal, sanitized before logging).
@@ -201,10 +201,10 @@ struct Authorized {
     trust: HostTrust,
     grant: SessionGrant,
     /// The granted SSH capabilities (proto `Capability` values); default
-    /// shell+exec if the decision context declares none (Design §6.1).
+    /// shell+exec if the decision context declares none.
     capabilities: Vec<i32>,
     /// The single-use Recording.BeginRecording token minted alongside the session
-    /// token (§12/§15). Empty when talking to an older CP that predates this field.
+    /// token. Empty when talking to an older CP that predates this field.
     recording_token: String,
     /// The **signature-verified** decision context. The
     /// per-channel local checks run against this — never an unverified copy.
@@ -373,7 +373,7 @@ impl SshHandler {
             .unwrap_or_default()
     }
 
-    /// Try an offered sk-ecdsa security key as a break-glass credential (FR-ACC-6, the
+    /// Try an offered sk-ecdsa security key as a break-glass credential (the
     /// PRIMARY break-glass path). russh has already verified the FIDO POSSESSION
     /// signature (possession only — the UP/touch bit is authenticator-enforced, not
     /// server-asserted). Returns `Some(Auth::Accept)` on a resolved credential; `None`
@@ -434,7 +434,7 @@ impl SshHandler {
     }
 
     /// Try the typed keyboard-interactive secret as a single-use break-glass OFFLINE CODE
-    /// (FR-ACC-6, the IdP-independent fallback). `Some` on a terminal outcome, `None` to
+    /// (the IdP-independent fallback). `Some` on a terminal outcome, `None` to
     /// fall through to the device flow. The `code` is a SECRET — NEVER logged.
     async fn try_break_glass_code(&mut self, code: &str) -> Option<Auth> {
         // Record the attempt so a failed break-glass-code login appears in the auth-failed
@@ -465,7 +465,7 @@ impl SshHandler {
         }
     }
 
-    /// The mid-session identity-expiry mode for THIS session, per access model (FR-ACC-8).
+    /// The mid-session identity-expiry mode for THIS session, per access model.
     /// Uses BOTH the local break-glass flag and the SIGNED `access_model`
     /// (belt-and-suspenders). A Lock always overrides with immediate teardown.
     fn mid_session_expiry_mode(&self) -> MidSessionExpiryMode {
@@ -487,7 +487,7 @@ impl SshHandler {
     }
 
     /// A rejection that keeps `publickey` + `keyboard-interactive` on the table so
-    /// the client degrades to its next key/method (FR-AUTH-2).
+    /// the client degrades to its next key/method.
     fn reject_and_degrade(&self) -> Auth {
         Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(
@@ -528,7 +528,7 @@ impl SshHandler {
                         }
                         Ok(_) => {
                             // Not an OTP: try the same typed secret as a single-use
-                            // break-glass OFFLINE CODE (IdP-independent, FR-ACC-6) so
+                            // break-glass OFFLINE CODE (IdP-independent) so
                             // break-glass works when the device flow is unavailable.
                             if self.deps.config.break_glass.enabled {
                                 if let Some(auth) = self.try_break_glass_code(otp).await {
@@ -585,7 +585,7 @@ impl SshHandler {
                     prompts: Cow::Owned(Vec::new()),
                 }
             }
-            // CP unreachable/errored during begin → fail closed. Surface the §7.1
+            // CP unreachable/errored during begin → fail closed. Surface the generic
             // service-unavailable message on the keyboard-interactive path.
             Err(e) if e.is_cp_down() => {
                 self.note_cp_down("device_flow");
@@ -606,7 +606,7 @@ impl SshHandler {
             return timed_out_partial();
         }
 
-        // Decouple the client-visible heartbeat cadence from CP-poll latency (FR-AUTH-4):
+        // Decouple the client-visible heartbeat cadence from CP-poll latency:
         // bound the poll by the heartbeat interval, then sleep only the remainder.
         let interval = Duration::from_secs(self.deps.config.device_flow.heartbeat_interval_secs);
         let started = Instant::now();
@@ -684,8 +684,8 @@ impl SshHandler {
         kind: ChannelKind,
         session: &mut Session,
     ) {
-        // Shared admission (FR-SESS-2 / FR-CHAN-2). A refusal closes THIS channel with the
-        // generic §7.1 outcome; live channels keep flowing.
+        // Shared admission. A refusal closes THIS channel with the generic
+        // non-disclosing outcome; live channels keep flowing.
         let accepts = required_capabilities(&kind);
         if let Err(o) = self.admit(accepts, session).await {
             self.close_with(channel, session, o);
@@ -768,7 +768,7 @@ impl SshHandler {
 
         // A BREAK-GLASS session is authorized ONCE by its single-use token and does NOT
         // re-authorize — a re-auth would replay the consumed token (fail-closed replay-DENY).
-        // Its deny-side safety comes from the pushed LockFeed (§8.4) + conservative
+        // Its deny-side safety comes from the pushed LockFeed + conservative
         // grant_expiry, enforced in (b)/(d). When the feed is UNHEALTHY it cannot confirm the
         // absence of a lock, so it refuses NEW privileged channel-opens (fail closed);
         // existing channels run to grant_expiry.
@@ -909,8 +909,8 @@ impl SshHandler {
         }
     }
 
-    /// Shared capability-gated admission for a channel or global request (FR-SESS-2 /
-    /// FR-CHAN-2). Returns the shared [`Authorized`], or the §7.1 outcome the caller
+    /// Shared capability-gated admission for a channel or global request.
+    /// Returns the shared [`Authorized`], or the non-disclosing outcome the caller
     /// signals however its channel type requires. Deny-wins, fail-closed — the SAME path
     /// shell/exec/sftp run, so a Lock tears a forward down like any channel.
     async fn admit(
@@ -934,7 +934,7 @@ impl SshHandler {
         Ok(authz)
     }
 
-    /// Begin the mandatory session recording once, before any bytes flow (§12/FR-AUD-1).
+    /// Begin the mandatory session recording once, before any bytes flow.
     /// Strict mode (or a break-glass session, which forces strict) refuses on failure;
     /// non-strict proceeds unrecorded (logged loudly).
     async fn ensure_recorder(
@@ -1106,7 +1106,7 @@ impl SshHandler {
         }));
     }
 
-    /// (Re)arm the per-session idle watchdog (FR-SESS-3): tear the session down once no
+    /// (Re)arm the per-session idle watchdog: tear the session down once no
     /// session-channel byte has moved for `min(static max_session_idle_secs, signed
     /// idle_timeout_seconds)`, TIGHTEN-ONLY. Teardown runs the same [`SessionControl`]
     /// path as a lock/expiry, so recorder finalize + session-end signal fire normally.
@@ -1115,7 +1115,7 @@ impl SshHandler {
             task.abort();
         }
         // Wall-clock deadlines, mirroring arm_expiry: a backward NTP step can stretch one
-        // idle window, but host time is outside the attacker model (Design §2.4) and the
+        // idle window, but host time is outside the attacker model and the
         // tightened transport backstop still bounds the session.
         let idle = effective_idle_secs(
             self.deps.config.inner.max_session_idle_secs,
@@ -1146,7 +1146,7 @@ impl SshHandler {
         }));
     }
 
-    /// Start the concurrency-lease keeper once per connection (FR-SESS-3 exact accounting):
+    /// Start the concurrency-lease keeper once per connection (exact accounting):
     /// a live session outliving `grant_expiry` (RunToTtl) must still occupy its slot.
     /// Break-glass is exempt from the concurrency cap and takes no lease.
     fn arm_lease_keeper(&mut self, authz: &Arc<Authorized>) {
@@ -1194,7 +1194,7 @@ impl SshHandler {
         };
 
         // Credential-principal reducer (deny-only): a login-scoped credential may
-        // only be used for a login it is scoped to (FR-AUTH-15 spirit, §5.4/§5.5).
+        // only be used for a login it is scoped to.
         if !auth.principals.is_empty() && !auth.principals.iter().any(|p| p == &target.login) {
             tracing::info!(source_ip = %self.source_ip, outcome = "policy_denied", reason = "credential_principal_scope", "generic denial");
             return Err(SshOutcome::PolicyDenied);
@@ -1208,7 +1208,7 @@ impl SshHandler {
         let req = AuthorizeRequest {
             identity: auth.identity.clone(),
             identity_groups: auth.groups.clone(),
-            // (FR-ADDR-1) The CP resolves the node NAME to runtime.node.id via findByName —
+            // The CP resolves the node NAME to runtime.node.id via findByName —
             // authoritative, server-side. node_id is kept only for back-compat (the CP
             // ignores it when node_name is set).
             node_name: target.node.clone(),
@@ -1231,7 +1231,7 @@ impl SshHandler {
                 return Err(SshOutcome::ServiceUnavailable);
             }
         };
-        // The CP takes the concurrency lease inside the ALLOW tx (FR-SESS-3), so from here
+        // The CP takes the concurrency lease inside the ALLOW tx, so from here
         // teardown owes a session-end signal even if the Gateway then fails the session closed.
         if resp.decision == Decision::Allow as i32 {
             self.lease_expected.store(true, Ordering::SeqCst);
@@ -1246,13 +1246,13 @@ impl SshHandler {
                 let trust = host_trust_from(nc.host_verification);
                 if trust.is_empty() {
                     // No enrollment anchor → the node cannot be verified → NEVER
-                    // TOFU. Abort (FR-CONN-5/7).
+                    // TOFU. Abort.
                     let m =
                         metrics::node_unreachable(UnreachableReason::NoHostVerificationMaterial);
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "aborting: node has no host-verification anchor (never TOFU)");
                     return Err(SshOutcome::NodeUnreachable(m));
                 }
-                // Per-node connector selection (FR-CONN-3). An OUTBOUND_AGENT node is joined
+                // Per-node connector selection. An OUTBOUND_AGENT node is joined
                 // to its Agent by the CP-stamped enrollment NAME; without one there is no
                 // join key, so fail closed to node-offline rather than dial anything.
                 if nc.connector_kind == ConnectorKind::OutboundAgent as i32
@@ -1356,7 +1356,7 @@ impl SshHandler {
         }
     }
 
-    /// Establish the inner leg once: dial the node, mint the ephemeral inner cert (D2 — key
+    /// Establish the inner leg once: dial the node, mint the ephemeral inner cert (key
     /// generated locally, cert only returned), verify the node host identity during the
     /// handshake (no TOFU), and authenticate. Fail-closed at every step; a
     /// host-verification abort is generic to the user, specific in the log.
@@ -1367,7 +1367,7 @@ impl SshHandler {
     ) -> Result<InnerClient, SshOutcome> {
         use tracing::Instrument;
         // Stamp the trace root with the (non-secret) decision facts now that they
-        // are known (OTEL-CONTRACT §4).
+        // are known.
         self.session_span
             .record("sessionlayer.node_id", sanitize(&authz.node.node_id));
         self.session_span.record(
@@ -1375,7 +1375,7 @@ impl SshHandler {
             access_model_label(authz.context.access_model),
         );
         // The connector is selected per node (agentless dial vs outbound-agent
-        // dial-back); everything below this line is identical either way (D21/D23).
+        // dial-back); everything below this line is identical either way.
         let stream = match self
             .deps
             .connector
@@ -1482,7 +1482,7 @@ impl SshHandler {
 
     fn inner_leg_config(&self, context_idle_secs: i64) -> InnerLegConfig {
         let inner = &self.deps.config.inner;
-        // Transport-level backstop for the per-session idle bound (FR-SESS-3): the effective
+        // Transport-level backstop for the per-session idle bound: the effective
         // idle plus a small slack so the watchdog — which attributes IDLE_TIMEOUT and runs the
         // clean teardown — is ALWAYS the enforcer. Clamping the backstop to exactly `static`
         // let russh race the watchdog and report CLOSED.
@@ -1547,7 +1547,7 @@ impl Drop for SshHandler {
         if let Some(rec) = self.recorder.take() {
             self.deps.finalize_tracker.spawn(rec.finalize());
         }
-        // FR-SESS-3: release the concurrency lease on EVERY teardown path — including the
+        // Release the concurrency lease on EVERY teardown path — including the
         // degraded ones where FinalizeRecording never fires. Drop is the one funnel every
         // path ends in, so this single send site is the exactly-once guard. Best-effort —
         // the CP-side lease expiry/reaper self-heals a lost signal.
@@ -1574,7 +1574,7 @@ impl Handler for SshHandler {
         Ok(Auth::Accept)
     }
 
-    // `skip_all`: the public key + username never enter the span (OTEL-CONTRACT §5).
+    // `skip_all`: the public key + username never enter the span.
     #[tracing::instrument(name = "gateway.outer_leg.auth", parent = &self.session_span, skip_all)]
     async fn auth_publickey(
         &mut self,
@@ -1585,7 +1585,7 @@ impl Handler for SshHandler {
         if self.attempt_cap_exceeded() {
             return Ok(self.hard_reject());
         }
-        // Break-glass FIDO2 (FR-ACC-6): an sk-ecdsa security key is the PRIMARY break-glass
+        // Break-glass FIDO2: an sk-ecdsa security key is the PRIMARY break-glass
         // path. Its whole security rests on FIDO PROOF-OF-POSSESSION, which russh ENFORCES
         // BEFORE this callback: it verifies the client's signature and only then invokes
         // `auth_publickey`. The registered break-glass key is PUBLIC/listable, so that
@@ -1691,7 +1691,7 @@ impl Handler for SshHandler {
     }
 
     // `skip_all`: the KI response (which may carry an OTP / device code) never
-    // enters the span (OTEL-CONTRACT §5).
+    // enters the span.
     #[tracing::instrument(name = "gateway.outer_leg.auth", parent = &self.session_span, skip_all)]
     async fn auth_keyboard_interactive(
         &mut self,
@@ -1884,7 +1884,7 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    /// Agent forwarding is **always refused** (FR-SESS-2): never bridged to the
+    /// Agent forwarding is **always refused**: never bridged to the
     /// node. Returning `false` sends `channel_failure` to the client.
     async fn agent_request(
         &mut self,
@@ -2124,7 +2124,7 @@ impl Handler for SshHandler {
     }
 }
 
-/// The SSH capabilities that admit a channel kind (FR-SESS-2) — allowed if ANY is granted.
+/// The SSH capabilities that admit a channel kind — allowed if ANY is granted.
 /// Legacy `scp` is `exec` of the `scp` binary with attacker-controlled argv (`scp -S <prog>`,
 /// shell metacharacters), so it can never be a safe standalone capability: it requires EXEC.
 /// Modern scp runs over the SFTP subsystem. An unknown subsystem has NO acceptable
@@ -2144,7 +2144,7 @@ fn capability_granted(accepts: &[Capability], authz: &Authorized) -> bool {
         .any(|c| *c != Capability::Unspecified && authz.capabilities.contains(&(*c as i32)))
 }
 
-/// Classify a bridged channel for the recorder (Design §12.1): a shell / exec is ALWAYS a
+/// Classify a bridged channel for the recorder: a shell / exec is ALWAYS a
 /// terminal (asciicast v2) — a legacy scp-over-exec additionally runs the SCP decoder, but
 /// NEVER instead of asciicast, so the exec command string can never suppress content
 /// capture. Only the sftp SUBSYSTEM is decode-only.
@@ -2175,7 +2175,7 @@ fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind
     }
 }
 
-/// Whether `alg` is a break-glass candidate algorithm (FR-ACC-6). ONLY
+/// Whether `alg` is a break-glass candidate algorithm. ONLY
 /// `sk-ecdsa-sha2-nistp256@openssh.com`. Every other algorithm — and an sk-ecdsa key that
 /// does not resolve as a break-glass credential — rides the ordinary pin path.
 fn is_break_glass_algorithm(alg: Algorithm) -> bool {
@@ -2195,7 +2195,7 @@ fn break_glass_resolved(res: &crate::pb::BreakglassResolution) -> bool {
 }
 
 /// The granted capabilities from the decision context; default shell+exec when
-/// the context declares none (Design §6.1 default). Agent-forward is never here.
+/// the context declares none. Agent-forward is never here.
 fn granted_capabilities(context: Option<&DecisionContext>) -> Vec<i32> {
     match context {
         Some(ctx) if !ctx.capabilities.is_empty() => ctx.capabilities.clone(),
@@ -2305,7 +2305,7 @@ pub(crate) fn now_epoch_secs() -> i64 {
 }
 
 /// Whether a grant with a fixed expiry is expired against the local clock, CONSERVATIVELY —
-/// early, never late (Design §2.4, FR-BOOT-4). With a non-negative `skew_secs` the grant is
+/// early, never late. With a non-negative `skew_secs` the grant is
 /// treated as expired that many seconds BEFORE `grant_expiry`, so a fast local clock never
 /// serves a new privileged channel past the real expiry. `grant_expiry == 0` means "no fixed
 /// expiry" and is handled by the caller, never expired here.
@@ -2313,7 +2313,7 @@ pub(crate) fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64
     grant_expiry != 0 && now_epoch.saturating_add(skew_secs) >= grant_expiry
 }
 
-/// The tighten-only per-session idle bound (FR-SESS-3): the SIGNED per-identity
+/// The tighten-only per-session idle bound: the SIGNED per-identity
 /// `idle_timeout_seconds` may only SHORTEN the static `max_session_idle_secs` — the smaller
 /// wins. 0/absent, negative, or at/above the static bound leaves the static bound in force:
 /// a decision context can never loosen the operator's ceiling.
@@ -2408,7 +2408,7 @@ fn classify_lease_failure(e: &CpError) -> LeaseRefusal {
     }
 }
 
-/// Keep a live session's CP concurrency lease stamped (FR-SESS-3 exact accounting): the first
+/// Keep a live session's CP concurrency lease stamped (exact accounting): the first
 /// extension fires a lead ahead of `grant_expiry`, then re-extends at half the returned
 /// window. Accounting, never authorization: only a definitive "the lease is gone" verdict
 /// stops the keeper — quietly for an N-1 CP, LOUDLY for a lost live lease. The session itself
@@ -2450,9 +2450,10 @@ async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant
 
 const SESSION_END_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// Deliver the FR-SESS-3 session-end signal: best-effort + bounded (one retry on a
-/// transport-shaped failure), quiet on an N-1 CP without the RPC. Runs off the Drop path, so
-/// it can never block teardown; an undelivered signal is self-healed by the CP reaper.
+/// Deliver the session-end signal that releases the concurrency lease: best-effort +
+/// bounded (one retry on a transport-shaped failure), quiet on an N-1 CP without the RPC.
+/// Runs off the Drop path, so it can never block teardown; an undelivered signal is
+/// self-healed by the CP reaper.
 async fn send_session_end(cpauth: Arc<CpAuthClient>, session_id: String, reason: SessionEndReason) {
     for attempt in 0..2u8 {
         match cpauth.notify_session_end(&session_id, reason).await {
@@ -2480,7 +2481,7 @@ async fn send_session_end(cpauth: Arc<CpAuthClient>, session_id: String, reason:
 mod tests {
     use super::*;
 
-    /// FR-BOOT-4: the Gateway expires grants CONSERVATIVELY — early, never late. A
+    /// The Gateway expires grants CONSERVATIVELY — early, never late. A
     /// non-negative skew can only bring the refusal FORWARD in time, and a grant is ALWAYS
     /// treated as expired at/after its real expiry regardless of skew.
     #[test]
@@ -2524,7 +2525,7 @@ mod tests {
         assert!(grant_is_expired(i64::MAX, ge, skew));
     }
 
-    /// FR-SESS-3: the signed per-identity idle timeout is TIGHTEN-ONLY against the static
+    /// The signed per-identity idle timeout is TIGHTEN-ONLY against the static
     /// bound — it can shorten it, never extend it.
     #[test]
     fn idle_bound_is_tighten_only() {
@@ -2701,7 +2702,7 @@ mod tests {
         ));
     }
 
-    /// The break-glass FIDO2 publickey path (FR-ACC-6): ONLY sk-ecdsa is a candidate.
+    /// The break-glass FIDO2 publickey path: ONLY sk-ecdsa is a candidate.
     /// sk-ed25519 and every other algorithm ride the pin path; a non-break-glass sk-ecdsa key
     /// also falls through to the pin path (never a hard reject).
     #[test]
@@ -2763,7 +2764,7 @@ mod tests {
         }
     }
 
-    /// Capability gate (FR-SESS-2): a legacy `scp` exec is gated by EXEC (never a standalone
+    /// Capability gate: a legacy `scp` exec is gated by EXEC (never a standalone
     /// SCP), an unknown subsystem is never granted, and UNSPECIFIED is never acceptable.
     ///
     /// Exercises the REAL `capability_granted`/`required_capabilities` used at the real
