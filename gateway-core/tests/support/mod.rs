@@ -2352,6 +2352,8 @@ impl MockCp {
     }
 
     /// The current HA presence owner NAME for `node_id` (for failover assertions), if any.
+    /// Ignores staleness — see [`Self::fresh_presence_owner`] when the claim's FRESHNESS is
+    /// the thing under test.
     pub fn presence_owner(&self, node_id: &str) -> Option<String> {
         self.state
             .presence
@@ -2359,6 +2361,14 @@ impl MockCp {
             .unwrap()
             .get(node_id)
             .map(|r| r.owner.clone())
+    }
+
+    /// The owner NAME of a FRESH presence claim, by the same staleness rule the real CP
+    /// derives `health` from: a claim heartbeated within the TTL reads as `healthy`, a
+    /// stale one as `unreachable`. A row that merely EXISTS is not the same answer, so a
+    /// test asking "is this node healthy" has to ask through here.
+    pub fn fresh_presence_owner(&self, node_name: &str) -> Option<String> {
+        self.state.fresh_presence(node_name).map(|r| r.owner)
     }
 
     /// Issue an **agent identity** leaf from this CP's internal mTLS CA: the
