@@ -1596,7 +1596,7 @@ impl LockFeed for MockSvc {
         request: Request<StreamLocksRequest>,
     ) -> Result<Response<Self::StreamLocksStream>, Status> {
         require_gateway(&request, self)?;
-        // G6: simulate an unhealthy lock feed — refuse the stream so the Gateway's feed
+        // Simulate an unhealthy lock feed — refuse the stream so the Gateway's feed
         // never delivers a snapshot and stays !healthy (no connection).
         if *self.lock_feed_down.lock().unwrap() {
             return Err(Status::unavailable("lock feed unavailable"));
@@ -2509,7 +2509,7 @@ impl MockCp {
         *self.state.force_signed_breakglass.lock().unwrap() = on;
     }
 
-    /// G1: force the exact `grant_expiry_epoch_seconds` signed into contexts (0 makes a
+    /// Force the exact `grant_expiry_epoch_seconds` signed into contexts (0 makes a
     /// break-glass ALLOW un-time-boxed → the GW must fail closed).
     pub fn set_grant_expiry(&self, epoch_seconds: i64) {
         *self.state.grant_expiry_override.lock().unwrap() = Some(epoch_seconds);
@@ -2593,7 +2593,7 @@ impl MockCp {
             .map(|l| l.released)
     }
 
-    /// G6: make the lock feed unavailable so the Gateway's feed never becomes healthy.
+    /// Make the lock feed unavailable so the Gateway's feed never becomes healthy.
     pub fn set_lock_feed_down(&self, on: bool) {
         *self.state.lock_feed_down.lock().unwrap() = on;
     }

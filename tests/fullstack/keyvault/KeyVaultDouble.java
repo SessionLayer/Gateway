@@ -82,7 +82,7 @@ public final class KeyVaultDouble {
 
 	private final KeyPair caKey;
 	// Generated once, unrelated to caKey. FaultMode.WRONG_KEY signs with this instead
-	// of caKey — the fault-injection proof for D-2 (the Control Plane must verify every
+	// of caKey — the fault injection (the Control Plane must verify every
 	// signature against the pinned public key and refuse, never accept a signature from
 	// whichever key actually signed it).
 	private final KeyPair wrongKey;
@@ -252,7 +252,7 @@ public final class KeyVaultDouble {
 	/**
 	 * Test-only admin surface, not part of the Key Vault REST API: toggles
 	 * whether {@link #signResponse} signs with the real CA key or
-	 * {@link #wrongKey} (D-2 fault injection). Kept as a runtime toggle rather
+	 * {@link #wrongKey}. Kept as a runtime toggle rather
 	 * than a process restart with a different key so the harness never has to
 	 * rebind the vault to a new port mid-run — the Control Plane's {@code
 	 * vault-uri}/{@code keyReference} are fixed at boot.
@@ -279,7 +279,8 @@ public final class KeyVaultDouble {
 	private String jwkResponse() {
 		// Always the REAL CA key, regardless of faultMode: the fault this double injects
 		// is a vault that signs with the wrong key while still reporting the pinned key's
-		// coordinates honestly — the failure mode D-2 exists to catch, isolated to signing.
+		// coordinates honestly — the failure mode the CP's pinned-key check exists to
+		// catch, isolated to signing.
 		ECPublicKey pub = (ECPublicKey) caKey.getPublic();
 		String kid = baseUrl + "/keys/" + keyName + "/" + KEY_VERSION;
 		return "{\"key\":{\"kid\":\"" + kid + "\",\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\""

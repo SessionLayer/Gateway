@@ -1140,7 +1140,7 @@ gw_hardening_json() {
 
 # Under a hardened profile use a SMALL ciphertext-spool threshold so a large
 # session spills to disk — exercising that the spool lands in the Landlock-allowed
-# data-dir, not /tmp (F-1). Default is the 8 MiB production value.
+# data-dir, not /tmp. Default is the 8 MiB production value.
 gw_spool_threshold() {
   case "${FS_HARDENING:-off}" in
     full | seccomp) printf '65536' ;;
@@ -2009,7 +2009,7 @@ $(printf '\033[32m========================================================\033[0
 EOF
 }
 
-# F-1: under a hardened profile the recorder spills ciphertext to disk once a
+# Under a hardened profile the recorder spills ciphertext to disk once a
 # session exceeds the (deliberately small) spool threshold. That spool MUST land in
 # a Landlock-allowed path (the data-dir), not /tmp — a /tmp spool would EACCES and,
 # in strict mode, tear the session down mid-flight. Force a spill with a large-output
@@ -2019,7 +2019,7 @@ assert_spill() {
     full | seccomp) : ;;
     *) return 0 ;;
   esac
-  log "F-1: forcing a recorder spill (>64KiB output) under hardening=$FS_HARDENING — must NOT tear down"
+  log "recorder spill: forcing a recorder spill (>64KiB output) under hardening=$FS_HARDENING — must NOT tear down"
   local out rc=0
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'head -c 300000 /dev/zero | base64; echo SPILL_OK')" || rc=$?
   { [[ $rc -eq 0 ]] && grep -q SPILL_OK <<<"$out"; } \
@@ -2027,7 +2027,7 @@ assert_spill() {
   # Spool file lives under the data-dir (created + removed there), never /tmp.
   [[ -d "$WORKDIR/gw-data/recording-spool" ]] \
     || die "expected the spool dir under the data-dir (gw-data/recording-spool)"
-  ok "recorder spill under hardening=$FS_HARDENING succeeded — spool in the data-dir, strict session intact (F-1)"
+  ok "recorder spill under hardening=$FS_HARDENING succeeded — spool in the data-dir, strict session intact"
 }
 
 main() {

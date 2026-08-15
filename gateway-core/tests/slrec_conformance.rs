@@ -1,4 +1,4 @@
-//! Cross-language SLREC1 golden conformance (M15). The committed golden object
+//! Cross-language SLREC1 golden conformance. The committed golden object
 //! is sealed by the REAL `RecordingCipher::seal_to_customer` + `seal_frame` path
 //! (`src/ssh/recorder/seal.rs`), never a reimplementation, and decrypted here by
 //! the real Rust unseal path AND by Dashboard's production

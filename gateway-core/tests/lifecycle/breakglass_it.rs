@@ -924,7 +924,7 @@ async fn gw_enforces_signed_access_model_not_unsigned_context() -> anyhow::Resul
     Ok(())
 }
 
-// ── G1: a break-glass ALLOW with grant_expiry==0 is refused (must be time-boxed) ─
+// ── A break-glass ALLOW with grant_expiry==0 is refused (must be time-boxed) ─
 
 #[tokio::test]
 async fn break_glass_without_grant_expiry_is_refused() -> anyhow::Result<()> {

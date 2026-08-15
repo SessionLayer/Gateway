@@ -33,7 +33,7 @@ const NODE_IMAGE: &str = "sessionlayer-gw-testnode:test";
 const AGENT_NODE_IMAGE: &str = "sessionlayer-gw-agentnode:test";
 
 // A REAL human node name (NOT UUID-shaped): the HA path resolves ownership by node NAME, and a
-// UUID-shaped name would mask the name->node.id resolution the CP performs (T3 item 1).
+// UUID-shaped name would mask the name->node.id resolution the CP performs.
 const NODE: &str = "web-01";
 const AGENT_ID: &str = "agent-ha";
 const GW_A: &str = "gw-a-ha"; // ingress

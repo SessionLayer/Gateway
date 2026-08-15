@@ -151,16 +151,16 @@ claimed here that `run.sh` does not assert would be worse than no table at all.
 | 2 | **Recording export + decrypt-proof**: the recording is retrieved through `POST /v1/recordings/{id}/export`, is opaque SLREC1 of the recorded size with no plaintext, ECIES-opens with the customer private key to the original session (marker present), and its hash-chain recomputes to the finalized head; the stored object is COMPLIANCE-locked and matches the recorded `content_digest` | **LIVE (core)** |
 | 3 | **Audit dimensions**: the connect/authorize event is searchable by each of source_ip / access_model / capability / node_label / correlation_id, and one correlationId returns the connect→recording chain | **LIVE (core)** |
 | 4 | **Bridge multi-host inner-cert** regression guard: node on a distinct SNAT IP → the session succeeds, which it cannot if the inner cert carries a client-IP `source-address` pin | **LIVE (`TOPOLOGY=all` / `FS_NODE_NETMODE=bridge`)** |
-| 5 | **Deny-path** fail-closed (deny-wins): an ungranted login is refused by the real CP (§7.1 generic) | **LIVE (core)** |
-| 6 | **CP-down** fail-closed (NFR-2): the real CP is killed → a new session fails closed, never fail-open | **LIVE (core)** |
-| 6a | **FR-CHAN-2 per-channel re-`Authorize`**: a ControlMaster channel opened past `decision_ttl` succeeds **and** a second `authz.decision` is recorded against the same session id | **LIVE (core)** |
+| 5 | **Deny-path** fail-closed (deny-wins): an ungranted login is refused by the real CP with a generic denial | **LIVE (core)** |
+| 6 | **CP-down** fail-closed: the real CP is killed → a new session fails closed, never fail-open | **LIVE (core)** |
+| 6a | **Per-channel re-`Authorize`**: a ControlMaster channel opened past `decision_ttl` succeeds **and** a second `authz.decision` is recorded against the same session id | **LIVE (core)** |
 | 7 | **Outbound-agent** connector: a node reached via the real Agent (dial-out WSS → dial-back splice) | referenced: `agent_e2e.rs` + `splice_e2e.rs` (real Agent binaries); full-stack flow scaffolded (`tests/fullstack/agent-node/` + `gateway-agent.json.tmpl` + `AGENT_BIN`), not yet a live assertion |
 | 8 | Lock mid-session teardown of a live recorded session | referenced: `recorder_it.rs` (real binaries, both strict + best_effort) |
 | 9 | JIT self-approval refused | referenced: `breakglass_it.rs` / CP JIT ITs |
 | 10 | Break-glass can't override a Lock / FIDO2 | referenced: `breakglass_it.rs` (real `sk-dummy`) |
-| 11 | HA owner-kill fail-closed (NFR-1) | referenced: `ha_e2e.rs` + `ha_instance_kill_it.rs` |
+| 11 | HA owner-kill fail-closed | referenced: `ha_e2e.rs` + `ha_instance_kill_it.rs` |
 | 12 | Wrong host key rejected (no TOFU) | referenced: `hostverify` + `inner_leg_it.rs` |
-| 13 | **Key Vault CA backend**: before rotation, the vault double receives zero requests despite the Control Plane booting fully configured for it (D-4's "configuring changes nothing until rotated", asserted, not just observed). The session CA is then rotated onto an Azure-Key-Vault-backed key over REST (no database credential; `POST /v1/cas/{id}/rotate`), authenticated via the App Service managed-identity credential (a real challenge/token round trip, verified to fetch the token exactly once), the CP is proven to be publishing the vault's own public key, trust is redistributed to the node, and a real session's certificate is signed there (the vault double's sign count increases). A session while the vault is signing with the WRONG key is refused and issues no certificate (D-2, checked via the absence of a successful `session.sign` audit event for that session — not "no recording appeared", which is created regardless of inner-leg outcome and was this scenario's own bug the first time it ran for real), and a normal session succeeds again immediately after restoring the double — a permanent scenario on every run, not a one-off manual exercise. With the vault stopped a new session fails closed by the same certificate-issuance check, with the vault's sign count staying flat as a second, independent signal — not by parsing the issued certificate (no seam puts one on disk without a Gateway code change) — and never falls back to `local` (D-4) | **LIVE (core)** — see the CI note below |
+| 13 | **Key Vault CA backend**: before rotation, the vault double receives zero requests despite the Control Plane booting fully configured for it ("configuring changes nothing until rotated", asserted, not just observed). The session CA is then rotated onto an Azure-Key-Vault-backed key over REST (no database credential; `POST /v1/cas/{id}/rotate`), authenticated via the App Service managed-identity credential (a real challenge/token round trip, verified to fetch the token exactly once), the CP is proven to be publishing the vault's own public key, trust is redistributed to the node, and a real session's certificate is signed there (the vault double's sign count increases). A session while the vault is signing with the WRONG key is refused and issues no certificate (checked via the absence of a successful `session.sign` audit event for that session — not "no recording appeared", which is created regardless of inner-leg outcome and was this scenario's own bug the first time it ran for real), and a normal session succeeds again immediately after restoring the double — a permanent scenario on every run, not a one-off manual exercise. With the vault stopped a new session fails closed by the same certificate-issuance check, with the vault's sign count staying flat as a second, independent signal — not by parsing the issued certificate (no seam puts one on disk without a Gateway code change) — and never falls back to `local` | **LIVE (core)** — see the CI note below |
 
 | 14 | **AWS KMS CA backend**: the Control Plane refuses to start behind **either** endpoint-override gate, each proven by booting the real jar — omitting `allow-endpoint-override` is refused for the redirect itself, and permitting the override with a plaintext URL is still refused for the scheme — and the startup warning naming the redirected endpoint is asserted, since that is an override's only runtime trace. Before rotation, KMS serves zero calls beyond the harness's own, despite the Control Plane booting fully configured for it. The session CA — by then on Key Vault — is rotated **on again** to a KMS-held key over REST with no database credential, the Control Plane is proven to publish the key KMS itself generated, trust is redistributed, and a real session's inner-leg certificate is signed there (KMS's own request log records the `Sign`; it recorded none before). The pinned ARN is then re-created from **different key material**, so it resolves, answers and signs with the wrong key: the session is refused and issues no certificate even though KMS's sign count *rises*, which is what separates the pinned-key check from an unreachable KMS — a permanent scenario on every run, not a manual exercise. With the KMS container stopped, a new session fails closed and issues no certificate, KMS's sign count staying flat as a second, independent signal. Both failure scenarios end by restoring KMS and running a normal session, so "it failed" is distinguishable from "the harness broke" | **LIVE (core)** |
 
@@ -265,10 +265,10 @@ offline".
 
 The Control Plane therefore **omits** `source-address` on that certificate. What binds it
 is stronger and does not depend on topology: it is session-bound, short-TTL, single-use,
-node-host-verified, and its key never leaves the Gateway (D2). Source-IP enforcement lives
-on the outer leg and in `Authorize` (Design §5.6), where the address is the client's. The
+node-host-verified, and its key never leaves the Gateway. Source-IP enforcement lives
+on the outer leg and in `Authorize`, where the address is the client's. The
 Control Plane's unit guard is `SessionSigningIT.mintedInnerCertOmitsSourceAddress`. This is
-a deliberate deviation from the letter of Design §3.3 ("source-address pinned"), which is
+a deliberate deviation from the original "source-address pinned" intent, which is
 unimplementable as written.
 
 `FS_NODE_NETMODE=bridge` is the live guard: it runs the node on a docker port-map so its
@@ -277,7 +277,7 @@ client-IP pin in place, because `MockCp` omits the option entirely; and even her
 default `FS_NODE_NETMODE=loopback` would match `127.0.0.1` and pass. Only the bridge
 variant fails.
 
-### The per-channel re-`Authorize` (FR-CHAN-2)
+### The per-channel re-`Authorize`
 
 A re-`Authorize` runs with the **same** `session_id`, so it collides with the row the first
 `Authorize` wrote. A Control Plane that inserts rather than refreshing that row rolls back

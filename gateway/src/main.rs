@@ -162,7 +162,7 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             drain_live_sessions(&outer.live_sessions, outer.served_relays.as_ref(), deadline).await;
             let remaining = outer.live_sessions.terminate_all();
             if remaining > 0 {
-                tracing::warn!(remaining, "tearing down sessions still live at the drain deadline via the recorder-finalize path (L4)");
+                tracing::warn!(remaining, "tearing down sessions still live at the drain deadline via the recorder-finalize path");
                 drain_live_sessions(&outer.live_sessions, None, TEARDOWN_SETTLE_BOUND).await;
             }
             let grace = Duration::from_secs(cfg.ssh.recorder.upload_timeout_secs.saturating_add(10));
@@ -706,9 +706,9 @@ mod tests {
         assert!(cfg.bootstrap.is_none());
     }
 
-    /// The bounded drain wait (used by both the M2 relay drain and the L4 teardown-settle wait)
+    /// The bounded drain wait (used by both the relay drain and the teardown-settle wait)
     /// must actually BLOCK until the tracked in-flight count reaches zero, and then return
-    /// PROMPTLY — not sit until the deadline. This is the load-bearing property of the L4 fix:
+    /// PROMPTLY — not sit until the deadline. This is its load-bearing property:
     /// waiting for `live_sessions.len() == 0` after `terminate_all()` is only safe if the wait
     /// genuinely observes the count draining. (A faithful live-session variant needs a real russh
     /// `Handle` in `SessionControl`, which only the Docker E2E provides.)
