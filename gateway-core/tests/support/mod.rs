@@ -1280,7 +1280,7 @@ impl MockState {
         r: &AuthorizeRequest,
         access_model: AccessModel,
     ) -> AuthorizeResponse {
-        // F2: optionally SIGN a stronger access_model than the unsigned copy carries.
+        // Optionally SIGN a stronger access_model than the unsigned copy carries.
         let signed_model = if access_model == AccessModel::Standing
             && *self.force_signed_breakglass.lock().unwrap()
         {
@@ -2502,7 +2502,7 @@ impl MockCp {
         *self.state.decision_ttl_secs.lock().unwrap() = secs;
     }
 
-    /// F2: on a STANDING allow, SIGN access_model=BREAKGLASS while shipping a
+    /// On a STANDING allow, SIGN access_model=BREAKGLASS while shipping a
     /// downgraded unsigned `context` (STANDING). Proves the Gateway enforces the
     /// SIGNED access_model, never the unsigned convenience copy.
     pub fn set_force_signed_breakglass(&self, on: bool) {

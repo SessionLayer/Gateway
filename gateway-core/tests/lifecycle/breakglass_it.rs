@@ -136,7 +136,7 @@ async fn break_glass_probe_costs_the_same_rpcs_whether_or_not_the_key_is_registe
     );
 }
 
-/// Divergence D6: a normal sk-ecdsa USER key (registered as a PIN, not a break-glass
+/// A normal sk-ecdsa USER key (registered as a PIN, not a break-glass
 /// credential) must FALL THROUGH the break-glass resolver to the ordinary pin path
 /// and authenticate — never a hard reject. sk-ed25519 and every other algorithm skip
 /// the break-glass branch entirely and go straight to the pin path.
@@ -578,7 +578,7 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
     );
     cp.register_break_glass_key(sk_pub.to_bytes()?, "breakglass-admin", &["deploy"]);
 
-    // F1 NEGATIVE: the registered break-glass PUBLIC key is listable, so possession
+    // NEGATIVE: the registered break-glass PUBLIC key is listable, so possession
     // of the FIDO private key must be REQUIRED. Offer the same key but with a BROKEN
     // provider so the client cannot produce a FIDO assertion → russh never receives a
     // valid signature → auth fails → NO break-glass session, NO activation. (Possession
