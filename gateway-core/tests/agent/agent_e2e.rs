@@ -11,6 +11,7 @@ use gateway_core::agent::token::{DialBackSigner, PendingDialBacks};
 use gateway_core::config::{
     AgentTransportConfig, DeviceFlowConfig, InnerLegServerConfig, RecorderConfig, SshServerConfig,
 };
+use gateway_core::ha::presence::{CpPresenceStore, HeartbeatLoop, OwnerCache};
 use gateway_core::pb::{Capability, KeySealAlgorithm, RecordingStatus};
 use gateway_core::ssh;
 use gateway_core::ssh::connector::{AgentlessDial, DispatchConnector, NodeConnector};
@@ -204,6 +205,20 @@ async fn start_gateway(cp: &MockCp, recorder: RecorderChoice) -> anyhow::Result<
         config.agent.dial_back_token_ttl_secs,
         Duration::from_secs(config.agent.dial_back_timeout_secs),
     ));
+
+    // The presence claim, wired exactly as `gateway/src/main.rs` wires it: holding an
+    // agent's control channel is what makes this Gateway tell the CP it owns the node,
+    // and that claim is what the CP's `health` answer is derived from. Without this loop
+    // the agent path here would work while the node stayed invisible to the API.
+    let presence_addr = format!("{}:0", docker::container_reachable_host_ip());
+    HeartbeatLoop::new(
+        Arc::new(CpPresenceStore::new(deps.cpauth.clone())),
+        registry.clone(),
+        Arc::new(OwnerCache::new(Duration::from_secs(30))),
+        presence_addr,
+        Duration::from_secs(1),
+    )
+    .spawn(sd_rx.clone());
     let deps = ssh::handler::HandlerDeps {
         connector: Arc::new(DispatchConnector::new(
             Arc::new(AgentlessDial::new(Duration::from_secs(4))),
@@ -633,5 +648,65 @@ async fn a_session_over_the_agent_path_is_still_recorded() -> anyhow::Result<()>
     );
 
     drop(agent_node);
+    Ok(())
+}
+
+/// The first link of the `health` answer: a live agent control channel must make THIS
+/// Gateway claim presence at the Control Plane, and the claim must be FRESH.
+///
+/// Freshness is the whole of it. The CP derives `healthy` from a claim heartbeated inside
+/// the staleness TTL and `unreachable` from one that is not, so a row that merely exists
+/// is a different answer than the one an operator reads. Every other presence assertion in
+/// this repo goes through `presence_owner`, which cannot tell those two apart.
+#[tokio::test]
+async fn a_live_agent_channel_makes_this_gateway_claim_fresh_presence() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let host_key = gen_key(Algorithm::Ed25519);
+
+    let gw = start_gateway(&cp, RecorderChoice::Null).await?;
+    assert_eq!(
+        cp.fresh_presence_owner(AGENT_NODE),
+        None,
+        "no agent has connected yet, so nothing may be claiming this node"
+    );
+
+    let node = start_agent_node(&cp, &host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
+    await_agent(&gw, &node, AGENT_NODE).await;
+
+    let mut claimed = None;
+    for _ in 0..120 {
+        claimed = cp.fresh_presence_owner(AGENT_NODE);
+        if claimed.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        claimed.as_deref(),
+        Some(GW_NAME),
+        "a registered agent control channel must produce a fresh presence claim owned by \
+         THIS gateway, by name — the CP names that owner back to the operator as \
+         owningGateway, so the value is the assertion"
+    );
+
+    // The other direction: losing the channel must give the claim up, or a dead node keeps
+    // reading as healthy. Release ages the row out rather than deleting it, so a
+    // presence-row-exists check would still pass here.
+    node.stop().await?;
+    let mut released = false;
+    for _ in 0..120 {
+        if cp.fresh_presence_owner(AGENT_NODE).is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        released,
+        "the claim outlived the agent's control channel; the node would keep reading as \
+         healthy with nothing serving it (presence_owner still reads {:?})",
+        cp.presence_owner(AGENT_NODE)
+    );
     Ok(())
 }
