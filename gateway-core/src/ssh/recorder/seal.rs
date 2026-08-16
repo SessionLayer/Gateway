@@ -138,10 +138,7 @@ pub fn unseal_data_key(
         PublicKey::from_sec1_bytes(&header.ephemeral_public).map_err(|_| SealError::Malformed)?;
     let shared =
         p256::ecdh::diffie_hellman(customer_secret.to_nonzero_scalar(), eph_pub.as_affine());
-    let kek = derive_kek(
-        &shared.raw_secret_bytes()[..],
-        &header.ephemeral_public,
-    )?;
+    let kek = derive_kek(&shared.raw_secret_bytes()[..], &header.ephemeral_public)?;
     let wrap_cipher = Aes256Gcm::new_from_slice(&kek[..]).map_err(|_| SealError::CustomerKey)?;
     let key = wrap_cipher
         .decrypt(
