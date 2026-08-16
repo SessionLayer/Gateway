@@ -21,7 +21,7 @@ boot jar and the Agent binary, and invokes `run.sh` with the env interface below
 | `CP_JAR` | **yes** | path to the real `controlplane-*.jar` boot jar |
 | `AGENT_BIN` | for `TOPOLOGY=agent\|all` | path to the real `sessionlayer-agent` executable |
 | `GATEWAY_BIN` | no | prebuilt gateway binary; if unset, `run.sh` runs `cargo build -p gateway` |
-| `TOPOLOGY` | no | `core` (default) · `agent` · `all` |
+| `TOPOLOGY` | no | `core` · `agent` · `all`. CI runs `core` and `agent` as parallel matrix jobs; a dispatch naming one runs only that one |
 
 Everything else — infra (Postgres + MinIO via `infra-compose.yml`), the node/client
 container images (`tests/fixtures/{sshd,ssh-client}`), CP launch, provisioning, and the

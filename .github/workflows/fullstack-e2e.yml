@@ -47,13 +47,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: fullstack-e2e-${{ github.ref }}
+  group: fullstack-e2e-${{ github.ref }}-${{ github.event.inputs.topology || 'matrix' }}
   cancel-in-progress: true
 
 jobs:
   fullstack-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Both topologies run, in parallel jobs. `core` is the agentless install and the
+    # key-service CA legs; `agent` is the outbound-agent leg, which proves the one thing
+    # core structurally cannot — a node the Gateway never dials, and the node `health` the
+    # API derives from that node's presence claim. A dispatch that names a topology runs
+    # only that one.
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: ${{ github.event.inputs.topology && fromJSON(format('["{0}"]', github.event.inputs.topology)) || fromJSON('["core","agent"]') }}
     steps:
       - name: Checkout Gateway (self, holds the harness)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -120,9 +129,11 @@ jobs:
       - name: Run the full-stack cross-repo E2E
         working-directory: Gateway
         env:
-          TOPOLOGY: ${{ github.event.inputs.topology || 'core' }}
+          TOPOLOGY: ${{ matrix.topology }}
           # The load-bearing hardening gate: the real session runs UNDER
           # seccomp=enforce + Landlock. Non-dispatch runs (PR/nightly) default to full.
+          # The agent topology does not take a hardening profile — its Gateway config has
+          # no hardening block — so the hardened data path is proven by the core leg.
           FS_HARDENING: ${{ github.event.inputs.fs_hardening || 'full' }}
         run: |
           set -euo pipefail
