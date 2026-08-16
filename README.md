@@ -15,7 +15,7 @@ its own recordings.
 ## Build and test
 
 ```bash
-cargo build --release -p gateway   # Rust 1.95 (pinned) + protoc
+cargo build --release -p gateway   # Rust 1.97 (pinned) + protoc
 cargo nextest run --all-features   # unit + integration tests (Docker for the E2Es)
 cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings
 cargo audit -D warnings && cargo deny check
