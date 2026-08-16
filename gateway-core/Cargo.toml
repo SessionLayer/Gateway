@@ -83,7 +83,7 @@ time = "0.3"
 # Integration tests only: throwaway credential data-dirs, and the real Debian 13
 # OpenSSH node. testcontainers drives Docker; never host ssh.
 tempfile = "3"
-testcontainers = "0.27"
+testcontainers = "0.28"
 hmac = "0.13"
 sha2 = { workspace = true }
 p256 = { workspace = true }
