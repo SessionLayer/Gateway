@@ -97,7 +97,8 @@ fn gen_key(alg: Algorithm) -> KeyMat {
 }
 
 /// A customer P-256 keypair: the DER SPKI public key configured on the CP, and the
-/// secret kept in the test to prove decryptability (the platform holds neither).
+/// secret kept in the test to prove decryptability (the platform holds the public
+/// half and never the secret).
 fn customer_keypair() -> (Vec<u8>, p256::SecretKey) {
     let secret = p256::SecretKey::random(&mut OsRng);
     let der = secret.public_key().to_public_key_der().unwrap();

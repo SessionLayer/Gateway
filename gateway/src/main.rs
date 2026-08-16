@@ -435,7 +435,7 @@ async fn start_outer_leg(
                 Some(Arc::new(state))
             }
             Err(e) => {
-                tracing::error!(error = %e, "ProxyJump enabled but outer host key generation failed; ProxyJump DISABLED (direct-tcpip refused)");
+                tracing::error!(error = %e, "ProxyJump enabled but outer host key generation failed; ProxyJump DISABLED (direct-tcpip is handled as an ordinary local port-forward, still gated on port_forward_local)");
                 None
             }
         }

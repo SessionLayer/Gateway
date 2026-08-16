@@ -82,8 +82,9 @@ struct Inner {
     handshake_timeout: Duration,
     heartbeat: Duration,
     max_frame_bytes: usize,
-    /// Caps concurrently-handshaking connections, preventing unauthenticated peers from
-    /// exhausting the Gateway before presenting a certificate.
+    /// Caps concurrent connections — the permit is held for the whole connection,
+    /// not just the handshake — so unauthenticated peers cannot exhaust the Gateway
+    /// before presenting a certificate.
     connection_slots: Arc<tokio::sync::Semaphore>,
     shutdown: watch::Receiver<bool>,
 }

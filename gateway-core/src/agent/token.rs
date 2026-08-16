@@ -18,8 +18,8 @@ const ENVELOPE: &str = "SLDB1";
 const DOMAIN: &[u8] = b"sessionlayer-dialback-v1:";
 const ISSUED_AT_SKEW_SECS: i64 = 5;
 
-/// The five bindings (plus the agent binding) a dial-back is tied to. Held
-/// in the pending map at issue and compared against the presented token's payload.
+/// The four bindings a dial-back is tied to. Held in the pending map at issue
+/// and compared against the presented token's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialBackBinding {
     pub node_name: String,

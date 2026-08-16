@@ -89,7 +89,9 @@ pub struct HandlerDeps {
     pub live_sessions: Arc<LiveSessionRegistry>,
     pub config: Arc<SshServerConfig>,
     /// ProxyJump host-cert MITM state. `Some` only when `ssh.proxy_jump.enabled`;
-    /// `None` ⇒ a `direct-tcpip` forward is refused.
+    /// `None` means a `direct-tcpip` is NOT terminated as a jump hop — it falls
+    /// through to the ordinary local port-forward path, which still requires
+    /// `Capability::PortForwardLocal`.
     pub proxy_jump: Option<Arc<crate::ssh::proxyjump::ProxyJumpState>>,
 }
 
@@ -1946,7 +1948,9 @@ fn break_glass_resolved(res: &crate::pb::BreakglassResolution) -> bool {
 }
 
 /// The granted capabilities from the decision context; default shell+exec when
-/// the context declares none. Agent-forward is never here.
+/// the context declares none. This returns whatever the context grants —
+/// agent forwarding is refused unconditionally in `agent_request`, not filtered
+/// out here.
 fn granted_capabilities(context: Option<&DecisionContext>) -> Vec<i32> {
     match context {
         Some(ctx) if !ctx.capabilities.is_empty() => ctx.capabilities.clone(),

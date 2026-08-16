@@ -372,7 +372,8 @@ pub(crate) mod testutil {
             Self { exporter, provider }
         }
 
-        /// The cumulative value of `name` for the data point carrying exactly `attrs`, or
+        /// The cumulative value of `name` for the first data point carrying AT LEAST
+        /// `attrs` (extra attributes still match), or
         /// `None` when no such series has been recorded. `None` and `Some(0)` are different
         /// answers on purpose: an absent series is what a typo'd instrument name looks like.
         pub fn read(&self, name: &str, attrs: &[(&str, &str)]) -> Option<u64> {

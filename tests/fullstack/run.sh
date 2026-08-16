@@ -37,9 +37,9 @@ fi
 DENY_LOGIN="${DENY_LOGIN:-dba}"
 # ── TOPOLOGY=agent ───────────────────────────────────────────────────────────
 # The Gateway's agent-facing transport, which the Agent dials OUT to. Bound on all
-# interfaces (not loopback) because the Agent runs in a bridge-network container and
-# reaches the host through the docker gateway; the Agent verifies the leaf by the
-# Gateway's NAME, which is the dNSName SAN the CP stamps into it.
+# interfaces (not loopback) so the dial-out reaches the Gateway whichever network
+# the node container is on; the Agent verifies the leaf by the Gateway's NAME,
+# which is the dNSName SAN the CP stamps into it.
 FS_GW_AGENT_PORT="${FS_GW_AGENT_PORT:-12444}"
 AGENT_NODE_CONTAINER="sl-fs-agent-node"
 FS_AGENT_NODE_PORT="${FS_AGENT_NODE_PORT:-12223}"
@@ -75,10 +75,10 @@ KMS_SECRET_ACCESS_KEY="${KMS_SECRET_ACCESS_KEY:-test}"
 KMS_BASELINE_GETPUBKEY=0
 KMS_PUBKEYS_BEFORE_ADOPTION=0
 KMS_LOG_SNAPSHOT=""
-# WORKDIR is a shared, fixed path (by default): a second run's preflight (rm -rf
-# "$WORKDIR") can delete a prior run's logs before anyone reads them, on a box where
-# more than one of these runs. The suffix makes this path unique per run regardless of
-# how SL_FS_EVIDENCE_DIR is overridden, so two runs can never collide.
+# preflight does `rm -rf "$WORKDIR"`, so a run pointed at a fixed WORKDIR via
+# SL_FS_WORKDIR can delete a prior run's logs before anyone reads them. The
+# timestamp+PID suffix makes the evidence path unique per run regardless of how
+# SL_FS_EVIDENCE_DIR is overridden, so two runs can never collide.
 EVIDENCE_DIR="${SL_FS_EVIDENCE_DIR:-/tmp/sl-fullstack-evidence}/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 MINIO_ENDPOINT="http://127.0.0.1:${FS_MINIO_PORT}"
@@ -271,7 +271,7 @@ v = json.load(sys.stdin).get(sys.argv[1])
 sys.stdout.write("" if v is None else (v if isinstance(v, str) else json.dumps(v)))' "$2"
 }
 
-# ── preflight: inputs + toolchain, no side effects ───────────────────────────
+# ── preflight: inputs + toolchain (wipes WORKDIR, installs the PATH shims) ───
 preflight() {
   command -v docker  >/dev/null || die "docker is required"
   command -v openssl >/dev/null || die "openssl is required"

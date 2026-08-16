@@ -2598,11 +2598,6 @@ impl MockCp {
     }
 }
 
-/// Enroll a Gateway against `cp` and assemble outer-leg [`HandlerDeps`] (a
-/// CP-delegating auth client + the `PendingInnerLeg` connector +
-/// the pass-through target resolver) for the given SSH server `config`. The
-/// enrolled credential is snapshotted into the channel factory, so the temp
-/// data-dir can be dropped immediately.
 /// Which recorder a set of [`HandlerDeps`] wires in.
 pub enum RecorderChoice {
     Null,

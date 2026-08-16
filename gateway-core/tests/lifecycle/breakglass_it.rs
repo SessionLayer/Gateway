@@ -344,8 +344,9 @@ async fn start_gateway(
     (port, tx)
 }
 
-/// A Gateway config whose recorder is DELIBERATELY non-strict, to prove break-glass
-/// forces strict on top of it. `require_https=false` for the plain-http MinIO E2E.
+/// A Gateway config carrying the caller's recorder, with `require_https=false`
+/// for the plain-http MinIO E2E. Callers pass a non-strict recorder to prove
+/// break-glass forces strict on top of it.
 fn gw_config(recorder: RecorderConfig) -> SshServerConfig {
     let recorder = RecorderConfig {
         require_https: false,

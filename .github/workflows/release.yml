@@ -150,8 +150,9 @@ jobs:
 
   # The container image carries the same integrity story as the binary: keyless
   # signatures, SLSA provenance and an SBOM, all verified here before the tag is
-  # considered released. No QEMU — the arm64 binary is cross-compiled from the
-  # amd64 runner inside the Dockerfile.
+  # considered released. The arm64 binary is cross-compiled from the amd64 runner
+  # inside the Dockerfile rather than emulated; QEMU is registered below only so
+  # the published arm64 child can be EXECUTED during verification.
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 60
