@@ -29,17 +29,17 @@ jobs:
       # requires an explicit `toolchain` input (it does not read the toml), so
       # keep this in sync with rust-toolchain.toml.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (pinned)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (pinned)
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
           targets: aarch64-unknown-linux-gnu
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
 
       - name: Install gate tools (protoc, nextest, cargo-deny, cargo-audit)
-        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
         with:
           tool: protoc,cargo-nextest,cargo-deny,cargo-audit
 
