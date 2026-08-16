@@ -19,12 +19,9 @@ pub enum IdentityError {
     #[error("identity store I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Generation counter must never race; refuse to start.
     #[error("data-dir {path} is locked by another Gateway process")]
     AlreadyLocked { path: PathBuf },
 
-    /// The persisted manifest could not be parsed — treated as unusable (fail
-    /// closed) rather than guessed at.
     #[error("persisted identity manifest is corrupt: {0}")]
     Corrupt(String),
 
@@ -54,13 +51,11 @@ struct CredentialManifest {
     manifest_version: u32,
     gateway_id: String,
     gateway_name: String,
-    /// Monotonic generation counter. Enrollment is 0; each renewal +1.
     generation: u64,
     not_before_epoch_seconds: i64,
     not_after_epoch_seconds: i64,
     cert_pem: String,
     ca_chain_pem: Vec<String>,
-    /// On-disk key (0600); every in-memory copy is a [`Zeroizing`] buffer scrubbed on drop.
     #[serde(with = "crate::secret::serde_zeroizing_string")]
     key_pem: Zeroizing<String>,
 }
@@ -69,7 +64,6 @@ struct CredentialManifest {
 pub struct Credential {
     pub gateway_id: String,
     pub gateway_name: String,
-    /// Monotonic generation counter.
     pub generation: u64,
     pub not_before: SystemTime,
     pub not_after: SystemTime,
@@ -97,8 +91,6 @@ impl Credential {
             acc.extend(mtls::pem_certs_to_der(pem.as_bytes())?);
             Ok::<_, mtls::MtlsError>(acc)
         })?;
-        // Validate the persisted window (a tampered on-disk manifest fails closed
-        // as Corrupt rather than panicking on an out-of-range epoch).
         let (not_before, not_after) =
             validated_window(m.not_before_epoch_seconds, m.not_after_epoch_seconds)?;
         Ok(Self {
@@ -128,7 +120,6 @@ struct IssuedCredential {
 }
 
 pub struct KeypairCsr {
-    /// Never leaves Gateway; zeroized on drop.
     pub key_pem: Zeroizing<String>,
     pub key_pkcs8_der: Zeroizing<Vec<u8>>,
     pub csr_der: Vec<u8>,
@@ -172,7 +163,6 @@ pub struct IdentityStore {
 }
 
 impl IdentityStore {
-    /// Acquire exclusive single-writer lock; second holder fails closed.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, IdentityError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
@@ -185,7 +175,6 @@ impl IdentityStore {
             .truncate(false)
             .open(&lock_path)?;
 
-        // Leak the RwLock to get a 'static guard held for the process lifetime.
         let lock: &'static mut fd_lock::RwLock<std::fs::File> =
             Box::leak(Box::new(fd_lock::RwLock::new(file)));
         let guard = lock.try_write().map_err(|_| IdentityError::AlreadyLocked {
@@ -202,7 +191,6 @@ impl IdentityStore {
         &self.data_dir
     }
 
-    /// Missing manifest is `Ok(None)`; unparseable is fail closed (Corrupt).
     pub fn load(&self) -> Result<Option<Credential>, IdentityError> {
         let path = self.data_dir.join(MANIFEST_NAME);
         let mut bytes = match std::fs::read(&path) {
@@ -224,7 +212,6 @@ impl IdentityStore {
         Ok(Some(Credential::from_manifest(manifest)?))
     }
 
-    /// Atomically persist, then adopt (the persist-before-adopt point): crash-safe.
     fn persist_issued(&self, issued: IssuedCredential) -> Result<Credential, IdentityError> {
         // Persist-AFTER-validate: reject a bad CP-supplied validity window BEFORE
         // it can reach disk. Otherwise a hostile/corrupt epoch would be written,
@@ -252,7 +239,6 @@ impl IdentityStore {
             not_after_epoch_seconds: issued.not_after_epoch_seconds,
             cert_pem,
             ca_chain_pem,
-            // Move the Zeroizing key in — never materialise a plain-String copy.
             key_pem: issued.key_pem,
         };
 
@@ -266,7 +252,6 @@ impl IdentityStore {
     }
 }
 
-/// Persist-before-adopt issued identity (generation 0). Operator-pinned anchor verifies CP cert.
 pub async fn enroll(
     store: &IdentityStore,
     params: &ChannelParams,
@@ -289,8 +274,6 @@ pub async fn enroll(
         .await?
         .into_inner();
 
-    // Enrollment always issues generation 0 (contract). A different value is a
-    // contract violation → fail closed.
     if resp.generation != 0 {
         return Err(IdentityError::GenerationMismatch {
             expected: 0,
@@ -310,7 +293,6 @@ pub async fn enroll(
     })
 }
 
-/// Verify generation is exactly `current + 1` (security event if not); persist-before-adopt.
 pub async fn renew(
     store: &IdentityStore,
     params: &ChannelParams,
@@ -360,12 +342,10 @@ pub fn compute_renew_delay(
 ) -> Duration {
     let ttl = match not_after.duration_since(not_before) {
         Ok(d) => d,
-        // Inverted/zero window → renew immediately (fail-closed, never trust it).
         Err(_) => return Duration::ZERO,
     };
     let eff = (fraction + jitter_sample * jitter_fraction).clamp(0.0, 0.95);
     let trigger_offset = ttl.mul_f64(eff);
-    // Checked add: an out-of-range instant → renew now (fail-closed), never panic.
     match not_before.checked_add(trigger_offset) {
         Some(trigger_instant) => trigger_instant
             .duration_since(now)
@@ -389,7 +369,6 @@ fn random_jitter_sample() -> f64 {
     (f64::from(x) / f64::from(u32::MAX)) * 2.0 - 1.0
 }
 
-/// Atomically publish via temp + fsync + rename + dir fsync; crash-safe, 0600 before secret write.
 fn atomic_write(
     data_dir: &Path,
     final_name: &str,
@@ -421,7 +400,6 @@ fn atomic_write(
     Ok(())
 }
 
-/// Checked arithmetic: bad CP value never panics; callers fail closed.
 fn systemtime_from_epoch(epoch_seconds: i64) -> Option<SystemTime> {
     if epoch_seconds >= 0 {
         UNIX_EPOCH.checked_add(Duration::from_secs(epoch_seconds as u64))
@@ -430,7 +408,6 @@ fn systemtime_from_epoch(epoch_seconds: i64) -> Option<SystemTime> {
     }
 }
 
-/// Never panics, never persists bad value; prevents crash-loop (persist-after-validate).
 pub fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), IdentityError> {
     if nb < 0 || na < 0 {
         return Err(IdentityError::Corrupt(format!(
@@ -455,8 +432,7 @@ pub fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), Id
 /// certificate is already past its renew trigger — a short TTL with a clock-skew
 /// backdate, or a CP clock ahead of ours — [`compute_renew_delay`] returns
 /// `ZERO` and the loop would renew back-to-back, hammering the CP and burning
-/// generations. Flooring the *post-renewal* wait bounds that. (The Agent hit this
-/// bug too.)
+/// generations. Flooring the *post-renewal* wait bounds that.
 const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Apply the post-renewal floor. When there is a real remaining window the floor is capped
@@ -464,7 +440,7 @@ const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// is **already gone** (`remaining == 0`) the cap would collapse the floor to zero, so
 /// the **full [`RENEW_MIN_INTERVAL`]** applies instead.
 ///
-/// **Retry-bounded, NOT terminal** (cross-repo alignment with the Agent's identical helper).
+/// **Retry-bounded, NOT terminal.**
 /// The likeliest cause of an already-expired *issued* certificate is the **CP's** clock or
 /// TTL config, common to the whole fleet — a terminal exit here would make every Gateway and
 /// Agent stop simultaneously on one central misconfig (fail-deadly). So the loop keeps
@@ -505,7 +481,6 @@ pub struct RenewHandle {
 }
 
 impl RenewHandle {
-    /// Best-effort: if loop stopped, send is dropped.
     pub async fn trigger(&self) {
         let _ = self.trigger_tx.send(()).await;
     }
@@ -558,10 +533,6 @@ impl RenewAhead {
         }
     }
 
-    /// Run the loop until `shutdown` resolves. Each iteration waits until the
-    /// jittered renew-ahead instant (or a manual trigger, or shutdown), then
-    /// renews with persist-before-adopt and publishes the new credential. A
-    /// generation-mismatch security event stops the loop (fail closed).
     pub async fn run(mut self, mut shutdown: impl std::future::Future<Output = ()> + Unpin) {
         let mut just_renewed = false;
         loop {
@@ -579,9 +550,6 @@ impl RenewAhead {
             // against the CP rather than a legitimate catch-up.
             let delay = if just_renewed {
                 let now = SystemTime::now();
-                // An already-expired issued cert is a clock/CP-TTL fault: log it loudly, then
-                // keep renewing BOUNDED (not terminal — a terminal exit on a fleet-wide CP
-                // misconfig would be fail-deadly). The floor turns the storm into ~1/min.
                 if expired_at_issue(now, current.not_after) {
                     tracing::error!(
                         gateway_id = %current.gateway_id,
@@ -624,8 +592,6 @@ impl RenewAhead {
                     just_renewed = true;
                 }
                 Err(IdentityError::GenerationMismatch { expected, got }) => {
-                    // Security event: refuse + flag + stop. Do NOT keep
-                    // retrying — a mismatch means a possible credential clone.
                     tracing::error!(
                         expected,
                         got,
@@ -634,12 +600,6 @@ impl RenewAhead {
                     return;
                 }
                 Err(e) if is_repair_needed(&e) => {
-                    // A rejection the CP will keep returning: locked identity,
-                    // unknown/rotated client cert, or a stale generation the CP
-                    // has already advanced past (a persist/commit desync). Not a
-                    // transient blip — retrying forever would spin. Stop + flag
-                    // for operator/automated **re-enrollment** (a token-join
-                    // re-provision). Fail-closed: the old credential is kept.
                     tracing::error!(
                         error = %e,
                         "REPAIR-NEEDED: renewal rejected by the Control Plane (locked / unknown cert / stale generation) — stopping renew-ahead; re-enrollment required"
@@ -647,9 +607,6 @@ impl RenewAhead {
                     return;
                 }
                 Err(e) => {
-                    // Transient (CP briefly down, network, connect/TLS): keep the
-                    // current credential and retry after a bounded backoff.
-                    // Fail-closed: we never adopt anything new on error.
                     tracing::warn!(error = %e, "renew-ahead: renewal failed transiently, will retry");
                     tokio::select! {
                         biased;
@@ -698,7 +655,6 @@ mod tests {
         );
     }
 
-    /// Silent regression breaks real CP enrollment, not just mocks.
     #[test]
     fn csr_carries_a_non_blank_cn_and_a_p256_key() {
         use x509_parser::certification_request::X509CertificationRequest;
@@ -729,9 +685,8 @@ mod tests {
     fn compute_renew_delay_two_thirds_no_jitter() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         let not_before = now;
-        let not_after = now + Duration::from_secs(300); // 5-minute TTL
+        let not_after = now + Duration::from_secs(300);
         let delay = compute_renew_delay(now, not_before, not_after, 2.0 / 3.0, 0.1, 0.0);
-        // 2/3 of 300s = 200s.
         assert_eq!(delay, Duration::from_secs(200));
     }
 
@@ -739,7 +694,7 @@ mod tests {
     fn compute_renew_delay_is_zero_when_past_trigger() {
         let not_before = UNIX_EPOCH + Duration::from_secs(1_000);
         let not_after = not_before + Duration::from_secs(300);
-        let now = not_before + Duration::from_secs(250); // already past 2/3
+        let now = not_before + Duration::from_secs(250);
         let delay = compute_renew_delay(now, not_before, not_after, 2.0 / 3.0, 0.0, 0.0);
         assert_eq!(delay, Duration::ZERO);
     }
@@ -749,7 +704,6 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         let not_before = now;
         let not_after = now + Duration::from_secs(300);
-        // Extreme positive jitter must never push the trigger past ~0.95 TTL.
         let delay = compute_renew_delay(now, not_before, not_after, 0.9, 0.5, 1.0);
         assert!(
             delay <= Duration::from_secs(285),
@@ -759,24 +713,18 @@ mod tests {
 
     #[test]
     fn floor_after_renew_never_collapses_to_zero() {
-        // A certificate born past its own renew trigger yields a ZERO base; the floor must
-        // not let the post-renewal loop spin on the CP.
         assert_eq!(
             floor_after_renew(Duration::ZERO, Duration::from_secs(3600)),
             RENEW_MIN_INTERVAL
         );
-        // A healthy schedule is untouched.
         assert_eq!(
             floor_after_renew(Duration::from_secs(600), Duration::from_secs(3600)),
             Duration::from_secs(600)
         );
-        // A real short window keeps the `remaining/2` cap (renew before expiry).
         assert_eq!(
             floor_after_renew(Duration::ZERO, Duration::from_secs(10)),
-            Duration::from_secs(5) // min(60, 10/2)
+            Duration::from_secs(5)
         );
-        // The exact collapse-to-zero case: `remaining == 0` applies the FULL floor, not the
-        // (now-zero) cap. Matches the Agent's identical helper.
         assert_eq!(
             floor_after_renew(Duration::ZERO, Duration::ZERO),
             RENEW_MIN_INTERVAL
@@ -786,10 +734,9 @@ mod tests {
     #[test]
     fn expired_at_issue_detects_an_already_dead_certificate() {
         let now = SystemTime::now();
-        assert!(expired_at_issue(now, now)); // not_after == now => nothing left
+        assert!(expired_at_issue(now, now));
         assert!(expired_at_issue(now, now - Duration::from_secs(10)));
         assert!(!expired_at_issue(now, now + Duration::from_secs(60)));
-        // reissue_delay is always floored (never zero), even for an expired window.
         assert_eq!(
             reissue_delay(now, now - Duration::from_secs(10), now),
             RENEW_MIN_INTERVAL
@@ -827,9 +774,6 @@ mod tests {
 
     #[test]
     fn persist_rejects_out_of_range_epoch_and_writes_nothing() {
-        // GW-EPOCH: a hostile CP-supplied not_before = i64::MIN must NOT panic
-        // and must NOT be written to disk (persist-after-validate) — otherwise a
-        // restart load() would keep failing (crash-loop brick).
         let dir = tempfile::tempdir().unwrap();
         let store = IdentityStore::open(dir.path()).unwrap();
         let mut issued = sample_issued("gw-bad", 0, SystemTime::now());
@@ -844,8 +788,8 @@ mod tests {
 
     #[test]
     fn load_rejects_out_of_range_epoch_without_panicking() {
-        // GW-EPOCH: a tampered on-disk epoch must fail closed as Corrupt, never
-        // panic on the `-(i64::MIN)` overflow.
+        // A tampered on-disk epoch must fail closed as Corrupt, never panic on the
+        // `-(i64::MIN)` overflow.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MANIFEST_NAME);
         {
@@ -854,7 +798,6 @@ mod tests {
                 .persist_issued(sample_issued("gw-tamper", 0, SystemTime::now()))
                 .unwrap();
         }
-        // Tamper the persisted not_before to i64::MIN (keep everything else valid).
         let bytes = std::fs::read(&path).unwrap();
         let mut manifest: CredentialManifest = serde_json::from_slice(&bytes).unwrap();
         manifest.not_before_epoch_seconds = i64::MIN;
@@ -873,15 +816,11 @@ mod tests {
         let hostile = "evil\n\u{1b}[2Jline";
         let err = IdentityError::Rpc(tonic::Status::permission_denied(hostile));
 
-        // (a) The error's own Display renders only the gRPC code.
         let disp = format!("{err}");
         assert!(!disp.contains("evil"), "Display leaked CP message: {disp}");
         assert!(!disp.contains('\u{1b}'));
         assert!(disp.contains("PermissionDenied"));
 
-        // (b) The `bootstrap_identity` boundary wrap (`anyhow!("… {e}")`) carries
-        // only the code-only Display and NO tonic::Status source, so even the
-        // source-chain-walking Debug print stays clean.
         let wrapped = anyhow::anyhow!("gateway enrollment/renewal failed: {err}");
         let dbg = format!("{wrapped:?}");
         assert!(
@@ -889,7 +828,6 @@ mod tests {
             "anyhow Debug leaked the CP message via the source chain: {dbg}"
         );
         assert!(!dbg.contains('\u{1b}'));
-        // No source chain to walk into (only the wrapper message itself).
         assert_eq!(
             wrapped.chain().count(),
             1,
@@ -899,7 +837,6 @@ mod tests {
 
     #[test]
     fn repair_needed_classifies_terminal_rejections() {
-        // Locked / unknown-cert / stale-generation → stop (repair needed).
         assert!(is_repair_needed(&IdentityError::Rpc(
             tonic::Status::permission_denied("locked")
         )));
@@ -909,7 +846,6 @@ mod tests {
         assert!(is_repair_needed(&IdentityError::Rpc(
             tonic::Status::failed_precondition("stale generation")
         )));
-        // Transient / genuinely-retryable → keep retrying.
         assert!(!is_repair_needed(&IdentityError::Rpc(
             tonic::Status::unavailable("cp restarting")
         )));
@@ -929,7 +865,6 @@ mod tests {
 
     #[test]
     fn compute_renew_delay_does_not_panic_on_extreme_window() {
-        // Extreme but ordered window must not overflow SystemTime arithmetic.
         let nb = systemtime_from_epoch(0).unwrap();
         let na = systemtime_from_epoch(i64::MAX).unwrap_or(nb);
         let _ = compute_renew_delay(SystemTime::now(), nb, na, 2.0 / 3.0, 0.1, 1.0);
@@ -937,10 +872,6 @@ mod tests {
 
     #[test]
     fn persist_then_load_roundtrips_and_survives_simulated_crash() {
-        // Persist an issued credential, then simulate a crash *between persist
-        // and adopt* by dropping the returned in-memory Credential and re-opening
-        // the store from scratch: load() must return the same, consistent
-        // credential (never a torn file).
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::now();
         let issued = sample_issued("gw-7", 0, now);
@@ -950,10 +881,8 @@ mod tests {
             let store = IdentityStore::open(dir.path()).unwrap();
             let adopted = store.persist_issued(issued).unwrap();
             assert_eq!(adopted.gateway_id, want_id);
-            // "crash": drop `adopted` and `store` without using them further.
         }
 
-        // Restart: a brand-new store loads the persisted credential intact.
         let store2 = IdentityStore::open(dir.path()).unwrap();
         let loaded = store2
             .load()
@@ -979,7 +908,6 @@ mod tests {
         let c1 = store.persist_issued(sample_issued("gw-9", 1, now)).unwrap();
         assert_eq!(c1.generation, 1);
 
-        // Re-open and confirm the persisted generation is the latest.
         let reloaded = store.load().unwrap().unwrap();
         assert_eq!(reloaded.generation, 1);
     }
@@ -1012,8 +940,6 @@ mod tests {
         );
     }
 
-    /// Build a sample issued credential with a real self-signed cert + CA so the
-    /// PEM round-trips exercise the actual encode/parse path.
     fn sample_issued(gateway_id: &str, generation: u64, now: SystemTime) -> IssuedCredential {
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let ca_params = rcgen::CertificateParams::new(vec!["test-ca".to_string()]).unwrap();

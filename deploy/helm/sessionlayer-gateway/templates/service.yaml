@@ -21,8 +21,6 @@ spec:
   selector:
     {{- include "sessionlayer-gateway.selectorLabels" . | nindent 4 }}
   ports:
-    # 22 on the outside, the container's high port on the inside, so nothing in
-    # the pod ever needs a privileged bind.
     - name: ssh
       port: {{ .Values.service.sshPort }}
       targetPort: ssh

@@ -1,9 +1,3 @@
-# A complete, realistic production configuration, used to lint and schema-check
-# the chart. The whole gateway.json comes from a Secret created out of band, so
-# the enrollment token never reaches a values file or Helm's release storage.
-#
-# One release is one Gateway, so a second Gateway is a second release of this
-# chart with its own name, its own token and its own values file.
 replicaCount: 1
 
 image:
@@ -38,8 +32,6 @@ resources:
     cpu: 500m
     memory: 512Mi
 
-# A budget over the single pod of one release either hangs a node drain or holds
-# nothing back, so availability comes from the other Gateway releases instead.
 podDisruptionBudget:
   enabled: false
 

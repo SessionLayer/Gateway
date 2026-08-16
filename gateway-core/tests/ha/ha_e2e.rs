@@ -36,8 +36,8 @@ const AGENT_NODE_IMAGE: &str = "sessionlayer-gw-agentnode:test";
 // UUID-shaped name would mask the name->node.id resolution the CP performs.
 const NODE: &str = "web-01";
 const AGENT_ID: &str = "agent-ha";
-const GW_A: &str = "gw-a-ha"; // ingress
-const GW_B: &str = "gw-b-ha"; // owner (holds the agent)
+const GW_A: &str = "gw-a-ha";
+const GW_B: &str = "gw-b-ha";
 
 async fn build_images() -> anyhow::Result<()> {
     build_image("ssh-client", CLIENT_IMAGE).await?;
@@ -71,8 +71,6 @@ fn test_agent_binary() -> Vec<u8> {
     std::fs::read(env!("CARGO_BIN_EXE_test-agent")).expect("cargo builds the test agent")
 }
 
-/// A coordination backend wrapping `InProcessBackend` that records every published signal, so
-/// the test can prove the session plaintext never rode the bus.
 struct RecordingBus {
     inner: InProcessBackend,
     published: Mutex<Vec<Vec<u8>>>,
@@ -459,7 +457,6 @@ async fn ssh_is_relayed_across_two_gateways_and_the_bus_carries_no_session_bytes
         cp.pinned_verification(host_key.public_wire.clone()),
     );
 
-    // gw-B owns the node's agent; gw-A is the ingress the client connects to.
     let owner = start_owner(&cp, coordination.clone()).await?;
     let ingress = start_ingress(&cp, coordination.clone()).await?;
     let node = start_agent_node(&cp, &host_key, owner.agent_port).await?;

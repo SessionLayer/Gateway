@@ -1,6 +1,3 @@
-//! asciicast v2 encoding; UTF-8-clean via Utf8Chunker (split multi-byte handled, malformed lossily replaced).
-//! Tier-0 zeroization: event lines + chunker buffer in scrub-on-drop Zeroizing.
-
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,14 +31,7 @@ pub fn header_line(width: u16, height: u16, timestamp: u64) -> Vec<u8> {
     line.into_bytes()
 }
 
-/// An asciicast v2 event line `[elapsed, "code", "data"]` (terminated with `\n`).
-/// `data` is UTF-8 text (JSON-escaped); `elapsed` is seconds since the header.
-///
-/// The returned line contains live plaintext (keystrokes/output), so it is a
-/// [`Zeroizing`] buffer: the recorder folds it into the hash-chain + sealed frame
-/// stream and drops it, scrubbing the transient copy.
 pub fn event_line(elapsed_secs: f64, code: EventCode, data: &str) -> Zeroizing<Vec<u8>> {
-    // serde_json renders the tuple as a JSON array with correct string escaping.
     let mut line =
         serde_json::to_string(&(elapsed_secs, code.as_str(), data)).expect("event serializes");
     line.push('\n');
@@ -51,9 +41,6 @@ pub fn event_line(elapsed_secs: f64, code: EventCode, data: &str) -> Zeroizing<V
     Zeroizing::new(line.into_bytes())
 }
 
-/// Splits a byte stream into UTF-8-clean event payloads, buffering an incomplete
-/// trailing multi-byte sequence across chunks so no event straddles a code point.
-/// The carry buffer holds live plaintext, so it is scrub-on-drop.
 #[derive(Debug, Default)]
 pub struct Utf8Chunker {
     pending: Zeroizing<Vec<u8>>,
@@ -64,8 +51,6 @@ impl Utf8Chunker {
         self.pending.extend_from_slice(chunk);
         match std::str::from_utf8(&self.pending) {
             Ok(_) => {
-                // Whole buffer is valid UTF-8: emit it all (moving the plaintext out
-                // of `pending`, which is left empty — no residual carry).
                 let out = std::mem::take(&mut *self.pending);
                 Zeroizing::new(String::from_utf8(out).expect("validated above"))
             }
@@ -79,7 +64,6 @@ impl Utf8Chunker {
                         self.pending.drain(..valid);
                         Zeroizing::new(String::from_utf8(out).expect("valid prefix"))
                     }
-                    // Genuinely malformed: lossily replace (UTF-8 terminal assumption).
                     Some(_) => {
                         let out = String::from_utf8_lossy(&self.pending).into_owned();
                         self.pending.clear();
@@ -90,8 +74,6 @@ impl Utf8Chunker {
         }
     }
 
-    /// Flush any buffered bytes at end-of-stream (lossy if still incomplete).
-    /// Returns `None` when nothing is pending. Scrub-on-drop.
     pub fn flush(&mut self) -> Option<Zeroizing<String>> {
         if self.pending.is_empty() {
             return None;
@@ -115,7 +97,6 @@ mod tests {
 
     #[test]
     fn chunker_preserves_split_multibyte_char() {
-        // "é" is 0xC3 0xA9; split across two chunks must reassemble byte-exact.
         let mut c = Utf8Chunker::default();
         let a = c.push(&[b'x', 0xC3]);
         let b = c.push(&[0xA9, b'y']);

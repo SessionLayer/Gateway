@@ -1,6 +1,3 @@
-//! Outbound-agent transport and mTLS WebSocket server. The recording, host-verification and
-//! inner-certificate seam is identical over this path and the direct one.
-
 pub mod dial;
 pub mod registry;
 pub mod server;
@@ -21,35 +18,28 @@ pub const CONTROL_PATH: &str = "/agent/v1/control";
 
 pub const DIALBACK_PATH: &str = "/agent/v1/dialback";
 
-/// The HA Gateway↔Gateway peer-relay path (`gateway-relay-v1.md` §2). A
-/// per-session byte relay on the same TLS server; the connecting peer is a GATEWAY, not an
-/// agent.
+/// A per-session byte relay on the same TLS server as the agent paths; the connecting peer
+/// is a GATEWAY, not an agent.
 pub const PEER_RELAY_PATH: &str = "/peer/v1/relay";
 
-/// Normative bound on the `heartbeat_interval_secs` we propose in `HELLO_ACK`
-/// (contract §3): below 1 is a self-inflicted DoS, above 300 a dead peer goes undetected
-/// too long.
+/// Bound on the `heartbeat_interval_secs` we propose in `HELLO_ACK`: below 1 is a
+/// self-inflicted DoS, above 300 a dead peer goes undetected too long.
 pub const HEARTBEAT_INTERVAL_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
 
-/// Normative bound on the `max_frame_bytes` we propose in `HELLO_ACK` (contract §3): it
-/// must clear the inner leg's max packet with headroom, and bound per-connection memory.
+/// Bound on the `max_frame_bytes` we propose in `HELLO_ACK`: it must clear the inner leg's
+/// max packet with headroom, and bound per-connection memory.
 pub const MAX_FRAME_BYTES_RANGE: std::ops::RangeInclusive<usize> = 4096..=1_048_576;
 
 /// The Agent <-> Gateway **wire** protocol range, `(major, minor)`. This is a DISTINCT
-/// protocol from the CP <-> Gateway gRPC plane (`crate::version::PROTOCOL_*`): it reuses
-/// the `ProtocolVersion`/`ComponentInfo` *concept* and the N-1 resolver, but it has its own
-/// version line, and the Control Plane is not a party to it (contract §1). Baseline **1.0**
-/// (contract §3) — do NOT couple it to the gRPC version, which is already at 1.1; advertising
-/// the gRPC max here would offer Agents a wire minor that does not exist and violate contract §3.
+/// protocol from the CP <-> Gateway gRPC plane (`crate::version::PROTOCOL_*`): it reuses the
+/// `ProtocolVersion`/`ComponentInfo` concept and the N-1 resolver, but it has its own version
+/// line, and the Control Plane is not a party to it. Do NOT couple it to the gRPC version,
+/// which is already at 1.1: advertising the gRPC max here would offer Agents a wire minor
+/// that does not exist.
 pub const WIRE_PROTOCOL_MIN: (u32, u32) = (1, 0);
 
-/// Highest Agent <-> Gateway wire protocol this build speaks. Bump only when the framed
-/// protocol itself gains a minor — never in lockstep with the gRPC plane.
 pub const WIRE_PROTOCOL_MAX: (u32, u32) = (1, 0);
 
-/// This Gateway's [`ComponentInfo`](crate::pb::ComponentInfo) for the wire preface: the
-/// artifact identity (name + semver) with the **agent-wire** protocol range, not the gRPC
-/// one.
 pub fn wire_component_info() -> crate::pb::ComponentInfo {
     crate::pb::ComponentInfo {
         name: crate::version::COMPONENT_NAME.to_string(),
@@ -66,9 +56,9 @@ pub fn wire_component_info() -> crate::pb::ComponentInfo {
 const AGENT_URI_PREFIX: &str = "sessionlayer://agent/";
 
 /// The URI SAN scheme the CP stamps into a GATEWAY identity certificate
-/// (`sessionlayer://gateway/<uuid>`). Its PRESENCE is the positive gateway-DiD check on the
-/// peer-relay path (F10a): a CA never issues this SAN to a non-gateway, so requiring it — not
-/// merely the ABSENCE of an agent URI SAN — closes the residual where a leaf carrying only a
+/// (`sessionlayer://gateway/<uuid>`). Its PRESENCE is the positive gateway check on the
+/// peer-relay path: a CA never issues this SAN to a non-gateway, so requiring it — not merely
+/// the ABSENCE of an agent URI SAN — closes the residual where a leaf carrying only a
 /// gateway-named dNSName could be mistaken for a gateway.
 const GATEWAY_URI_PREFIX: &str = "sessionlayer://gateway/";
 
@@ -81,7 +71,6 @@ pub struct AgentPeer {
     pub node_name: String,
 }
 
-/// Why a client certificate does not resolve to exactly one agent (fail closed).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PeerError {
     #[error("no client certificate presented")]
@@ -92,16 +81,10 @@ pub enum PeerError {
     NotOneAgent,
     #[error("certificate does not resolve to exactly one node name")]
     NotOneNode,
-    /// The certificate does not resolve to exactly one gateway identity: it carries an
-    /// agent URI SAN (so it is an agent, not a gateway), or not exactly one dNSName SAN.
     #[error("certificate does not resolve to exactly one gateway identity")]
     NotOneGateway,
 }
 
-/// Resolve the agent peer from its mTLS client certificate (contract §1).
-///
-/// A certificate that does not resolve to **exactly one** agent — zero, or several
-/// smuggled in as extra SANs — is refused rather than guessed at.
 pub fn peer_identity(cert_der: &[u8]) -> Result<AgentPeer, PeerError> {
     let (_, cert) = X509Certificate::from_der(cert_der).map_err(|_| PeerError::Parse)?;
 
@@ -139,15 +122,14 @@ pub fn peer_identity(cert_der: &[u8]) -> Result<AgentPeer, PeerError> {
     })
 }
 
-/// Resolve a peer **gateway** NAME from its mTLS client certificate
-/// (`gateway-relay-v1.md` §2), for the peer-relay path.
+/// Resolve a peer **gateway** NAME from its mTLS client certificate, for the peer-relay path.
 ///
 /// The HA routing key is the gateway NAME (`gateway_identity.name`), which the CP stamps as
 /// the **dNSName SAN** alongside a `sessionlayer://gateway/<uuid>` URI SAN. A gateway peer must
 /// therefore satisfy BOTH: exactly one dNSName SAN (the name we return) AND a present gateway
-/// URI SAN (the positive DiD check, F10a). A certificate carrying an *agent* URI SAN is an
-/// agent — refused on this gateway-only path. The relay token binding
-/// (`owner_gateway_id == this name`) is the second, decisive check at the call site.
+/// URI SAN (the positive check). A certificate carrying an *agent* URI SAN is an agent —
+/// refused on this gateway-only path. The relay token binding (`owner_gateway_id == this
+/// name`) is the second, decisive check at the call site.
 pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
     let (_, cert) = X509Certificate::from_der(cert_der).map_err(|_| PeerError::Parse)?;
 
@@ -159,7 +141,6 @@ pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
         };
         for name in &san.general_names {
             match name {
-                // An agent identity on the gateway-only path is refused, not guessed at.
                 GeneralName::URI(uri) if uri.starts_with(AGENT_URI_PREFIX) => {
                     return Err(PeerError::NotOneGateway);
                 }
@@ -171,8 +152,8 @@ pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
             }
         }
     }
-    // Positive check (F10a): a gateway MUST carry the gateway URI SAN, not merely lack an agent
-    // one — otherwise a leaf with a gateway-named dNSName but no gateway identity would pass.
+    // Positive check: a gateway MUST carry the gateway URI SAN, not merely lack an agent one —
+    // otherwise a leaf with a gateway-named dNSName but no gateway identity would pass.
     if !has_gateway_uri {
         return Err(PeerError::NotOneGateway);
     }
@@ -185,13 +166,10 @@ pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
     Ok(name.clone())
 }
 
-/// The WebSocket bounds both roles run under.
-///
-/// `max_message_size`/`max_frame_size` are the DoS guard the contract requires: an
-/// oversized frame is refused at its **length header**, so it is never buffered.
-/// `write_buffer_size = 0` makes every message an eager socket write, and the bounded
-/// `max_write_buffer_size` is what turns a blocked socket into `poll_ready` ⇒
-/// `Pending` — the backpressure the byte stream relies on.
+/// `max_message_size`/`max_frame_size` are the DoS guard: an oversized frame is refused at
+/// its **length header**, so it is never buffered. `write_buffer_size = 0` makes every message
+/// an eager socket write, and the bounded `max_write_buffer_size` is what turns a blocked
+/// socket into `poll_ready` ⇒ `Pending` — the backpressure the byte stream relies on.
 pub fn ws_config(max_frame_bytes: usize) -> WebSocketConfig {
     let max_message = max_frame_bytes.saturating_add(HEADER_LEN);
     WebSocketConfig::default()
@@ -298,8 +276,6 @@ mod tests {
             vec![dns("gw-A"), uri("sessionlayer://gateway/abc-uuid")],
         );
         assert_eq!(gateway_peer_identity(&gw).unwrap(), "gw-A");
-        // F10a positive check: a leaf with a gateway-named dNSName but NO gateway URI SAN is
-        // NOT a gateway — a CA only issues the gateway URI SAN to a real gateway.
         let dns_only = leaf(&ca, vec![dns("gw-B")]);
         assert_eq!(
             gateway_peer_identity(&dns_only),
@@ -322,7 +298,6 @@ mod tests {
         let cfg = ws_config(65536);
         assert_eq!(cfg.max_message_size, Some(65536 + HEADER_LEN));
         assert_eq!(cfg.max_frame_size, Some(65536 + HEADER_LEN));
-        // Bounded write buffering is what makes poll_ready a real backpressure gate.
         assert!(cfg.max_write_buffer_size < usize::MAX);
         assert!(cfg.max_write_buffer_size > cfg.write_buffer_size);
     }

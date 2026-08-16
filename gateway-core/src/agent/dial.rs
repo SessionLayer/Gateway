@@ -1,5 +1,3 @@
-//! Outbound-agent NodeConnector: mint dial-back tokens, signal agents, and wait for splice back.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +8,6 @@ use crate::ssh::connector::{ConnectFuture, NodeConnectError, NodeConnector, Node
 use crate::ssh::locks::{LockBindings, LockSet};
 use crate::telemetry::metrics::{self, UnreachableReason};
 
-/// Reaches an OUTBOUND_AGENT node by signalling its Agent to dial back.
 pub struct AgentDial {
     registry: Arc<AgentRegistry>,
     pending: Arc<PendingDialBacks>,
@@ -50,8 +47,6 @@ impl AgentDial {
 impl NodeConnector for AgentDial {
     fn connect<'a>(&'a self, dial: &'a NodeDial) -> ConnectFuture<'a> {
         Box::pin(async move {
-            // Without the CP-supplied enrollment name there is no join key to an
-            // Agent — fail closed rather than guess.
             if dial.node_name.is_empty() {
                 return Err(NodeConnectError::NoNodeName);
             }
@@ -121,8 +116,6 @@ impl NodeConnector for AgentDial {
                 principal: dial.principal.clone(),
                 gateway_id: self.gateway_id.clone(),
                 dial_back_endpoint: self.advertise_url.clone(),
-                // The token is a capability: it goes on the wire and nowhere else —
-                // never logged, never persisted, never echoed.
                 token,
                 not_after_epoch_seconds: not_after,
             };
@@ -214,8 +207,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_unhealthy_lock_feed_refuses_to_signal_and_mints_no_token() {
-        // Deny fails closed. With the feed unable to confirm the absence of a
-        // lock, the connector must NOT mint a single-use dial-back capability for the agent.
         let registry = Arc::new(AgentRegistry::new(8));
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let _g = registry.register("node-a", "agent-a", tx).unwrap();
@@ -238,8 +229,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_lock_feed_refuses_to_signal() {
-        // The feed WAS healthy, then the CP stream dropped: a lock raised at the CP during
-        // the outage never arrived, so an empty set is not "unlocked".
         let locks = healthy_locks();
         locks.mark_disconnected();
         assert!(!locks.healthy());

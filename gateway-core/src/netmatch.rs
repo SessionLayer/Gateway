@@ -119,7 +119,6 @@ mod tests {
         let c = Cidr::parse("2001:db8::/32").unwrap();
         assert!(c.contains(v6("2001:db8:abcd::1")));
         assert!(!c.contains(v6("2001:db9::1")));
-        // A v6 CIDR must never match a v4 address (and vice versa).
         assert!(!c.contains(v4("10.0.0.1")));
         let c4 = Cidr::parse("10.0.0.0/8").unwrap();
         assert!(!c4.contains(v6("::ffff:10.0.0.1")));

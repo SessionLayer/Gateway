@@ -1,7 +1,3 @@
-//! Decision-context verification (Rust port of CP's DecisionContextVerifier).
-//! Trust cached context ONLY if the signature verifies: PKIX-validate CONTEXT_SIGNER leaf to pinned mTLS CA,
-//! require SAN URI + codeSigning EKU (reject CA certs), verify ECDSA-P256/SHA-256 signature. Fail-closed on any failure.
-
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
@@ -28,7 +24,6 @@ pub fn canonical_bytes(context: &DecisionContext) -> Vec<u8> {
     <DecisionContext as prost::Message>::encode_to_vec(context)
 }
 
-/// A fail-closed rejection reason. Every variant collapses to "reject the context" at the call site.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     #[error("empty signed context, signature, or signer certificate")]
@@ -53,8 +48,6 @@ pub enum VerifyError {
     ContextDecode,
 }
 
-/// Verify a signed decision context and return the decoded context.
-/// `ca_anchors` are the pinned internal mTLS CA certs; context is decoded from signed_context only.
 pub fn verify_decision_context(
     signed_context: &[u8],
     signature: &[u8],
@@ -77,14 +70,10 @@ pub fn verify_decision_context(
         return Err(VerifyError::UntrustedChain);
     }
 
-    // (2) Expire conservatively: reject a leaf outside its own validity window.
     if !leaf.validity().is_valid() {
         return Err(VerifyError::LeafExpired);
     }
 
-    // (3) Defense in depth: the SAN marker is NOT sufficient alone —
-    // require the codeSigning EKU AND reject any CA cert, so a mis-issued or
-    // wrong-purpose leaf cannot masquerade as the context signer.
     if is_ca(&leaf) {
         return Err(VerifyError::LeafIsCa);
     }
@@ -95,8 +84,6 @@ pub fn verify_decision_context(
         return Err(VerifyError::NotCodeSigner);
     }
 
-    // (4) Verify the ECDSA-P256/SHA-256 signature over {DOMAIN_PREFIX ||
-    // signed_context} with the leaf's public key.
     let verifying_key = VerifyingKey::from_public_key_der(leaf.public_key().raw)
         .map_err(|_| VerifyError::BadSignerKey)?;
     let sig = Signature::from_der(signature).map_err(|_| VerifyError::BadSignature)?;
@@ -111,7 +98,6 @@ pub fn verify_decision_context(
         .map_err(|_| VerifyError::ContextDecode)
 }
 
-/// True if leaf's signature verifies under a pinned CA anchor and issuer matches (one-level chain).
 fn chains_to_pinned_ca(leaf: &X509Certificate, ca_anchors: &[Vec<u8>]) -> bool {
     for der in ca_anchors {
         let Ok((_, ca)) = X509Certificate::from_der(der) else {
@@ -279,7 +265,6 @@ mod tests {
     #[test]
     fn non_signer_leaf_without_marker_is_rejected() {
         let ca = make_ca();
-        // A valid server leaf (no signer marker, no codeSigning) cannot masquerade.
         let (leaf, sk) = issue(&ca, vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth], None);
         let (signed, sig) = sign(&sk, &sample_context());
         assert!(
@@ -290,8 +275,6 @@ mod tests {
     #[test]
     fn marked_leaf_with_wrong_eku_is_rejected() {
         let ca = make_ca();
-        // Carries the SAN marker but clientAuth EKU (not codeSigning) → rejected:
-        // the marker alone is insufficient (defense in depth).
         let (leaf, sk) = issue(
             &ca,
             vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth],

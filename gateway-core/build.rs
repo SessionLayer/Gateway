@@ -1,9 +1,6 @@
-//! Build script: generate gRPC client from vendored contract proto.
-
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // gateway-core/.. == repo root, which holds the vendored `proto/`.
     let proto_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("gateway-core manifest dir has a parent (the workspace root)")
@@ -65,8 +62,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".sessionlayer.controlplane.v1", "crate::pb")
         .compile_protos(&[agent_wire], std::slice::from_ref(&proto_root))?;
 
-    // Gateway<->Gateway coordination payloads (messages only; no CP types, so no
-    // extern_path). Generated into its own module (crate::pbgw via lib.rs).
     tonic_prost_build::configure()
         .build_client(false)
         .build_server(false)

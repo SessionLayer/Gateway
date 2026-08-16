@@ -2,41 +2,29 @@
 //! locks/denials produce the same generic denial as any auth failure (deny wins).
 //! Detailed reasons go only to structured logs at the call site, never to the user.
 
-/// Generic denial (Lock/RBAC deny/no-match/malformed target/credential-scope; no disclosure).
 pub const ACCESS_DENIED: &str = "access denied by policy";
 
-/// Device-flow poll deadline elapsed.
 pub const DEVICE_FLOW_TIMEOUT: &str = "authentication timed out, please reconnect";
 
-/// CP unreachable / decision failure (fail-closed).
 pub const SERVICE_UNAVAILABLE: &str = "service temporarily unavailable";
 
-/// Post-auth node-side failure (dial/host-verify/handshake); one message for all (no host-verify detail disclosed).
 pub const NODE_UNREACHABLE: &str = "the target node is offline or unavailable";
 
-/// Recording failure when mandatory (fail-closed; reason in operator log only).
 pub const RECORDING_UNAVAILABLE: &str = "session cannot start: recording unavailable";
 
 use crate::telemetry::metrics::Counted;
 
-/// SSH outcome: channel-level outcomes carry a user message + exit code; pre-banner outcomes carry neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshOutcome {
-    /// Source IP outside global gate — dropped at TCP, no banner.
     SourceBlocked,
-    /// All auth methods failed — russh emits the standard SSH auth failure.
     AuthFailed,
-    /// Authorization denied (RBAC/lock/no-match/malformed/credential-scope).
     PolicyDenied,
-    /// Device-flow poll deadline elapsed.
     DeviceFlowTimeout,
-    /// CP was unreachable / decision error (fail-closed).
     ServiceUnavailable,
     /// Post-auth node-side failure (dial/host-verify/handshake); generic to user, specific in operator log.
     /// The [`Counted`] payload is only mintable by `telemetry::metrics::node_unreachable`, so
     /// no site can fail a session closed here without the counter seeing it.
     NodeUnreachable(Counted),
-    /// Recording failure when mandatory (fail-closed).
     RecordingUnavailable,
 }
 
@@ -68,7 +56,6 @@ impl SshOutcome {
         }
     }
 
-    /// Whether this outcome is pre-authorization (must stay generic; no identity/node/rule disclosure). NodeUnreachable is post-authorization but carries no host-verify detail.
     pub fn is_pre_authorization(&self) -> bool {
         matches!(
             self,

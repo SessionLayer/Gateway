@@ -1,5 +1,3 @@
-//! Owner-side peer-relay client and signal handler; dumb byte relay.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,7 +24,6 @@ use crate::telemetry::metrics::{self, RelayDecline};
 
 const DEFAULT_PER_NODE_RELAY_CAP: usize = 8;
 
-/// Per-node concurrency cap + graceful-drain wait (relays finish before process exits).
 pub struct ServedRelays {
     per_node: Mutex<HashMap<String, usize>>,
     active: AtomicUsize,
@@ -48,7 +45,6 @@ impl ServedRelays {
         }
     }
 
-    /// Returns `None` if per-node cap reached (fail closed).
     pub fn begin(self: &Arc<Self>, node: &str) -> Option<RelaySlot> {
         let mut map = self.per_node.lock().unwrap_or_else(|e| e.into_inner());
         let count = map.entry(node.to_string()).or_insert(0);
@@ -68,7 +64,6 @@ impl ServedRelays {
     }
 }
 
-/// Reservation; releasing (on drop) decrements per-node and total counters.
 pub struct RelaySlot {
     registry: Arc<ServedRelays>,
     node: String,
@@ -91,7 +86,6 @@ impl Drop for RelaySlot {
     }
 }
 
-/// Owner-side signal handler dependencies.
 #[derive(Clone)]
 pub struct PeerClientDeps {
     pub coordination: Arc<dyn CoordinationBackend>,
@@ -105,8 +99,6 @@ pub struct PeerClientDeps {
     pub handshake_timeout: Duration,
 }
 
-/// A failure serving a relay for the ingress. Every variant is fail-closed: the owner drops
-/// the attempt and the ingress times out ("node offline") — a relay is never forced.
 #[derive(Debug, thiserror::Error)]
 enum RelayError {
     #[error("this gateway does not own the signalled node")]
@@ -169,7 +161,6 @@ async fn run(
                         tokio::spawn(async move {
                             let node = signal.node_name.clone();
                             if let Err(e) = serve_relay(deps, signal).await {
-                                // Fail closed silently for the ingress (it times out); log for us.
                                 tracing::info!(node = %node, reason = %e, "declined a dial-back signal (ingress will fail closed)");
                             }
                         });
@@ -267,7 +258,6 @@ async fn open_relay(
 ) -> Result<OpenRelay, RelayError> {
     let tls_config = client_tls_config(&deps.credential.borrow()).map_err(|_| RelayError::Tls)?;
 
-    // TCP → TLS (SNI = the ingress NAME, verified against the internal CA) → WS.
     let tcp = TcpStream::connect(&signal.ingress_relay_addr)
         .await
         .map_err(|_| RelayError::Connect)?;
@@ -425,7 +415,6 @@ mod tests {
     use crate::mtls::ClientIdentity;
     use crate::ssh::connector::{ByteStream, ConnectFuture, NodeConnectError};
 
-    /// A local connector that records whether `connect` (the AgentDial) was ever invoked.
     struct SpyConnector(Arc<AtomicBool>);
     impl NodeConnector for SpyConnector {
         fn connect<'a>(&'a self, _dial: &'a NodeDial) -> ConnectFuture<'a> {
@@ -437,7 +426,6 @@ mod tests {
     }
 
     fn dummy_credential() -> watch::Receiver<CredentialSnapshot> {
-        // Never read: `serve_relay` returns before it would build the client TLS config.
         let (tx, rx) = watch::channel(CredentialSnapshot {
             identity: ClientIdentity {
                 cert_pem: Vec::new(),
@@ -449,10 +437,6 @@ mod tests {
         rx
     }
 
-    /// Even when the owner STILL believes it owns the node (`is_self_owner == true`) and holds
-    /// a live agent channel, a `DialBackSignal` whose `owner_nonce` is OLDER than the observed
-    /// ownership epoch is a stale/replay and must be dropped with `StaleNonce` — and, crucially,
-    /// WITHOUT any local node dial-back (no `AgentDial` fires).
     #[tokio::test]
     async fn a_stale_nonce_is_dropped_while_still_owner_and_fires_no_node_dial() {
         let dialed = Arc::new(AtomicBool::new(false));
@@ -464,7 +448,6 @@ mod tests {
         std::mem::forget(rx);
         std::mem::forget(registry.register("web-01", "agent-b", tx).unwrap());
 
-        // …and we still believe we own web-01, at ownership epoch (nonce) 5.
         let owner_cache = Arc::new(OwnerCache::new(Duration::from_secs(30)));
         owner_cache.observe("web-01", "gw-B", "gw-b:9444", 5);
 
@@ -480,7 +463,6 @@ mod tests {
             handshake_timeout: Duration::from_secs(5),
         };
 
-        // A signal addressed to us as owner but carrying an OLDER nonce (3 < observed 5).
         let signal = DialBackSignal {
             node_id: "node-uuid".into(),
             node_name: "web-01".into(),
@@ -506,14 +488,12 @@ mod tests {
         let relays = Arc::new(ServedRelays::new(2));
         assert_eq!(relays.active(), 0);
 
-        // Two concurrent relays for one node are allowed; the third is refused (fail closed).
         let a = relays.begin("web-01").expect("first slot");
         let b = relays.begin("web-01").expect("second slot");
         assert!(
             relays.begin("web-01").is_none(),
             "per-node cap refuses the third"
         );
-        // A DIFFERENT node is independent (the cap is per-node, not global).
         let c = relays
             .begin("web-02")
             .expect("other node has its own budget");
@@ -523,7 +503,6 @@ mod tests {
             "the drain wait sees every in-flight relay"
         );
 
-        // Releasing a slot frees per-node capacity and decrements the drain counter.
         drop(a);
         assert_eq!(relays.active(), 2);
         let _d = relays.begin("web-01").expect("a freed slot is reusable");
@@ -535,9 +514,6 @@ mod tests {
         assert_eq!(relays.active(), 0, "all relays drained");
     }
 
-    /// The HA relay counters move on the real paths: a refusal is counted with its cause,
-    /// and a served relay is counted both when it opens and when it closes (so
-    /// `served - closed` is a usable in-flight gauge).
     #[tokio::test]
     async fn relay_counters_move_on_decline_and_on_a_served_relay() {
         use crate::telemetry::metrics::testutil::CounterProbe;
@@ -583,7 +559,6 @@ mod tests {
             "the decline is credited to its own cause only"
         );
 
-        // A different cause lands on a different series (so the None above is real).
         let foreign = DialBackSignal {
             node_name: "web-99".into(),
             owner_gateway_id: "gw-B".into(),
@@ -593,7 +568,6 @@ mod tests {
         serve_relay(deps, foreign).await.unwrap_err();
         assert_eq!(probe.read(PEER_RELAYS_DECLINED, &not_owner), Some(1));
 
-        // The served path: both ends of a relay that carries bytes and then closes.
         let (mut node, mut node_peer) = tokio::io::duplex(64);
         let (mut relay, mut relay_peer) = tokio::io::duplex(64);
         let pump = tokio::spawn(async move { pump_relay(&mut node, &mut relay).await });

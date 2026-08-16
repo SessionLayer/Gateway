@@ -7,13 +7,10 @@ use crate::version;
 use std::time::Duration;
 use tonic::transport::Channel;
 
-/// Default bound on establishing the transport to the Control Plane.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Default per-RPC deadline for `Negotiate`.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A failure while negotiating the protocol version with the Control Plane.
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
     #[error("failed to connect to Control Plane at {endpoint}: {source}")]

@@ -1,5 +1,3 @@
-//! E2E inner leg: no-TOFU host verify (CA cert, pinned key, untrusted aborts, mismatch aborts).
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,7 +129,6 @@ fn gw_config() -> SshServerConfig {
             poll_timeout_secs: 20,
         },
         inner: InnerLegServerConfig {
-            // Snappy fail-closed bounds so the abort/offline cases are fast.
             connect_timeout_secs: 4,
             handshake_timeout_secs: 8,
             max_session_idle_secs: 120,
@@ -307,7 +304,6 @@ async fn untrusted_host_key_aborts_no_tofu() -> anyhow::Result<()> {
     grant(&cp, &pin);
 
     let (node, node_port) = start_node(&cp, &host_key).await?;
-    // Gate c: pin a DIFFERENT key than the node presents → abort (never TOFU).
     let trust = cp.pinned_verification(impostor.public_wire.clone());
     cp.set_node_connection(NODE_ID, &format!("127.0.0.1:{node_port}"), trust);
 
@@ -506,13 +502,11 @@ async fn addressing_wildcard_dns_suffix_is_stripped() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The client addresses the node by its HUMAN NAME (`web-01`), the CP resolves it to a DISTINCT id, and the whole downstream keys
-/// on that CP-resolved id (dial + inner-cert). Proves the Gateway forwards the NAME and does
-/// NOT leak the raw parsed string past resolution — the regression guard for the
-/// downstream fix (NodeTarget/NodeDial.node_id -> context.node_id): without it,
-/// SignContext.node_id is the parsed name "web-01" while the session token is bound to the
-/// resolved id, so SignSessionCertificate rejects (ctx.node_id != token.node_id) and the
-/// session fails closed. With the fix the end-to-end session succeeds.
+/// The CP resolves the human name (`web-01`) to a DISTINCT id and everything downstream
+/// (dial + inner cert) keys on that resolved id. If the raw parsed string leaked past
+/// resolution, `SignContext.node_id` would be "web-01" while the session token is bound
+/// to the resolved id, so `SignSessionCertificate` rejects (ctx.node_id != token.node_id)
+/// and the session fails closed.
 #[tokio::test]
 async fn addressing_by_name_resolves_to_a_distinct_cp_id() -> anyhow::Result<()> {
     const NODE_UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -552,8 +546,7 @@ async fn addressing_by_name_resolves_to_a_distinct_cp_id() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Write `content` to `path` inside the client container (small config/known_hosts
-/// files). `content` must contain no single quotes (ssh_config / base64 keys don't).
+/// `content` must contain no single quotes (ssh_config / base64 keys don't).
 async fn write_client_file(container: &ContainerAsync<GenericImage>, path: &str, content: &str) {
     let (code, _o, e) = ssh_exec(
         container,
@@ -567,8 +560,6 @@ async fn write_client_file(container: &ContainerAsync<GenericImage>, path: &str,
     assert_eq!(code, Some(0), "write {path} failed: {e}");
 }
 
-/// The `@cert-authority * <host-CA>` known_hosts line the client installs once so it
-/// trusts the Gateway's outer host cert for the node namespace (the consensual MITM).
 fn cert_authority_line(cp: &MockCp) -> String {
     let ca = ssh_key::PublicKey::from_bytes(&cp.host_ca_public_wire())
         .unwrap()

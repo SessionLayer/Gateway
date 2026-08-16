@@ -1,44 +1,12 @@
 #!/usr/bin/env bash
 #
-# Full-stack cross-repo E2E — the REAL CP jar + REAL Gateway binary + REAL node +
-# REAL stock ssh client, together, driven through the REAL CP Authorize decision.
-# This is the proof the per-repo Docker suites (all MockCp) structurally cannot give.
-#
-# It lives INSIDE the Gateway repo (committed) so it runs in CI:
-# .github/workflows/fullstack-e2e.yml checks out CP + Agent + Gateway, builds the CP
-# boot jar and the Agent binary, and invokes this script with a clean env interface
-# (see README.md):
-#
-#   CP_JAR       (required)  path to the real controlplane-*.jar
-#   AGENT_BIN    (optional)  path to the real sessionlayer-agent binary (agent topology)
-#   GATEWAY_BIN  (optional)  path to the built gateway binary (else this builds it)
-#   TOPOLOGY     (optional)  core | agent | all   (default: core)
-#
-# Topology (CORE, the default): single-instance CP + agentless Gateway + one node
-# container (Debian-13 sshd trusting the CP SESSION CA via TrustedUserCAKeys) + a
-# stock-ssh client container.
-#
-# The run is also the FIRST-INSTALL acceptance test. Everything an install needs — the
-# first admin, a machine credential, the mTLS trust anchor, the session CA public key
-# the node must trust, the customer recording key, the WORM default, a data-plane rule,
-# a client pin, the Gateway enrolment token and the node registration — is provisioned
-# over the REST API with the database made unreachable, and the run ends by decrypting
-# the session's recording with a private key the Control Plane never saw. If any of
-# that reaches for a database credential the run dies instead of quietly passing.
-#
-# The CP + Gateway run as HOST processes; the node + infra run in
-# containers with mapped ports. The Gateway dials the node at 127.0.0.1:<node_port>;
-# the client container (--network host) dials the Gateway at 127.0.0.1:<gw_ssh_port>.
-#
-# Ports default HIGH and ENV-overridable so a run coexists with a developer's parent
-# dev stack. Cross-repo, so NOT part of `cargo nextest` — run it (under the build
-# lock on a small box) via: flock /tmp/sl-build.lock bash tests/fullstack/run.sh
+# Cross-repo, so NOT part of `cargo nextest` — run it (under the build lock on a
+# small box) via: flock /tmp/sl-build.lock bash tests/fullstack/run.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GW_REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# ── knobs (all ENV-overridable) ──────────────────────────────────────────────
 TOPOLOGY="${TOPOLOGY:-core}"
 FS_PG_PORT="${FS_PG_PORT:-55432}"
 FS_MINIO_PORT="${FS_MINIO_PORT:-59000}"
@@ -57,22 +25,16 @@ FS_GW_SSH_PORT="${FS_GW_SSH_PORT:-12201}"
 # CP's database, not this directory. preflight() logs the resolved path so it never has
 # to be guessed at.
 WORKDIR="${SL_FS_WORKDIR:-/tmp/sl-fullstack-$$}"
-WAIT_SECS="${WAIT_SECS:-300}"   # CP-boot healthz wait; generous for shared-box CPU starvation
+WAIT_SECS="${WAIT_SECS:-300}"
 GW_NAME="${GW_NAME:-gw-fullstack}"
 NODE_NAME="${NODE_NAME:-web-01}"
 NODE_LOGIN="${NODE_LOGIN:-deploy}"
-FS_NODE_PORT="${FS_NODE_PORT:-12222}"   # node sshd port (host network; see start_node WHY)
-# loopback (default): node on --network host, all-loopback — the only topology an inner-cert
-# source-address pin could ever satisfy. bridge: node on a docker port-map so it sees a DISTINCT
-# SNAT IP, which is the multi-host proof that the inner cert carries no source-address pin.
-# Node netmode: honor an explicit FS_NODE_NETMODE; otherwise TOPOLOGY=all defaults to the BRIDGE
-# (multi-host, distinct-SNAT-IP) variant — the permanent regression guard against re-introducing
-# that pin — and every other topology to loopback.
+FS_NODE_PORT="${FS_NODE_PORT:-12222}"
 FS_NODE_NETMODE="${FS_NODE_NETMODE:-}"
 if [[ -z "$FS_NODE_NETMODE" ]]; then
   [[ "$TOPOLOGY" == all ]] && FS_NODE_NETMODE=bridge || FS_NODE_NETMODE=loopback
 fi
-DENY_LOGIN="${DENY_LOGIN:-dba}"          # a node login the CP never grants (deny-path negative)
+DENY_LOGIN="${DENY_LOGIN:-dba}"
 # ── TOPOLOGY=agent ───────────────────────────────────────────────────────────
 # The Gateway's agent-facing transport, which the Agent dials OUT to. Bound on all
 # interfaces (not loopback) because the Agent runs in a bridge-network container and
@@ -80,26 +42,14 @@ DENY_LOGIN="${DENY_LOGIN:-dba}"          # a node login the CP never grants (den
 # Gateway's NAME, which is the dNSName SAN the CP stamps into it.
 FS_GW_AGENT_PORT="${FS_GW_AGENT_PORT:-12444}"
 AGENT_NODE_CONTAINER="sl-fs-agent-node"
-# The agent node's sshd port. Distinct from FS_NODE_PORT so the two topologies can coexist,
-# and never 22: the Agent splices to this port, and a port the harness allocated cannot be
-# confused with whatever the host itself runs on 22.
 FS_AGENT_NODE_PORT="${FS_AGENT_NODE_PORT:-12223}"
 AGENT_NODE_IMAGE="sessionlayer-gw-fullstack-agentnode:test"
-# A node registered with an anchor that no Agent ever joins: the `unknown` health case
-# (agent-connected, anchored, never claimed). Costs one REST call and no container.
 UNJOINED_NODE="${UNJOINED_NODE:-agent-unjoined}"
-# The Gateway caps the Control Plane's decision_ttl with this, and a channel opened past
-# the cap is re-authorized. Deliberately short so the multiplexed-channel re-validate can
-# be crossed inside a test run; every other case opens its channel immediately.
 GW_MAX_DECISION_TTL_SECS="${GW_MAX_DECISION_TTL_SECS:-8}"
-DECRYPT_BIN="${DECRYPT_BIN:-$GW_REPO/target/debug/examples/decrypt_recording}"  # opens the sealed object
+DECRYPT_BIN="${DECRYPT_BIN:-$GW_REPO/target/debug/examples/decrypt_recording}"
 CLIENT_IDENTITY="${CLIENT_IDENTITY:-fullstack-user}"
 MARKER="FULLSTACK_OK_$$"
 KEEP_UP="${KEEP_UP:-}"
-# The Key Vault double's own hostname (never an IP): the SDK's challenge policy only
-# attaches a token when the request host is the challenge's `resource` host or a
-# subdomain of it, and an IP literal can satisfy neither. Must resolve to 127.0.0.1 —
-# ensure_keyvault_hostname adds that /etc/hosts mapping if it is not already present.
 KEYVAULT_HOSTNAME="${KEYVAULT_HOSTNAME:-sl.vault.azure.net}"
 # /etc/hosts is host-level state shared by every run on the box, so "did I
 # add it" (a single process-local boolean) is not enough to decide "may I remove it" —
@@ -110,15 +60,7 @@ KEYVAULT_HOSTNAME="${KEYVAULT_HOSTNAME:-sl.vault.azure.net}"
 # "check/add/register" and "deregister/check/remove" atomic across concurrent processes.
 KEYVAULT_HOSTS_LOCK="/tmp/sl-fullstack-keyvault-hosts.lock"
 KEYVAULT_HOSTS_REFS_DIR="/tmp/sl-fullstack-keyvault-hosts.refs"
-# Set while the double is armed with the wrong_key fault (assert_keyvault_wrong_key_rejected)
-# and cleared once restored. cleanup() checks this and restores unconditionally: a `die`
-# partway through that scenario would otherwise skip the tail-end restore call, leaving
-# the double faulted for whatever runs next — KEEP_UP inspection or a later run entirely.
 KEYVAULT_FAULT_MODE_ARMED=""
-# LocalStack's KMS, which does real P-256 key generation and real ECDSA signing over the
-# real AWS protocol — so this leg exercises the Control Plane's actual SDK path (request
-# signing, endpoint resolution, the credential chain, DER responses) rather than a double
-# of our own interface. There is no hand-written KMS double anywhere in this repo.
 KMS_IMAGE="${KMS_IMAGE:-localstack/localstack:4}"
 KMS_CONTAINER="sl-fs-kms"
 # A FIXED port, unlike the Key Vault double's OS-assigned one. The Control Plane's
@@ -126,24 +68,12 @@ KMS_CONTAINER="sl-fs-kms"
 # this container — which is exactly when docker hands a `0` host port a different number.
 FS_KMS_PORT="${FS_KMS_PORT:-14566}"
 KMS_REGION="${KMS_REGION:-us-east-1}"
-# LocalStack answers for the zero account. The Control Plane anchors every key ARN to the
-# partition/region/account it is configured with, so these two have to agree or adoption
-# is refused before a single KMS call is made.
 KMS_ACCOUNT_ID="${KMS_ACCOUNT_ID:-000000000000}"
 KMS_ENDPOINT="http://127.0.0.1:${FS_KMS_PORT}"
-# LocalStack accepts any credential, but the SDK's default chain has to resolve SOME
-# credential or the client refuses to build — which would fail the run for a reason that
-# has nothing to do with what is under test. These are LocalStack's own documented values.
 KMS_ACCESS_KEY_ID="${KMS_ACCESS_KEY_ID:-test}"
 KMS_SECRET_ACCESS_KEY="${KMS_SECRET_ACCESS_KEY:-test}"
-# The harness's own create-key/get-public-key calls land in the same container log the
-# sign counter is read from, so what "untouched" means for KMS is a baseline, not zero.
 KMS_BASELINE_GETPUBKEY=0
-# Captured by adopt_session_ca_onto_kms before its operator phase opens (docker is
-# deliberately unavailable inside one) and compared by assert_kms_backed_session after.
 KMS_PUBKEYS_BEFORE_ADOPTION=0
-# Where the KMS request log is copied when the container is stopped, so the counters
-# survive the container being pruned out from under them (see kms_request_log).
 KMS_LOG_SNAPSHOT=""
 # WORKDIR is a shared, fixed path (by default): a second run's preflight (rm -rf
 # "$WORKDIR") can delete a prior run's logs before anyone reads them, on a box where
@@ -160,11 +90,9 @@ MINIO_PASS="sessionlayer-dev-secret"
 # address, so a `localhost` that resolved to ::1 would be judged against a rule the
 # operator did not think they were writing.
 CP_REST="http://127.0.0.1:${FS_CP_REST_PORT}"
-ADMIN_ID="e2e-admin"          # the machine service account the install creates over REST
-ADMIN_SECRET=""               # issued by the API; never chosen here
+ADMIN_ID="e2e-admin"
+ADMIN_SECRET=""
 ADMIN_TOKEN=""
-# The escape-hatch operator. Deployment configuration arms it, it claims the printed
-# bootstrap credential, it creates the machine identity above, and then it is done.
 BOOTSTRAP_USER="${BOOTSTRAP_USER:-fs-install-operator}"
 BOOTSTRAP_PASSWORD=""
 BOOTSTRAP_PASSWORD_HASH=""
@@ -177,7 +105,6 @@ NODE_CONTAINER="sl-fs-node"
 COMPOSE=(docker compose -f "$SCRIPT_DIR/infra-compose.yml")
 export FS_PG_PORT FS_MINIO_PORT FS_MINIO_CONSOLE_PORT   # consumed by infra-compose.yml
 
-# ── logging ──────────────────────────────────────────────────────────────────
 log()  { printf '\033[36m[fs-e2e]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m[fs-e2e] OK:\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m[fs-e2e] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -236,9 +163,9 @@ trap cleanup EXIT
 # the container and sails straight past a host-PATH stub. So the phases that are pure
 # REST shadow `docker` as well, and `db_fixture` — a shell function, which bypasses PATH
 # entirely — refuses to run at all while any operator phase is open.
-SHIM_NO_DB=""       # psql and friends; on PATH for the whole run, never lifted
-SHIM_NO_DOCKER=""   # a docker stub; added only for the phases that need no container
-OPERATOR_PHASE=""   # the label of the operator step in flight, empty between them
+SHIM_NO_DB=""
+SHIM_NO_DOCKER=""
+OPERATOR_PHASE=""
 
 install_operator_shims() {
   SHIM_NO_DB="$WORKDIR/shim-no-db"
@@ -255,7 +182,7 @@ shim_stub() {
   chmod +x "$1"
 }
 
-operator_step() {  # $1=label; pass `rest-only` as $2 to also make docker unavailable
+operator_step() {
   PATH="${PATH#"$SHIM_NO_DOCKER":}"
   OPERATOR_PHASE="$1"
   if [[ "${2:-}" == rest-only ]]; then PATH="$SHIM_NO_DOCKER:$PATH"; fi
@@ -268,29 +195,24 @@ operator_flow_end() {
   ok "the first install completed end to end with no database credential used at any point"
 }
 
-# The harness's ONLY database access, and never an operator step: each call site says why
-# it is a fixture or an assertion rather than something an operator performs.
 db_fixture() {
   [[ -z "$OPERATOR_PHASE" ]] \
     || die "the harness reached for the database during the operator step '$OPERATOR_PHASE' — the first install is not API-only"
   "${COMPOSE[@]}" exec -T postgres psql -U sessionlayer -d sessionlayer -v ON_ERROR_STOP=1 "$@"
 }
 
-# ── REST plumbing ────────────────────────────────────────────────────────────
-# One place where an API call is made, so every step fails the same way and the server's
-# RFC 9457 problem body reaches the transcript instead of a bare exit code.
 API_AUTH=()
 use_basic_credential()   { API_AUTH=(-u "$BOOTSTRAP_USER:$BOOTSTRAP_PASSWORD"); }
 use_machine_credential() { API_AUTH=(-H "Authorization: Bearer $ADMIN_TOKEN"); }
 
-api() {  # $1=METHOD $2=path [$3=json body] -> body then a trailing line with the status
+api() {
   local method="$1" path="$2" body="${3:-}"
   local args=(-s -w $'\n%{http_code}' -X "$method" "$CP_REST$path" "${API_AUTH[@]}")
   if [[ -n "$body" ]]; then args+=(-H 'Content-Type: application/json' -d "$body"); fi
   curl "${args[@]}"
 }
 
-api_ok() {  # same, but a non-2xx is fatal and only the body is returned
+api_ok() {
   local out code
   out="$(api "$@")" || die "curl could not reach $1 $2"
   code="$(printf %s "$out" | tail -1)"
@@ -301,7 +223,7 @@ api_ok() {  # same, but a non-2xx is fatal and only the body is returned
 # Cold-start provisioning (the CA rows, the operator-settings singleton) can still be
 # running when /v1/healthz goes green, so the readiness gate is the API serving what the
 # install actually needs rather than a row count.
-api_ok_eventually() {  # $1=path
+api_ok_eventually() {
   local deadline=$((SECONDS + 180)) out code
   while :; do
     out="$(api GET "$1")"
@@ -342,7 +264,7 @@ session_ids() {
     | python3 -c 'import json,sys;print(" ".join(s["id"] for s in json.load(sys.stdin).get("items") or []))'
 }
 
-json_get() {  # $1=json document $2=top-level key -> the value, or empty when absent
+json_get() {
   printf %s "$1" | python3 -c '
 import json, sys
 v = json.load(sys.stdin).get(sys.argv[1])
@@ -361,7 +283,7 @@ preflight() {
   [[ -n "${CP_JAR:-}" ]] || die "CP_JAR must point at the real controlplane boot jar"
   [[ -f "$CP_JAR" ]]     || die "CP_JAR does not exist: $CP_JAR"
   case "$TOPOLOGY" in
-    core|all) : ;;  # live: loopback (core) / bridge multi-host guard (all)
+    core|all) : ;;
     agent)
       [[ -n "${AGENT_BIN:-}" ]] || die "TOPOLOGY=agent needs AGENT_BIN pointing at the real sessionlayer-agent binary"
       [[ -x "$AGENT_BIN" ]]     || die "AGENT_BIN is not executable: $AGENT_BIN" ;;
@@ -372,7 +294,6 @@ preflight() {
   ok "preflight: CP_JAR=$CP_JAR TOPOLOGY=$TOPOLOGY workdir=$WORKDIR (psql shadowed for the whole run)"
 }
 
-# ── build the Gateway binary (unless supplied) + the node/client fixture images ─
 build_artifacts() {
   if [[ -z "${GATEWAY_BIN:-}" ]]; then
     log "building the Gateway binary (cargo build -p gateway)"
@@ -382,8 +303,6 @@ build_artifacts() {
   fi
   [[ -x "$GATEWAY_BIN" ]] || die "GATEWAY_BIN not executable: $GATEWAY_BIN"
 
-  # The recording decrypt-prover: reuses the production seal:: code to ECIES-open
-  # the WORM object with the customer PRIVATE key. Built from the workspace unless supplied.
   if [[ ! -x "$DECRYPT_BIN" ]]; then
     log "building the recording decrypt-prover (cargo build -p gateway-core --example decrypt_recording)"
     ( cd "$GW_REPO" && CARGO_INCREMENTAL=0 cargo build -p gateway-core --example decrypt_recording >/dev/null 2>&1 ) \
@@ -391,15 +310,12 @@ build_artifacts() {
   fi
   [[ -x "$DECRYPT_BIN" ]] || die "DECRYPT_BIN not executable: $DECRYPT_BIN"
 
-  # Build the fixture images. The ssh-client image compiles OpenSSH (minutes), so
-  # reuse an already-built image on a re-run unless FS_FORCE_BUILD is set. CI starts
-  # clean (no image) and builds once.
   build_image_once "$NODE_IMAGE"   "$GW_REPO/tests/fixtures/sshd"       "node"
   build_image_once "$CLIENT_IMAGE" "$GW_REPO/tests/fixtures/ssh-client" "ssh-client"
   ok "gateway=$GATEWAY_BIN; node+client images ready"
 }
 
-build_image_once() {  # $1=tag $2=context $3=label
+build_image_once() {
   if [[ -z "${FS_FORCE_BUILD:-}" ]] && docker image inspect "$1" >/dev/null 2>&1; then
     log "reusing existing $3 image ($1); set FS_FORCE_BUILD=1 to rebuild"
     return
@@ -423,7 +339,7 @@ start_infra() {
 # truststore the CP jar can use to validate it. Copy (never replace) the JDK's own
 # cacerts: handing the CP a truststore holding ONLY our double's cert would silently
 # strip every other trust anchor the process needs.
-build_keyvault_trust_material() {  # $1=dir
+build_keyvault_trust_material() {
   local D="$1" java_home cacerts
   keytool -genkeypair -alias keyvault-double -keyalg EC -groupname secp256r1 -sigalg SHA256withECDSA \
       -keystore "$D/keyvault-double.p12" -storetype PKCS12 -storepass "$KV_STOREPASS" -keypass "$KV_STOREPASS" \
@@ -462,7 +378,7 @@ ensure_keyvault_hostname() {
     flock -x 9
     resolved="$(getent hosts "$KEYVAULT_HOSTNAME" 2>/dev/null | awk '{print $1; exit}')"
     if [[ -n "$resolved" && "$resolved" != "127.0.0.1" ]]; then
-      exit 2   # already resolves to something else — refuse to shadow an unrelated entry
+      exit 2
     fi
     if [[ -z "$resolved" ]]; then
       printf '127.0.0.1 %s\n' "$KEYVAULT_HOSTNAME" | sudo -n tee -a /etc/hosts >/dev/null 2>&1 || exit 3
@@ -478,12 +394,6 @@ ensure_keyvault_hostname() {
   ok "hosts: $KEYVAULT_HOSTNAME resolves to 127.0.0.1 (this run registered as a user of the mapping)"
 }
 
-# The other half of the concurrency-safe fix: deregister this run, then remove the
-# mapping only if no run still depends on it — inside the same lock, so "is anyone still
-# using this" is never answered from a stale read. Best-effort like the rest of cleanup(): a
-# leaked ref file from a run that was `kill -9`'d before reaching here just leaves the
-# mapping in place (a loopback-only entry, harmless) rather than silently breaking a peer
-# — the failure this replaces was the opposite: an overly eager, unconditional removal.
 release_keyvault_hostname() {
   (
     flock -x 9
@@ -511,9 +421,9 @@ start_keyvault_double() {
       --keystore "$D/keyvault-double.p12" --storepass "$KV_STOREPASS" --hostname "$KEYVAULT_HOSTNAME" \
       --key-name session-ca --request-log "$D/requests.log" \
       > "$D/double.log" 2>&1 &
-  KV_PID=$!; PIDS+=("$KV_PID")   # KV_PID: assert_keyvault_fail_closed kills it explicitly
+  KV_PID=$!; PIDS+=("$KV_PID")
 
-  local deadline=$((SECONDS + 60))   # generous: a cold JVM start on a shared/CI box, like the CP's own WAIT_SECS
+  local deadline=$((SECONDS + 60))
   until KEYVAULT_URL="$(sed -n 's/^KEYVAULT_URL=//p' "$D/double.log" | head -1)"; [[ -n "$KEYVAULT_URL" ]]; do
     kill -0 "$KV_PID" 2>/dev/null || { cat "$D/double.log" >&2; die "the Key Vault double exited during startup"; }
     [[ $SECONDS -lt $deadline ]] || { cat "$D/double.log" >&2; die "the Key Vault double never printed KEYVAULT_URL"; }
@@ -538,10 +448,6 @@ start_keyvault_double() {
   ok "Key Vault double up: $KEYVAULT_URL (key=$KEY_ID); managed-identity endpoint: $MSI_ENDPOINT"
 }
 
-# Started BEFORE start_cp for the same reason the Key Vault double is: the Control Plane
-# boots with sessionlayer.ca.aws.* already pointing here, while every CA is still local,
-# so this leg can make the same claim — being configured for KMS changes nothing until a
-# CA is rotated onto it (assert_kms_untouched_before_rotation).
 start_kms_localstack() {
   log "starting LocalStack KMS on 127.0.0.1:$FS_KMS_PORT (real P-256 key generation, real ECDSA signing, real AWS protocol)"
   mkdir -p "$WORKDIR/kms"
@@ -554,9 +460,6 @@ start_kms_localstack() {
   # later assertion silently counting zero forever.
   KMS_BASELINE_GETPUBKEY="$(kms_await_count kms_get_public_key_count 1)" \
     || die "LocalStack's request log did not record the harness's own GetPublicKey — its log is not a usable call counter, so this leg cannot prove what signed anything"
-  # The same scraping discipline the Key Vault double's KEY=value banner gets: the three
-  # values every later assertion is judged against are written where the preserved
-  # evidence keeps them, not left in a shell variable that dies with the run.
   ok "LocalStack KMS up with a P-256 SIGN_VERIFY CA key ($KMS_BASELINE_GETPUBKEY GetPublicKey baseline, all the harness's own)"
 }
 
@@ -605,14 +508,7 @@ except Exception:
   done
 }
 
-# The CA key is created with the awslocal bundled INSIDE the container, so no AWS CLI is
-# needed on the host or the CI runner. Sets the two values the whole leg is judged
-# against: the ARN, which is what the CA's key_reference must be, and the SPKI, which is
-# what the Control Plane must independently end up publishing as the session CA.
-#
-# $1, when given, forces the new key's id via LocalStack's `_custom_id_` tag, which is how
-# assert_kms_wrong_key_rejected makes one ARN resolve to a second, unrelated keypair.
-kms_create_key() {  # [$1 = key id to force]
+kms_create_key() {
   local created public tag=()
   [[ -n "${1:-}" ]] && tag=(--tags "TagKey=_custom_id_,TagValue=$1")
   created="$(docker exec -e AWS_DEFAULT_REGION="$KMS_REGION" "$KMS_CONTAINER" \
@@ -625,8 +521,6 @@ kms_create_key() {  # [$1 = key id to force]
     || die "kms get-public-key failed: $public"
   KMS_PUBKEY_SPKI_B64="$(printf %s "$public" | python3 -c 'import json,sys;print(json.load(sys.stdin)["PublicKey"])')" \
     || die "could not read a public key out of the get-public-key response: $public"
-  # The Control Plane refuses a key_reference outside its configured anchor, so a mismatch
-  # here would surface as a confusing rotation failure rather than as what it is.
   [[ "$KMS_KEY_ARN" == "arn:aws:kms:$KMS_REGION:$KMS_ACCOUNT_ID:key/"* ]] \
     || die "the created key's ARN is outside the region/account the Control Plane is anchored to: $KMS_KEY_ARN"
   # The same scraping discipline the Key Vault double's KEY=value banner gets, written from
@@ -640,10 +534,6 @@ kms_create_key() {  # [$1 = key id to force]
   log "KMS_PUBKEY_SPKI_B64=$KMS_PUBKEY_SPKI_B64"
 }
 
-# `docker start` cannot revive a container that has been removed, and the one
-# assert_kms_fail_closed stopped is a prime candidate for a prune. Both branches reach the
-# same place: a restarted LocalStack has lost its keys either way, so the caller re-adopts
-# regardless of which one ran.
 kms_restart_with_fresh_key() {
   kms_restart
   kms_create_key
@@ -670,7 +560,7 @@ kms_get_public_key_count() { kms_request_log | grep -cE 'AWS kms\.GetPublicKey =
 # rather than read once: a false negative here would be indistinguishable from the Control
 # Plane never having reached KMS at all, which is exactly the finding this leg exists to
 # make trustworthy.
-kms_await_count() {  # $1=counter function $2=minimum -> the count reached (rc!=0 if never)
+kms_await_count() {
   local deadline=$((SECONDS + 20)) n
   while :; do
     n="$("$1")"
@@ -709,8 +599,6 @@ assert_cp_refuses_insecure_kms_endpoint() {
     --sessionlayer.ca.aws.allow-endpoint-override=true
 }
 
-# $1=what is being withheld  $2=the message that proves the right gate refused  $3=log file
-# $4...=extra Control Plane flags for this case
 kms_boot_must_fail() {
   local what="$1" expect="$2" out="$WORKDIR/kms/$3" rc=0
   shift 3
@@ -745,11 +633,6 @@ kms_boot_must_fail() {
   ok "boot guard: $what failed the application context (rc=$rc)"
 }
 
-# The escape-hatch password is a fresh per-run value, hashed with the very encoder the
-# Control Plane verifies it against: spring-security-crypto is lifted out of CP_JAR and
-# the hash computed by a single-file JDK program. That keeps a bcrypt tool (`htpasswd`,
-# `mkpasswd`) off the CI runner's dependency list and keeps a static credential out of
-# the repository.
 arm_bootstrap_escape_hatch() {
   local D="$WORKDIR/escape-hatch"
   mkdir -p "$D"
@@ -778,11 +661,6 @@ JAVA
   ok "escape hatch armed for '$BOOTSTRAP_USER' from deployment configuration (127.0.0.1 only)"
 }
 
-# The optional key-service CA backends. The core topology configures BOTH from boot while
-# every CA is still local — that is what makes "configuring them changes nothing until a CA
-# is actually rotated" provable. The agent topology proves the node-health and splice path
-# instead, and each backend costs a container (LocalStack is a ~1GB pull), so it boots on
-# the local CA alone. Nothing it asserts touches a key service.
 cp_key_service_flags() {
   [[ "$TOPOLOGY" == agent ]] && return 0
   printf '%s\n' \
@@ -819,7 +697,6 @@ start_cp() {
   arm_bootstrap_escape_hatch
   local ca_flags=() jvm_flags=()
   mapfile -t ca_flags < <(cp_key_service_flags)
-  # The Key Vault double's TLS is the only reason the CP needs a custom truststore.
   [[ -n "${KEYVAULT_TRUSTSTORE:-}" ]] && jvm_flags=(
     "-Djavax.net.ssl.trustStore=$KEYVAULT_TRUSTSTORE"
     -Djavax.net.ssl.trustStorePassword=changeit
@@ -843,7 +720,7 @@ start_cp() {
       --sessionlayer.rest-security.basic-auth.allowed-cidrs=127.0.0.1/32,::1/128 \
       "${ca_flags[@]}" \
       > "$WORKDIR/cp.log" 2>&1 &
-  CP_PID=$!; PIDS+=("$CP_PID")   # CP_PID: the CP-down case kills it explicitly
+  CP_PID=$!; PIDS+=("$CP_PID")
   local deadline=$((SECONDS + WAIT_SECS))
   until curl -sf "$CP_REST/v1/healthz" >/dev/null 2>&1; do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { tail -60 "$WORKDIR/cp.log" >&2; die "CP process exited during startup"; }
@@ -878,15 +755,10 @@ claim_first_admin() {
   code="$(printf %s "$resp" | tail -1)"
   [[ "$code" == 200 ]] || die "the bootstrap claim was refused (HTTP $code): $(printf %s "$resp" | sed '$d')"
 
-  # A claim that returns 200 but resolves no permissions would leave every later step to
-  # fail with a confusing 403, so prove the binding is live before going on.
   api_ok GET /v1/operator-settings > "$WORKDIR/settings-at-install.json"
   ok "first admin bootstrapped: '$BOOTSTRAP_USER' claimed the printed credential and resolves platform-admin"
 }
 
-# The escape hatch is a bootstrap tool, not a working credential. Use it exactly long
-# enough to create a proper machine identity over the API and hand over to that — which is
-# also what removes the last service-account row this harness used to insert by hand.
 provision_admin_service_account() {
   operator_step "create the admin machine identity" rest-only
   local created credential roles sa_id role_id
@@ -899,7 +771,6 @@ provision_admin_service_account() {
   ADMIN_SECRET="$(json_get "$credential" clientSecret)"
   [[ -n "$ADMIN_SECRET" ]] || die "the credential response carried no client secret: $credential"
 
-  # platform-admin is the role the bootstrap claim created; bind the machine identity to it.
   roles="$(api_ok GET /v1/roles)"
   role_id="$(printf %s "$roles" | python3 -c '
 import json, sys
@@ -911,7 +782,6 @@ for role in json.load(sys.stdin).get("items") or []:
   api_ok POST /v1/role-bindings "$(json roleId "$role_id" subjectKind user subject "$ADMIN_ID")" >/dev/null
 
   mint_admin_token
-  # The handover is only real if the machine credential carries the same authority.
   api_ok GET /v1/operator-settings >/dev/null
   ok "machine identity '$ADMIN_ID' created over REST, bound to platform-admin, and now in use"
 }
@@ -940,7 +810,6 @@ export_trust_material() {
   anchor="$(api_ok_eventually /v1/cas/mtls/trust-anchor)"
   printf %s "$anchor" | python3 -c 'import sys,json;sys.stdout.write(json.load(sys.stdin)["pem"])' > "$D/ca.pem"
   openssl x509 -in "$D/ca.pem" -noout -subject >/dev/null || die "the trust-anchor PEM did not parse"
-  # The response must be the certificate and nothing adjacent to it.
   ! grep -qi 'PRIVATE KEY' <<<"$anchor" || die "the trust-anchor response contained private key material"
   served="$(json_get "$anchor" fingerprintSha256)"
   computed="$(openssl x509 -in "$D/ca.pem" -outform der | sha256sum | cut -d' ' -f1)"
@@ -954,8 +823,6 @@ export_trust_material() {
   grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9]+) [A-Za-z0-9+/]+=*( |$)' "$D/session_ca.line" \
     || die "the exported session CA is not an OpenSSH public-key line: $SESSION_CA_LINE"
   ! grep -qi 'PRIVATE' <<<"$ca" || die "the CA public-key response contained private key material"
-  # An operator installs this line by hand, so what the API says the key is has to be what
-  # ssh-keygen makes of the line it served.
   line_fingerprint="$(ssh-keygen -lf "$D/session_ca.line" | awk '{print $2}')"
   [[ "$line_fingerprint" == "$(json_get "$ca" fingerprint)" ]] \
     || die "the served fingerprint does not match the served key: $line_fingerprint vs $(json_get "$ca" fingerprint)"
@@ -1016,7 +883,6 @@ print(json.dumps(body))')")"
   ok "customer recording key provisioned (sha256 $fingerprint); WORM default ratcheted to compliance"
 }
 
-# The grant the session will be authorized by, and the key the client authenticates with.
 create_grants() {
   operator_step "create the data-plane rule and the client pin" rest-only
   local D="$WORKDIR" fingerprint
@@ -1066,7 +932,6 @@ issue_gateway_enrollment_token() {
   minted="$(api_ok POST /v1/gateway-enrollment-tokens "$(json gatewayName "$GW_NAME" ttlSeconds %7200)")"
   GW_ENROLL_TOKEN="$(json_get "$minted" token)"
   [[ -n "$GW_ENROLL_TOKEN" ]] || die "the mint returned no token: $minted"
-  # The raw value is returned once and never again: the list path must not carry it.
   listed="$(api_ok GET /v1/gateway-enrollment-tokens)"
   ! grep -qF "$GW_ENROLL_TOKEN" <<<"$listed" || die "the list response leaked the raw enrolment token"
   ok "Gateway enrolment token minted over REST (single-use, $GW_NAME)"
@@ -1083,7 +948,7 @@ start_node() {
   log "generating the node host key (pinned; no TOFU)"
   rm -f "$D/node_host_key" "$D/node_host_key.pub"
   ssh-keygen -t ed25519 -N '' -f "$D/node_host_key" -q
-  NODE_HOSTKEY_LINE="$(awk '{print $1" "$2}' "$D/node_host_key.pub")"     # 'ssh-ed25519 AAAA...' (no comment)
+  NODE_HOSTKEY_LINE="$(awk '{print $1" "$2}' "$D/node_host_key.pub")"
   NODE_HOSTKEY_FP="$(ssh-keygen -lf "$D/node_host_key.pub" | awk '{print $2}')"
 
   # Node network mode (FS_NODE_NETMODE), and why it matters:
@@ -1116,7 +981,6 @@ start_node() {
   docker cp "$D/node_host_key"     "$NODE_CONTAINER:/etc/ssh/ssh_host_ed25519_key"
   docker cp "$D/node_host_key.pub" "$NODE_CONTAINER:/etc/ssh/ssh_host_ed25519_key.pub"
   docker start "$NODE_CONTAINER" >/dev/null
-  # sshd must be listening before the Gateway dials it.
   local deadline=$((SECONDS + 60))
   until docker logs "$NODE_CONTAINER" 2>&1 | grep -q "Server listening on"; do
     docker ps -q --filter "name=$NODE_CONTAINER" | grep -q . || { docker logs "$NODE_CONTAINER" >&2; die "node container exited"; }
@@ -1132,15 +996,10 @@ start_node() {
   ok "node up: $NODE_NAME sshd on 127.0.0.1:$NODE_PORT (netmode=$FS_NODE_NETMODE, pinned fp $NODE_HOSTKEY_FP)"
 }
 
-# Register the agentless node via the admin REST API (POST /v1/nodes), proving that surface
-# end-to-end rather than reaching into the database. The CP creates the node (connector_kind=agentless, status=active) AND the
-# pinned host anchor (runtime.node_host_key source='pinned_key') from pinnedHostKey — no SQL.
 register_node() {
   operator_step "register the node in inventory" rest-only
   log "registering $NODE_NAME via POST /v1/nodes (agentless 127.0.0.1:$NODE_PORT, pinned host key)"
   local body created
-  # Build the JSON with python reading the host-key line from the env (it has spaces + base64
-  # chars); never interpolate it into a shell-built JSON string.
   body="$(NODE_NAME="$NODE_NAME" NODE_PORT="$NODE_PORT" HK="$NODE_HOSTKEY_LINE" python3 -c '
 import json, os
 print(json.dumps({"name": os.environ["NODE_NAME"], "address": "127.0.0.1:" + os.environ["NODE_PORT"],
@@ -1206,9 +1065,7 @@ launch_gateway() {
   ok "Gateway enrolled + outer SSH leg on 127.0.0.1:$FS_GW_SSH_PORT (log: $WORKDIR/gateway.log)"
 }
 
-# Run one stock-ssh attempt `<login>%<node>` through the Gateway and echo its combined output;
-# the caller inspects the exit code + output (used by the deny-path + CP-down negatives).
-ssh_attempt() {  # $1=login $2=node $3=remote-command
+ssh_attempt() {
   docker run --rm --network host -v "$WORKDIR/client_key:/mnt/client_key:ro" --entrypoint sh \
     "$CLIENT_IMAGE" -c "cp /mnt/client_key /root/k && chmod 600 /root/k && \
       ssh -p $FS_GW_SSH_PORT -i /root/k -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
@@ -1216,8 +1073,6 @@ ssh_attempt() {  # $1=login $2=node $3=remote-command
         '$1%$2@127.0.0.1' '$3'" 2>&1
 }
 
-# The headline: a stock ssh client runs a command on the REAL node, THROUGH the
-# REAL CP Authorize decision. Returns the session output in $SESSION_OUT.
 run_session() {
   operator_step "run a real SSH session through the Gateway"
   log "ssh $NODE_LOGIN%$NODE_NAME@gw (:$FS_GW_SSH_PORT) — real CP Authorize -> real node"
@@ -1278,8 +1133,6 @@ for item in json.load(sys.stdin).get("items") or []:
   method="$(json_get "$signed" method)"
   [[ -n "$url" ]] || die "the export response carried no URL: $signed"
   [[ "$method" == GET ]] || die "the export URL is for $method, not GET"
-  # Bytes never proxy through the Control Plane: the signed URL addresses the object store
-  # directly, so this download is the operator's, not the platform's.
   rm -f "$D/obj.bin"
   curl -sf -o "$D/obj.bin" "$url" || die "the export URL did not serve the object"
   [[ -s "$D/obj.bin" ]] || die "the exported recording object is empty"
@@ -1288,8 +1141,6 @@ for item in json.load(sys.stdin).get("items") or []:
   [[ "$magic" == "SLREC1" ]] || die "the exported object is not an SLREC1 sealed object (magic='$magic')"
   size="$(wc -c < "$D/obj.bin")"
   [[ "$size" == "$RECORDING_SIZE" ]] || die "exported object size $size is not the recorded sizeBytes $RECORDING_SIZE"
-  # The platform holds only the customer PUBLIC key, so the sealed object must not carry
-  # the session plaintext.
   ! grep -qa "$MARKER" "$D/obj.bin" || die "SESSION PLAINTEXT MARKER found in the exported object — sealing failed"
 
   openssl pkcs8 -topk8 -nocrypt -in "$D/customer_key.pem" -outform DER -out "$D/customer_key.pkcs8.der" 2>/dev/null \
@@ -1336,13 +1187,10 @@ assert_recording_store_integrity() {
 assert_audit_dimensions() {
   log "asserting the connect/authorize audit event is searchable by all 5 dimensions + the correlated chain"
   mint_admin_token
-  # The correlation id is the session id, read from the sessions API rather than the
-  # database — the auditor's own view is the one worth asserting against.
   local sid
   sid="$(latest_session_id)"
   [[ -n "$sid" ]] || die "the sessions API returned no session to correlate against"
 
-  # (1) the authorize event carries the projected dims populated.
   api_ok GET "/v1/audit-events?correlationId=$sid&action=authz.decision" > "$WORKDIR/audit-authz.json"
   SID="$sid" python3 - "$WORKDIR/audit-authz.json" <<'PY' || die "authorize audit event missing a projected dimension (see audit-authz.json)"
 import sys, json, os
@@ -1357,7 +1205,6 @@ print("authorize event carries sourceIp=%s access_model=%s correlationId(ok)" % 
 PY
   ok "the authorize audit event carries source_ip + access_model + correlation_id"
 
-  # (2) a search filtered by EACH of the 5 dimensions returns at least the session's event.
   local q n
   for q in "sourceIp=127.0.0.1" "accessModel=standing" "capability=exec" "nodeLabel=env=fullstack" "correlationId=$sid"; do
     n="$(api_ok GET "/v1/audit-events?$q" \
@@ -1367,8 +1214,6 @@ PY
   done
   ok "each of source_ip / access_model / capabilities / node_labels / correlation_id is independently searchable"
 
-  # (3) the correlated path: one correlationId reconstructs the session chain
-  # (authz.decision + recording begin/upload/finalize).
   local chain
   chain="$(api_ok GET "/v1/audit-events?correlationId=$sid" \
     | python3 -c 'import sys,json
@@ -1433,9 +1278,6 @@ print(new[0] if new else "")')"
   ok "per-channel re-Authorize: the second channel re-Authorized against the real CP ($decisions decisions for session $sid) and ran"
 }
 
-# ── deny-wins at the REAL-CP integration layer, not just against the MockCp double ──
-# An ungranted login must be refused by the real CP Authorize — fail closed, and the
-# client is told only that the node is offline or unavailable.
 assert_deny_closed() {
   log "deny-path: an UNGRANTED login ($DENY_LOGIN%$NODE_NAME) must be refused by the real CP (fail closed)"
   local out rc=0
@@ -1470,18 +1312,14 @@ keyvault_sign_count() {
 # real Control Plane gap, reported and being fixed separately. Once that lands, a denied
 # event will appear where today there is none, and this check must keep passing rather
 # than start failing on what would then be a correct fix.
-certificate_issued_for_session() {  # $1 = session id
+certificate_issued_for_session() {
   api_ok GET "/v1/audit-events?correlationId=$1&action=session.sign" \
     | python3 -c 'import json,sys
 d = json.load(sys.stdin)
 print("yes" if any(i.get("outcome") == "success" for i in (d.get("items") or [])) else "no")'
 }
 
-# The session id a just-completed attempt produced, found by set difference against a
-# captured baseline — mirrors assert_channel_revalidate's own idiom: session ids are
-# random v4 UUIDs, so there is no ordering to sort by, and asserting against the wrong
-# session would read as a check that never really ran.
-new_session_id() {  # $1 = baseline session_ids() output, captured before the attempt
+new_session_id() {
   local before="$1" after
   after="$(session_ids)"
   BEFORE="$before" AFTER="$after" python3 -c '
@@ -1512,7 +1350,7 @@ assert_keyvault_untouched_before_rotation() {
 adopt_session_ca_onto_keyvault() {
   operator_step "rotate the session CA onto Key Vault" rest-only
   local D="$WORKDIR/keyvault" session_ca_id rotated backend state ref pubkey fp
-  mint_admin_token   # the token from provision_admin_service_account may have aged out by now
+  mint_admin_token
 
   session_ca_id="$(api_ok GET /v1/cas | python3 -c '
 import json, sys
@@ -1529,9 +1367,6 @@ for ca in json.load(sys.stdin).get("items") or []:
   [[ "$state" == active ]] || die "the rotated CA is not active: $rotated"
   [[ "$ref" == "$KEY_ID" ]] || die "the rotated CA's keyReference is not the vault key: $ref vs $KEY_ID"
 
-  # The CP must be serving the VAULT's public key now, not a database one — the point
-  # of moving the CA. Recompute the fingerprint independently, the same way export_trust_material
-  # already does for the original local CA.
   pubkey="$(api_ok GET /v1/cas/session/public-key)"
   [[ "$(json_get "$pubkey" publicKeySpkiDer)" == "$PUBKEY_SPKI_B64" ]] \
     || die "the CP is not publishing the vault's public key: $(json_get "$pubkey" publicKeySpkiDer) vs $PUBKEY_SPKI_B64"
@@ -1541,9 +1376,6 @@ for ca in json.load(sys.stdin).get("items") or []:
   [[ "$fp" == "$(json_get "$pubkey" fingerprint)" ]] \
     || die "the served fingerprint does not match the served Key-Vault-backed key: $fp vs $(json_get "$pubkey" fingerprint)"
 
-  # bearer=true, not just any GET: the SDK's challenge policy sends a bodyless,
-  # unauthenticated probe first (bearer=false, refused with a 401) and only replays
-  # authenticated once it has a token — only the authenticated line proves a real read.
   grep -qE '^GET .*/keys/.*bearer=true' "$KEYVAULT_REQUEST_LOG" \
     || die "the Control Plane never authenticated a read of the key from the vault at adoption — request log: $KEYVAULT_REQUEST_LOG"
   ok "session CA rotated onto Key Vault over REST (backend=$backend keyReference=$ref, fingerprint $fp); the vault's request log recorded the read"
@@ -1690,15 +1522,11 @@ assert_keyvault_fail_closed() {
   [[ $rc -ne 0 ]] || die "a session SUCCEEDED with the Key Vault double down (fail-OPEN): $out"
   grep -q KVDOWN_SHOULD_NOT_RUN <<<"$out" && die "the command RAN with the Key Vault double down — fail-open: $out"
 
-  # Load-bearing #1: the vault's OWN counter proves the Control Plane never reached it —
-  # the double is stopped, so any increase is impossible unless something else signed.
   local after_signs
   after_signs="$(keyvault_sign_count)"
   [[ "$after_signs" -eq "$before_signs" ]] \
     || die "the vault double's sign count moved ($before_signs -> $after_signs) while it was stopped — impossible unless something else is signing"
 
-  # Load-bearing #2: no certificate reached usable form for the new session, independent
-  # of the vault's own counter and of why the ssh client failed.
   mint_admin_token
   local sid
   sid="$(new_session_id "$before_sessions")"
@@ -1734,8 +1562,6 @@ assert_keyvault_fail_closed() {
 assert_kms_endpoint_override_is_logged() {
   grep -q "AWS KMS calls are redirected to $KMS_ENDPOINT by sessionlayer.ca.aws.endpoint-override" "$WORKDIR/cp.log" \
     || die "the Control Plane logged no warning that its KMS endpoint is overridden — the redirect would leave no runtime trace at all; see $WORKDIR/cp.log"
-  # The harness runs with the plaintext opt-in, so the line must say so too: an override
-  # that is also unencrypted is a strictly larger disclosure than one that is not.
   grep -q "Plaintext HTTP is permitted on it." "$WORKDIR/cp.log" \
     || die "the endpoint-override warning does not record that plaintext HTTP is permitted, which this run has enabled; see $WORKDIR/cp.log"
   ok "the Control Plane warned at startup that its KMS endpoint is overridden to $KMS_ENDPOINT, and that plaintext is permitted on it"
@@ -1766,7 +1592,7 @@ adopt_session_ca_onto_kms() {
   KMS_PUBKEYS_BEFORE_ADOPTION="$(kms_get_public_key_count)"
   operator_step "rotate the session CA onto AWS KMS" rest-only
   local D="$WORKDIR/kms" session_ca_id rotated backend state ref pubkey fp
-  mint_admin_token   # the token minted for the Key Vault leg may have aged out by now
+  mint_admin_token
 
   session_ca_id="$(api_ok GET /v1/cas | python3 -c '
 import json, sys
@@ -1783,10 +1609,6 @@ for ca in json.load(sys.stdin).get("items") or []:
   [[ "$state" == active ]] || die "the rotated CA is not active: $rotated"
   [[ "$ref" == "$KMS_KEY_ARN" ]] || die "the rotated CA's keyReference is not the KMS key ARN: $ref vs $KMS_KEY_ARN"
 
-  # The Control Plane must now be publishing the key KMS generated — the public half no
-  # node will trust unless it genuinely came from there. Compared against what KMS itself
-  # reported at create time, and the fingerprint recomputed independently, exactly as
-  # export_trust_material does for the CA an operator installs by hand.
   pubkey="$(api_ok GET /v1/cas/session/public-key)"
   [[ "$(json_get "$pubkey" publicKeySpkiDer)" == "$KMS_PUBKEY_SPKI_B64" ]] \
     || die "the CP is not publishing the KMS key's public half: $(json_get "$pubkey" publicKeySpkiDer) vs $KMS_PUBKEY_SPKI_B64"
@@ -1799,11 +1621,6 @@ for ca in json.load(sys.stdin).get("items") or []:
   ok "session CA rotated onto AWS KMS over REST (backend=$backend keyReference=$ref, fingerprint $fp)"
 }
 
-# The documented rotation procedure, as for Key Vault: the node already trusts the CAs it
-# was given before, and the KMS-backed CA is a SEPARATE trusted line appended without
-# removing them, so both verify during the overlap window. TrustedUserCAKeys is re-read on
-# every authentication attempt regardless, so the SIGHUP is not what makes this take
-# effect; it is sent because it is what an operator's runbook does after editing the file.
 redistribute_trust_for_kms_ca() {
   operator_step "redistribute trust for the KMS-backed session CA"
   [[ -n "${KMS_SESSION_CA_LINE:-}" ]] \
@@ -1872,8 +1689,6 @@ assert_kms_wrong_key_rejected() {
   kms_restart
   kms_create_key "$key_id"
 
-  # Prove the injection actually injected. If LocalStack ever returned the same ARN with the
-  # same material, every assertion below would pass while testing nothing at all.
   [[ "$KMS_KEY_ARN" == "$pinned_arn" ]] \
     || die "the impostor key did not take the pinned ARN ($KMS_KEY_ARN vs $pinned_arn) — the CA is no longer pointed at it, so this scenario would prove nothing"
   [[ "$KMS_PUBKEY_SPKI_B64" != "$pinned_spki" ]] \
@@ -1890,9 +1705,6 @@ assert_kms_wrong_key_rejected() {
   [[ $rc -ne 0 ]] || die "a session SUCCEEDED while KMS was signing with the WRONG key: $out"
   grep -q WRONGKEY_SHOULD_NOT_RUN <<<"$out" && die "the command RAN while KMS was signing with the wrong key: $out"
 
-  # KMS was genuinely reached and genuinely signed — the refusal came from the verification,
-  # not from an unreachable key service. This is what makes the scenario distinct from
-  # assert_kms_fail_closed rather than a second copy of it.
   after_signs="$(kms_await_count kms_sign_count $((before_signs + 1)))" \
     || die "KMS was never asked to sign ($before_signs -> $after_signs) — the session failed before reaching it, so this run says nothing about the pinned-key check"
 
@@ -1915,8 +1727,6 @@ assert_kms_wrong_key_rejected() {
     || die "a certificate WAS issued for session $sid even though KMS signed with the wrong key"
   ok "the wrong-key session was refused (KMS signed, $before_signs -> $after_signs; the pinned-key check rejected it; no certificate issued for session $sid)"
 
-  # Restoring is not optional: without a normal session immediately afterwards, "the session
-  # was refused" cannot be told apart from "the key swap broke the harness".
   log "restoring KMS to a key the CA can be rotated onto, and proving a normal session still runs"
   kms_create_key
   adopt_session_ca_onto_kms
@@ -1955,16 +1765,11 @@ assert_kms_fail_closed() {
   [[ $rc -ne 0 ]] || die "a session SUCCEEDED with KMS stopped (fail-OPEN): $out"
   grep -q KMSDOWN_SHOULD_NOT_RUN <<<"$out" && die "the command RAN with KMS stopped — fail-open: $out"
 
-  # Load-bearing #1. `docker logs` keeps serving a stopped container's output, so this
-  # counter stays readable exactly when it matters most: any increase now would be
-  # impossible unless something other than this KMS produced a signature.
   local after_signs
   after_signs="$(kms_sign_count)"
   [[ "$after_signs" -eq "$before_signs" ]] \
     || die "KMS's sign count moved ($before_signs -> $after_signs) while its container was stopped — impossible unless something else is signing"
 
-  # Load-bearing #2: no certificate reached usable form for the new session, independent of
-  # KMS's own counter and of why the ssh client failed.
   mint_admin_token
   local sid
   sid="$(new_session_id "$before_sessions")"
@@ -1972,9 +1777,6 @@ assert_kms_fail_closed() {
   [[ "$(certificate_issued_for_session "$sid")" == no ]] \
     || die "a certificate WAS issued for session $sid even though KMS was stopped"
 
-  # Corroborating only: names the failure as KMS-specific rather than merely confirming the
-  # two checks above. Owned by ControlPlane's AwsKmsSigner, not by anything this repo
-  # controls, so when it moves, update the string rather than the shape of this check.
   grep -q "KMS signing failed for key" "$WORKDIR/cp.log" \
     || die "cp.log shows no KMS-specific signing failure (corroborating check) — the session failed, but not visibly for the KMS reason"
   ok "with KMS stopped, the new session failed closed (rc=$rc); sign count unchanged ($before_signs); no certificate issued for session $sid; the Control Plane never fell back to local"
@@ -2054,7 +1856,6 @@ assert_spill() {
   out="$(ssh_attempt "$NODE_LOGIN" "$NODE_NAME" 'head -c 300000 /dev/zero | base64; echo SPILL_OK')" || rc=$?
   { [[ $rc -eq 0 ]] && grep -q SPILL_OK <<<"$out"; } \
     || die "large-output session failed under hardening — the ciphertext spool was likely EACCES'd (e.g. /tmp not in the Landlock set):\n$(tail -40 "$WORKDIR/gateway.log")"
-  # Spool file lives under the data-dir (created + removed there), never /tmp.
   [[ -d "$WORKDIR/gw-data/recording-spool" ]] \
     || die "expected the spool dir under the data-dir (gw-data/recording-spool)"
   ok "recorder spill under hardening=$FS_HARDENING succeeded — spool in the data-dir, strict session intact"
@@ -2101,7 +1902,6 @@ issue_agent_join_token() {
   ok "agent join token minted over REST (single-use, scoped to '$NODE_NAME')"
 }
 
-# The `unknown` arm: agent-connector, anchored at registration, no Agent will ever join it.
 register_unjoined_agent_node() {
   operator_step "register a second agent node that no Agent will join" rest-only
   local created
@@ -2205,9 +2005,7 @@ start_agent_node() {
 
 agent_log() { docker exec "$AGENT_NODE_CONTAINER" cat /agent/agent.log 2>/dev/null || true; }
 
-# The node's whole API view, by NAME. `health` and `owningGateway` are both derived at read
-# time, so this is the operator's answer and not a stored column.
-node_view() {  # $1=node name -> "<id> <health> <owningGateway>", "" if absent
+node_view() {
   # NODES_BODY is kept for the failure path. A helper that answers "" for BOTH "the API
   # refused me" and "the node is not there yet" turns a broken query into a polling timeout
   # that blames the node — which is exactly how the first version of this wasted a run.
@@ -2228,7 +2026,7 @@ for node in listed:
         break'
 }
 
-await_node_health() {  # $1=node name $2=expected health -> sets NODE_ID/NODE_HEALTH/NODE_OWNER
+await_node_health() {
   local deadline=$((SECONDS + ${3:-120})) view
   while :; do
     view="$(node_view "$1")"
@@ -2236,8 +2034,6 @@ await_node_health() {  # $1=node name $2=expected health -> sets NODE_ID/NODE_HE
     [[ "$NODE_HEALTH" != "$2" ]] || return 0
     [[ $SECONDS -lt $deadline ]] || {
       agent_log >&2
-      # The whole listing, so "the node is missing" and "the node is there with the wrong
-      # health" are distinguishable without a second run.
       printf 'GET /v1/nodes returned:\n%s\n' "$NODES_BODY" >&2
       die "node '$1' never reported health=$2 (last: health=$NODE_HEALTH owningGateway=$NODE_OWNER)"
     }
@@ -2245,10 +2041,6 @@ await_node_health() {  # $1=node name $2=expected health -> sets NODE_ID/NODE_HE
   done
 }
 
-# A live control channel is NOT sufficient for healthy. The Agent has joined a name nobody
-# registered, so the node exists with no host anchor, and the Gateway never TOFUs — every
-# session to it would abort. Reporting it healthy here would be a new lie in place of the
-# old one.
 assert_agent_node_is_unhealthy_without_an_anchor() {
   log "the joined-but-anchorless node must read unhealthy, live control channel notwithstanding"
   await_node_health "$NODE_NAME" unhealthy 180
@@ -2269,12 +2061,10 @@ print(len(d["anchors"]))' <<<"$anchors")" \
   ok "auto-created node $NODE_NAME is unhealthy with zero anchors (id=$AGENT_NODE_ID)"
 }
 
-# The repair path the published guides promise. Full atomic replace over REST, no database.
 repair_host_anchor() {
   operator_step "repair the node's host anchor over REST" rest-only
   api_ok PUT "/v1/nodes/$AGENT_NODE_ID/host-anchors" \
     "$(json pinnedHostKey "$NODE_HOSTKEY_LINE")" >/dev/null
-  # The repair has to be visible in the anchor set, not merely accepted.
   local after
   after="$(api_ok GET "/v1/nodes/$AGENT_NODE_ID/host-anchors")"
   [[ "$(python3 -c 'import json,sys;print(len(json.load(sys.stdin)["anchors"]))' <<<"$after")" == 1 ]] \
@@ -2282,8 +2072,6 @@ repair_host_anchor() {
   ok "host anchor written over REST (pinned $NODE_HOSTKEY_FP)"
 }
 
-# The headline of this topology: with an anchor AND a fresh presence claim, the node reads
-# healthy and the API names the Gateway that actually holds its control channel.
 assert_agent_node_is_healthy_and_owned() {
   log "with the anchor repaired, the node must read healthy and name its owner"
   await_node_health "$NODE_NAME" healthy 180
@@ -2292,8 +2080,6 @@ assert_agent_node_is_healthy_and_owned() {
   ok "$NODE_NAME reports health=healthy owningGateway=$GW_NAME over GET /v1/nodes"
 }
 
-# The third arm, and the one that makes the other two mean something: a node with an anchor
-# that no Agent ever claimed is `unknown`, not `healthy`.
 assert_unjoined_agent_node_is_unknown() {
   local view health
   view="$(node_view "$UNJOINED_NODE")"
@@ -2307,7 +2093,7 @@ assert_unjoined_agent_node_is_unknown() {
 # and CP-down are proven there against the same binaries, and re-proving them here would
 # spend the budget this leg needs. What is here is what only this topology can show.
 main_agent() {
-  NODE_NAME="${AGENT_NODE_NAME:-agent-01}"   # the helpers below key sessions off NODE_NAME
+  NODE_NAME="${AGENT_NODE_NAME:-agent-01}"
   preflight
   build_artifacts
   build_agent_node_image
@@ -2325,7 +2111,7 @@ main_agent() {
   launch_gateway_agent          # the agent transport must exist before the Agent dials it
   operator_flow_end
 
-  start_agent_node              # real Agent binary, real enroll, real dial-out
+  start_agent_node
   assert_agent_node_is_unhealthy_without_an_anchor
   repair_host_anchor
   register_unjoined_agent_node
@@ -2333,7 +2119,7 @@ main_agent() {
   assert_agent_node_is_healthy_and_owned
   assert_unjoined_agent_node_is_unknown
 
-  run_session                   # spliced through the Agent; the Gateway never dials the node
+  run_session
   export_and_decrypt_recording
   report_agent
 }
@@ -2361,13 +2147,11 @@ main() {
   preflight
   build_artifacts
   start_infra
-  start_keyvault_double      # before start_cp — the CP boots with azure.vault-uri already set
-  start_kms_localstack       # likewise: the CP boots with sessionlayer.ca.aws.* already set
-  assert_cp_refuses_insecure_kms_endpoint   # a boot that must fail, before the one that must not
+  start_keyvault_double
+  start_kms_localstack
+  assert_cp_refuses_insecure_kms_endpoint
   start_cp
 
-  # ── the first install: every step below is an operator step, and the database is
-  # ── unreachable throughout (see the no-database guard).
   claim_first_admin
   provision_admin_service_account
   export_trust_material
@@ -2375,44 +2159,39 @@ main() {
   create_grants
   free_gateway_name
   issue_gateway_enrollment_token
-  start_node                 # install the node with the exported TrustedUserCAKeys line
-  register_node              # POST /v1/nodes (agentless + pinned host anchor)
+  start_node
+  register_node
   launch_gateway
-  run_session                # ssh through the REAL CP Authorize -> real node
+  run_session
   export_and_decrypt_recording
   operator_flow_end
 
   assert_recording_store_integrity
-  assert_audit_dimensions    # 5 dims searchable + correlated chain
-  assert_channel_revalidate  # multiplexed re-Authorize past decision_ttl
-  assert_spill               # recorder spill lands in the Landlock-allowed data-dir
-  assert_deny_closed         # deny-wins at the real CP
+  assert_audit_dimensions
+  assert_channel_revalidate
+  assert_spill
+  assert_deny_closed
 
-  assert_keyvault_untouched_before_rotation  # proof, not just an after-the-fact read
-  # Rotate the session CA onto Key Vault (still over REST, no database credential),
-  # redistribute trust to the node, and prove the resulting session is Key-Vault-signed.
+  assert_keyvault_untouched_before_rotation
   adopt_session_ca_onto_keyvault
   redistribute_trust_for_keyvault_ca
   assert_keyvault_backed_session
-  assert_keyvault_wrong_key_rejected  # permanent (was a manual-only cycle)
+  assert_keyvault_wrong_key_rejected
   assert_keyvault_credential_flow
   operator_flow_end
 
   assert_keyvault_fail_closed  # the vault double stays down from here
 
-  # Rotate the session CA on again, to AWS KMS this time. The CA is on Key Vault when this
-  # starts, so this is a key-service-to-key-service rotation rather than local -> KMS —
-  # a stronger claim, since no signature below can be served by a database-held key.
-  assert_kms_endpoint_override_is_logged   # the redirect's only runtime trace
+  assert_kms_endpoint_override_is_logged
   assert_kms_untouched_before_rotation
   adopt_session_ca_onto_kms
   redistribute_trust_for_kms_ca
   assert_kms_backed_session
-  assert_kms_wrong_key_rejected  # the pinned-key check, at the real boundary, every run
+  assert_kms_wrong_key_rejected
   operator_flow_end
-  assert_kms_fail_closed     # ends by restoring KMS and running a normal session
+  assert_kms_fail_closed
 
-  assert_cp_down             # fail-closed — LAST (kills the CP)
+  assert_cp_down
   report
 }
 main "$@"

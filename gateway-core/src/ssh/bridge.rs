@@ -1,5 +1,3 @@
-//! Byte bridge with recorder tap (no plaintext retained or logged at this seam); backpressure on outer WRITE half.
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,7 +45,6 @@ pub struct ScpMode {
     pub target: Vec<u8>,
 }
 
-/// Tunnel direction; metadata-only (NEVER content-captured).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelDirection {
     Local,
@@ -84,19 +81,15 @@ pub struct TunnelCounters {
     pub bytes_out: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// How a bridged channel's plaintext is captured: shell/exec as asciicast v2 (ALWAYS); SFTP decode-only.
 #[derive(Debug, Clone)]
 pub enum RecChannelKind {
-    /// Interactive shell or exec: asciicast v2 (output + input).
     Terminal {
         command: Option<Vec<u8>>,
         scp: Option<ScpMode>,
         cols: u16,
         rows: u16,
     },
-    /// The SFTP subsystem: per-operation file-transfer audit only.
     Sftp,
-    /// Forwarded tunnel (metadata-only; NEVER the forwarded bytes).
     Tunnel {
         direction: TunnelDirection,
         target: String,
@@ -169,7 +162,6 @@ impl SessionRecorder for NullSessionRecorder {
     }
 }
 
-/// Non-strict degraded path only: session proceeds UNRECORDED, logged loudly.
 pub fn disabled_recorder() -> Arc<dyn SessionRecorder> {
     Arc::new(NullSessionRecorder)
 }

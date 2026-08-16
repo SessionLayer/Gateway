@@ -1,5 +1,3 @@
-//! Disable coredumps (secrets live in plaintext; `Zeroizing` and RLIMIT_CORE+DUMPABLE).
-
 pub fn disable() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {

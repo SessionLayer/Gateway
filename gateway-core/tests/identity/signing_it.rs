@@ -94,7 +94,6 @@ async fn cross_session_context_is_rejected() {
         Duration::from_secs(60),
     );
 
-    // Advisory context disagreeing with the (authoritative) token fails closed.
     let ctx = Some(SignContext {
         session_id: "sess-DIFFERENT".to_string(),
         node_id: String::new(),
@@ -140,7 +139,6 @@ async fn replayed_token_is_rejected() {
         .await
         .expect("first use of the single-use token succeeds");
 
-    // Reusing the same token is refused (single-use / replay).
     let err = signing::sign_session_certificate(channel, &token, &inner, None, RT)
         .await
         .expect_err("a replayed token must be rejected");

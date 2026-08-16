@@ -14,8 +14,6 @@ use gateway_core::ssh::recorder::{chain::HashChain, seal};
 use p256::pkcs8::DecodePrivateKey;
 use std::io::Write;
 
-/// Recompute the hash-chain head from a decrypted asciicast object exactly as the recorder does
-/// (each `\n`-terminated line is one record; a trailing partial line is the last record).
 fn recompute_chain(plaintext: &[u8]) -> String {
     let mut c = HashChain::new();
     let mut start = 0;

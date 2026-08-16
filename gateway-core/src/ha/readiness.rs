@@ -1,5 +1,3 @@
-//! Readiness HTTP surface (200/503).
-
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

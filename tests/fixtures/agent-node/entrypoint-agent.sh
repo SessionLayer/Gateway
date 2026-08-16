@@ -1,11 +1,8 @@
 #!/bin/sh
-# Start the node's Agent (non-root) then hand off to the sshd entrypoint.
-#
 # The Agent runs as `deploy`, so it cannot read /etc/ssh/ssh_host_*_key: spoofing this
 # node's host identity requires node-ROOT compromise, which is exactly why the agent
-# model raises rather than lowers the host-verification bar. It dials OUT
-# and splices to 127.0.0.1:22 — an address it reads from its own configuration, never
-# from the wire.
+# model raises rather than lowers the host-verification bar. It dials OUT and splices to
+# 127.0.0.1:22 — an address it reads from its own configuration, never from the wire.
 set -eu
 
 if [ -n "${AGENT_ENDPOINT:-}" ] && [ -f /agent/test-agent ]; then

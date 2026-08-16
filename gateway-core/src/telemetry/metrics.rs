@@ -1,7 +1,3 @@
-//! Native OTel counters for the HA / node-reachability plane. They export through the
-//! SAME meter provider [`super::init`] installs (one OTLP path, no second mechanism) and
-//! **complement** the structured log lines — the logs keep the diagnostic detail.
-//!
 //! Cardinality is an operational hazard, not a style question: every attribute value here
 //! comes from a closed Rust enum. A session id, node id, node name, agent id, lock id or
 //! source IP MUST NOT reach a metric attribute — those stay on the log line.
@@ -32,11 +28,8 @@ const OUTCOME_NODE_UNREACHABLE: &str = "node_unreachable";
 /// surfaces as a `session` outcome); `layer="session"` is the user-visible failure count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
-    /// HA owner selection and the peer relay (`ha::connector`).
     Route,
-    /// Reaching the node itself: outbound-agent dial-back and agent-channel loss.
     Dial,
-    /// The SSH surface — what the client's session actually ended as.
     Session,
 }
 
@@ -50,7 +43,6 @@ impl Layer {
     }
 }
 
-/// Bounded causes for a fail-closed node-unreachable event; one variant per call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnreachableReason {
     NoFreshOwner,
@@ -188,7 +180,6 @@ pub fn node_unreachable(reason: UnreachableReason) -> Counted {
     Counted(reason)
 }
 
-/// Why an owner declined a peer's dial-back signal. Every variant is fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayDecline {
     NotOwner,
@@ -228,16 +219,11 @@ pub fn peer_relay_declined(reason: RelayDecline) {
         .add(1, &[KeyValue::new(ATTR_REASON, reason.as_str())]);
 }
 
-/// A change in this Gateway's CP-confirmed ownership of a node — not the per-tick log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresenceTransition {
-    /// This Gateway now owns a node it did not own last tick.
     Acquired,
-    /// A peer now owns a node this Gateway owned (failover away from us).
     Standby,
-    /// Ownership handed back on drain or on the agent channel dropping.
     Released,
-    /// The release RPC failed: ownership lingers until the CP staleness TTL expires.
     ReleaseFailed,
 }
 
@@ -258,8 +244,6 @@ pub fn presence_transition(transition: PresenceTransition) {
         .add(1, &[KeyValue::new(ATTR_TRANSITION, transition.as_str())]);
 }
 
-/// Coarse CP-failure class. The gRPC status code stays in the log line (`error = %e`);
-/// promoting it to an attribute would widen the series for no alerting gain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpFailure {
     Unreachable,
@@ -368,8 +352,6 @@ pub(crate) mod testutil {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 
-    /// A real SDK meter provider feeding an in-memory exporter, with the Gateway counters
-    /// bound to it — the same wiring production gets from an OTLP provider.
     pub struct CounterProbe {
         exporter: InMemoryMetricExporter,
         provider: SdkMeterProvider,
@@ -428,17 +410,12 @@ mod tests {
     use super::testutil::CounterProbe;
     use super::*;
 
-    /// The session-layer counter moves on the real minting path, the reader can tell an
-    /// unrecorded series from a recorded one, and the log labels an operator greps come from
-    /// the same mint. Also pins the guarantee the [`Counted`] token exists for: the
-    /// `SshOutcome` variant cannot be built without it.
     #[test]
     fn node_unreachable_counts_at_the_mint_and_carries_the_log_labels() {
         let probe = CounterProbe::install();
         let relay_timeout = [(ATTR_REASON, "relay_timeout"), (ATTR_LAYER, "route")];
         let no_conn = [(ATTR_REASON, "no_node_connection"), (ATTR_LAYER, "session")];
 
-        // Nothing recorded yet: absent, not zero.
         assert_eq!(probe.read(NODE_UNREACHABLE, &no_conn), None);
         assert_eq!(probe.read(NODE_UNREACHABLE, &relay_timeout), None);
 
@@ -451,8 +428,6 @@ mod tests {
             "the span label must not drift from the counted outcome"
         );
 
-        // The SAME reader that returned None now sees the increment — so a None above is a
-        // real absence, not a broken lookup.
         assert_eq!(probe.read(NODE_UNREACHABLE, &no_conn), Some(1));
         assert_eq!(
             probe.read(NODE_UNREACHABLE, &relay_timeout),
@@ -516,10 +491,6 @@ mod tests {
         );
     }
 
-    /// The `outcome = "node_unreachable"` label may exist in exactly one place: this module.
-    /// Anywhere else it would be a log line with no counter behind it — the drift this whole
-    /// item exists to stop. The [`Counted`] token blocks that for `SshOutcome` sites at
-    /// compile time; this guards the log-only sites, which the compiler cannot see.
     #[test]
     fn the_outcome_label_is_minted_in_exactly_one_place() {
         let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");

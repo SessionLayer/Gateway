@@ -1,5 +1,3 @@
-//! Recorder + WORM: asciicast v2, customer-key encryption, hash-chain; no decrypt without key.
-
 mod support;
 
 use std::sync::Arc;

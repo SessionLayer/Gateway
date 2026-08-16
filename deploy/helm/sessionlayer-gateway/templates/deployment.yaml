@@ -125,7 +125,6 @@ spec:
           {{- end }}
         - name: config
           projected:
-            # Readable by the runtime group only, which fsGroup owns.
             defaultMode: 0440
             sources:
               - secret:

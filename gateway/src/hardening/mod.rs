@@ -1,5 +1,3 @@
-//! Tier-0 hardening: privilege drop, Landlock, seccomp (fail-closed contract).
-
 use gateway_core::config::HardeningConfig;
 
 mod coredump;
@@ -10,7 +8,7 @@ mod privdrop;
 #[cfg(target_os = "linux")]
 mod seccomp;
 
-/// Disable coredumps early (before listeners bind or secrets handled).
+/// Must run before any listener binds or any secret is in memory.
 pub fn disable_coredumps(cfg: &HardeningConfig) -> anyhow::Result<()> {
     if cfg.disable_coredumps {
         coredump::disable()?;
@@ -18,12 +16,10 @@ pub fn disable_coredumps(cfg: &HardeningConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply hardening in order: privilege drop → Landlock → seccomp (fail-closed on operator error).
 pub fn apply(cfg: &HardeningConfig, io_uring_active: bool) -> anyhow::Result<()> {
     apply_inner(cfg, io_uring_active)
 }
 
-/// Confine thread with Landlock (fail-closed: aborts process if required confinement fails).
 #[cfg(target_os = "linux")]
 pub fn confine_thread_for_landlock(cfg: &gateway_core::config::LandlockConfig) {
     if !cfg.enabled {

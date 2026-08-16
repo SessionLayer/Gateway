@@ -1,5 +1,3 @@
-//! Protocol versioning (N-1 window: 1.0–1.1; no common version fails closed).
-
 use crate::pb::{ComponentInfo, ProtocolVersion};
 
 pub const COMPONENT_NAME: &str = "SessionLayer Gateway";
@@ -81,7 +79,6 @@ mod tests {
 
     #[test]
     fn resolves_to_highest_common_minor() {
-        // Client [1.0, 1.0] vs server [1.0, 1.2] -> 1.0 (order-independent).
         assert_eq!(
             resolve_common_version((1, 0), (1, 0), (1, 0), (1, 2)),
             Some((1, 0))
@@ -90,7 +87,6 @@ mod tests {
             resolve_common_version((1, 0), (1, 2), (1, 0), (1, 0)),
             Some((1, 0))
         );
-        // Both support up to 1.3 -> pick 1.3.
         assert_eq!(
             resolve_common_version((1, 0), (1, 3), (1, 1), (1, 3)),
             Some((1, 3))
@@ -99,7 +95,6 @@ mod tests {
 
     #[test]
     fn n_minus_one_window_overlaps() {
-        // A 1.1 peer keeps min at 1.0 so it still talks to a 1.0 peer.
         assert_eq!(
             resolve_common_version((1, 0), (1, 1), (1, 0), (1, 0)),
             Some((1, 0))

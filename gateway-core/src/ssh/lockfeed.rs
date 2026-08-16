@@ -1,5 +1,3 @@
-//! CP → Gateway lock-feed stream client: deny wins, never clears locks on disconnect.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,13 +9,9 @@ use crate::pb::{lock_event::Event, StreamLocksRequest};
 use crate::ssh::locks::{LiveSessionRegistry, LockSet};
 use crate::version;
 
-/// Reconnect backoff bounds for the lock feed.
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
-/// ±50% jitter (matches the Agent's and the NATS backend's reconnect jitter)
-/// so a CP restart doesn't resync every Gateway's lock-feed retry timer.
-/// `sample` is `[-1, 1]`; split out from the RNG draw so the bound is unit-testable.
 fn jittered_backoff(base: Duration, sample: f64) -> Duration {
     base.mul_f64(1.0 + 0.5 * sample.clamp(-1.0, 1.0))
 }
@@ -60,14 +54,12 @@ impl LockFeedClientTask {
                 return;
             }
             match self.connect_and_stream(&mut shutdown, &mut backoff).await {
-                Ok(()) => return, // clean shutdown
+                Ok(()) => return,
                 Err(e) => {
                     self.lock_set.mark_disconnected();
                     tracing::warn!(error = %e, outcome = "lock_feed_disconnected", "lock feed stream down; deny-set retained (fail closed), reconnecting");
                 }
             }
-            // Jittered: a CP restart must not resync every Gateway's lock-feed
-            // reconnect in lockstep, the same ±50% convention used fleet-wide elsewhere.
             tokio::select! {
                 _ = tokio::time::sleep(jittered_backoff(backoff, random_sample())) => {}
                 res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { return; } }
@@ -161,14 +153,12 @@ impl LockFeedClientTask {
 mod tests {
     use super::*;
 
-    /// Reconnect jitter stays within ±50% of the base backoff.
     #[test]
     fn jittered_backoff_stays_within_half_bounds() {
         let base = Duration::from_secs(2);
         assert_eq!(jittered_backoff(base, 0.0), base);
         assert_eq!(jittered_backoff(base, -1.0), Duration::from_secs(1));
         assert_eq!(jittered_backoff(base, 1.0), Duration::from_secs(3));
-        // Out-of-range samples clamp rather than invert or overshoot.
         assert_eq!(jittered_backoff(base, -9.0), Duration::from_secs(1));
         assert_eq!(jittered_backoff(base, 9.0), Duration::from_secs(3));
     }

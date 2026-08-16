@@ -1,19 +1,14 @@
-//! OpenTelemetry tracing: Gateway is trace root; mints root span on accept; injects W3C context to CP RPCs.
-//! Off by default (OTEL_EXPORTER_OTLP_ENDPOINT enables it); uses tonic/ring transport. Carries correlation only, never content.
-//! Plaintext/keys/OTP/tokens never enter spans (test greps for secret markers).
+//! Plaintext/keys/OTP/tokens never enter spans: correlation only, never content.
 
 pub mod metrics;
 
 use opentelemetry::propagation::{Injector, TextMapPropagator};
-// `with_endpoint` on the OTLP exporter builder is provided by this trait.
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-/// Standard, non-content span attribute keys. Only IDs, enums,
-/// outcomes — never secret content.
 pub mod attr {
     pub const SESSION_ID: &str = "sessionlayer.session_id";
     pub const CORRELATION_ID: &str = "sessionlayer.correlation_id";
@@ -235,7 +230,6 @@ mod tests {
         let mut md = MetadataMap::new();
         let mut inj = MetadataInjectorMut(&mut md);
         inj.set("traceparent", "00-abc-def-01".to_string());
-        // A non-ASCII key is skipped, never panics.
         inj.set("tráce", "x".to_string());
         assert_eq!(
             md.get("traceparent")
@@ -247,7 +241,6 @@ mod tests {
 
     #[test]
     fn service_name_defaults_when_unset() {
-        // Do not clobber a real env in CI; only assert the default path shape.
         if std::env::var(SERVICE_NAME_ENV).is_err() {
             assert_eq!(service_name(), DEFAULT_SERVICE_NAME);
         }
@@ -271,8 +264,6 @@ mod tests {
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
 
         tracing::subscriber::with_default(subscriber, || {
-            // A `gateway.session`-shaped root that declares the two fields the marker
-            // records after creation (exactly as the real handler span does).
             let span = tracing::info_span!(
                 "gateway.session",
                 sessionlayer.outcome = tracing::field::Empty,
@@ -321,7 +312,6 @@ mod tests {
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
 
         tracing::subscriber::with_default(subscriber, || {
-            // CP-down at auth: exactly what `note_cp_down` does.
             let cp_down = tracing::info_span!(
                 "gateway.session",
                 marker = "cp_down",
@@ -332,8 +322,6 @@ mod tests {
                 let _e = cp_down.enter();
                 record_span_fail_closed(&cp_down, "cp_unavailable");
             }
-            // Ordinary AuthFailed: russh rejects, `close_with` never runs, and nothing
-            // marks the span — it ends Unset (normal noise, not a fault).
             let auth_noise = tracing::info_span!(
                 "gateway.session",
                 marker = "auth_noise",
@@ -368,11 +356,6 @@ mod tests {
         );
     }
 
-    /// The two native saturation gauges emit the live state on export: a
-    /// session raises `live_sessions`, and an unhealthy
-    /// lock feed drops `lock_feed_healthy` to 0. Drive a real [`LockSet`] as the
-    /// health source (exactly what `register_gateway_gauges` wires) and read the
-    /// values back through an in-memory exporter.
     #[test]
     fn native_gauges_reflect_live_state() {
         use opentelemetry::metrics::MeterProvider as _;
@@ -387,9 +370,6 @@ mod tests {
             .build();
         let meter = provider.meter("test");
 
-        // `live` is an atomic the test bumps to stand in for the registry length
-        // (production wires `live_sessions.len()`); `lock` is the REAL LockSet whose
-        // `healthy()` the production gauge reads verbatim.
         let live = Arc::new(AtomicU64::new(0));
         let lock = Arc::new(crate::ssh::locks::LockSet::new(30, 30));
         let live_src = live.clone();
@@ -418,17 +398,14 @@ mod tests {
             0
         };
 
-        // Empty registry + a disconnected feed → 0 / 0.
         assert_eq!(read("sessionlayer.gateway.live_sessions"), 0);
         assert_eq!(read("sessionlayer.gateway.lock_feed_healthy"), 0);
 
-        // A live session raises live_sessions; a snapshot makes the feed healthy → 1.
         live.store(3, Ordering::SeqCst);
         lock.replace_snapshot(Vec::new(), 1);
         assert_eq!(read("sessionlayer.gateway.live_sessions"), 3);
         assert_eq!(read("sessionlayer.gateway.lock_feed_healthy"), 1);
 
-        // The feed drops (disconnect) → lock_feed_healthy back to 0 (fail-closed signal).
         lock.mark_disconnected();
         assert_eq!(read("sessionlayer.gateway.lock_feed_healthy"), 0);
     }

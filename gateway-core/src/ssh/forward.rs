@@ -1,5 +1,3 @@
-//! Port-forwarding + X11 data plane: default-deny, lock-aware, resource-bounded — a forward
-//! is permitted only when the session's grant carries the matching capability.
 //! Local forward (`-L`): dialled from node (no Gateway-side SSRF). Remote (`-R`): node binds listener.
 //! X11 (`-Y`): request relayed unchanged; bytes opaque, metadata-only audit (open/close + counts/duration).
 
@@ -73,7 +71,6 @@ pub(crate) fn tunnel_bridge_task(
             abort.clone(),
         );
         let client_to_node = pump_tunnel(outer_read, inner_write, counters.bytes_in.clone(), abort);
-        // Either half closing tears the tunnel down; select drops (cancels) the peer.
         tokio::select! {
             _ = node_to_client => {}
             _ = client_to_node => {}
@@ -143,15 +140,6 @@ impl ReverseDispatcher {
             return;
         }
 
-        // Spawn the outer open call rather than awaiting it inline, so a timeout
-        // can walk away from it without dropping it: the vendored server has
-        // already allocated a ChannelId and wired it into its own session-scoped
-        // channel table the instant CHANNEL_OPEN is dispatched
-        // (server/session.rs `channel_open_generic`), well before this future
-        // would resolve. Dropping the future here would abandon the receiver
-        // that is the only way we ever learn that id, orphaning the entry for
-        // the life of the connection. `race_with_reclaim` below is the
-        // reusable shape that keeps it alive across the timeout.
         let (inner, direction, target, open_task) = match open {
             ReverseOpen::ForwardedTcpip {
                 channel,
@@ -219,9 +207,6 @@ impl ReverseDispatcher {
                 return;
             }
             RaceOutcome::Panicked(join_err) => {
-                // The spawned open call panicked, not the protocol call failing;
-                // treat it the same as a refusal rather than propagating a panic
-                // out of the dispatcher loop.
                 self.active_tunnels.fetch_sub(1, Ordering::SeqCst);
                 tracing::error!(source_ip = %self.source_ip, session_id = %self.session_id, error = %join_err, outcome = "channel_open_task_panic", "outer reverse channel-open task panicked");
                 return;
@@ -255,8 +240,6 @@ impl ReverseDispatcher {
     }
 }
 
-/// Outcome of [`race_with_reclaim`]: distinguishes a normal result from the
-/// task itself panicking from a timeout, since callers handle each differently.
 enum RaceOutcome<T> {
     Resolved(T),
     Panicked(tokio::task::JoinError),
@@ -303,7 +286,6 @@ mod tests {
     #[test]
     fn tunnel_slot_reservation_bounds_concurrency() {
         let active = AtomicUsize::new(0);
-        // Reserve up to the cap, then refuse; a release re-opens exactly one slot.
         assert!(reserve_tunnel_slot(&active, 2));
         assert!(reserve_tunnel_slot(&active, 2));
         assert!(!reserve_tunnel_slot(&active, 2), "cap reached → refuse");
@@ -332,14 +314,9 @@ mod tests {
         assert_eq!(TunnelDirection::X11.audit_family(), "x11_forward");
     }
 
-    /// This is the exact function `handle_open` races the real
-    /// `channel_open_forwarded_tcpip`/`channel_open_x11` calls through (typed
-    /// here over a plain `u32` rather than the vendored `Channel<Msg>`, which
-    /// only a live session can construct -- the mechanism under test doesn't
-    /// depend on the payload type). A regression back to awaiting the task
-    /// inline under a bare `tokio::time::timeout` (dropping it on elapse, the
-    /// pre-fix shape) would silently lose this late resolution too, exactly as
-    /// it silently lost the vendored server's `ChannelId`.
+    /// Typed over a plain `u32` rather than the vendored `Channel<Msg>`, which only a
+    /// live session can construct -- the mechanism under test does not depend on the
+    /// payload type.
     #[tokio::test(start_paused = true)]
     async fn a_late_resolution_past_the_timeout_is_still_reclaimed_not_dropped() {
         let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
@@ -355,7 +332,7 @@ mod tests {
             "the task must not have resolved within the timeout"
         );
 
-        tx.send(42).unwrap(); // the stalling peer finally answers, late
+        tx.send(42).unwrap();
         let late_value = late_rx
             .await
             .expect("a late resolution past the timeout must still reach `on_late`, not be silently dropped");

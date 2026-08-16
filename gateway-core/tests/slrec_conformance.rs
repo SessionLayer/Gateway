@@ -1,12 +1,6 @@
-//! Cross-language SLREC1 golden conformance. The committed golden object
-//! is sealed by the REAL `RecordingCipher::seal_to_customer` + `seal_frame` path
-//! (`src/ssh/recorder/seal.rs`), never a reimplementation, and decrypted here by
-//! the real Rust unseal path AND by Dashboard's production
-//! `src/crypto/slrec.ts` (see that repo's `src/crypto/slrecConformance.test.ts`).
-//!
-//! Why this exists: `seal.rs`'s own unit tests round-trip Rust-seal ->
-//! Rust-unseal, and the Dashboard's `slrec.test.ts` round-trips a TS-only mirror
-//! (`src/test/recordingFixture.ts`) -> TS-unseal. Neither ever ties the two
+//! Cross-language SLREC1 golden conformance. `seal.rs`'s own unit tests round-trip
+//! Rust-seal -> Rust-unseal, and the Dashboard's `slrec.test.ts` round-trips a TS-only
+//! mirror (`src/test/recordingFixture.ts`) -> TS-unseal. Neither ever ties the two
 //! languages together, so a framing drift (header layout, nonce derivation, AAD
 //! composition, length prefixes) between the two independently hand-maintained
 //! mirrors would pass both test suites and surface only when a customer can't
@@ -14,8 +8,7 @@
 //! by the real Gateway code, decrypted by both real production paths.
 //!
 //! Regenerate ONLY when the on-wire format intentionally changes (manual dev
-//! tool, mirrors `framegen`'s role for the agent-wire golden -- never runs in
-//! CI):
+//! tool, never runs in CI):
 //!
 //!   cargo test --test slrec_conformance -- --ignored regenerate_golden --nocapture
 //!
@@ -59,8 +52,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Splits `plaintext` into the uneven, zero-length-inclusive chunks fed to
-/// successive `seal_frame` calls when (re)generating the golden.
 fn frame_chunks(plaintext: &[u8]) -> Vec<&[u8]> {
     let lens = [40usize, 35, 0, plaintext.len().saturating_sub(75)];
     assert_eq!(
@@ -81,11 +72,6 @@ fn golden() -> serde_json::Value {
     serde_json::from_str(GOLDEN_JSON).expect("parse golden.json")
 }
 
-/// The standing conformance check: the committed golden -- produced by the REAL
-/// seal path -- still decrypts via the REAL Rust unseal path (`parse_header` /
-/// `unseal_data_key` / `decrypt_frames`) to the exact known plaintext. A
-/// Rust-side format change that breaks this fails HERE, before it would
-/// otherwise only be noticed by a customer failing to decrypt a real recording.
 #[test]
 fn golden_slrec1_object_decrypts_via_production_path() {
     let g = golden();
@@ -105,9 +91,6 @@ fn golden_slrec1_object_decrypts_via_production_path() {
     );
 }
 
-/// Pins the wire-format bytes both languages hard-code independently (MAGIC,
-/// the algorithm byte, the reserved byte) against the golden itself, the same
-/// way `wire_conformance.rs` pins the agent-wire type bytes.
 #[test]
 fn golden_header_bytes_are_pinned() {
     let object = unhex(golden()["object_hex"].as_str().unwrap());
@@ -120,9 +103,6 @@ fn golden_header_bytes_are_pinned() {
     assert_eq!(object[7], 0, "reserved byte");
 }
 
-/// A byte flipped in the golden's frame region must be rejected, not silently
-/// return garbage -- proven here Rust-side; the TS side proves the same thing
-/// independently against this exact object (`slrecConformance.test.ts`).
 #[test]
 fn golden_object_tamper_is_rejected() {
     let mut object = unhex(golden()["object_hex"].as_str().unwrap());
@@ -186,8 +166,6 @@ fn regenerate_golden() {
         object.extend_from_slice(&cipher.seal_frame(i as u64, chunk).unwrap());
     }
 
-    // Self-check with the real unseal path before committing -- a golden that
-    // doesn't even decrypt to itself would be a worse oracle than none.
     let header = seal::parse_header(&object).unwrap();
     let key = seal::unseal_data_key(&header, &secret).unwrap();
     let roundtrip = seal::decrypt_frames(&object, &header, &key).unwrap();

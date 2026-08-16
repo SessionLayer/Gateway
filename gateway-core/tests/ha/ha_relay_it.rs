@@ -1,5 +1,3 @@
-//! Direct Gateway relay: DialBackSignal to owner; bytes never on bus; fail-closed.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -209,9 +207,6 @@ async fn a_remote_owned_node_is_relayed_and_the_bus_carries_no_session_bytes() {
 
 #[tokio::test]
 async fn a_superseded_owner_refuses_and_the_ingress_fails_closed() {
-    // gw-B still holds the node's agent channel but its heartbeat loop no longer
-    // believes it OWNS the node (ownership migrated to a peer). It MUST refuse to serve the
-    // relay; gw-A then fails closed WITHIN relay_timeout rather than relaying a stale channel.
     let cp = MockCp::start().await;
     let coordination: Arc<dyn CoordinationBackend> = Arc::new(InProcessBackend::new());
     let ingress = start_ingress(&cp, coordination.clone()).await;
@@ -267,8 +262,6 @@ async fn an_unreachable_owner_times_out_and_fails_closed() {
     );
 }
 
-/// A coordination backend that wraps `InProcessBackend` and records every published signal, so
-/// a test can assert the session plaintext never rode the bus.
 struct RecordingBus {
     inner: InProcessBackend,
     published: std::sync::Mutex<Vec<Vec<u8>>>,

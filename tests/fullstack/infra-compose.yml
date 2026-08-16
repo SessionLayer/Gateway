@@ -1,13 +1,10 @@
-# Self-contained infra for the full-stack cross-repo E2E (tests/fullstack/run.sh).
-#
-# The parent SessionLayer/ compose is NOT in any git repo, so CI (which checks out
-# this repo alone, plus CP + Agent) cannot rely on it. This file bundles the only
-# infra the single-instance topologies need — Postgres (the CP's store) and MinIO
-# (the WORM recording store) — with images pinned to the parent stack's versions.
+# Self-contained infra for the full-stack cross-repo E2E. The parent SessionLayer/
+# compose is NOT in any git repo, so CI (which checks out this repo alone, plus CP +
+# Agent) cannot rely on it; this file bundles the only infra the single-instance
+# topologies need, with images pinned to the parent stack's versions.
 #
 # Ports are ENV-overridable and default HIGH so a run can coexist with a developer's
-# already-running parent dev stack on the standard 5432/9000. Every credential here
-# is a DEV-ONLY placeholder (matches the CP's built-in dev defaults).
+# already-running parent dev stack on the standard 5432/9000.
 name: sl-fullstack
 
 services:

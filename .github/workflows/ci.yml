@@ -4,12 +4,9 @@ on:
   push:
   pull_request:
 
-# Least privilege: the gate only needs to read the repo.
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref so a hung/old build does not sit in the
-# queue or run to the 6h default.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -25,11 +22,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Real drift gate: clone SessionLayer/Contracts at the tag pinned in
-      # contracts.lock, verify the resolved commit SHA, and diff the vendored
-      # proto + wire-conformance frames against the canonical copies. A
-      # sibling-checkout-path sync would no-op here, since CI checks out one
-      # repo at a time and a sibling path never exists.
       - name: Contracts drift check
         run: ./scripts/vendor-contracts.sh --check
 
@@ -41,15 +33,11 @@ jobs:
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
-          # arm64 std for the aarch64 cross-check below: the Tier-0 hardening
-          # constants are cfg-gated per arch, so aarch64 needs its own build proof.
           targets: aarch64-unknown-linux-gnu
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # protoc: needed by build.rs (tonic-prost-build shells out to protoc).
-      # nextest / cargo-deny / cargo-audit: used by the gate steps below.
       - name: Install gate tools (protoc, nextest, cargo-deny, cargo-audit)
         uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2
         with:
@@ -80,10 +68,6 @@ jobs:
       - name: cargo deny
         run: cargo deny check
 
-      # aarch64 cross-check: aarch64 is a supported target, so it must actually
-      # compile. A `check` (not a full link) is enough to prove the cfg-gated hardening
-      # constants + every dep resolve on aarch64. ring/build scripts compile target
-      # asm, so the aarch64 cross-toolchain is required even for `check`.
       - name: aarch64 cross-check
         env:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
@@ -97,9 +81,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
 
-  # Deliberately NOT the required check — `gate` is. This runs on every push and
-  # pull request so the image cannot rot into something nobody builds, and it
-  # asserts the runtime posture the Kubernetes manifests depend on.
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -125,8 +106,6 @@ jobs:
             VERSION=${{ github.ref_name }}
             REVISION=${{ github.sha }}
 
-      # Compile proof only: nothing needs to execute, and the cross-compiled
-      # arm64 binary cannot run on the runner anyway.
       - name: Build linux/arm64
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -168,15 +147,11 @@ jobs:
             [ -n "$value" ] || { echo "::error::label org.opencontainers.image.$key is unset"; exit 1; }
           done
 
-          # version/revision must come from the build args, not a baked constant.
           got_version=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.version"')
           got_revision=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.revision"')
           [ "$got_version" = "$EXPECT_VERSION" ] || { echo "::error::version label is '$got_version', expected '$EXPECT_VERSION'"; exit 1; }
           [ "$got_revision" = "$EXPECT_REVISION" ] || { echo "::error::revision label is '$got_revision', expected '$EXPECT_REVISION'"; exit 1; }
 
-  # Not the required check — `gate` is. Without this the chart's only validation
-  # is whatever someone ran by hand, and the first values change that breaks a
-  # render lands green.
   chart:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -184,14 +159,10 @@ jobs:
       contents: read
     env:
       CHART: deploy/helm/sessionlayer-gateway
-      # Floating tool versions are the hazard a floating image tag is. Both
-      # downloads are checksum-verified below.
       HELM_VERSION: 3.19.0
       HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
       KUBECONFORM_VERSION: 0.7.0
       KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
-      # Schemas are fetched per run, so the Kubernetes version is pinned too;
-      # otherwise the meaning of a green check moves under the chart.
       KUBE_VERSION: 1.31.0
     steps:
       - name: Checkout
@@ -219,8 +190,6 @@ jobs:
           set -euo pipefail
           helm lint "$CHART"
 
-          # Both configuration paths: the operator-supplied Secret and the one
-          # the chart renders. Only the second exercises gateway.json.
           for values in "$CHART"/ci/*.yaml; do
             name=$(basename "$values" .yaml)
             echo "::group::$name"
@@ -261,15 +230,9 @@ jobs:
           [ "$maps" = 0 ] \
             || { echo "::error::this chart renders $maps ConfigMap(s); the config carries a bearer token and must stay in a Secret"; exit 1; }
 
-          # One release is one Gateway, and nothing else in this job would
-          # notice the Deployment asking for more.
           grep -q '^  replicas: 1$' "$RUNNER_TEMP/production-values.rendered.yaml" \
             || { echo "::error::the production path does not render a single replica"; exit 1; }
 
-          # ssh.sourceIpAllowlist is the one control this chart will not render
-          # without, and Kubernetes' Cluster policy SNATs the client address to
-          # a node address before the Gateway ever sees it, which leaves the
-          # allowlist filtering on the wrong thing.
           grep -q '^  externalTrafficPolicy: Local$' "$RUNNER_TEMP/production-values.rendered.yaml" \
             || { echo "::error::the LoadBalancer Service does not preserve the client address"; exit 1; }
           # The same field is rejected by the API server on a ClusterIP
@@ -280,13 +243,9 @@ jobs:
             exit 1
           fi
 
-          # The other way to recover the client address, which has to reach the
-          # Gateway's own config to do anything at all.
           grep -q '"lb_cidrs"' "$RUNNER_TEMP/rendered-config-values.rendered.yaml" \
             || { echo "::error::ssh.proxy.lbCidrs did not reach the rendered gateway.json"; exit 1; }
 
-          # image.digest must win over image.tag, or pinning by digest is
-          # decoration. Both are set here, and only one may survive.
           ref=$(helm template chart-ci "$CHART" -f "$CHART"/ci/production-values.yaml \
                   --set image.tag=v9.9.9 --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
                 | grep -m1 -oE 'image: ghcr\.io/sessionlayer/gateway[@:][^ ]+')
@@ -296,15 +255,13 @@ jobs:
             *) echo "::error::image.digest did not win over image.tag: $ref"; exit 1 ;;
           esac
 
-      # The half with teeth. Everything above would still pass if every
-      # `required` in the chart were deleted.
       - name: Assert the chart refuses an install it must refuse
         run: |
           set -euo pipefail
           prod="$CHART/ci/production-values.yaml"
           rendered="$CHART/ci/rendered-config-values.yaml"
 
-          refuse() { # refuse <expected-substring> <command...>
+          refuse() {
             local want="$1"; shift
             local out rc
             set +e
@@ -322,7 +279,7 @@ jobs:
             esac
           }
 
-          renders() { # renders <why> <command...>
+          renders() {
             local why="$1"; shift
             local out rc
             set +e
@@ -336,14 +293,9 @@ jobs:
             printf 'renders as required: %s\n' "$why"
           }
 
-          # An install with nothing configured must not render at all. Which
-          # guard fires first depends on template ordering, so this asserts only
-          # that the refusal is one of this chart's own, named ones.
           refuse "sessionlayer-gateway:" \
             helm template chart-ci "$CHART"
 
-
-          # Neither an operator-supplied config nor a token of its own.
           refuse "set bootstrap.enrollmentToken" \
             helm template chart-ci "$CHART" -f "$prod" --set config.existingSecret=null
           refuse "set trustAnchor.existingConfigMap" \
@@ -356,21 +308,13 @@ jobs:
           printf 'ssh:\n  sourceIpAllowlist: []\n' > "$RUNNER_TEMP/empty-allowlist.yaml"
           refuse "sourceIpAllowlist is empty" \
             helm template chart-ci "$CHART" -f "$rendered" -f "$RUNNER_TEMP/empty-allowlist.yaml"
-          # And the same guard reached through the raw-config escape hatch.
           printf 'config:\n  overrides:\n    ssh:\n      source_ip_allowlist: []\n' > "$RUNNER_TEMP/empty-override.yaml"
           refuse "sourceIpAllowlist is empty" \
             helm template chart-ci "$CHART" -f "$rendered" -f "$RUNNER_TEMP/empty-override.yaml"
 
-          # A grace period under the drain budget SIGKILLs mid-drain and loses a
-          # live session's finalized recording.
           refuse "not above the drain budget" \
             helm template chart-ci "$CHART" -f "$rendered" --set ha.drain.deadlineSecs=60
 
-          # One release is one Gateway. Both replica counts above 1 were
-          # rendering happily until today: the token is single-use, so the
-          # second pod's enrollment is refused and it crash-loops. The
-          # production path is the one that has to be asserted, since that is
-          # where an operator sets a replica count and the chart can see least.
           refuse "one release deploys one Gateway" \
             helm template chart-ci "$CHART" -f "$prod" --set replicaCount=2
           refuse "one release deploys one Gateway" \
@@ -384,8 +328,6 @@ jobs:
           pdb="--set podDisruptionBudget.enabled=true"
           refuse "is not below replicaCount" \
             helm template chart-ci "$CHART" -f "$prod" $pdb --set podDisruptionBudget.minAvailable=99
-          # Kubernetes rounds a minAvailable percentage UP, so at one replica
-          # every budget above 0% demands the only pod.
           refuse "leaves no room" \
             helm template chart-ci "$CHART" -f "$prod" $pdb --set 'podDisruptionBudget.minAvailable=100%'
           refuse "leaves no room" \
@@ -395,29 +337,21 @@ jobs:
           refuse "cannot be negative" \
             helm template chart-ci "$CHART" -f "$prod" $pdb --set podDisruptionBudget.minAvailable=-1
 
-          # The other direction. Without these, a guard that refused every value
-          # would satisfy every refusal assertion above it.
           renders "the only budget one replica can hold that still lets a drain finish" \
             helm template chart-ci "$CHART" -f "$prod" $pdb --set podDisruptionBudget.minAvailable=0
           renders "the same budget as a percentage" \
             helm template chart-ci "$CHART" -f "$prod" $pdb --set 'podDisruptionBudget.minAvailable=0%'
 
-          # values.schema.json must reject a malformed values file rather than
-          # rendering something surprising.
           refuse "/hardening/seccomp/mode" \
             helm lint "$CHART" -f "$prod" --set hardening.seccomp.mode=permissive
           refuse "/image/digest" \
             helm lint "$CHART" -f "$prod" --set image.digest=sha256:abc
 
-      # Nothing else ties the chart's runtime uid to the image's own USER, and
-      # the two disagreed for hours today, caught only because someone looked.
-      # This needs no image build: both files are in this checkout.
       - name: Assert the chart and the image agree on the runtime uid
         run: |
           set -euo pipefail
           dockerfile=deploy/Dockerfile
 
-          # A missing USER must not read as "nothing to compare".
           line=$(grep -E '^USER[[:space:]]' "$dockerfile" | tail -1 || true)
           [ -n "$line" ] || {
             echo "::error::$dockerfile declares no USER, so the image runs as root and runAsNonRoot has nothing to enforce"
@@ -428,9 +362,6 @@ jobs:
           img_gid=${spec#*:}
           [ "$img_gid" = "$spec" ] && img_gid=""
 
-          # A named user is a different defect from a wrong number, and saying so
-          # matters: reported as a mismatch, someone would "fix" it by copying the
-          # name into the chart, where runAsNonRoot still could not enforce it.
           case "$img_uid" in
             ''|*[!0-9]*)
               echo "::error::$dockerfile has USER $spec, which is not numeric. Kubernetes runAsNonRoot cannot enforce a named user without an /etc/passwd lookup in the image. Make the Dockerfile numeric; do not put the name in the chart."
@@ -441,9 +372,7 @@ jobs:
           out="$RUNNER_TEMP/uid-check.yaml"
           helm template chart-ci "$CHART" -f "$CHART/ci/production-values.yaml" > "$out"
 
-          # Every declaration of each id, pod-level and container-level, so a
-          # disagreement between the two is caught as well as one with the image.
-          check() { # check <field> <expected>
+          check() {
             local field="$1" want="$2" got n
             got=$(grep -oE "^[[:space:]]*$field:[[:space:]]*[0-9]+" "$out" | grep -oE '[0-9]+$' | sort -u)
             n=$(printf '%s' "$got" | grep -c . || true)

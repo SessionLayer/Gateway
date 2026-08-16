@@ -7,10 +7,6 @@
 # because rustup honours the toml and fetches the pinned toolchain over the
 # network, so the drift is invisible while defeating the pinned builder.
 
-# ---- build stage ----
-# Pinned to $BUILDPLATFORM and cross-compiled: a QEMU-emulated release build of
-# this workspace costs hours per architecture, and aarch64 is a target CI already
-# compiles on every push.
 FROM --platform=$BUILDPLATFORM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
 
 # protoc: build.rs generates the CP<->GW gRPC stubs via tonic-prost-build.
@@ -22,19 +18,14 @@ RUN apt-get update \
       protobuf-compiler gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
  && rm -rf /var/lib/apt/lists/*
 
-# Target-scoped, so they are inert on the native build.
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
     AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
 
 WORKDIR /src
-# The whole workspace, including the vendored [patch.crates-io] russh under
-# third_party/ and the vendored proto/ (CI checks out this repo alone).
 COPY . .
 
 ARG TARGETARCH
-# rustc strips rather than binutils: one command covers both targets, with no
-# per-architecture strip binary to keep in step.
 ENV CARGO_INCREMENTAL=0 \
     RUSTFLAGS="-C strip=symbols"
 # The cache ids are per-architecture because buildx runs the two platform builds
@@ -52,9 +43,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=gateway-registry-$TAR
     install -D "target/$triple/release/gateway" /out/gateway; \
     install -d -o 65532 -g 65532 /out/rootfs/var/lib/sessionlayer-gateway
 
-# ---- runtime stage ----
-# distroless/cc = glibc + libgcc + CA certificates, no shell and no package
-# manager. The :nonroot variant ships uid/gid 65532 and owns nothing writable.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 
 ARG VERSION=0.0.0-dev
@@ -71,9 +59,6 @@ COPY --from=build /out/gateway /usr/local/bin/gateway
 # still lands writable for the runtime user.
 COPY --from=build /out/rootfs/ /
 
-# The credential data-dir is the only location the daemon writes; mount a tmpfs or
-# PVC there and keep the root filesystem read-only. Declared so an operator who
-# forgets the mount fails loudly rather than writing into an overlay that vanishes.
 VOLUME ["/var/lib/sessionlayer-gateway"]
 
 # uid 65532 cannot bind :22; listen high and front it with a Service/LB that maps

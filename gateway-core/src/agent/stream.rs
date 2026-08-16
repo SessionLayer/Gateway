@@ -1,5 +1,3 @@
-//! Dial-back WebSocket as a byte stream with backpressure via poll_ready gating.
-
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
@@ -13,13 +11,10 @@ use tokio_tungstenite::WebSocketStream;
 use crate::agent::wire::{self, FrameError, MsgType, HEADER_LEN};
 use crate::pbagent::{StreamClose, StreamCloseReason};
 
-/// One session's spliced byte stream over a dial-back WebSocket.
 pub struct WsByteStream<S> {
     ws: WebSocketStream<S>,
     ver: u8,
     max_frame_bytes: usize,
-    /// Payload bytes received but not yet handed to the reader (a `STREAM_DATA`
-    /// frame is generally larger than one `poll_read` buffer).
     pending: Bytes,
     read_eof: bool,
     close_sent: bool,
@@ -40,14 +35,14 @@ impl<S> WsByteStream<S> {
     /// The largest `STREAM_DATA` payload the Gateway puts in one frame.
     ///
     /// Deliberately `max_frame_bytes − HEADER_LEN`, whereas the Agent chunks to the full
-    /// `max_frame_bytes` (the negotiated bound is on the PAYLOAD, contract §2). The asymmetry
-    /// is safe and intentional: each side's *receive* guard bounds the payload inclusively at
+    /// `max_frame_bytes` (the negotiated bound is on the PAYLOAD). The asymmetry is safe
+    /// and intentional: each side's *receive* guard bounds the payload inclusively at
     /// `max_frame_bytes`, and each side's WebSocket message ceiling is
     /// `max_frame_bytes + HEADER_LEN` (see [`ws_config`](super::ws_config)) — so an
     /// Agent-sized frame (header + full payload) still clears the Gateway's receive limits.
     /// The Gateway staying a header under the bound just means its own frames never sit
-    /// exactly on the ceiling. (Protocol-review INFO: noted rather than aligned, to avoid
-    /// churning the frozen wire behaviour for a purely cosmetic symmetry.)
+    /// exactly on the ceiling; do not "align" it and churn the frozen wire behaviour for a
+    /// purely cosmetic symmetry.
     fn max_payload(&self) -> usize {
         self.max_frame_bytes.saturating_sub(HEADER_LEN).max(1)
     }
@@ -96,8 +91,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsByteStream<S> {
                             me.read_eof = true;
                             return Poll::Ready(Ok(()));
                         }
-                        // No other type is legal once the splice is live; a peer that
-                        // sends one is a protocol error, not a stream to keep reading.
                         _ => return Poll::Ready(Err(frame_err(FrameError::UnknownType))),
                     }
                 }
@@ -171,8 +164,6 @@ mod tests {
     const VER: u8 = 1;
     const MAX: usize = 64;
 
-    /// A `WsByteStream` (server role) wired to a raw peer WebSocket (client role)
-    /// over an in-memory duplex — the real codec on both ends, no network.
     async fn pair() -> (
         WsByteStream<tokio::io::DuplexStream>,
         WebSocketStream<tokio::io::DuplexStream>,
@@ -259,9 +250,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_abrupt_peer_reset_is_an_error_not_a_silent_eof() {
-        // A dial-back connection that vanishes without a close handshake is a fault,
-        // not a clean end of session: it must surface as an I/O error so the inner leg
-        // tears the session down rather than treating it as an orderly logout.
         let (mut stream, peer) = pair().await;
         drop(peer);
         let mut buf = [0u8; 8];
@@ -307,8 +295,6 @@ mod tests {
 
     #[tokio::test]
     async fn writes_apply_backpressure_instead_of_buffering() {
-        // A peer that never reads must NOT let the Gateway buffer without bound: once
-        // the socket is full, poll_write is Pending.
         let (a, _b) = tokio::io::duplex(512);
         let ws =
             WebSocketStream::from_raw_socket(a, Role::Server, Some(super::super::ws_config(MAX)))

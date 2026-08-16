@@ -1,5 +1,3 @@
-//! Agent ↔ Gateway wire protocol frame codec: VER | TYPE | LENGTH | PAYLOAD binary frames.
-
 use bytes::Bytes;
 use prost::Message;
 
@@ -7,15 +5,12 @@ use crate::pbagent::{
     AgentHello, DialBackAccept, DialBackAuth, DialBackRequest, DialBackResult, GatewayHelloAck,
     Ping, Pong, StreamClose, StreamOpen, VersionReject, WireError, WireErrorCode,
 };
-// The HA relay payloads (0x24-0x26) live in the gateway package; the framing is the
-// shared Agent<->Gateway v1 wire (gateway-relay-v1.md §3 reuses it verbatim).
 use crate::pbgw::{RelayAccept, RelayOpen, RelayReject};
 
-/// Fixed frame header length: `VER | TYPE | LENGTH(u32 BE)`.
 pub const HEADER_LEN: usize = 6;
 
-/// Wire message types (contract §4). Numbers are **stable**: once assigned, never
-/// reused for a different meaning.
+/// Wire message types. Numbers are **stable**: once assigned, never reused for a
+/// different meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MsgType {
@@ -124,7 +119,7 @@ pub fn encode_error(ver: u8, code: WireErrorCode, message: &str) -> Vec<u8> {
 ///
 /// The oversize guard here is the *second* line of defence: the WebSocket layer is
 /// configured with the same bound (see [`ws_config`](super::ws_config)), so an
-/// oversized frame is refused at its length header and never buffered (contract §2).
+/// oversized frame is refused at its length header and never buffered.
 pub fn decode(bytes: Bytes, max_frame_bytes: usize, expect_ver: u8) -> Result<Frame, FrameError> {
     if bytes.len() < HEADER_LEN {
         return Err(FrameError::Short);
@@ -193,7 +188,6 @@ mod tests {
 
     #[test]
     fn round_trips_raw_stream_data() {
-        // 0x31 carries raw bytes: they must survive byte-for-byte (no protobuf).
         let raw: Vec<u8> = (0u8..=255).collect();
         let bytes = Bytes::from(encode(1, MsgType::StreamData, &raw));
         let frame = decode(bytes, MAX, 1).unwrap();
@@ -219,7 +213,6 @@ mod tests {
 
     #[test]
     fn oversized_frame_is_rejected_by_the_length_header() {
-        // The declared LENGTH alone rejects it — the body is never inspected.
         let mut bytes = vec![1u8, MsgType::StreamData as u8];
         bytes.extend_from_slice(&(MAX as u32 + 1).to_be_bytes());
         assert_eq!(
@@ -230,14 +223,12 @@ mod tests {
 
     #[test]
     fn length_must_match_the_body_exactly() {
-        // Truncated body.
         let mut short = encode(1, MsgType::StreamData, &[1, 2, 3, 4]);
         short.pop();
         assert_eq!(
             decode(Bytes::from(short), MAX, 1),
             Err(FrameError::LengthMismatch)
         );
-        // Trailing garbage after a well-formed frame.
         let mut trailing = encode(1, MsgType::StreamData, &[1, 2, 3, 4]);
         trailing.push(0xff);
         assert_eq!(
@@ -254,8 +245,6 @@ mod tests {
 
     #[test]
     fn ha_relay_types_are_defined_and_round_trip() {
-        // 0x24-0x26 were free slots in the shared registry; the HA relay profile
-        // (gateway-relay-v1.md §4) defines them additively without moving the version.
         assert_eq!(MsgType::from_u8(0x24), Some(MsgType::RelayOpen));
         assert_eq!(MsgType::from_u8(0x25), Some(MsgType::RelayAccept));
         assert_eq!(MsgType::from_u8(0x26), Some(MsgType::RelayReject));
@@ -274,8 +263,8 @@ mod tests {
 
     #[test]
     fn unknown_and_reserved_types_are_rejected() {
-        // 0x40 NODE_STATUS, 0x50 CREDENTIAL_ROTATE and 0x7F GOAWAY are RESERVED:
-        // they must be protocol errors until they are defined (contract §4).
+        // 0x40 NODE_STATUS, 0x50 CREDENTIAL_ROTATE and 0x7F GOAWAY are RESERVED: they
+        // must be protocol errors until they are defined.
         for t in [0x00u8, 0x40, 0x50, 0x7f, 0xff] {
             let mut bytes = vec![1u8, t];
             bytes.extend_from_slice(&0u32.to_be_bytes());
@@ -289,7 +278,6 @@ mod tests {
 
     #[test]
     fn garbage_payload_for_a_typed_frame_fails_closed() {
-        // A well-framed message whose payload is not the protobuf it claims.
         let bytes = Bytes::from(encode(1, MsgType::DialBackAuth, &[0xff, 0xff, 0xff, 0xff]));
         let frame = decode(bytes, MAX, 1).unwrap();
         assert_eq!(as_dial_back_auth(&frame), Err(FrameError::BadPayload));
@@ -297,7 +285,6 @@ mod tests {
 
     #[test]
     fn every_error_reports_the_coarse_protocol_code() {
-        // Non-disclosure: the peer learns only PROTOCOL, never which check failed.
         for e in [
             FrameError::Short,
             FrameError::TooLarge,

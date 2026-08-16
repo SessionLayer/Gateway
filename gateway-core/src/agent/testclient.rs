@@ -1,5 +1,3 @@
-//! Test-only agent peer for end-to-end gateway transport validation; local splice config only.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,10 +17,8 @@ use crate::pbagent::{
     AgentHello, DialBackAuth, DialBackErrorCode, DialBackRequest, DialBackResult, Pong, StreamOpen,
 };
 
-/// The WebSocket a client peer speaks over.
 pub type ClientWs = WebSocketStream<TlsStream<TcpStream>>;
 
-/// Everything the test agent needs. All of it is *local* configuration.
 #[derive(Clone)]
 pub struct AgentClient {
     pub endpoint: String,
@@ -36,7 +32,6 @@ pub struct AgentClient {
     pub max_frame_bytes: usize,
 }
 
-/// What the Gateway's `HELLO_ACK` fixed for this connection.
 #[derive(Debug, Clone, Copy)]
 pub struct Negotiated {
     pub ver: u8,
@@ -62,7 +57,6 @@ impl AgentClient {
         Ok(Arc::new(config))
     }
 
-    /// No preface yet; adversarial tests can drive the framing themselves.
     pub async fn connect(&self, endpoint: &str, path: &str) -> anyhow::Result<ClientWs> {
         let authority = endpoint
             .strip_prefix("wss://")
@@ -86,11 +80,8 @@ impl AgentClient {
 
     pub async fn hello(&self, ws: &mut ClientWs) -> anyhow::Result<Negotiated> {
         let hello = AgentHello {
-            // The AGENT-WIRE range (1.0), not the gRPC plane's (contract §3) — a faithful
-            // client must not advertise a wire minor that does not exist.
             component: Some(crate::agent::wire_component_info()),
         };
-        // The preface frame carries the SENDER's wire protocol major.
         let ver = crate::agent::WIRE_PROTOCOL_MAX.0 as u8;
         ws.send(Message::Binary(WsBytes::from(wire::encode_msg(
             ver,
@@ -112,15 +103,11 @@ impl AgentClient {
                     max_frame_bytes: ack.max_frame_bytes as usize,
                 })
             }
-            // Fail closed: never retry with a guessed version.
             MsgType::VersionReject => anyhow::bail!("gateway rejected our protocol version"),
             other => anyhow::bail!("unexpected preface frame {other:?}"),
         }
     }
 
-    /// Read the next wire frame. `pub` so an adversarial test can drive the framing
-    /// itself (a replayed token, an oversized frame, a bad version) instead of using
-    /// the well-behaved loops below.
     pub async fn next_frame(&self, ws: &mut ClientWs, ver: u8) -> anyhow::Result<Frame> {
         loop {
             let msg = ws
@@ -141,9 +128,6 @@ impl AgentClient {
         }
     }
 
-    /// Run the control channel until `shutdown`: register, answer `PING`, and serve
-    /// every `DIAL_BACK_REQUEST` on its own task (so a slow dial-back never blocks
-    /// liveness).
     pub async fn run_control(
         &self,
         shutdown: impl std::future::Future<Output = ()>,
@@ -169,8 +153,6 @@ impl AgentClient {
                         }
                         MsgType::DialBackRequest => {
                             let req = wire::as_dial_back_request(&frame)?;
-                            // A Gateway must not be able to task this Agent for another
-                            // node: refuse anything that is not the node we are bound to.
                             if req.node_name != self.node_name {
                                 ws.send(Message::Binary(WsBytes::from(wire::encode_msg(ver, MsgType::DialBackResult, &DialBackResult {
                                     request_id: req.request_id,
@@ -237,7 +219,6 @@ impl AgentClient {
             anyhow::bail!("dial-back refused: {:?}", frame.msg_type);
         }
 
-        // The splice target is OURS, not the Gateway's. Nothing on that wire named it.
         let mut node = TcpStream::connect(&self.splice_addr).await?;
         node.set_nodelay(true)?;
 
@@ -248,8 +229,6 @@ impl AgentClient {
         ))))
         .await?;
 
-        // Opaque bytes in both directions: this Agent structurally cannot read what it
-        // carries (the SSH session is end-to-end between the Gateway and the node).
         let mut spliced = WsByteStream::new(ws, ver, negotiated.max_frame_bytes);
         let _ = tokio::io::copy_bidirectional(&mut spliced, &mut node).await;
         Ok(())
@@ -271,9 +250,9 @@ impl AgentClient {
             if *shutdown.borrow() {
                 return;
             }
-            // Backoff WITH jitter (contract §7): a fleet that dropped together (a Gateway
-            // restart) must not reconnect in lockstep. `[0.5, 1.5)` of the current backoff —
-            // a test double that violated the spec would be a bad oracle.
+            // Backoff WITH jitter: a fleet that dropped together (a Gateway restart) must
+            // not reconnect in lockstep. `[0.5, 1.5)` of the current backoff — a test
+            // double that violated the spec would be a bad oracle.
             let jittered = {
                 use rand_core::RngCore;
                 let f = 0.5 + f64::from(rand_core::OsRng.next_u32()) / f64::from(u32::MAX);

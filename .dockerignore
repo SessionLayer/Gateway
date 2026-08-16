@@ -1,6 +1,3 @@
-# Keep the build context to what `cargo build --bin gateway` reads. target/ alone
-# is gigabytes, and every excluded path is one more reason a build cache hit
-# survives an unrelated edit.
 target/
 .git/
 .github/

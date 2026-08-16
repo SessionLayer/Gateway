@@ -1,5 +1,3 @@
-//! Session-bound inner-leg signer client: obtain short-lived SSH cert via SessionSigning.SignSessionCertificate over mTLS.
-//! Key custody: local ECDSA P-256 keypair generation; public key sent only, private key never leaves Gateway.
 //! Per-RPC authorization: session_token authorizes specific request (single-use, bound to gateway/session/node/principal/exp).
 
 use crate::pb::session_signing_client::SessionSigningClient;
@@ -8,38 +6,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::transport::Channel;
 use zeroize::Zeroizing;
 
-/// A failure while generating the inner keypair or obtaining a session cert.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
     #[error("inner-leg key error: {0}")]
     Ssh(#[from] ssh_key::Error),
 
-    /// The CP refused the signing RPC — an invalid/expired/reused token, a
-    /// cross-gateway or cross-session token, an unknown/locked identity, etc.
-    /// The caller fails closed (no certificate). Only the gRPC status **code** is
-    /// rendered — never the CP-supplied message, which is untrusted wire text
-    /// (log-injection / terminal-escape guard); the code is still available via
-    /// the wrapped `Status`.
+    /// Only the gRPC status **code** is rendered — never the CP-supplied message,
+    /// which is untrusted wire text (log-injection / terminal-escape guard); the
+    /// code is still available via the wrapped `Status`.
     #[error("Control Plane refused SignSessionCertificate (gRPC status {:?})", .0.code())]
     Rpc(#[from] tonic::Status),
 
-    /// The signing RPC did not complete within its deadline — a hung CP must
-    /// never hang the Gateway (fail closed).
     #[error("SignSessionCertificate timed out after {0:?}")]
     Timeout(Duration),
 
     #[error("Control Plane returned an empty certificate")]
     EmptyCertificate,
 
-    /// The mTLS channel to the CP could not be established for the signing call
-    /// (CP down) — fail closed as "service temporarily unavailable", not
-    /// as a node fault.
     #[error("Control Plane unreachable for SignSessionCertificate")]
     Unavailable,
 }
 
 impl SigningError {
-    /// Classify CP-down (service-unavailable) vs token/material fault (node outcome).
     pub fn is_cp_down(&self) -> bool {
         match self {
             SigningError::Unavailable | SigningError::Timeout(_) => true,
@@ -56,7 +44,6 @@ impl SigningError {
     }
 }
 
-/// A locally-generated inner-leg keypair. The private half never leaves the Gateway.
 pub struct InnerKeyPair {
     private: ssh_key::PrivateKey,
     public_wire: Vec<u8>,
@@ -64,7 +51,6 @@ pub struct InnerKeyPair {
 
 impl std::fmt::Debug for InnerKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never render private key material.
         f.debug_struct("InnerKeyPair")
             .field("algorithm", &"ecdsa-sha2-nistp256")
             .field("public_wire_len", &self.public_wire.len())
@@ -89,7 +75,6 @@ impl InnerKeyPair {
         })
     }
 
-    /// Inner-leg public key in OpenSSH wire format (sent to CP only).
     pub fn public_key_openssh_wire(&self) -> &[u8] {
         &self.public_wire
     }
@@ -106,13 +91,11 @@ impl InnerKeyPair {
     }
 }
 
-/// A signed inner-leg certificate returned by the CP (certificate only — never a private key).
 #[derive(Debug, Clone)]
 pub struct SignedInnerCert {
     pub certificate_line: String,
     pub certificate_blob: Vec<u8>,
     pub key_id: String,
-    /// Certificate validity window (backdated for skew).
     pub valid_after: SystemTime,
     pub valid_before: SystemTime,
 }
@@ -131,9 +114,6 @@ fn build_request(
     }
 }
 
-/// Call SignSessionCertificate with session_token and inner public key (only).
-/// Private key stays on the Gateway. Any CP refusal fails closed (no certificate).
-/// `timeout` prevents hung CP from hanging the SSH handshake.
 pub async fn sign_session_certificate(
     channel: Channel,
     session_token: &str,
@@ -194,8 +174,6 @@ mod tests {
 
     #[test]
     fn request_carries_only_the_public_key_and_token() {
-        // Key-custody proof: what we would transmit contains the token
-        // and the public wire blob — and NO fragment of the private key.
         let kp = InnerKeyPair::generate().unwrap();
         let priv_pem = kp.private_key_openssh_pem().unwrap();
         let req = build_request("tok-123", kp.public_key_openssh_wire(), None);

@@ -30,9 +30,6 @@ fn ensure_docker_host() {
     }
 }
 
-/// Build the vendored Debian 13 sshd node image (idempotent; Docker layer-caches
-/// so repeat runs are fast). Uses the `docker` CLI to assemble the image, which
-/// Testcontainers then runs.
 async fn build_node_image() -> anyhow::Result<()> {
     ensure_docker_host();
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

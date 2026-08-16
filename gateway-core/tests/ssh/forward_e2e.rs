@@ -1,5 +1,3 @@
-//! Port-forward + X11: -L/-R/-X per-capability, ProxyJump MITM cap, lock teardown.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -419,11 +417,6 @@ async fn remote_forward_binds_on_node_only_when_granted() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// `-R 0:host:port`, previously verified only by reading the code: the node picks a free port and
-/// reports it back through the same `tcpip-forward` reply a fixed port uses
-/// (RFC 4254 §7.1; `handler.rs::tcpip_forward` already passes `port == 0` through
-/// unmodified). Prove the client actually receives a non-zero port AND that bytes
-/// flow through it, not just that the request was accepted.
 #[tokio::test]
 async fn remote_forward_dynamic_port_is_allocated_and_relays_bytes() -> anyhow::Result<()> {
     build_images().await?;
@@ -469,8 +462,6 @@ async fn remote_forward_dynamic_port_is_allocated_and_relays_bytes() -> anyhow::
         "a granted dynamic remote forward must succeed: {err_ok}"
     );
 
-    // OpenSSH reports the node-allocated port on the SAME setup path a fixed `-R`
-    // uses: "Allocated port NNNN for remote forward to ...".
     let allocated: u16 = out_ok
         .lines()
         .chain(err_ok.lines())
@@ -634,23 +625,10 @@ fn x11_roundtrip_script(gw_port: u16) -> Vec<String> {
     ]
 }
 
-/// Full X11 reverse data-plane round trip: every other test here proves only the
-/// control path (`DISPLAY` gets set on the node); this one drives real bytes
-/// through the forwarded x11 channel. The Gateway's relay is pure pass-through
-/// (no cookie rewriting, `handler.rs`'s `x11_request`), so this proves the two
-/// REAL endpoints -- the node's stock sshd and the client's stock ssh -- carry
-/// bytes correctly through it.
-///
-/// This failed on its first execution in a way that looked like a broken relay,
-/// and was not. Running the identical client script against the node's sshd
-/// directly, with no Gateway in the path, failed identically: `X11 connection
-/// uses different authentication protocol`, from the *client's* own ssh. The
-/// probe's setup packet declared a 19-byte protocol name for the 18-byte
-/// `MIT-MAGIC-COOKIE-1`, so `x11_open_helper` rejected it before a single
-/// Gateway byte was involved.
-///
-/// So: keep the length fields exact, and if this ever goes red again, run it
-/// against the node directly before suspecting the relay.
+/// The Gateway's relay here is pure pass-through (no cookie rewriting), so a red run
+/// is more likely the probe than the relay: this failed once on the probe's own setup
+/// packet, and reproduced identically against the node's sshd with no Gateway in the
+/// path. Run it that way before suspecting the relay.
 #[tokio::test]
 async fn x11_reverse_channel_carries_real_bytes_end_to_end() -> anyhow::Result<()> {
     build_images().await?;
@@ -750,9 +728,6 @@ fn cert_authority_line(cp: &MockCp) -> String {
     format!("@cert-authority * {ca}")
 }
 
-/// Client ssh_config for the ProxyJump path: `jump` is the Gateway (not the no-TOFU
-/// boundary), `node-e2e` is reached via ProxyJump and verified strictly against the
-/// `@cert-authority` line (as inner_leg_it's MITM cases).
 fn nested_proxyjump_ssh_config(gw_port: u16) -> String {
     format!(
         "Host jump\n\
@@ -779,9 +754,8 @@ fn nested_proxyjump_ssh_config(gw_port: u16) -> String {
     )
 }
 
-/// A `direct-tcpip` from the already-terminated ProxyJump inner hop is refused
-/// UNCONDITIONALLY — a maximal grant (incl. `port_forward_local`) must never open a
-/// nested forward chain (one MITM hop only; the structural invariant is preserved).
+/// One MITM hop only: a nested `direct-tcpip` is refused unconditionally, so no grant --
+/// not even one carrying `port_forward_local` -- can open a nested forward chain.
 #[tokio::test]
 async fn nested_proxyjump_forward_refused_even_with_full_grant() -> anyhow::Result<()> {
     build_images().await?;
@@ -888,8 +862,6 @@ async fn local_forward_records_metadata_only() -> anyhow::Result<()> {
     let (status, object) = get_object(&s3, &keys[0]).await?;
     assert_eq!(status, 200);
 
-    // Decrypt with the customer key: the object must carry the tunnel open/close
-    // markers and NO forwarded byte content (the SSH banner never appears).
     let header = seal::parse_header(&object).unwrap();
     let key = seal::unseal_data_key(&header, &cust_secret).unwrap();
     let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
@@ -1010,14 +982,12 @@ fn second_local_forward_via_master(gw_port: u16, lport: u16, target: &str) -> Ve
     ]
 }
 
-/// Relabeling a node mid-session, previously argued from mechanism only: nothing pushes a
-/// lock or a new decision to the Gateway -- the node's inventory labels just
-/// change in the CP. The lock below targets the label the node moves TO, so it
-/// cannot match the ORIGINAL `Authorized.bindings` captured at connect; only a
-/// fresh per-channel re-authorize (`local_recheck_value`, forced every time here
-/// via `decision_ttl=0`) observes the new label. Proves the LIVE, already-open
-/// connection is refused at its next channel-open, not merely that a brand-new
-/// session would be.
+/// Nothing pushes a lock or a new decision to the Gateway when a node is relabeled --
+/// the node's inventory labels just change in the CP. The lock here targets the label
+/// the node moves TO, so it cannot match the ORIGINAL `Authorized.bindings` captured at
+/// connect; only a fresh per-channel re-authorize (`local_recheck_value`, forced every
+/// time here via `decision_ttl=0`) observes the new label. The refusal must land on the
+/// LIVE, already-open connection at its next channel-open, not merely on a new session.
 #[tokio::test]
 async fn relabeling_a_node_mid_session_is_caught_at_the_next_recheck() -> anyhow::Result<()> {
     build_images().await?;

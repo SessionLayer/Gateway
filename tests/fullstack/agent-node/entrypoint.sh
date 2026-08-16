@@ -1,15 +1,14 @@
 #!/bin/sh
-# Full-stack agent-node entrypoint: start the REAL Agent binary (non-root, real enrollment via a
-# join token against the real CP) then hand off to the sshd entrypoint. The agent binary + the
-# bootstrap CA are docker-cp'd into /agent by run.sh; the join token + endpoints come from env.
+# The agent binary + bootstrap CA are docker-cp'd into /agent by run.sh; the join token
+# and endpoints come from env.
 #
-# The agent runs as `deploy` (non-root): it therefore CANNOT read the
-# node host key, so host identity is anchored out-of-band (run.sh generates the key, places it in
-# the container before start, and registers it as the pinned host anchor). It dials OUT to the
-# Gateway's agent transport and splices each dial-back to the sshd named by AGENT_SPLICE_ADDR —
-# an address it reads from its OWN config, never from the wire. The default is this container's
-# own :22; run.sh overrides it with the port it started this node's sshd on, so the splice target
-# is one the harness created rather than whatever happens to answer on 22.
+# The agent runs as `deploy` (non-root): it therefore CANNOT read the node host key, so
+# host identity is anchored out-of-band (run.sh generates the key, places it in the
+# container before start, and registers it as the pinned host anchor). It dials OUT and
+# splices each dial-back to AGENT_SPLICE_ADDR — an address it reads from its OWN config,
+# never from the wire. The default is this container's own :22; run.sh overrides it with
+# the port it started this node's sshd on, so the splice target is one the harness
+# created rather than whatever happens to answer on 22.
 set -eu
 
 if [ -n "${AGENT_JOIN_TOKEN:-}" ] && [ -x /agent/sessionlayer-agent ]; then

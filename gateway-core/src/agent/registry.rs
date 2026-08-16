@@ -1,5 +1,3 @@
-//! Live agent registry: node_name → control channel; re-registration replaces, scoped by conn-id.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,11 +11,11 @@ pub enum ControlOut {
     Superseded,
 }
 
-/// Hand-written so the dial-back **token cannot transit `Debug`** (contract §6: "never
-/// logged, never persisted, never echoed"). `DialBackRequest` is prost-generated and would
-/// otherwise derive `Debug` including its `token` field, so a single future `debug!(?out)`
-/// in the control loop would dump a live single-use capability. Mirrors the
-/// `SessionGrant` redaction elsewhere.
+/// Hand-written so the dial-back **token cannot transit `Debug`**: it must never be logged,
+/// persisted or echoed. `DialBackRequest` is prost-generated and would otherwise derive
+/// `Debug` including its `token` field, so a single future `debug!(?out)` in the control loop
+/// would dump a live single-use capability. Mirrors the `SessionGrant` redaction in
+/// `ssh/connector.rs`.
 impl std::fmt::Debug for ControlOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -33,7 +31,6 @@ impl std::fmt::Debug for ControlOut {
     }
 }
 
-/// A live control channel to the Agent that owns one node.
 #[derive(Clone, Debug)]
 pub struct ControlHandle {
     pub agent_id: String,
@@ -69,23 +66,18 @@ impl ControlHandle {
     }
 }
 
-/// A registry failure. All are fail-closed: the session becomes "node offline". They are
-/// distinguished so an operator can tell a dead agent from a saturated one.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RegistryError {
     #[error("no agent is registered for this node")]
     NotRegistered,
     #[error("the agent control channel is gone")]
     ChannelGone,
-    /// The control channel's outbound queue stayed full for the whole bound — the agent is
-    /// registered and (probably) alive but its signal path is saturated or wedged.
     #[error("the agent control channel is saturated")]
     Busy,
     #[error("agent registry is at capacity")]
     AtCapacity,
 }
 
-/// The `node_name -> live control channel` map.
 #[derive(Debug)]
 pub struct AgentRegistry {
     agents: Mutex<HashMap<String, ControlHandle>>,
@@ -102,9 +94,6 @@ impl AgentRegistry {
         }
     }
 
-    /// Register (or replace) the control channel for `node_name`. An existing
-    /// registration for the same node is superseded: it is told to close, and the
-    /// new connection takes ownership.
     pub fn register(
         self: &Arc<Self>,
         node_name: &str,
@@ -176,8 +165,6 @@ impl AgentRegistry {
     }
 }
 
-/// Deregisters a control channel when its connection ends (heartbeat loss, close,
-/// or supersession). The node then has no owner and is simply offline.
 #[derive(Debug)]
 pub struct Registration {
     registry: Arc<AgentRegistry>,
@@ -212,7 +199,6 @@ mod tests {
         let _g = reg.register("node-a", "agent-a", tx).unwrap();
         assert_eq!(reg.lookup("node-a").unwrap().agent_id, "agent-a");
         assert!(reg.owns("agent-a", "node-a"));
-        // Ownership is exact: another (valid) agent does not own this node.
         assert!(!reg.owns("agent-b", "node-a"));
         assert!(!reg.owns("agent-a", "node-b"));
     }
@@ -226,13 +212,9 @@ mod tests {
         let (tx2, _rx2) = chan();
         let _g2 = reg.register("node-a", "agent-a", tx2).unwrap();
 
-        // The older connection is told to close (a partition must not lock the node
-        // out until a TCP timeout expires).
         assert!(matches!(rx1.try_recv(), Ok(ControlOut::Superseded)));
         assert_eq!(reg.len(), 1);
 
-        // …and when the superseded connection finally tears down, its guard must NOT
-        // evict the newer registration.
         drop(g1);
         assert_eq!(reg.len(), 1, "the newer connection still owns the node");
         assert!(reg.lookup("node-a").is_ok());
@@ -262,15 +244,12 @@ mod tests {
             reg.register("node-b", "agent-b", tx2),
             Err(RegistryError::AtCapacity)
         ));
-        // A reconnect for an ALREADY-registered node is a replace, not a new slot —
-        // the cap must not lock an existing node out of reconnecting.
         let (tx3, _rx3) = chan();
         assert!(reg.register("node-a", "agent-a", tx3).is_ok());
     }
 
     #[test]
     fn control_out_debug_redacts_the_dial_back_token() {
-        // A future debug!(?out) must never dump the single-use capability.
         let out = ControlOut::DialBack(Box::new(DialBackRequest {
             request_id: "req-1".into(),
             token: "SLDB1.supersecretpayload.sig".into(),
@@ -287,7 +266,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_burst_queues_up_to_the_channel_capacity() {
-        // A momentary burst must not shed: sends within capacity succeed without draining.
         let reg = Arc::new(AgentRegistry::new(8));
         let (tx, _rx) = mpsc::channel(4);
         let _g = reg.register("node-a", "agent-a", tx).unwrap();
@@ -302,14 +280,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_saturated_channel_sheds_as_busy_not_channel_gone() {
-        // The receiver exists but never drains: a full queue sheds as Busy — distinct from a
-        // disconnected agent — after the bound, so an operator is not sent to chase a dead
-        // agent that is actually just overloaded.
         let reg = Arc::new(AgentRegistry::new(8));
         let (tx, _rx) = mpsc::channel(1);
         let _g = reg.register("node-a", "agent-a", tx).unwrap();
         let handle = reg.lookup("node-a").unwrap();
-        // Fill the single slot, then a second send has nowhere to go and times out.
         handle
             .send_dial_back(DialBackRequest::default(), Duration::from_millis(50))
             .await
@@ -328,7 +302,7 @@ mod tests {
         let (tx, rx) = chan();
         let _g = reg.register("node-a", "agent-a", tx).unwrap();
         let handle = reg.lookup("node-a").unwrap();
-        drop(rx); // the control task ended between lookup and send
+        drop(rx);
         assert_eq!(
             handle
                 .send_dial_back(DialBackRequest::default(), Duration::from_millis(50))

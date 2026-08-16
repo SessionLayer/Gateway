@@ -1,5 +1,3 @@
-//! Test-only hardening canary (spawned by hardening_e2e.rs).
-
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("hardening-canary is Linux-only");
@@ -93,12 +91,9 @@ fn apply_seccomp() {
     gateway::hardening::apply(&cfg, false).unwrap_or_else(|e| fail(&format!("APPLY_FAIL: {e}")));
 }
 
-/// Representative data-path syscalls the hardened profile must still permit:
-/// file create/write/read, a TCP socket bind, thread spawn/join, /dev/urandom.
 #[cfg(target_os = "linux")]
 fn data_path_io() -> std::io::Result<()> {
     use std::io::{Read, Write};
-    // File I/O (openat/write/read/close).
     let dir = std::env::temp_dir();
     let path = dir.join(format!("gw-canary-{}", std::process::id()));
     {
@@ -109,14 +104,11 @@ fn data_path_io() -> std::io::Result<()> {
     let mut buf = Vec::new();
     std::fs::File::open(&path)?.read_to_end(&mut buf)?;
     let _ = std::fs::remove_file(&path);
-    // Socket create + bind (socket/bind/listen).
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let _ = listener.local_addr()?;
-    // Thread spawn/join (clone3/futex).
     std::thread::spawn(|| std::hint::black_box(1 + 1))
         .join()
         .ok();
-    // Kernel RNG (getrandom, or /dev/urandom fallback).
     let mut rnd = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut rnd)?;
     Ok(())

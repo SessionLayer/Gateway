@@ -13,11 +13,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::pb::KeySealAlgorithm;
 
-/// Object magic + format version (`SLREC` + version 1).
 const MAGIC: &[u8; 6] = b"SLREC1";
-/// HKDF `info` domain separation for the ECIES key-wrap KEK derivation.
 const KEK_INFO: &[u8] = b"SessionLayer/recording/ECIES-P256-HKDF-SHA256/kek/v1";
-/// AEAD associated data domain-separating the key-wrap ciphertext.
 const WRAP_AAD: &[u8] = b"SessionLayer/recording/data-key-wrap/v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -217,7 +214,7 @@ fn encode_header(
     let mut h = Vec::with_capacity(MAGIC.len() + 6 + eph_pub.len() + 12 + wrapped_key.len());
     h.extend_from_slice(MAGIC);
     h.push(algorithm as u8);
-    h.push(0); // reserved
+    h.push(0);
     h.extend_from_slice(&(eph_pub.len() as u16).to_be_bytes());
     h.extend_from_slice(eph_pub);
     h.extend_from_slice(wrap_nonce);
