@@ -73,6 +73,21 @@ if [[ -z "$FS_NODE_NETMODE" ]]; then
   [[ "$TOPOLOGY" == all ]] && FS_NODE_NETMODE=bridge || FS_NODE_NETMODE=loopback
 fi
 DENY_LOGIN="${DENY_LOGIN:-dba}"          # a node login the CP never grants (deny-path negative)
+# ── TOPOLOGY=agent ───────────────────────────────────────────────────────────
+# The Gateway's agent-facing transport, which the Agent dials OUT to. Bound on all
+# interfaces (not loopback) because the Agent runs in a bridge-network container and
+# reaches the host through the docker gateway; the Agent verifies the leaf by the
+# Gateway's NAME, which is the dNSName SAN the CP stamps into it.
+FS_GW_AGENT_PORT="${FS_GW_AGENT_PORT:-12444}"
+AGENT_NODE_CONTAINER="sl-fs-agent-node"
+# The agent node's sshd port. Distinct from FS_NODE_PORT so the two topologies can coexist,
+# and never 22: the Agent splices to this port, and a port the harness allocated cannot be
+# confused with whatever the host itself runs on 22.
+FS_AGENT_NODE_PORT="${FS_AGENT_NODE_PORT:-12223}"
+AGENT_NODE_IMAGE="sessionlayer-gw-fullstack-agentnode:test"
+# A node registered with an anchor that no Agent ever joins: the `unknown` health case
+# (agent-connected, anchored, never claimed). Costs one REST call and no container.
+UNJOINED_NODE="${UNJOINED_NODE:-agent-unjoined}"
 # The Gateway caps the Control Plane's decision_ttl with this, and a channel opened past
 # the cap is re-authorized. Deliberately short so the multiplexed-channel re-validate can
 # be crossed inside a test run; every other case opens its channel immediately.
@@ -207,7 +222,7 @@ cleanup() {
     return
   fi
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
-  docker rm -f "$NODE_CONTAINER" "$KMS_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$NODE_CONTAINER" "$AGENT_NODE_CONTAINER" "$KMS_CONTAINER" >/dev/null 2>&1 || true
   "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
   release_keyvault_hostname
 }
@@ -348,13 +363,9 @@ preflight() {
   case "$TOPOLOGY" in
     core|all) : ;;  # live: loopback (core) / bridge multi-host guard (all)
     agent)
-      # The outbound-agent connector is proven per-repo with REAL Agent binaries in
-      # gateway-core/tests/agent/agent_e2e.rs + Agent splice_e2e.rs (dial-out WSS + dial-back splice to the
-      # node's own 127.0.0.1:22). The full-stack agent flow (real-CP OUTBOUND_AGENT Authorize +
-      # presence + real agent enroll) is scaffolded here — tests/fullstack/agent-node/ +
-      # config/gateway-agent.json.tmpl + AGENT_BIN — but is NOT yet wired as a live assertion.
-      die "TOPOLOGY=agent is scaffolded, not live — the outbound-agent path is proven per-repo (agent_e2e.rs/splice_e2e.rs, real binaries); see README 'Scenario matrix'. Use core|all." ;;
-    *) die "unknown TOPOLOGY '$TOPOLOGY' (core|all)" ;;
+      [[ -n "${AGENT_BIN:-}" ]] || die "TOPOLOGY=agent needs AGENT_BIN pointing at the real sessionlayer-agent binary"
+      [[ -x "$AGENT_BIN" ]]     || die "AGENT_BIN is not executable: $AGENT_BIN" ;;
+    *) die "unknown TOPOLOGY '$TOPOLOGY' (core|agent|all)" ;;
   esac
   rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
   install_operator_shims
@@ -767,6 +778,25 @@ JAVA
   ok "escape hatch armed for '$BOOTSTRAP_USER' from deployment configuration (127.0.0.1 only)"
 }
 
+# The optional key-service CA backends. The core topology configures BOTH from boot while
+# every CA is still local — that is what makes "configuring them changes nothing until a CA
+# is actually rotated" provable. The agent topology proves the node-health and splice path
+# instead, and each backend costs a container (LocalStack is a ~1GB pull), so it boots on
+# the local CA alone. Nothing it asserts touches a key service.
+cp_key_service_flags() {
+  [[ "$TOPOLOGY" == agent ]] && return 0
+  printf '%s\n' \
+    "--sessionlayer.ca.azure.enabled=true" \
+    "--sessionlayer.ca.azure.vault-uri=$KEYVAULT_URL" \
+    "--sessionlayer.ca.azure.credential=managed-identity" \
+    "--sessionlayer.ca.aws.enabled=true" \
+    "--sessionlayer.ca.aws.region=$KMS_REGION" \
+    "--sessionlayer.ca.aws.account-id=$KMS_ACCOUNT_ID" \
+    "--sessionlayer.ca.aws.endpoint-override=$KMS_ENDPOINT" \
+    "--sessionlayer.ca.aws.allow-endpoint-override=true" \
+    "--sessionlayer.ca.aws.allow-insecure-endpoint=true"
+}
+
 start_cp() {
   log "starting the real Control Plane jar (mTLS :$FS_CP_MTLS_PORT, REST :$FS_CP_REST_PORT)"
   # azure.enabled/vault-uri are set unconditionally, from boot, while every CA is
@@ -787,6 +817,13 @@ start_cp() {
   # opt-in a plaintext LocalStack endpoint requires — assert_cp_refuses_insecure_kms_endpoint
   # has already proven, against this same jar, that omitting it refuses the boot.
   arm_bootstrap_escape_hatch
+  local ca_flags=() jvm_flags=()
+  mapfile -t ca_flags < <(cp_key_service_flags)
+  # The Key Vault double's TLS is the only reason the CP needs a custom truststore.
+  [[ -n "${KEYVAULT_TRUSTSTORE:-}" ]] && jvm_flags=(
+    "-Djavax.net.ssl.trustStore=$KEYVAULT_TRUSTSTORE"
+    -Djavax.net.ssl.trustStorePassword=changeit
+  )
   SESSIONLAYER_CA_LOCAL_ALLOW_DEV_KEK=true \
   SESSIONLAYER_MTLS_SERVER_PORT="$FS_CP_MTLS_PORT" \
   SERVER_PORT="$FS_CP_REST_PORT" \
@@ -795,25 +832,16 @@ start_cp() {
   SPRING_R2DBC_USERNAME="sessionlayer" SPRING_R2DBC_PASSWORD="sessionlayer" \
   SPRING_FLYWAY_URL="jdbc:postgresql://localhost:${FS_PG_PORT}/sessionlayer" \
   SPRING_FLYWAY_USER="sessionlayer" SPRING_FLYWAY_PASSWORD="sessionlayer" \
-  IDENTITY_ENDPOINT="$MSI_ENDPOINT" IDENTITY_HEADER="fs-e2e-keyvault-double" \
-  AWS_ACCESS_KEY_ID="$KMS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$KMS_SECRET_ACCESS_KEY" AWS_REGION="$KMS_REGION" \
+  IDENTITY_ENDPOINT="${MSI_ENDPOINT:-}" IDENTITY_HEADER="fs-e2e-keyvault-double" \
+  AWS_ACCESS_KEY_ID="${KMS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${KMS_SECRET_ACCESS_KEY:-}" AWS_REGION="${KMS_REGION:-}" \
     java \
-      -Djavax.net.ssl.trustStore="$KEYVAULT_TRUSTSTORE" \
-      -Djavax.net.ssl.trustStorePassword=changeit \
+      "${jvm_flags[@]}" \
       -jar "$CP_JAR" \
       --sessionlayer.rest-security.basic-auth.enabled=true \
       --sessionlayer.rest-security.basic-auth.username="$BOOTSTRAP_USER" \
       --sessionlayer.rest-security.basic-auth.password-hash="$BOOTSTRAP_PASSWORD_HASH" \
       --sessionlayer.rest-security.basic-auth.allowed-cidrs=127.0.0.1/32,::1/128 \
-      --sessionlayer.ca.azure.enabled=true \
-      --sessionlayer.ca.azure.vault-uri="$KEYVAULT_URL" \
-      --sessionlayer.ca.azure.credential=managed-identity \
-      --sessionlayer.ca.aws.enabled=true \
-      --sessionlayer.ca.aws.region="$KMS_REGION" \
-      --sessionlayer.ca.aws.account-id="$KMS_ACCOUNT_ID" \
-      --sessionlayer.ca.aws.endpoint-override="$KMS_ENDPOINT" \
-      --sessionlayer.ca.aws.allow-endpoint-override=true \
-      --sessionlayer.ca.aws.allow-insecure-endpoint=true \
+      "${ca_flags[@]}" \
       > "$WORKDIR/cp.log" 2>&1 &
   CP_PID=$!; PIDS+=("$CP_PID")   # CP_PID: the CP-down case kills it explicitly
   local deadline=$((SECONDS + WAIT_SECS))
@@ -1196,6 +1224,8 @@ run_session() {
   # --entrypoint sh: the ssh-client image's ENTRYPOINT is `sleep infinity`, so a bare
   # `docker run image sh -c ...` would exec `sleep sh -c ...`. Copy the key to a
   # root-owned 0600 path inside the container to sidestep host-uid perm quirks.
+  AGENT_SIDE_LOG=""
+  [[ "$TOPOLOGY" == agent ]] && AGENT_SIDE_LOG="$(agent_log | tail -25)"
   SESSION_OUT="$(docker run --rm --network host \
       -v "$WORKDIR/client_key:/mnt/client_key:ro" \
       --entrypoint sh \
@@ -1206,7 +1236,7 @@ run_session() {
           -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 \
           '$NODE_LOGIN%$NODE_NAME@127.0.0.1' \
           'echo $MARKER; echo FULLSTACK_PATH_OK; hostname'" 2>&1)" \
-    || die "cross-stack ssh failed:\n$SESSION_OUT\n--- gateway.log ---\n$(tail -30 "$WORKDIR/gateway.log")"
+    || die "cross-stack ssh failed:\n$SESSION_OUT\n--- gateway.log ---\n$(tail -30 "$WORKDIR/gateway.log")${AGENT_SIDE_LOG:+\n--- agent.log ---\n$(agent_log | tail -25)}"
   grep -q FULLSTACK_PATH_OK <<<"$SESSION_OUT" || die "node output did not return: $SESSION_OUT"
   grep -q "$MARKER" <<<"$SESSION_OUT" || die "session marker not returned: $SESSION_OUT"
   ok "command ran on the REAL node via the REAL CP Authorize decision; output returned"
@@ -2030,7 +2060,304 @@ assert_spill() {
   ok "recorder spill under hardening=$FS_HARDENING succeeded — spool in the data-dir, strict session intact"
 }
 
+
+# ── TOPOLOGY=agent: the outbound-agent leg ───────────────────────────────────
+#
+# What this topology proves that the core one structurally cannot: a node the Gateway
+# NEVER dials. The Agent dials OUT to the Gateway and splices each dial-back to the sshd
+# in its own container, and the Control Plane's view of whether that node is usable comes
+# from a presence claim rather than from anything anyone can reach out and probe.
+#
+# The health arc it walks is the whole point, and every value in it is asserted:
+#   unhealthy — the Agent joined a name nobody registered, so the CP auto-created the node
+#               with NO host anchor. It holds a live control channel and is still unusable,
+#               because the Gateway never TOFUs. Presence alone must NOT read as healthy.
+#   healthy   — after the anchor is repaired over REST, with owningGateway naming this
+#               Gateway.
+#   unknown   — a second node, anchored at registration, that no Agent ever joins.
+# A run that returned a constant would fail two of those three.
+
+build_agent_node_image() {
+  if [[ -z "${FS_FORCE_BUILD:-}" ]] && docker image inspect "$AGENT_NODE_IMAGE" >/dev/null 2>&1; then
+    log "reusing existing agent-node image ($AGENT_NODE_IMAGE)"
+    return
+  fi
+  log "building the agent-node fixture image ($AGENT_NODE_IMAGE)"
+  docker build -q -t "$AGENT_NODE_IMAGE" \
+    --build-arg "NODE_IMAGE=$NODE_IMAGE" "$SCRIPT_DIR/agent-node" >/dev/null \
+    || die "agent-node image build failed"
+}
+
+# A join token scoped to a node name the CP has never seen. Minting does not require the
+# node to exist — which is exactly how a node comes to exist with no anchor.
+issue_agent_join_token() {
+  operator_step "issue the agent join token" rest-only
+  local minted listed
+  minted="$(api_ok POST /v1/join-tokens "$(json nodeName "$NODE_NAME" ttlSeconds %7200)")"
+  AGENT_JOIN_TOKEN="$(json_get "$minted" token)"
+  [[ -n "$AGENT_JOIN_TOKEN" ]] || die "the join-token mint returned no token: $minted"
+  listed="$(api_ok GET /v1/join-tokens)"
+  ! grep -qF "$AGENT_JOIN_TOKEN" <<<"$listed" || die "the list response leaked the raw join token"
+  ok "agent join token minted over REST (single-use, scoped to '$NODE_NAME')"
+}
+
+# The `unknown` arm: agent-connector, anchored at registration, no Agent will ever join it.
+register_unjoined_agent_node() {
+  operator_step "register a second agent node that no Agent will join" rest-only
+  local created
+  created="$(api_ok POST /v1/nodes "$(NODE="$UNJOINED_NODE" HK="$NODE_HOSTKEY_LINE" python3 -c '
+import json, os
+print(json.dumps({"name": os.environ["NODE"], "connectorKind": "agent",
+                  "labels": {"env": "fullstack"}, "pinnedHostKey": os.environ["HK"]}))')")"
+  UNJOINED_NODE_ID="$(json_get "$created" id)"
+  [[ -n "$UNJOINED_NODE_ID" ]] || die "POST /v1/nodes returned no id for $UNJOINED_NODE: $created"
+  ok "registered $UNJOINED_NODE (agent, anchored, unclaimed)"
+}
+
+# The advertise URL is an ADDRESS, not the Gateway's name, for the same reason the Agent's
+# own endpoints are: it is handed to the Agent in a dial-back instruction, and the Agent
+# resolves it AFTER Landlock has taken /etc/resolv.conf and /etc/hosts away from it. A named
+# advertise URL produces a dial-back the agent simply refuses, which surfaces at the Gateway
+# as an opaque "agent refused the dial-back". The verified identity is unaffected — the Agent
+# checks the certificate against its configured --gateway-server-name.
+launch_gateway_agent() {
+  operator_step "start the Gateway with its agent transport, which enrols itself" rest-only
+  log "rendering + launching the real Gateway (outbound-agent transport on :$FS_GW_AGENT_PORT)"
+  CP_MTLS_ENDPOINT="https://localhost:${FS_CP_MTLS_PORT}" \
+  CP_SERVER_NAME="localhost" \
+  GW_DATA_DIR="$WORKDIR/gw-data" \
+  GW_ENROLL_TOKEN="$GW_ENROLL_TOKEN" \
+  GW_CA_PEM="$WORKDIR/ca.pem" \
+  GW_NAME="$GW_NAME" \
+  GW_SSH_ADDR="127.0.0.1:${FS_GW_SSH_PORT}" \
+  GW_AGENT_ADDR="0.0.0.0:${FS_GW_AGENT_PORT}" \
+  GW_AGENT_ADVERTISE="wss://127.0.0.1:${FS_GW_AGENT_PORT}" \
+    envsubst '${CP_MTLS_ENDPOINT} ${CP_SERVER_NAME} ${GW_DATA_DIR} ${GW_ENROLL_TOKEN} ${GW_CA_PEM} ${GW_NAME} ${GW_SSH_ADDR} ${GW_AGENT_ADDR} ${GW_AGENT_ADVERTISE}' \
+    < "$SCRIPT_DIR/config/gateway-agent.json.tmpl" > "$WORKDIR/gateway.json"
+  rm -rf "$WORKDIR/gw-data"; mkdir -p "$WORKDIR/gw-data"
+  RUST_LOG="${GW_RUST_LOG:-info}" "$GATEWAY_BIN" --config "$WORKDIR/gateway.json" > "$WORKDIR/gateway.log" 2>&1 &
+  GW_PID=$!; PIDS+=("$GW_PID")
+  local deadline=$((SECONDS + 180))
+  until grep -q "outer SSH leg listening" "$WORKDIR/gateway.log" 2>/dev/null; do
+    kill -0 "$GW_PID" 2>/dev/null || { tail -40 "$WORKDIR/gateway.log" >&2; die "Gateway exited during startup (enrollment?)"; }
+    [[ $SECONDS -lt $deadline ]] || { tail -40 "$WORKDIR/gateway.log" >&2; die "Gateway outer leg never started"; }
+    sleep 1
+  done
+  grep -q "outbound-agent transport" "$WORKDIR/gateway.log" \
+    || die "the Gateway started without its agent transport; the Agent would have nothing to dial:\n$(tail -40 "$WORKDIR/gateway.log")"
+  ok "Gateway enrolled; outer SSH leg :$FS_GW_SSH_PORT, agent transport :$FS_GW_AGENT_PORT"
+}
+
+# The node container runs the REAL Agent binary, non-root, enrolling with the real CP over
+# a real join token, then dialling out to the Gateway. Two constraints shape how it is
+# started, and both were found by running it rather than by reading:
+#
+# 1. HOST networking, with the node's sshd on a port THIS HARNESS allocated. The Agent
+#    dials out, so it needs to reach the CP and the Gateway, which are host processes; a
+#    bridge container cannot necessarily reach them (on the box this was developed on, the
+#    docker bridge cannot reach the host at all). Host networking removes that dependency —
+#    but `--splice-addr 127.0.0.1:22` in a shared namespace would be the HOST's sshd, and on
+#    a box that runs one that is a green run which proved nothing. Allocating the port here
+#    and passing it as the splice address removes the ambiguity: the only thing listening on
+#    FS_AGENT_NODE_PORT is the sshd this harness just started in this container.
+# 2. Both endpoints are dialled by IP with the verified name supplied SEPARATELY, which is
+#    not a shortcut around DNS but the only shape that works. The Agent applies Tier-0
+#    hardening BEFORE it joins, and its Landlock read set is its CA file plus its join
+#    material and nothing else, so /etc/resolv.conf, /etc/hosts and /etc/nsswitch.conf are
+#    all unreadable by the time it dials; a hostname endpoint fails as an opaque "transport
+#    error". TLS identity is unweakened — --cp-server-name / --gateway-server-name are what
+#    the certificate is verified against, and they still have to match the CP-stamped SANs.
+start_agent_node() {
+  log "generating the node host key (the anchor is deliberately NOT registered yet)"
+  local D="$WORKDIR"
+  rm -f "$D/node_host_key" "$D/node_host_key.pub"
+  ssh-keygen -t ed25519 -N '' -f "$D/node_host_key" -q
+  NODE_HOSTKEY_LINE="$(awk '{print $1" "$2}' "$D/node_host_key.pub")"
+  NODE_HOSTKEY_FP="$(ssh-keygen -lf "$D/node_host_key.pub" | awk '{print $2}')"
+
+  docker rm -f "$AGENT_NODE_CONTAINER" >/dev/null 2>&1 || true
+  docker create --name "$AGENT_NODE_CONTAINER" --network host \
+    -e TRUSTED_USER_CA="$SESSION_CA_LINE" \
+    -e AGENT_JOIN_TOKEN="$AGENT_JOIN_TOKEN" \
+    -e AGENT_NODE_NAME="$NODE_NAME" \
+    -e AGENT_CP_ENDPOINT="https://127.0.0.1:${FS_CP_MTLS_PORT}" \
+    -e AGENT_CP_SERVER_NAME="controlplane" \
+    -e AGENT_GATEWAY_ENDPOINT="wss://127.0.0.1:${FS_GW_AGENT_PORT}" \
+    -e AGENT_GATEWAY_SERVER_NAME="$GW_NAME" \
+    -e AGENT_SPLICE_ADDR="127.0.0.1:${FS_AGENT_NODE_PORT}" \
+    -e AGENT_LOG="${AGENT_LOG:-info}" \
+    "$AGENT_NODE_IMAGE" -p "$FS_AGENT_NODE_PORT" >/dev/null
+  docker cp "$D/node_host_key"     "$AGENT_NODE_CONTAINER:/etc/ssh/ssh_host_ed25519_key"
+  docker cp "$D/node_host_key.pub" "$AGENT_NODE_CONTAINER:/etc/ssh/ssh_host_ed25519_key.pub"
+  docker cp "$AGENT_BIN"           "$AGENT_NODE_CONTAINER:/agent/sessionlayer-agent"
+  docker cp "$D/ca.pem"            "$AGENT_NODE_CONTAINER:/agent/ca.pem"
+  docker start "$AGENT_NODE_CONTAINER" >/dev/null
+
+  local deadline=$((SECONDS + 120))
+  until docker logs "$AGENT_NODE_CONTAINER" 2>&1 | grep -q "Server listening on"; do
+    docker ps -q --filter "name=$AGENT_NODE_CONTAINER" | grep -q . \
+      || { docker logs "$AGENT_NODE_CONTAINER" >&2; die "agent-node container exited"; }
+    [[ $SECONDS -lt $deadline ]] || { agent_log >&2; die "the agent node's sshd never listened"; }
+    sleep 1
+  done
+  ok "agent node up ($NODE_NAME; sshd in-container only, host key $NODE_HOSTKEY_FP)"
+}
+
+agent_log() { docker exec "$AGENT_NODE_CONTAINER" cat /agent/agent.log 2>/dev/null || true; }
+
+# The node's whole API view, by NAME. `health` and `owningGateway` are both derived at read
+# time, so this is the operator's answer and not a stored column.
+node_view() {  # $1=node name -> "<id> <health> <owningGateway>", "" if absent
+  # NODES_BODY is kept for the failure path. A helper that answers "" for BOTH "the API
+  # refused me" and "the node is not there yet" turns a broken query into a polling timeout
+  # that blames the node — which is exactly how the first version of this wasted a run.
+  NODES_BODY="$(api_ok GET /v1/nodes)"
+  # NodeList's array is `nodes`, NOT the `items` every other list response in this API
+  # uses. Reading `items` here yields "no such node" in EVERY state, which is a check that
+  # can only ever fail — and, polled, one that blames the node for the parser's mistake.
+  printf %s "$NODES_BODY" | NAME="$1" python3 -c '
+import json, os, sys
+want = os.environ["NAME"]
+body = json.load(sys.stdin)
+listed = body.get("nodes")
+if listed is None:
+    raise SystemExit("GET /v1/nodes has no `nodes` array; the response shape moved: %r" % body)
+for node in listed:
+    if node.get("name") == want:
+        print(node["id"], node.get("health") or "-", node.get("owningGateway") or "-")
+        break'
+}
+
+await_node_health() {  # $1=node name $2=expected health -> sets NODE_ID/NODE_HEALTH/NODE_OWNER
+  local deadline=$((SECONDS + ${3:-120})) view
+  while :; do
+    view="$(node_view "$1")"
+    read -r NODE_ID NODE_HEALTH NODE_OWNER <<<"${view:-- - -}"
+    [[ "$NODE_HEALTH" != "$2" ]] || return 0
+    [[ $SECONDS -lt $deadline ]] || {
+      agent_log >&2
+      # The whole listing, so "the node is missing" and "the node is there with the wrong
+      # health" are distinguishable without a second run.
+      printf 'GET /v1/nodes returned:\n%s\n' "$NODES_BODY" >&2
+      die "node '$1' never reported health=$2 (last: health=$NODE_HEALTH owningGateway=$NODE_OWNER)"
+    }
+    sleep 2
+  done
+}
+
+# A live control channel is NOT sufficient for healthy. The Agent has joined a name nobody
+# registered, so the node exists with no host anchor, and the Gateway never TOFUs — every
+# session to it would abort. Reporting it healthy here would be a new lie in place of the
+# old one.
+assert_agent_node_is_unhealthy_without_an_anchor() {
+  log "the joined-but-anchorless node must read unhealthy, live control channel notwithstanding"
+  await_node_health "$NODE_NAME" unhealthy 180
+  AGENT_NODE_ID="$NODE_ID"
+  local anchors count
+  anchors="$(api_ok GET "/v1/nodes/$AGENT_NODE_ID/host-anchors")"
+  # `anchors` is the array; a count taken from a key that does not exist is zero for the
+  # wrong reason and would let this assertion pass against any response at all.
+  count="$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if "anchors" not in d:
+    raise SystemExit("host-anchors response has no `anchors` array: %r" % d)
+print(len(d["anchors"]))' <<<"$anchors")" \
+    || die "could not read the anchor set: $anchors"
+  [[ "$count" == 0 ]] \
+    || die "the auto-created node already had $count anchor(s); the unhealthy reading proves nothing: $anchors"
+  ok "auto-created node $NODE_NAME is unhealthy with zero anchors (id=$AGENT_NODE_ID)"
+}
+
+# The repair path the published guides promise. Full atomic replace over REST, no database.
+repair_host_anchor() {
+  operator_step "repair the node's host anchor over REST" rest-only
+  api_ok PUT "/v1/nodes/$AGENT_NODE_ID/host-anchors" \
+    "$(json pinnedHostKey "$NODE_HOSTKEY_LINE")" >/dev/null
+  # The repair has to be visible in the anchor set, not merely accepted.
+  local after
+  after="$(api_ok GET "/v1/nodes/$AGENT_NODE_ID/host-anchors")"
+  [[ "$(python3 -c 'import json,sys;print(len(json.load(sys.stdin)["anchors"]))' <<<"$after")" == 1 ]] \
+    || die "the anchor PUT returned 2xx but the node still has no single anchor: $after"
+  ok "host anchor written over REST (pinned $NODE_HOSTKEY_FP)"
+}
+
+# The headline of this topology: with an anchor AND a fresh presence claim, the node reads
+# healthy and the API names the Gateway that actually holds its control channel.
+assert_agent_node_is_healthy_and_owned() {
+  log "with the anchor repaired, the node must read healthy and name its owner"
+  await_node_health "$NODE_NAME" healthy 180
+  [[ "$NODE_OWNER" == "$GW_NAME" ]] \
+    || die "health is healthy but owningGateway is '$NODE_OWNER', not the Gateway holding the channel ('$GW_NAME')"
+  ok "$NODE_NAME reports health=healthy owningGateway=$GW_NAME over GET /v1/nodes"
+}
+
+# The third arm, and the one that makes the other two mean something: a node with an anchor
+# that no Agent ever claimed is `unknown`, not `healthy`.
+assert_unjoined_agent_node_is_unknown() {
+  local view health
+  view="$(node_view "$UNJOINED_NODE")"
+  health="$(awk '{print $2}' <<<"$view")"
+  [[ "$health" == unknown ]] \
+    || die "an anchored agent node no Agent ever joined must read unknown, got '$health'"
+  ok "$UNJOINED_NODE reports health=unknown (anchored, never claimed)"
+}
+
+# The reduced agent scenario. Deliberately NOT the core run's full chain: Key Vault, KMS
+# and CP-down are proven there against the same binaries, and re-proving them here would
+# spend the budget this leg needs. What is here is what only this topology can show.
+main_agent() {
+  NODE_NAME="${AGENT_NODE_NAME:-agent-01}"   # the helpers below key sessions off NODE_NAME
+  preflight
+  build_artifacts
+  build_agent_node_image
+  start_infra
+  start_cp
+
+  claim_first_admin
+  provision_admin_service_account
+  export_trust_material
+  provision_recording_key
+  create_grants
+  free_gateway_name
+  issue_gateway_enrollment_token
+  issue_agent_join_token
+  launch_gateway_agent          # the agent transport must exist before the Agent dials it
+  operator_flow_end
+
+  start_agent_node              # real Agent binary, real enroll, real dial-out
+  assert_agent_node_is_unhealthy_without_an_anchor
+  repair_host_anchor
+  register_unjoined_agent_node
+  operator_flow_end
+  assert_agent_node_is_healthy_and_owned
+  assert_unjoined_agent_node_is_unknown
+
+  run_session                   # spliced through the Agent; the Gateway never dials the node
+  export_and_decrypt_recording
+  report_agent
+}
+
+report_agent() {
+  cat <<EOF
+
+$(printf '\033[32m========================================================\033[0m')
+$(printf '\033[32m  FULL-STACK AGENT-TOPOLOGY E2E PASSED\033[0m')
+$(printf '\033[32m========================================================\033[0m')
+  Real CP jar   : $CP_JAR  (mTLS :$FS_CP_MTLS_PORT, REST :$FS_CP_REST_PORT)
+  Real Gateway  : $GATEWAY_BIN  (ssh :$FS_GW_SSH_PORT, agent transport :$FS_GW_AGENT_PORT)
+  Real Agent    : $AGENT_BIN  (in $AGENT_NODE_CONTAINER, non-root, real join token)
+  Node health   : $NODE_NAME  unhealthy (joined, anchorless) -> healthy, owningGateway=$GW_NAME
+                  $UNJOINED_NODE  unknown (anchored, never claimed)
+  Session       : ssh $NODE_LOGIN%$NODE_NAME@gw spliced through the Agent's own channel —
+                  the Gateway holds no dial address for this node and never dialled it
+  Recording     : exported over REST and opened with the offline customer private key
+  Logs          : $WORKDIR/{cp,gateway}.log, docker exec $AGENT_NODE_CONTAINER cat /agent/agent.log
+EOF
+}
+
 main() {
+  if [[ "$TOPOLOGY" == agent ]]; then main_agent; return; fi
   preflight
   build_artifacts
   start_infra
