@@ -52,7 +52,7 @@ impl RecordingCipher {
         let eph_pub = ephemeral.public_key().to_encoded_point(false);
         let eph_pub_bytes = eph_pub.as_bytes();
         let shared = ephemeral.diffie_hellman(&customer_pub);
-        let kek = derive_kek(shared.raw_secret_bytes().as_slice(), eph_pub_bytes)?;
+        let kek = derive_kek(&shared.raw_secret_bytes()[..], eph_pub_bytes)?;
         drop(shared);
         drop(ephemeral);
 
@@ -139,7 +139,7 @@ pub fn unseal_data_key(
     let shared =
         p256::ecdh::diffie_hellman(customer_secret.to_nonzero_scalar(), eph_pub.as_affine());
     let kek = derive_kek(
-        shared.raw_secret_bytes().as_slice(),
+        &shared.raw_secret_bytes()[..],
         &header.ephemeral_public,
     )?;
     let wrap_cipher = Aes256Gcm::new_from_slice(&kek[..]).map_err(|_| SealError::CustomerKey)?;
