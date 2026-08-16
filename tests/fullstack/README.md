@@ -21,7 +21,7 @@ boot jar and the Agent binary, and invokes `run.sh` with the env interface below
 | `CP_JAR` | **yes** | path to the real `controlplane-*.jar` boot jar |
 | `AGENT_BIN` | for `TOPOLOGY=agent\|all` | path to the real `sessionlayer-agent` executable |
 | `GATEWAY_BIN` | no | prebuilt gateway binary; if unset, `run.sh` runs `cargo build -p gateway` |
-| `TOPOLOGY` | no | `core` (default) · `agent` · `all` |
+| `TOPOLOGY` | no | `core` · `agent` · `all`. CI runs `core` and `agent` as parallel matrix jobs; a dispatch naming one runs only that one |
 
 Everything else — infra (Postgres + MinIO via `infra-compose.yml`), the node/client
 container images (`tests/fixtures/{sshd,ssh-client}`), CP launch, provisioning, and the
@@ -154,7 +154,7 @@ claimed here that `run.sh` does not assert would be worse than no table at all.
 | 5 | **Deny-path** fail-closed (deny-wins): an ungranted login is refused by the real CP with a generic denial | **LIVE (core)** |
 | 6 | **CP-down** fail-closed: the real CP is killed → a new session fails closed, never fail-open | **LIVE (core)** |
 | 6a | **Per-channel re-`Authorize`**: a ControlMaster channel opened past `decision_ttl` succeeds **and** a second `authz.decision` is recorded against the same session id | **LIVE (core)** |
-| 7 | **Outbound-agent** connector: a node reached via the real Agent (dial-out WSS → dial-back splice) | referenced: `agent_e2e.rs` + `splice_e2e.rs` (real Agent binaries); full-stack flow scaffolded (`tests/fullstack/agent-node/` + `gateway-agent.json.tmpl` + `AGENT_BIN`), not yet a live assertion |
+| 7 | **Outbound-agent** connector + **node health**: the real Agent binary enrols against the real CP with a real join token and dials out to the Gateway, which never holds a dial address for the node. The node's `health` is asserted through `GET /v1/nodes` at every value it can take: `unhealthy` for the node the Agent's join auto-created, which holds a live control channel and has NO host anchor and so aborts every session; `healthy` with `owningGateway` naming this Gateway once the anchor is repaired over `PUT /v1/nodes/{id}/host-anchors`; and `unknown` for a second node that is anchored but that no Agent ever claimed. A real `ssh` session is then spliced through the Agent's own channel and its recording exported and decrypted offline | **LIVE (`TOPOLOGY=agent`)** |
 | 8 | Lock mid-session teardown of a live recorded session | referenced: `recorder_it.rs` (real binaries, both strict + best_effort) |
 | 9 | JIT self-approval refused | referenced: `breakglass_it.rs` / CP JIT ITs |
 | 10 | Break-glass can't override a Lock / FIDO2 | referenced: `breakglass_it.rs` (real `sk-dummy`) |
