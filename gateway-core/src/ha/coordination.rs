@@ -1,5 +1,3 @@
-//! Coordination signal bus seam (DialBackSignal only, never session bytes).
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -45,7 +43,6 @@ impl InProcessBackend {
     }
 
     fn sender(&self, gateway_id: &str) -> broadcast::Sender<DialBackSignal> {
-        // Fail-closed: recover a poisoned lock (critical section runs no user code).
         self.channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -130,7 +127,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_signal_is_delivered_only_to_the_addressed_owner() {
-        // The whole point of the subject/id keying: gw-C must not see gw-B's signal.
         let bus = InProcessBackend::new();
         let mut for_b = bus.subscribe("gw-B");
         let mut for_c = bus.subscribe("gw-C");
@@ -155,7 +151,6 @@ mod tests {
 
     #[tokio::test]
     async fn publishing_with_no_subscriber_fails_closed() {
-        // No owner subscribed ⇒ NoSubscriber ⇒ the ingress will time out and fail closed.
         let bus = InProcessBackend::new();
         let err = bus
             .publish_dial_back("gw-nobody", &signal("node-a", "gw-nobody"))
@@ -166,9 +161,6 @@ mod tests {
 
     #[tokio::test]
     async fn two_gateways_sharing_one_bus_route_across_each_other() {
-        // The HA-E2E topology: gw-A (ingress) and gw-B (owner) share one Arc<bus>. gw-A
-        // publishes to gw-B and gw-B's own subscriber receives it — a real cross-gateway
-        // signal, in-process, no broker.
         let bus: Arc<dyn CoordinationBackend> = Arc::new(InProcessBackend::new());
         let mut owner_sub = bus.subscribe("gw-B");
         bus.publish_dial_back("gw-B", &signal("node-x", "gw-B"))

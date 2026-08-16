@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-/// Gateway configuration; `deny_unknown_fields` fails misconfiguration closed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GatewayConfig {
@@ -401,7 +400,6 @@ pub struct BootstrapConfig {
 
 impl std::fmt::Debug for BootstrapConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never render the bearer token.
         f.debug_struct("BootstrapConfig")
             .field("enrollment_token", &"<redacted>")
             .field("ca_cert_path", &self.ca_cert_path)
@@ -514,7 +512,6 @@ mod tests {
 
     #[test]
     fn deserialises_partial_config_with_defaults() {
-        // Only io_backend given; the rest fall back to defaults.
         let cfg: GatewayConfig = serde_json::from_str(r#"{"io_backend":"uring"}"#).unwrap();
         assert_eq!(cfg.io_backend, IoBackend::Uring);
         assert_eq!(cfg.cp_mtls_endpoint, "https://127.0.0.1:9443");
@@ -533,7 +530,6 @@ mod tests {
 
     #[test]
     fn unknown_key_fails_closed() {
-        // A misspelled key must error, not be silently dropped.
         let result: Result<GatewayConfig, _> = serde_json::from_str(r#"{"io_back_end":"uring"}"#);
         assert!(result.is_err(), "unknown config key must be rejected");
     }
@@ -541,11 +537,9 @@ mod tests {
     #[test]
     fn hardening_sandbox_off_but_coredumps_disabled_by_default() {
         let cfg = GatewayConfig::default();
-        // The sandbox steps are opt-in...
         assert!(cfg.hardening.run_as_user.is_empty(), "no privilege drop");
         assert!(!cfg.hardening.landlock.enabled, "landlock off");
         assert_eq!(cfg.hardening.seccomp.mode, SeccompMode::Off, "seccomp off");
-        // ...but coredump-disable (low-risk, directly protects secrets) is ON.
         assert!(
             cfg.hardening.disable_coredumps,
             "coredumps disabled by default"
@@ -592,14 +586,12 @@ mod tests {
             cfg.ssh.source_ip_allowlist.is_empty(),
             "gate off by default"
         );
-        // The device flow must fit inside the login grace window.
         assert!(cfg.ssh.device_flow.poll_timeout_secs < cfg.ssh.login_grace_secs);
         assert_eq!(cfg.ssh.device_flow.heartbeat_interval_secs, 10);
     }
 
     #[test]
     fn wildcard_dns_suffixes_parse_and_deny_unknown_keys() {
-        // The wildcard-DNS node domains parse from config.
         let cfg: GatewayConfig =
             serde_json::from_str(r#"{"ssh":{"node_dns_suffixes":["ssh.corp",".db.internal"]}}"#)
                 .unwrap();
@@ -607,7 +599,6 @@ mod tests {
             cfg.ssh.node_dns_suffixes,
             vec!["ssh.corp".to_string(), ".db.internal".to_string()]
         );
-        // A misspelled key still fails closed (deny_unknown_fields).
         assert!(serde_json::from_str::<GatewayConfig>(
             r#"{"ssh":{"node_dns_suffix":["ssh.corp"]}}"#
         )
@@ -635,8 +626,6 @@ mod tests {
 
     #[test]
     fn recorder_unknown_key_fails_closed() {
-        // A misspelled recorder key must error (fail closed), not leave the default
-        // (possibly security-relevant, e.g. `strict`) silently in place.
         let result: Result<GatewayConfig, _> =
             serde_json::from_str(r#"{"ssh":{"recorder":{"strickt":false}}}"#);
         assert!(result.is_err(), "unknown recorder key must be rejected");
@@ -676,7 +665,7 @@ mod tests {
         // The two ordering invariants validate_config enforces hold at the defaults.
         assert!((a.dial_back_timeout_secs as i64) < a.dial_back_token_ttl_secs);
         assert!(a.max_frame_bytes > InnerLegServerConfig::default().max_packet_bytes as usize);
-        // …and the defaults sit inside the wire-contract §3 ranges the Agent also enforces,
+        // …and the defaults sit inside the agent-wire ranges the Agent also enforces,
         // so an out-of-the-box Gateway is one every Agent will accept.
         assert!(crate::agent::MAX_FRAME_BYTES_RANGE.contains(&a.max_frame_bytes));
         assert!(crate::agent::HEARTBEAT_INTERVAL_SECS_RANGE.contains(&a.heartbeat_interval_secs));
@@ -694,7 +683,6 @@ mod tests {
         let cfg: GatewayConfig =
             serde_json::from_str(r#"{"ssh":{"recorder":{"strict":false}}}"#).unwrap();
         assert!(!cfg.ssh.recorder.strict);
-        // The rest of the recorder block keeps its (strict-adjacent) defaults.
         assert!(cfg.ssh.recorder.spool_dir.is_none());
     }
 
@@ -735,7 +723,6 @@ mod tests {
 
     #[test]
     fn ha_unknown_key_fails_closed() {
-        // A stray key anywhere in the HA block is rejected, not silently ignored.
         for bad in [
             r#"{"ha":{"moed":"ha"}}"#,
             r#"{"ha":{"routing":{"relay_timeout":10}}}"#,
@@ -766,7 +753,6 @@ mod tests {
         ));
         std::fs::remove_file(&bad).ok();
 
-        // A named-but-missing file is a fail-closed error, never a silent default.
         assert!(matches!(
             GatewayConfig::load_from_path(Path::new("/nonexistent/sl-gw.json")),
             Err(ConfigError::Read { .. })
@@ -775,7 +761,6 @@ mod tests {
 
     #[test]
     fn load_without_a_path_is_the_default() {
-        // `load(None)` with the env unset yields the built-in default.
         let cfg = GatewayConfig::load(None).unwrap();
         assert_eq!(cfg.ha.mode, HaMode::SingleInstance);
     }

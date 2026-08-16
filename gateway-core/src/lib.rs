@@ -1,5 +1,3 @@
-//! SessionLayer Gateway core library — Tier-0 data plane.
-
 pub mod agent;
 pub mod asyncio;
 pub mod config;

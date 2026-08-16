@@ -1,10 +1,3 @@
-//! The outer-leg russh [`Handler`], one instance per SSH connection. The Gateway is a
-//! thin PEP: every authentication and authorization decision is delegated to the CP.
-//! On ALLOW it dials the node, mints the inner cert, verifies the node host identity
-//! (no TOFU) and bridges the two legs per channel under the granted capability set.
-//! Every SSH-surface outcome goes through the [`SshOutcome`] taxonomy; no
-//! secret/OTP/token/plaintext is ever logged.
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -46,9 +39,7 @@ use crate::version;
 #[derive(Default)]
 pub struct ConnState {
     pub authenticated: AtomicBool,
-    /// Set when any CP call failed as CP-down (fail-closed).
     pub cp_unavailable: AtomicBool,
-    /// Coarse method labels attempted (no secrets), for the auth-failed record.
     pub methods_tried: Mutex<Vec<&'static str>>,
 }
 
@@ -67,14 +58,11 @@ enum AuthMethod {
     Pin,
     Otp,
     DeviceFlow,
-    /// Break-glass: a FIDO2 `sk-ecdsa` key or a single-use
-    /// offline code, resolved by the CP independent of the primary OIDC IdP.
     BreakGlass,
 }
 
 struct Authenticated {
     identity: String,
-    /// Credential-scoped logins (deny-only reducer applied at authorize time).
     principals: Vec<String>,
     groups: Vec<String>,
     method: AuthMethod,
@@ -96,16 +84,14 @@ pub struct HandlerDeps {
     pub connector: Arc<dyn NodeConnector>,
     pub resolver: Arc<dyn TargetResolver>,
     pub recorder_factory: Arc<dyn RecorderFactory>,
-    /// Tracks in-flight recording finalizes so a graceful shutdown can await them.
     pub finalize_tracker: crate::ssh::recorder::FinalizeTracker,
-    /// The actively-pushed lock deny-set: consulted per channel-open
-    /// (deny wins, datastore-independent) and carrying the feed-health signal.
     pub lock_set: Arc<LockSet>,
-    /// Live sessions, so a pushed lock tears down matching ones.
     pub live_sessions: Arc<LiveSessionRegistry>,
     pub config: Arc<SshServerConfig>,
     /// ProxyJump host-cert MITM state. `Some` only when `ssh.proxy_jump.enabled`;
-    /// `None` ⇒ a `direct-tcpip` forward is refused.
+    /// `None` means a `direct-tcpip` is NOT terminated as a jump hop — it falls
+    /// through to the ordinary local port-forward path, which still requires
+    /// `Capability::PortForwardLocal`.
     pub proxy_jump: Option<Arc<crate::ssh::proxyjump::ProxyJumpState>>,
 }
 
@@ -114,83 +100,43 @@ pub struct SshHandler {
     /// The real client source IP (PROXY-derived, gate-checked before this exists).
     source_ip: IpAddr,
     session_id: String,
-    /// The root OTel span for this connection. Carries
-    /// IDs/enums/outcomes only — never plaintext/keys/tokens.
     session_span: tracing::Span,
-    /// The SSH username (client-supplied; parsed as `login%node`, never trusted
-    /// as a principal, sanitized before logging).
     username: Option<String>,
-    /// Set on the INNER hop of a ProxyJump connection: the target node comes from the
-    /// `direct-tcpip` request, and the whole username is the login (no `%` parse).
     proxyjump_node: Option<String>,
     authenticated: Option<Authenticated>,
-    /// True once a break-glass credential (FIDO2 key / offline code) authenticated
-    /// this connection. Drives the break-glass Authorize + forced
-    /// strict recording + the break-glass mid-session-expiry policy.
     break_glass: bool,
-    /// The single-use break-glass token minted by the CP resolution, presented once
-    /// as `AuthorizeRequest.breakglass_token`. Not a long-lived secret; never logged.
     breakglass_token: Option<String>,
     ki: KiState,
     authz: Option<Arc<Authorized>>,
     authz_denied: Option<SshOutcome>,
     inner: Option<InnerClient>,
-    /// Cached so a second channel after a failed establish fails the same way without re-dialing.
     inner_failed: Option<SshOutcome>,
     recorder: Option<Arc<dyn SessionRecorder>>,
-    /// Cached so a second channel fails the same way without re-attempting BeginRecording.
     recorder_failed: Option<SshOutcome>,
     pty: HashMap<ChannelId, PtyParams>,
-    /// Retained outer channel objects (kept from `channel_open_session` so their
-    /// write half can drive the backpressured node→client direction). The read
-    /// half is dropped — outer→inner still flows via the `data` callback.
     pending_channels: HashMap<ChannelId, Channel<russh::server::Msg>>,
     writers: HashMap<ChannelId, InnerWriteHalf>,
     pumps: HashMap<ChannelId, tokio::task::JoinHandle<()>>,
-    /// Tier-0 cap: russh enforces none.
     channels_opened: usize,
-    /// Stashed `x11-req` per session channel: relayed UNCHANGED to the
-    /// node when the inner session channel opens (like [`Self::pty`]). Only present
-    /// when the `x11` capability was granted (gated at `x11_request`). The auth
-    /// cookie is a secret — NEVER logged.
     x11_reqs: HashMap<ChannelId, X11Params>,
-    /// Concurrent forwarded-tunnel count, shared with the [`ReverseDispatcher`] and each
-    /// tunnel pump so ALL forwards from one connection share one concurrency cap.
     active_tunnels: Arc<AtomicUsize>,
-    /// Remote-forward (`ssh -R`) listeners bound on the node, keyed by `(bind_address,
-    /// bound_port)`. A set, so a spurious/duplicate cancel cannot under-count the cap.
     remote_forwards: std::collections::HashSet<(String, u32)>,
-    /// Shared with the reverse dispatcher so it enforces the SAME time-box; a
-    /// mid-session re-authorize updates it in place.
     grant_expiry: Arc<AtomicI64>,
-    /// Shared with the reverse dispatcher for the same reason as `grant_expiry`:
-    /// a `-R`/X11 listener bound early must stop admitting node-pushed opens once a
-    /// re-authorize narrows the capability set, not just on Lock or expiry.
     allow_remote: Arc<AtomicBool>,
     allow_x11: Arc<AtomicBool>,
     reverse_tx: Option<tokio::sync::mpsc::Sender<ReverseOpen>>,
     reverse_dispatcher: Option<tokio::task::JoinHandle<()>>,
-    /// Aborted on Drop; finished handles are reaped on every new open so a busy `-L`
-    /// proxying many short-lived connections cannot grow this unbounded.
     local_forward_pumps: tokio::task::JoinSet<()>,
     /// Count of credential-resolution attempts (bounds the CP-RPC amplification
     /// per connection — russh does NOT enforce its own `max_auth_attempts`).
     auth_attempts: usize,
-    /// Flipped by a lock/expiry teardown so the bridge + recorder stop plaintext at once.
     session_abort: Option<Arc<AtomicBool>>,
     live_guard: Option<SessionGuard>,
     session_control: Option<SessionControl>,
-    /// The mid-session identity-expiry timer, rearmed on re-authorize.
     expiry_task: Option<tokio::task::JoinHandle<()>>,
     activity: Arc<AtomicU64>,
-    /// Tears the session down once no bytes have moved for the effective (tighten-only)
-    /// idle bound. Rearmed on re-authorize; aborted on Drop.
     idle_task: Option<tokio::task::JoinHandle<()>>,
-    /// Re-stamps the CP lease ahead of expiry while the session lives.
     lease_task: Option<tokio::task::JoinHandle<()>>,
-    /// Set once Authorize returned ALLOW: the CP took a concurrency lease inside
-    /// that decision, so teardown owes it a session-end signal — even when the
-    /// Gateway then failed the session closed (unverified context, node fault).
     lease_expected: AtomicBool,
     conn: Arc<ConnState>,
 }
@@ -200,17 +146,9 @@ struct Authorized {
     dial: NodeDial,
     trust: HostTrust,
     grant: SessionGrant,
-    /// The granted SSH capabilities (proto `Capability` values); default
-    /// shell+exec if the decision context declares none.
     capabilities: Vec<i32>,
-    /// The single-use Recording.BeginRecording token minted alongside the session
-    /// token. Empty when talking to an older CP that predates this field.
     recording_token: String,
-    /// The **signature-verified** decision context. The
-    /// per-channel local checks run against this — never an unverified copy.
     context: DecisionContext,
-    /// When the context was verified (Gateway clock). Bounds how long a cached
-    /// allow is served before a forced re-authorize (`decision_ttl`).
     verified_at: Instant,
     bindings: LockBindings,
 }
@@ -220,7 +158,6 @@ impl SshHandler {
         Self::with_proxyjump_node(deps, source_ip, conn, None)
     }
 
-    /// Handler for the INNER hop of a ProxyJump connection.
     pub fn new_proxyjump(
         deps: HandlerDeps,
         source_ip: IpAddr,
@@ -245,8 +182,6 @@ impl SshHandler {
             sessionlayer.node_id = tracing::field::Empty,
             sessionlayer.access_model = tracing::field::Empty,
             sessionlayer.outcome = tracing::field::Empty,
-            // Declared here so the fail-closed path can set the span STATUS to error —
-            // a recorded outcome alone leaves the RED error-rate blind to denials.
             otel.status_code = tracing::field::Empty,
         );
         Self {
@@ -305,7 +240,6 @@ impl SshHandler {
         self.source_ip.to_string()
     }
 
-    /// Bounds CP-RPC amplification per connection.
     fn attempt_cap_exceeded(&mut self) -> bool {
         self.auth_attempts += 1;
         self.auth_attempts > self.deps.config.max_auth_attempts
@@ -320,13 +254,8 @@ impl SshHandler {
         }
     }
 
-    /// Record a CP-down observation (fail-closed): flag it for the auth-failed
-    /// record and the KI service-unavailable message, and log the outcome.
     fn note_cp_down(&self, method: &str) {
         self.conn.cp_unavailable.store(true, Ordering::SeqCst);
-        // A CP outage at the AUTH phase (before any channel, so `close_with` never runs)
-        // is a genuine fail-closed SYSTEM fault — mark the span error. Ordinary auth
-        // rejections are NOT errored: they are internet noise, not faults.
         crate::telemetry::record_span_fail_closed(&self.session_span, "cp_unavailable");
         tracing::warn!(source_ip = %self.source_ip, outcome = "cp_unavailable", method, "CP unreachable during resolution; failing closed");
     }
@@ -348,8 +277,6 @@ impl SshHandler {
         });
     }
 
-    /// Store the single-use token and flip the break-glass flag (forces strict recording
-    /// + the break-glass Authorize + the break-glass mid-session-expiry policy).
     fn set_break_glass_authenticated(&mut self, id: ResolvedIdentity, token: String) {
         self.break_glass = true;
         self.breakglass_token = Some(token);
@@ -364,8 +291,6 @@ impl SshHandler {
         parse_username(username, self.deps.config.target_separator)
             .ok()
             .map(|mut t| {
-                // Wildcard DNS: strip the suffix so `user@web-01.ssh.corp` scopes to the
-                // same node as `user%web-01`.
                 t.node = strip_dns_suffix(&t.node, &self.deps.config.node_dns_suffixes);
                 t
             })
@@ -373,15 +298,6 @@ impl SshHandler {
             .unwrap_or_default()
     }
 
-    /// Try an offered sk-ecdsa security key as a break-glass credential (the
-    /// PRIMARY break-glass path). russh has already verified the FIDO POSSESSION
-    /// signature (possession only — the UP/touch bit is authenticator-enforced, not
-    /// server-asserted). Returns `Some(Auth::Accept)` on a resolved credential; `None`
-    /// when the key is NOT a registered break-glass credential (or the CP could not
-    /// answer) so the caller falls through to the ordinary pin path.
-    /// Issue the break-glass and pin lookups together, so a registered emergency key and
-    /// an unregistered one cost the same number of CP round-trips (the pin result is
-    /// carried back and reused rather than discarded).
     async fn resolve_break_glass_and_pin(
         &self,
         public_key: &PublicKey,
@@ -402,8 +318,6 @@ impl SshHandler {
                 let (bg, pin) = tokio::join!(bg, pin);
                 (Some(bg), pin)
             }
-            // An unencodable key cannot be a registered credential; still pay the pin
-            // lookup so this path is not itself distinguishable by round-trip count.
             Err(_) => (None, pin.await),
         }
     }
@@ -433,12 +347,7 @@ impl SshHandler {
         }
     }
 
-    /// Try the typed keyboard-interactive secret as a single-use break-glass OFFLINE CODE
-    /// (the IdP-independent fallback). `Some` on a terminal outcome, `None` to
-    /// fall through to the device flow. The `code` is a SECRET — NEVER logged.
     async fn try_break_glass_code(&mut self, code: &str) -> Option<Auth> {
-        // Record the attempt so a failed break-glass-code login appears in the auth-failed
-        // record. The code itself is a secret and is NEVER recorded — only the label.
         self.conn.record_method("breakglass-code");
         let node_id = self.break_glass_node_id();
         match self
@@ -465,9 +374,6 @@ impl SshHandler {
         }
     }
 
-    /// The mid-session identity-expiry mode for THIS session, per access model.
-    /// Uses BOTH the local break-glass flag and the SIGNED `access_model`
-    /// (belt-and-suspenders). A Lock always overrides with immediate teardown.
     fn mid_session_expiry_mode(&self) -> MidSessionExpiryMode {
         if self.session_is_break_glass() {
             self.deps.config.break_glass.mid_session_expiry
@@ -476,8 +382,6 @@ impl SshHandler {
         }
     }
 
-    /// Whether this session is break-glass, from the local auth flag OR the SIGNED
-    /// decision-context `access_model` — either signal forces break-glass treatment.
     fn session_is_break_glass(&self) -> bool {
         self.break_glass
             || self
@@ -486,8 +390,6 @@ impl SshHandler {
                 .is_some_and(|a| a.context.access_model == AccessModel::Breakglass as i32)
     }
 
-    /// A rejection that keeps `publickey` + `keyboard-interactive` on the table so
-    /// the client degrades to its next key/method.
     fn reject_and_degrade(&self) -> Auth {
         Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(
@@ -514,7 +416,6 @@ impl SshHandler {
                 }
             }
             KiState::AwaitingOtp => {
-                // The OTP is a secret: held in a scrub-on-drop buffer, never logged.
                 let otp = first_response(response);
                 if let Some(otp) = otp.as_ref().map(|z| z.as_str()).filter(|s| !s.is_empty()) {
                     self.conn.record_method("otp");
@@ -527,9 +428,6 @@ impl SshHandler {
                             return Auth::Accept;
                         }
                         Ok(_) => {
-                            // Not an OTP: try the same typed secret as a single-use
-                            // break-glass OFFLINE CODE (IdP-independent) so
-                            // break-glass works when the device flow is unavailable.
                             if self.deps.config.break_glass.enabled {
                                 if let Some(auth) = self.try_break_glass_code(otp).await {
                                     return auth;
@@ -537,8 +435,6 @@ impl SshHandler {
                             }
                             tracing::info!(source_ip = %self.source_ip, "OTP did not resolve; falling back to device flow")
                         }
-                        // CP down during OTP resolution → surface service-unavailable
-                        // (do NOT silently degrade to the device flow).
                         Err(e) if e.is_cp_down() => {
                             self.note_cp_down("otp");
                             self.ki = KiState::TimedOut;
@@ -585,8 +481,6 @@ impl SshHandler {
                     prompts: Cow::Owned(Vec::new()),
                 }
             }
-            // CP unreachable/errored during begin → fail closed. Surface the generic
-            // service-unavailable message on the keyboard-interactive path.
             Err(e) if e.is_cp_down() => {
                 self.note_cp_down("device_flow");
                 self.ki = KiState::TimedOut;
@@ -606,8 +500,6 @@ impl SshHandler {
             return timed_out_partial();
         }
 
-        // Decouple the client-visible heartbeat cadence from CP-poll latency:
-        // bound the poll by the heartbeat interval, then sleep only the remainder.
         let interval = Duration::from_secs(self.deps.config.device_flow.heartbeat_interval_secs);
         let started = Instant::now();
         let poll = self.deps.cpauth.poll_device_flow(&device_code);
@@ -643,8 +535,6 @@ impl SshHandler {
                 }
             }
             Err(e) => {
-                // Throttled or a transient CP fault: keep the connection alive with
-                // a heartbeat until the deadline (which fails closed). Never grants.
                 if e.code() != Some(tonic::Code::ResourceExhausted) {
                     tracing::warn!(error = %e, source_ip = %self.source_ip, "device flow poll failed transiently; heartbeating");
                 }
@@ -666,8 +556,6 @@ impl SshHandler {
     }
 
     fn close_with(&self, channel: ChannelId, session: &mut Session, outcome: SshOutcome) {
-        // Every value reaching here is a denial / node fault, so the RED error-rate must
-        // see it. The outcome enum is a stable label, never content.
         crate::telemetry::record_span_fail_closed(&self.session_span, outcome.span_label());
         if let Some(msg) = outcome.user_message() {
             let line = format!("{msg}\r\n").into_bytes();
@@ -684,8 +572,6 @@ impl SshHandler {
         kind: ChannelKind,
         session: &mut Session,
     ) {
-        // Shared admission. A refusal closes THIS channel with the generic
-        // non-disclosing outcome; live channels keep flowing.
         let accepts = required_capabilities(&kind);
         if let Err(o) = self.admit(accepts, session).await {
             self.close_with(channel, session, o);
@@ -696,8 +582,6 @@ impl SshHandler {
             .as_ref()
             .expect("inner client established by admit");
 
-        // Classify the channel for the recorder BEFORE `kind` is moved into the node open,
-        // carrying the PTY size so the asciicast header reflects it.
         let (pty_cols, pty_rows) = self
             .pty
             .get(&channel)
@@ -705,8 +589,6 @@ impl SshHandler {
             .unwrap_or((0, 0));
         let rec_kind = classify_rec_kind(&kind, pty_cols, pty_rows);
         let pty = self.pty.get(&channel);
-        // Relay a stashed x11-req to the node's session channel, in the
-        // OpenSSH order (after pty, before shell). Only present when x11 was granted.
         let x11 = self.x11_reqs.get(&channel);
         let inner_chan = match inner.open_channel(kind, pty, x11).await {
             Ok(c) => c,
@@ -731,8 +613,6 @@ impl SshHandler {
         };
         let (_outer_read, outer_write) = outer_chan.split();
 
-        // Wrapped so node→client output also stamps the idle watchdog's activity clock
-        // (the tap/bridge seam itself is unchanged).
         let recorder = self.recorder.clone().expect("recorder set above");
         recorder.open_channel(channel, rec_kind);
         let tap: Arc<dyn RecorderTap> = Arc::new(ActivityTap {
@@ -778,8 +658,6 @@ impl SshHandler {
                 return Err(SshOutcome::PolicyDenied);
             }
         } else {
-            // Re-authorize when decision_ttl has elapsed, or immediately when the lock feed
-            // is unhealthy (effective TTL 0), so a missed lock cannot be served stale-open.
             let max_decision_ttl_secs = self.deps.config.reeval.max_decision_ttl_secs;
             let healthy = self.deps.lock_set.healthy();
             let effective_ttl = if healthy {
@@ -796,13 +674,8 @@ impl SshHandler {
                     Ok(fresh) => {
                         let fresh = Arc::new(fresh);
                         self.authz = Some(fresh.clone());
-                        // The re-authorized context may carry drifted node_labels /
-                        // allowed_logins, so a lock on the NEW facet still tears this live
-                        // session down; rearm the expiry timer against the refreshed expiry.
                         if let Some(control) = self.session_control.clone() {
                             control.update_bindings(fresh.bindings.clone());
-                            // Refresh the shared grant_expiry so the reverse dispatcher
-                            // enforces the re-authorized (extended/shortened) time-box.
                             self.grant_expiry
                                 .store(fresh.context.grant_expiry_epoch_seconds, Ordering::SeqCst);
                             self.arm_expiry(fresh.context.grant_expiry_epoch_seconds);
@@ -814,8 +687,6 @@ impl SshHandler {
                         authz = fresh;
                     }
                     Err(o) => {
-                        // Refuse this NEW channel-open; existing channels keep flowing
-                        // (allow fails open for the live session, deny/new fails closed).
                         tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "revalidate_failed", "per-channel re-authorize failed; refusing new channel");
                         return Err(o);
                     }
@@ -840,8 +711,6 @@ impl SshHandler {
             return Err(SshOutcome::PolicyDenied);
         }
 
-        // (c) Source pin: multiplexed channels share one connection, so a mismatch means a
-        // mis-bound context.
         if !authz.context.source_address.is_empty()
             && authz.context.source_address != self.source_ip()
         {
@@ -859,8 +728,6 @@ impl SshHandler {
         Ok(authz)
     }
 
-    /// Register this session in the live registry (so a pushed lock can tear it
-    /// down) and arm the mid-session-expiry timer — once per connection.
     fn ensure_registered(&mut self, authz: &Arc<Authorized>, session: &Session) {
         if self.live_guard.is_some() {
             return;
@@ -909,10 +776,6 @@ impl SshHandler {
         }
     }
 
-    /// Shared capability-gated admission for a channel or global request.
-    /// Returns the shared [`Authorized`], or the non-disclosing outcome the caller
-    /// signals however its channel type requires. Deny-wins, fail-closed — the SAME path
-    /// shell/exec/sftp run, so a Lock tears a forward down like any channel.
     async fn admit(
         &mut self,
         accepts: &[Capability],
@@ -934,9 +797,6 @@ impl SshHandler {
         Ok(authz)
     }
 
-    /// Begin the mandatory session recording once, before any bytes flow.
-    /// Strict mode (or a break-glass session, which forces strict) refuses on failure;
-    /// non-strict proceeds unrecorded (logged loudly).
     async fn ensure_recorder(
         &mut self,
         authz: &Arc<Authorized>,
@@ -980,9 +840,6 @@ impl SshHandler {
         }
     }
 
-    /// Establish the inner leg once and spawn the reverse-channel dispatcher. The reverse
-    /// sink is baked into the inner client so node-initiated channels reach the outer
-    /// client only for a session that requested them.
     async fn ensure_inner(
         &mut self,
         authz: &Arc<Authorized>,
@@ -1051,9 +908,6 @@ impl SshHandler {
         }
     }
 
-    /// Publish the current reverse-forward capabilities to the shared cells the
-    /// dispatcher reads. Tighten-and-widen both apply: the authorize result is
-    /// always the live truth, exactly as for `grant_expiry`.
     fn refresh_reverse_caps(&self, authz: &Arc<Authorized>) {
         self.allow_remote.store(
             authz
@@ -1067,10 +921,6 @@ impl SshHandler {
         );
     }
 
-    /// (Re)arm the mid-session identity-expiry timer for `grant_expiry`. In `run_to_ttl`
-    /// mode there is no active teardown (new channels are already refused after expiry);
-    /// the other modes tear the live session down at (or a grace after) it. A Lock
-    /// overrides all.
     fn arm_expiry(&mut self, grant_expiry: i64) {
         if let Some(task) = self.expiry_task.take() {
             task.abort();
@@ -1106,17 +956,10 @@ impl SshHandler {
         }));
     }
 
-    /// (Re)arm the per-session idle watchdog: tear the session down once no
-    /// session-channel byte has moved for `min(static max_session_idle_secs, signed
-    /// idle_timeout_seconds)`, TIGHTEN-ONLY. Teardown runs the same [`SessionControl`]
-    /// path as a lock/expiry, so recorder finalize + session-end signal fire normally.
     fn arm_idle(&mut self, context_idle_secs: i64) {
         if let Some(task) = self.idle_task.take() {
             task.abort();
         }
-        // Wall-clock deadlines, mirroring arm_expiry: a backward NTP step can stretch one
-        // idle window, but host time is outside the attacker model and the
-        // tightened transport backstop still bounds the session.
         let idle = effective_idle_secs(
             self.deps.config.inner.max_session_idle_secs,
             context_idle_secs,
@@ -1146,9 +989,6 @@ impl SshHandler {
         }));
     }
 
-    /// Start the concurrency-lease keeper once per connection (exact accounting):
-    /// a live session outliving `grant_expiry` (RunToTtl) must still occupy its slot.
-    /// Break-glass is exempt from the concurrency cap and takes no lease.
     fn arm_lease_keeper(&mut self, authz: &Arc<Authorized>) {
         if self.lease_task.is_some() || self.session_is_break_glass() {
             return;
@@ -1166,18 +1006,12 @@ impl SshHandler {
         )));
     }
 
-    /// Resolve the target, call `Authorize`, and on ALLOW re-check the credential
-    /// reducer against the signed context and build the [`Authorized`] hand-off.
-    /// Pre-authorization failures collapse to the generic denial (no existence
-    /// disclosure); missing host-verification material aborts (never TOFU).
     async fn decide(&self) -> Result<Authorized, SshOutcome> {
         let Some(auth) = &self.authenticated else {
             return Err(SshOutcome::AuthFailed);
         };
         let username = self.username.as_deref().unwrap_or_default();
         let target = if let Some(node) = &self.proxyjump_node {
-            // ProxyJump inner hop: the node is fixed by the `direct-tcpip` target and the
-            // whole username IS the login — no `%` parse.
             Target {
                 login: username.to_string(),
                 node: node.clone(),
@@ -1187,8 +1021,6 @@ impl SshHandler {
                 tracing::info!(source_ip = %self.source_ip, username = %sanitize(username), outcome = "policy_denied", reason = "malformed_target", "generic denial");
                 return Err(SshOutcome::PolicyDenied);
             };
-            // Wildcard DNS: fold `web-01.ssh.corp` back to the bare node name so it reaches
-            // the same node as a plain `login%web-01`. A no-op when nothing matches.
             target.node = strip_dns_suffix(&target.node, &self.deps.config.node_dns_suffixes);
             target
         };
@@ -1205,23 +1037,13 @@ impl SshHandler {
         let req = AuthorizeRequest {
             identity: auth.identity.clone(),
             identity_groups: auth.groups.clone(),
-            // The CP resolves the node NAME to runtime.node.id via findByName —
-            // authoritative, server-side. node_id is kept only for back-compat (the CP
-            // ignores it when node_name is set, so an unresolved empty id is fine).
             node_name: target.node.clone(),
             node_id: node_id.clone(),
-            // The credential's login scope, deny-only. Sending it is what makes an
-            // out-of-scope refusal AUDITABLE: the CP is the sole decision authority and
-            // the only writer of the decision log, so a refusal it never sees is a
-            // refusal no auditor can see. It can never widen a decision.
             credential_principals: auth.principals.clone(),
             requested_principal: target.login.clone(),
             source_ip: self.source_ip(),
             session_id: self.session_id.clone(),
             client: Some(version::component_info()),
-            // Present ONLY on a break-glass connect: the CP consumes it (single-use), fires
-            // the alert, forces access_model = BREAKGLASS + strict, and evaluates the allow
-            // SUBJECT TO the top-tier Lock (a Lock still denies — deny wins).
             breakglass_token: self.breakglass_token.clone().unwrap_or_default(),
         };
 
@@ -1258,14 +1080,10 @@ impl SshHandler {
                         return Err(SshOutcome::PolicyDenied);
                     }
                 };
-                // The signed context binds the session/gateway this decision was
-                // made for — a mismatch means a mis-routed or replayed context.
                 if context.session_id != self.session_id {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "policy_denied", reason = "context_session_mismatch", "decision context bound to a different session (fail closed)");
                     return Err(SshOutcome::PolicyDenied);
                 }
-                // Everything downstream (inner cert, node login, recording, dial) runs as
-                // THIS login, so it is read from the signed context like node_id above.
                 let principal = match inner_leg_principal(&context, &target.login) {
                     Ok(p) => p,
                     Err(o) => {
@@ -1294,8 +1112,6 @@ impl SshHandler {
                 };
                 let trust = host_trust_from(nc.host_verification);
                 if trust.is_empty() {
-                    // No enrollment anchor → the node cannot be verified → NEVER
-                    // TOFU. Abort.
                     let m =
                         metrics::node_unreachable(UnreachableReason::NoHostVerificationMaterial);
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "aborting: node has no host-verification anchor (never TOFU)");
@@ -1311,9 +1127,6 @@ impl SshHandler {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, node_id = %sanitize(&node_id), outcome = m.outcome(), reason = m.reason(), "outbound-agent node has no enrollment name; failing closed");
                     return Err(SshOutcome::NodeUnreachable(m));
                 }
-                // A break-glass auth should always come back access_model=BREAKGLASS. A
-                // mismatch signals token mis-binding / contract drift (the local flag still
-                // forces strict, so it is not a downgrade). Not user-facing.
                 if self.break_glass && context.access_model != AccessModel::Breakglass as i32 {
                     tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, break_glass = true, access_model = context.access_model, "break-glass auth resolved to a non-BREAKGLASS access model (token mis-binding / contract drift?)");
                 }
@@ -1344,9 +1157,6 @@ impl SshHandler {
                         node_name: nc.node_name,
                         session_id: self.session_id.clone(),
                         principal,
-                        // HA: the fresh presence owner the CP folded into the decision. Empty
-                        // for agentless / no-fresh-owner; the agent-model connector routes by
-                        // owner==self and fails closed on an empty owner ("node offline").
                         owning_gateway_id: nc.owning_gateway_id,
                         owning_gateway_addr: nc.owning_gateway_addr,
                         owner_nonce: nc.owner_nonce,
@@ -1372,26 +1182,18 @@ impl SshHandler {
         }
     }
 
-    /// Establish the inner leg once: dial the node, mint the ephemeral inner cert (key
-    /// generated locally, cert only returned), verify the node host identity during the
-    /// handshake (no TOFU), and authenticate. Fail-closed at every step; a
-    /// host-verification abort is generic to the user, specific in the log.
     async fn establish_inner(
         &self,
         authz: &Authorized,
         reverse_tx: Option<tokio::sync::mpsc::Sender<ReverseOpen>>,
     ) -> Result<InnerClient, SshOutcome> {
         use tracing::Instrument;
-        // Stamp the trace root with the (non-secret) decision facts now that they
-        // are known.
         self.session_span
             .record("sessionlayer.node_id", sanitize(&authz.node.node_id));
         self.session_span.record(
             "sessionlayer.access_model",
             access_model_label(authz.context.access_model),
         );
-        // The connector is selected per node (agentless dial vs outbound-agent
-        // dial-back); everything below this line is identical either way.
         let stream = match self
             .deps
             .connector
@@ -1512,9 +1314,6 @@ impl SshHandler {
         }
     }
 
-    /// Why this session ended, for the session-end signal (advisory; a closed vocabulary).
-    /// An out-of-band teardown recorded its cause on the [`SessionControl`]; a session that
-    /// never became functional ended abnormally; everything else is an orderly close.
     fn end_reason(&self) -> SessionEndReason {
         let recorded = self
             .session_control
@@ -1536,19 +1335,13 @@ impl SshHandler {
 
 impl Drop for SshHandler {
     fn drop(&mut self) {
-        // Connection end: abort any live pump tasks deterministically (dropping the
-        // inner client also closes the node transport, but this bounds the teardown).
         for (_, pump) in self.pumps.drain() {
             pump.abort();
         }
-        // Abort the reverse-channel dispatcher + any live local-forward bridges so
-        // forwarded tunnels tear down with the connection (no leak).
         if let Some(d) = self.reverse_dispatcher.take() {
             d.abort();
         }
         self.local_forward_pumps.abort_all();
-        // Stop the mid-session-expiry timer (the connection is already ending). The
-        // live_guard drops here too, deregistering the session from the lock registry.
         if let Some(task) = self.expiry_task.take() {
             task.abort();
         }
@@ -1558,8 +1351,6 @@ impl Drop for SshHandler {
         if let Some(task) = self.lease_task.take() {
             task.abort();
         }
-        // Finalize off the Drop path. Spawned via the tracker so teardown never blocks but a
-        // graceful shutdown can still await it.
         if let Some(rec) = self.recorder.take() {
             self.deps.finalize_tracker.spawn(rec.finalize());
         }
@@ -1590,7 +1381,6 @@ impl Handler for SshHandler {
         Ok(Auth::Accept)
     }
 
-    // `skip_all`: the public key + username never enter the span.
     #[tracing::instrument(name = "gateway.outer_leg.auth", parent = &self.session_span, skip_all)]
     async fn auth_publickey(
         &mut self,
@@ -1608,9 +1398,7 @@ impl Handler for SshHandler {
         // possession check is what stops a public-key holder getting a break-glass session.
         // russh verifies POSSESSION ONLY and does NOT surface the sk assertion flags, so the
         // UP/user-presence (touch) bit is enforced by the AUTHENTICATOR, not asserted
-        // server-side (Accepted-Risk) — break-glass keys MUST be provisioned touch-required.
-        // A key that is NOT a registered break-glass credential FALLS THROUGH to the pin
-        // path, never a hard reject. Only sk-ecdsa enters here.
+        // server-side — break-glass keys MUST be provisioned touch-required.
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
         // Resolved eagerly alongside the break-glass lookup below so BOTH outcomes cost the
         // same number of CP round-trips. Resolving the pin only after a break-glass miss
@@ -1630,9 +1418,6 @@ impl Handler for SshHandler {
                 return Ok(auth);
             }
         } else if is_security_key_algorithm(public_key.algorithm()) {
-            // A non-sk-ecdsa security key (e.g. sk-ed25519): break-glass supports ONLY
-            // sk-ecdsa, so route it to the pin path — but log it operator-side so a
-            // mis-provisioned emergency key does not fail silently.
             tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, algorithm = %public_key.algorithm().as_str(), "non-sk-ecdsa security key offered; break-glass supports only sk-ecdsa — routing to the pin path");
         }
         self.conn.record_method("publickey-pin");
@@ -1654,8 +1439,6 @@ impl Handler for SshHandler {
                 tracing::info!(source_ip = %self.source_ip, "offered key is not pinned; degrading");
                 Ok(self.reject_and_degrade())
             }
-            // CP down: flag it (the KI fallback surfaces service-unavailable) and
-            // degrade so the client moves to keyboard-interactive; never fail open.
             Err(e) if e.is_cp_down() => {
                 self.note_cp_down("publickey-pin");
                 Ok(self.reject_and_degrade())
@@ -1738,8 +1521,6 @@ impl Handler for SshHandler {
             tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection channel cap exceeded; refusing channel open");
             return Ok(());
         }
-        // Retain the channel so its write half drives the backpressured node→client
-        // direction (see `pending_channels`).
         self.pending_channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
@@ -1806,8 +1587,6 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    /// Outer → inner: forward client bytes to the node's channel write half. The recorder
-    /// taps the input stream (`i`) first; the await naturally backpressures the outer read.
     async fn data(
         &mut self,
         channel: ChannelId,
@@ -1841,8 +1620,6 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    /// Client closed its half — relay EOF to the node so the remote command sees
-    /// end-of-input (SFTP/SCP uploads, `cat |` pipelines).
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
@@ -1865,8 +1642,6 @@ impl Handler for SshHandler {
         if let Some(rec) = &self.recorder {
             rec.close_channel(channel);
         }
-        // Deterministic teardown: abort the pump rather than wait for the node to
-        // propagate Close (no leak-until-disconnect).
         if let Some(pump) = self.pumps.remove(&channel) {
             pump.abort();
         }
@@ -1876,8 +1651,6 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    /// Relay an interactive resize to the node's PTY, recording it as an asciicast
-    /// `r` event.
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
@@ -1891,8 +1664,6 @@ impl Handler for SshHandler {
             rec.resize(channel, col as u16, row as u16);
         }
         if let Some(w) = self.writers.get(&channel) {
-            // A resize on a live bridged channel is session activity (same
-            // forwarded-only rule as `data`, review info-2).
             self.activity
                 .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
             let _ = w.window_change(col, row, pw, ph).await;
@@ -1900,8 +1671,6 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    /// Agent forwarding is **always refused**: never bridged to the
-    /// node. Returning `false` sends `channel_failure` to the client.
     async fn agent_request(
         &mut self,
         _channel: ChannelId,
@@ -1911,17 +1680,6 @@ impl Handler for SshHandler {
         Ok(false)
     }
 
-    /// A `direct-tcpip` channel open. Three cases, in strict precedence:
-    ///
-    /// 1. **Nested ProxyJump refused (structural invariant):** a `direct-tcpip` from an
-    ///    already-terminated ProxyJump inner hop is refused UNCONDITIONALLY — one MITM hop
-    ///    only, never a forward chain. A `port_forward_local` grant must NEVER let it through.
-    /// 2. **ProxyJump host-cert MITM:** when enabled and this is the OUTER jump connection,
-    ///    we terminate the inner hop with a host-CA host cert (no TOFU) and run the full
-    ///    recorded session seam. In this mode `direct-tcpip` is ProxyJump, never a forward.
-    /// 3. **Local port-forward** (`ssh -L`), gated on `port_forward_local`. The NODE dials
-    ///    `host:port`, so the forward reaches only what the node can reach (no Gateway-side
-    ///    SSRF escape); bytes are bridged opaquely (metadata-only recording).
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: Channel<russh::server::Msg>,
@@ -1932,7 +1690,7 @@ impl Handler for SshHandler {
         reply: russh::server::ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // (1) Nested ProxyJump: an already-terminated inner hop NEVER forwards,
+        // Nested ProxyJump: an already-terminated inner hop NEVER forwards,
         // regardless of any port-forward grant (structural one-hop-only invariant).
         if self.proxyjump_node.is_some() {
             tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "port_forward_refused", reason = "nested_proxyjump", "direct-tcpip from a terminated ProxyJump inner hop refused (one hop only)");
@@ -1965,8 +1723,6 @@ impl Handler for SshHandler {
             return Ok(());
         }
 
-        // (3) Local port-forward. Admission runs the SAME authorize / lock-recheck /
-        // recorder / inner-leg path every channel gets.
         match self.admit(&[Capability::PortForwardLocal], session).await {
             Ok(_) => {}
             Err(o) => {
@@ -1974,8 +1730,6 @@ impl Handler for SshHandler {
                 return Ok(());
             }
         }
-        // Bound concurrent forward fan-out per connection (grant is not a licence
-        // for unbounded tunnels).
         let max = self.deps.config.inner.max_channels_per_connection;
         if !forward::reserve_tunnel_slot(&self.active_tunnels, max) {
             tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, outcome = "channel_cap", "per-connection tunnel cap exceeded; refusing local forward");
@@ -2030,11 +1784,6 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    /// Remote port-forward request (`ssh -R`), gated on `port_forward_remote`. The NODE binds
-    /// the listener (`tcpip_forward`, RFC 4254 §7.1) — real `ssh -R`-through-a-bastion
-    /// semantics, no Gateway-side listener leaking across sessions. `port == 0` lets the node
-    /// pick. Incoming connections arrive as `forwarded-tcpip` and are relayed by the
-    /// [`ReverseDispatcher`].
     async fn tcpip_forward(
         &mut self,
         address: &str,
@@ -2096,9 +1845,6 @@ impl Handler for SshHandler {
         }
     }
 
-    /// X11 forwarding request (`ssh -X`/`-Y`), gated on `x11`. Gate it, stash the parameters,
-    /// and relay them UNCHANGED to the node when the inner session channel opens (pure
-    /// pass-through — no cookie rewriting, RFC 4254 §6.3.1). Ungranted → `channel_failure`.
     async fn x11_request(
         &mut self,
         channel: ChannelId,
@@ -2180,8 +1926,6 @@ fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind
             rows,
         },
         ChannelKind::Subsystem(name) if name == "sftp" => RecChannelKind::Sftp,
-        // Only the sftp subsystem is ever bridged (the capability gate refuses the
-        // rest); default to an opaque terminal for safety.
         ChannelKind::Subsystem(_) => RecChannelKind::Terminal {
             command: None,
             scp: None,
@@ -2191,27 +1935,22 @@ fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind
     }
 }
 
-/// Whether `alg` is a break-glass candidate algorithm. ONLY
-/// `sk-ecdsa-sha2-nistp256@openssh.com`. Every other algorithm — and an sk-ecdsa key that
-/// does not resolve as a break-glass credential — rides the ordinary pin path.
 fn is_break_glass_algorithm(alg: Algorithm) -> bool {
     matches!(alg, Algorithm::SkEcdsaSha2NistP256)
 }
 
-/// Whether `alg` is ANY FIDO2/U2F security-key algorithm. Used to log when a non-sk-ecdsa
-/// security key is offered, so a mis-provisioned emergency key does not fail silently.
 fn is_security_key_algorithm(alg: Algorithm) -> bool {
     matches!(alg, Algorithm::SkEcdsaSha2NistP256 | Algorithm::SkEd25519)
 }
 
-/// Whether a break-glass resolution actually succeeded: identity resolved AND a single-use
-/// token minted. A resolved identity with no token is fail-closed.
 fn break_glass_resolved(res: &crate::pb::BreakglassResolution) -> bool {
     res.identity.as_ref().is_some_and(|i| i.resolved) && !res.breakglass_token.is_empty()
 }
 
 /// The granted capabilities from the decision context; default shell+exec when
-/// the context declares none. Agent-forward is never here.
+/// the context declares none. This returns whatever the context grants —
+/// agent forwarding is refused unconditionally in `agent_request`, not filtered
+/// out here.
 fn granted_capabilities(context: Option<&DecisionContext>) -> Vec<i32> {
     match context {
         Some(ctx) if !ctx.capabilities.is_empty() => ctx.capabilities.clone(),
@@ -2231,8 +1970,6 @@ fn inner_leg_principal(context: &DecisionContext, requested: &str) -> Result<Str
     Ok(context.principal.clone())
 }
 
-/// Deny-only: an unscoped credential (empty `principals`) permits any login; a scoped
-/// one permits only a login it names. Never widens — it can only refuse.
 fn credential_scope_permits(principals: &[String], login: &str) -> bool {
     principals.is_empty() || principals.iter().any(|p| p == login)
 }
@@ -2261,8 +1998,6 @@ fn timed_out_partial() -> Auth {
     partial_message(DEVICE_FLOW_TIMEOUT)
 }
 
-/// Read the user's first keyboard-interactive response as a UTF-8 string, held in
-/// a scrub-on-drop buffer (the first response may be a secret OTP; NEVER logged).
 fn first_response(response: Option<Response<'_>>) -> Option<Zeroizing<String>> {
     let bytes = response?.next()?;
     std::str::from_utf8(&bytes)
@@ -2283,10 +2018,6 @@ fn is_unsafe_display(c: char) -> bool {
         )
 }
 
-/// Sanitize a client/CP-supplied string for a log field or terminal line: drop control +
-/// format/bidi characters and bound the length (log-injection / terminal-escape /
-/// bidi-spoofing guard). Never applied to secrets — those are not rendered at all.
-/// `pub(crate)` so the lock feed sanitizes CP-supplied lock ids the same way.
 pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| !is_unsafe_display(*c))
@@ -2294,8 +2025,6 @@ pub(crate) fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// The `sessionlayer.access_model` span-attribute label. A safe, closed enum — never
-/// free-form CP text. UNSPECIFIED maps to `standing` (the N-1 safe default).
 fn access_model_label(access_model: i32) -> &'static str {
     match AccessModel::try_from(access_model) {
         Ok(AccessModel::Jit) => "jit",
@@ -2335,10 +2064,6 @@ pub(crate) fn grant_is_expired(now_epoch: i64, grant_expiry: i64, skew_secs: i64
     grant_expiry != 0 && now_epoch.saturating_add(skew_secs) >= grant_expiry
 }
 
-/// The tighten-only per-session idle bound: the SIGNED per-identity
-/// `idle_timeout_seconds` may only SHORTEN the static `max_session_idle_secs` — the smaller
-/// wins. 0/absent, negative, or at/above the static bound leaves the static bound in force:
-/// a decision context can never loosen the operator's ceiling.
 fn effective_idle_secs(static_secs: u64, context_secs: i64) -> u64 {
     if context_secs > 0 {
         static_secs.min(context_secs as u64)
@@ -2372,9 +2097,6 @@ fn apply_cancel_forward_outcome(
     }
 }
 
-/// Slack added to the inner transport's inactivity backstop over the effective idle bound so
-/// the idle watchdog — which attributes IDLE_TIMEOUT and drives the clean teardown —
-/// reliably fires before russh's own inactivity abort, including when effective == static.
 const IDLE_BACKSTOP_SLACK_SECS: u64 = 5;
 
 struct ActivityTap {
@@ -2398,25 +2120,14 @@ impl RecorderTap for ActivityTap {
     }
 }
 
-/// How far ahead of the last-known lease expiry the keeper re-stamps, how soon a transient
-/// failure is retried, and the floor on the server-driven cadence (a tiny returned window
-/// must not busy-loop the CP).
 const LEASE_EXTEND_LEAD_SECS: i64 = 60;
 const LEASE_RETRY_SECS: i64 = 5;
 const LEASE_MIN_TICK_SECS: i64 = 5;
 
-/// How the keeper reacts to an `ExtendSessionLease` failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseRefusal {
-    /// Not a verdict on the lease: transport faults plus retryable/unexpected codes —
-    /// ABORTED (the CP extends inside a Postgres tx, which can serialize-conflict),
-    /// CANCELLED, RESOURCE_EXHAUSTED, anything else. Never abandon the accounting on a blip.
     RetryTransient,
-    /// An N-1 CP without the RPC (UNIMPLEMENTED): benign, stop quietly.
     StopQuiet,
-    /// NOT_FOUND / FAILED_PRECONDITION: the CP no longer holds a lease this Gateway still
-    /// considers live (reaped under a sustained partition, or released) — the one exactness
-    /// break. Stop LOUDLY so an operator can correlate the transient under-count.
     StopLoud,
 }
 
@@ -2472,10 +2183,6 @@ async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant
 
 const SESSION_END_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// Deliver the session-end signal that releases the concurrency lease: best-effort +
-/// bounded (one retry on a transport-shaped failure), quiet on an N-1 CP without the RPC.
-/// Runs off the Drop path, so it can never block teardown; an undelivered signal is
-/// self-healed by the CP reaper.
 async fn send_session_end(cpauth: Arc<CpAuthClient>, session_id: String, reason: SessionEndReason) {
     for attempt in 0..2u8 {
         match cpauth.notify_session_end(&session_id, reason).await {
@@ -2503,9 +2210,6 @@ async fn send_session_end(cpauth: Arc<CpAuthClient>, session_id: String, reason:
 mod tests {
     use super::*;
 
-    /// The Gateway expires grants CONSERVATIVELY — early, never late. A
-    /// non-negative skew can only bring the refusal FORWARD in time, and a grant is ALWAYS
-    /// treated as expired at/after its real expiry regardless of skew.
     #[test]
     fn grants_expire_conservatively_early_never_late() {
         let skew = 30;
@@ -2520,7 +2224,6 @@ mod tests {
             "expired `skew` seconds early (conservative)"
         );
 
-        // NEVER late: at and after the real expiry it is always expired, any skew.
         for now in [ge, ge + 1, ge + 10_000] {
             assert!(
                 grant_is_expired(now, ge, 0),
@@ -2532,8 +2235,6 @@ mod tests {
             );
         }
 
-        // Monotone in skew: a larger non-negative skew can only expire EARLIER (or
-        // equal), never later — the "never late" guarantee across the skew range.
         for now in [ge - 100, ge - 31, ge - 30, ge - 1, ge, ge + 1] {
             if grant_is_expired(now, ge, 0) {
                 assert!(
@@ -2547,8 +2248,6 @@ mod tests {
         assert!(grant_is_expired(i64::MAX, ge, skew));
     }
 
-    /// The signed per-identity idle timeout is TIGHTEN-ONLY against the static
-    /// bound — it can shorten it, never extend it.
     #[test]
     fn idle_bound_is_tighten_only() {
         assert_eq!(effective_idle_secs(900, 300), 300, "context tightens");
@@ -2577,10 +2276,6 @@ mod tests {
         );
     }
 
-    /// The lease keeper's failure taxonomy. ONLY a definitive "lease is gone" verdict
-    /// (NOT_FOUND / FAILED_PRECONDITION) stops LOUDLY; UNIMPLEMENTED (N-1) stops quietly;
-    /// EVERYTHING else — notably ABORTED (the CP's lease tx can serialize-conflict),
-    /// CANCELLED, RESOURCE_EXHAUSTED — reschedules at the retry floor.
     #[test]
     fn lease_failure_taxonomy_retries_blips_and_is_loud_only_for_a_lost_lease() {
         use crate::cpauth::CpError;
@@ -2594,7 +2289,6 @@ mod tests {
             CpError::Rpc(tonic::Status::resource_exhausted("x")),
             CpError::Rpc(tonic::Status::deadline_exceeded("x")),
             CpError::Rpc(tonic::Status::unknown("x")),
-            // Unexpected codes are NOT a lease verdict either: keep trying.
             CpError::Rpc(tonic::Status::permission_denied("x")),
             CpError::Rpc(tonic::Status::invalid_argument("x")),
         ] {
@@ -2623,8 +2317,6 @@ mod tests {
 
     #[test]
     fn session_id_is_a_canonical_uuid() {
-        // The CP `parseUuid`s `AuthorizeRequest.session_id` (contract: UUID); an
-        // un-dashed blob denies the connect. Guard the canonical 8-4-4-4-12 v4 shape.
         let id = new_session_id();
         let groups: Vec<&str> = id.split('-').collect();
         assert_eq!(
@@ -2634,14 +2326,13 @@ mod tests {
         assert!(id
             .chars()
             .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-        assert_eq!(groups[2].as_bytes()[0], b'4'); // version 4
-        assert!(matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')); // RFC 4122 variant
-        assert_ne!(new_session_id(), new_session_id()); // fresh per call
+        assert_eq!(groups[2].as_bytes()[0], b'4');
+        assert!(matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
+        assert_ne!(new_session_id(), new_session_id());
     }
 
     #[test]
     fn sanitize_strips_control_and_bounds_length() {
-        // The dangerous control bytes (newline, ESC) are removed.
         let cleaned = sanitize("ab\nc\u{1b}[2Jd");
         assert!(!cleaned.contains('\n') && !cleaned.contains('\u{1b}'));
         assert_eq!(cleaned, "abc[2Jd");
@@ -2650,15 +2341,11 @@ mod tests {
 
     #[test]
     fn sanitize_strips_bidi_and_format_chars() {
-        // RLO + zero-width joiner + BOM must all be stripped (bidi-spoofing guard).
         let cleaned = sanitize("admin\u{202E}txt\u{200D}\u{FEFF}");
         assert_eq!(cleaned, "admintxt");
         assert!(!cleaned.contains('\u{202E}'));
     }
 
-    /// A stalling node must not pin a `cancel-tcpip-forward` bookkeeping slot for
-    /// the rest of the connection just because it never answers, but an explicit
-    /// rejection (the node IS there and answering) is left alone.
     #[test]
     fn cancel_forward_bookkeeping_releases_on_timeout_not_on_rejection() {
         let mut set: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
@@ -2695,9 +2382,6 @@ mod tests {
         );
     }
 
-    /// The inner leg must never run as a login the signed decision context did not
-    /// name. Exercises the REAL selector used by `decide` — the value it returns is
-    /// what reaches the inner cert, the node login, the recorder and the dial.
     #[test]
     fn inner_leg_principal_comes_from_the_signed_context_and_a_mismatch_fails_closed() {
         let ctx = DecisionContext {
@@ -2706,8 +2390,6 @@ mod tests {
         };
         assert_eq!(inner_leg_principal(&ctx, "deploy").unwrap(), "deploy");
 
-        // A context naming a different login than the client asked for is a mis-bound
-        // decision: refuse, rather than connect to the node as either of them.
         for requested in ["root", "", "Deploy", "deploy "] {
             assert!(
                 matches!(
@@ -2717,15 +2399,12 @@ mod tests {
                 "requested {requested:?} against a context principal of \"deploy\" must fail closed"
             );
         }
-        // An empty context principal never opens the door either.
         assert!(matches!(
             inner_leg_principal(&DecisionContext::default(), "root"),
             Err(SshOutcome::PolicyDenied)
         ));
     }
 
-    /// The reducer half the Gateway keeps after the CP's answer. Deny-only: it must
-    /// refuse an out-of-scope login and be incapable of granting anything.
     #[test]
     fn the_credential_scope_reducer_only_ever_denies() {
         let scoped = vec!["deploy".to_string(), "ops".to_string()];
@@ -2737,16 +2416,11 @@ mod tests {
                 "{outside:?} is outside the credential's scope"
             );
         }
-        // Unscoped credentials are untouched — the reducer never widens, and never
-        // narrows a credential that carried no scope to begin with.
         for login in ["root", "deploy", ""] {
             assert!(credential_scope_permits(&[], login));
         }
     }
 
-    /// The break-glass FIDO2 publickey path: ONLY sk-ecdsa is a candidate.
-    /// sk-ed25519 and every other algorithm ride the pin path; a non-break-glass sk-ecdsa key
-    /// also falls through to the pin path (never a hard reject).
     #[test]
     fn only_sk_ecdsa_routes_to_break_glass() {
         assert!(is_break_glass_algorithm(Algorithm::SkEcdsaSha2NistP256));
@@ -2754,8 +2428,6 @@ mod tests {
         assert!(!is_break_glass_algorithm(Algorithm::Ed25519));
     }
 
-    /// Break-glass resolution is fail-closed: it succeeds ONLY when the identity
-    /// resolved AND a single-use token was minted.
     #[test]
     fn break_glass_resolution_requires_identity_and_token() {
         let resolved_id = ResolvedIdentity {
@@ -2769,7 +2441,6 @@ mod tests {
             breakglass_token: "tok".into(),
         };
         assert!(break_glass_resolved(&ok));
-        // Resolved identity but NO token → fail closed (no break-glass Authorize).
         assert!(!break_glass_resolved(&crate::pb::BreakglassResolution {
             identity: Some(resolved_id),
             breakglass_token: String::new(),
@@ -2784,8 +2455,6 @@ mod tests {
         }));
     }
 
-    /// A minimal `Authorized` carrying only `capabilities` — everything else is
-    /// placeholder data the capability gate itself never reads.
     fn authorized_with(capabilities: &[i32]) -> Authorized {
         Authorized {
             node: NodeTarget {
@@ -2806,23 +2475,13 @@ mod tests {
         }
     }
 
-    /// Capability gate: a legacy `scp` exec is gated by EXEC (never a standalone
-    /// SCP), an unknown subsystem is never granted, and UNSPECIFIED is never acceptable.
-    ///
-    /// Exercises the REAL `capability_granted`/`required_capabilities` used at the real
-    /// admission site (`admit`, `decide_capability`) against a real `Authorized`, not a
-    /// hand-copied reimplementation of the gate's logic (a prior version of this test did
-    /// that, and so could not have caught a bug in the real function).
     #[test]
     fn capability_gate_never_admits_scp_exec_or_unknown_subsystem() {
-        // A file-transfer-only grant (scp+sftp, no exec/shell).
         let scp_only = authorized_with(&[Capability::Scp as i32, Capability::Sftp as i32]);
         let admits = |kind: &ChannelKind, authz: &Authorized| {
             capability_granted(required_capabilities(kind), authz)
         };
 
-        // `scp -S /bin/sh …` and metacharacter smuggling are plain exec → need EXEC,
-        // so an scp-only grant must NOT admit them.
         for cmd in [
             "scp -S /bin/sh a b",
             "scp x y; id",
@@ -2840,14 +2499,11 @@ mod tests {
             &authorized_with(&[Capability::Exec as i32])
         ));
 
-        // Modern scp uses the sftp subsystem → SFTP or SCP admits it.
         let sftp = ChannelKind::Subsystem("sftp".into());
         assert!(admits(&sftp, &scp_only));
         assert!(admits(&sftp, &authorized_with(&[Capability::Sftp as i32])));
         assert!(!admits(&sftp, &authorized_with(&[Capability::Exec as i32])));
 
-        // Unknown subsystem: no acceptable capability → refused even against a set
-        // literally containing UNSPECIFIED (0).
         let unknown = ChannelKind::Subsystem("netconf".into());
         assert!(required_capabilities(&unknown).is_empty());
         assert!(!admits(

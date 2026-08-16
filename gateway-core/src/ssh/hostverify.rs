@@ -19,8 +19,6 @@ pub(crate) struct HostTrust {
 }
 
 impl HostTrust {
-    /// Whether the CP supplied any verification anchor at all. An agentless node
-    /// with none is a misconfiguration; the Gateway MUST abort (never TOFU).
     pub fn is_empty(&self) -> bool {
         self.host_ca_keys.is_empty()
             && self.host_certificates.is_empty()
@@ -42,7 +40,6 @@ pub(crate) enum HostVerifyError {
     Untrusted,
 }
 
-/// The no-TOFU host-identity verifier built from the CP's [`HostTrust`].
 pub(crate) struct HostVerifier {
     trust: HostTrust,
 }
@@ -65,9 +62,6 @@ impl HostVerifier {
         Err(HostVerifyError::Untrusted)
     }
 
-    /// A CP-provided host cert verifies iff it is signed by a trusted host CA,
-    /// currently valid, `type = host`, carries an expected principal, AND its
-    /// certified key equals the plain key the node presented at KEX.
     fn verify_host_ca(&self, presented: &PublicKey) -> bool {
         if self.trust.host_certificates.is_empty() || self.trust.host_ca_keys.is_empty() {
             return false;
@@ -167,8 +161,6 @@ mod tests {
 
     #[test]
     fn host_ca_material_without_a_cert_does_not_verify() {
-        // host_ca_keys present but no cert → the host-CA path cannot verify; with
-        // no pin either, the result is an abort (fail closed).
         let ca = host_key(5);
         let node = host_key(6);
         let trust = HostTrust {

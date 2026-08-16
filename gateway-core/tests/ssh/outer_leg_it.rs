@@ -86,7 +86,6 @@ async fn start_server(
     (port, tx)
 }
 
-/// Like [`start_server`] but with an explicit target resolver.
 async fn start_server_with_resolver(
     cp: &MockCp,
     config: Arc<SshServerConfig>,
@@ -103,9 +102,8 @@ async fn start_server_with_resolver(
     (port, tx)
 }
 
-/// A resolver that knows a fixed inventory and returns `None` for everything else —
-/// the shape the shipped `IdentityResolver` (which echoes any non-empty name back)
-/// cannot produce.
+/// The shipped `IdentityResolver` echoes any non-empty name back, so it can never
+/// return the `None` this test needs.
 struct KnownNodesOnly(&'static [&'static str]);
 
 impl TargetResolver for KnownNodesOnly {
@@ -144,7 +142,6 @@ async fn ssh_exec(
     (code, stdout, stderr)
 }
 
-/// `ssh -i <key> <target> true`, publickey-only and non-interactive.
 fn pubkey_args(port: u16, key_path: &str, target: &str) -> Vec<String> {
     ssh_args(
         port,
@@ -319,7 +316,6 @@ async fn publickey_paths_and_error_taxonomy_e2e() -> anyhow::Result<()> {
         "denied → generic policy message; stderr={stderr:?}"
     );
 
-    // Unknown node → the SAME generic denial (no existence disclosure).
     let (_code, _stdout, stderr_unknown) = ssh_exec(
         &container,
         ssh_args(
@@ -380,7 +376,6 @@ async fn publickey_paths_and_error_taxonomy_e2e() -> anyhow::Result<()> {
         "auth failure must be a standard SSH failure; stderr={stderr:?}"
     );
 
-    // CP unreachable during the connect-time decision → fail closed.
     cp.set_authorize_unavailable(true);
     let (code, _stdout, stderr) = ssh_exec(
         &container,
@@ -858,8 +853,6 @@ async fn a_credential_scope_denial_reaches_the_control_plane() -> anyhow::Result
     let (port, _shutdown) = start_server(&cp, Arc::new(base_config())).await;
     let container = client_container(&scoped, &unscoped, &cert_line).await;
 
-    // In scope: authorized, and the inner leg then finds no node — NODE_OFFLINE is how
-    // this suite spells "authentication and authorization both passed".
     let (_code, _stdout, stderr) = ssh_exec(
         &container,
         pubkey_args(port, "/root/pin_key", "deploy%web-01"),
@@ -879,7 +872,6 @@ async fn a_credential_scope_denial_reaches_the_control_plane() -> anyhow::Result
         "the credential's scope must reach the CP on every call, not only the denials"
     );
 
-    // Out of scope: the same generic denial as before, but now the CP made it.
     let (code, _stdout, stderr) = ssh_exec(
         &container,
         pubkey_args(port, "/root/pin_key", "root%web-01"),
@@ -901,7 +893,6 @@ async fn a_credential_scope_denial_reaches_the_control_plane() -> anyhow::Result
         "the CP cannot write the decision record without the scope that produced it"
     );
 
-    // An unscoped credential is untouched by the reducer.
     let (_code, _stdout, stderr) = ssh_exec(
         &container,
         pubkey_args(port, "/root/cert_key", "root%web-01"),
@@ -983,8 +974,6 @@ async fn the_gateway_refuses_an_out_of_scope_login_the_control_plane_allowed() -
         "a scoped credential must be refused even on an allow; stderr={stderr:?}"
     );
 
-    // The CP really did ALLOW: it took a concurrency lease, which only the ALLOW path
-    // mints and which the refused session then released on teardown.
     let session_id = cp
         .last_authorize_request()
         .expect("the refused connect must still have called Authorize")
@@ -1054,7 +1043,6 @@ async fn an_unresolvable_target_reaches_the_control_plane() -> anyhow::Result<()
         req.node_id
     );
 
-    // A username with no target in it never reaches the CP: there is nothing to decide.
     let (code, _stdout, stderr) = ssh_exec(
         &container,
         pubkey_args(port, "/root/pin_key", "nodelimiter"),

@@ -616,8 +616,6 @@ async fn a_session_over_the_agent_path_is_still_recorded() -> anyhow::Result<()>
     );
     assert!(stdout.contains(marker));
 
-    // The recorder tap is above the connector seam, so it sees the same bytes it always
-    // did: the recording is registered, uploaded to the WORM store, and finalized.
     let mut finalized = Vec::new();
     for _ in 0..120 {
         finalized = cp.finalized_recordings();
@@ -690,9 +688,6 @@ async fn a_live_agent_channel_makes_this_gateway_claim_fresh_presence() -> anyho
          owningGateway, so the value is the assertion"
     );
 
-    // The other direction: losing the channel must give the claim up, or a dead node keeps
-    // reading as healthy. Release ages the row out rather than deleting it, so a
-    // presence-row-exists check would still pass here.
     node.stop().await?;
     let mut released = false;
     for _ in 0..120 {

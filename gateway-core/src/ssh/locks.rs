@@ -1,5 +1,3 @@
-//! Lock deny-list and session teardown: push-fed, fail-closed, deny wins.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -18,7 +16,6 @@ pub struct LockBindings {
 }
 
 impl LockBindings {
-    /// Bindings for an agent peer (identity + node from certificate, deny wins).
     pub fn for_agent(agent_id: &str, node_name: &str) -> Self {
         Self {
             identity: agent_id.to_string(),
@@ -160,7 +157,6 @@ impl LockSet {
         now_epoch_secs().saturating_sub(last) <= self.unhealthy_after_secs as i64
     }
 
-    /// First active lock matching bindings (deny wins); reason is operator-log only.
     pub fn matching(&self, b: &LockBindings) -> Option<Lock> {
         let now = now_epoch_secs();
         self.locks
@@ -472,7 +468,6 @@ mod tests {
             &b
         ));
         assert!(target_matches(&LockTarget { all: true, ..tgt() }, &b));
-        // A lock aimed at some other agent or node does not touch this one.
         assert!(!target_matches(
             &LockTarget {
                 identities: vec!["agent-8".into()],
@@ -489,7 +484,6 @@ mod tests {
         // A facet-less, non-global target matches nothing (avoids a fleet wipe from
         // a malformed lock; a real global lock sets `all`).
         assert!(!target_matches(&tgt(), &b));
-        // Non-matching facets do not match.
         assert!(!target_matches(
             &LockTarget {
                 identities: vec!["mallory".into()],
@@ -517,8 +511,6 @@ mod tests {
 
     #[test]
     fn teardown_mode_spares_only_best_effort() {
-        // STRICT and UNSPECIFIED (a CP that sent no mode) tear down; only the explicit
-        // BEST_EFFORT is spared; a garbled value fails safe to teardown (deny wins).
         assert!(tears_down_live_sessions(&lock_with_mode(
             "s",
             tgt(),
@@ -544,8 +536,6 @@ mod tests {
 
     #[test]
     fn best_effort_lock_still_denies_new_access() {
-        // New-access denial is mode-agnostic: a BEST_EFFORT lock is returned by `matching`
-        // (so it blocks new sessions/channels) exactly like STRICT — only teardown differs.
         let set = LockSet::new(30, 30);
         let b = bindings();
         set.replace_snapshot(
@@ -579,7 +569,7 @@ mod tests {
     #[test]
     fn lockset_snapshot_add_remove_and_match() {
         let set = LockSet::new(30, 30);
-        assert!(!set.healthy()); // never connected
+        assert!(!set.healthy());
         let b = bindings();
         assert!(set.matching(&b).is_none());
 
@@ -594,20 +584,17 @@ mod tests {
             )],
             7,
         );
-        assert!(set.healthy()); // connected + fresh after a snapshot
+        assert!(set.healthy());
         assert_eq!(set.matching(&b).map(|l| l.lock_id), Some("l1".into()));
 
-        // A resync replaces the set wholesale.
         set.replace_snapshot(Vec::new(), 8);
         assert!(set.matching(&b).is_none());
 
-        // Add then remove.
         set.add(lock("l2", LockTarget { all: true, ..tgt() }, 0));
         assert_eq!(set.matching(&b).map(|l| l.lock_id), Some("l2".into()));
         set.remove("l2");
         assert!(set.matching(&b).is_none());
 
-        // Disconnect never clears the set (a pushed lock keeps denying).
         set.add(lock("l3", LockTarget { all: true, ..tgt() }, 0));
         set.mark_disconnected();
         assert!(!set.healthy());

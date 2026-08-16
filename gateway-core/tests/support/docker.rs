@@ -1,5 +1,3 @@
-//! Docker harness: image builds, MinIO WORM, rootless endpoint discovery.
-
 #![allow(dead_code)] // shared across several test binaries; not all use every item.
 
 use std::time::Duration;

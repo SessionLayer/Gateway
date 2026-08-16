@@ -1,12 +1,11 @@
-//! Per-PR proof that the Tier-0 hardening profile is CORRECT and does not break
-//! the SSH data path. It spawns the `hardening-canary`
-//! binary — which applies the REAL `gateway::hardening` seccomp/Landlock/coredump
-//! code to itself in a fresh process — and asserts on the outcome, so nothing
-//! sandboxes the test runner. The authoritative full-session proof (real CP + node
-//! + binary under the profile) is the full-stack harness under `FS_HARDENING=full`.
+//! Spawns the `hardening-canary` binary — which applies the REAL `gateway::hardening`
+//! seccomp/Landlock/coredump code to itself in a fresh process — and asserts on the
+//! outcome, so nothing sandboxes the test runner. The authoritative full-session proof
+//! (real CP + node + binary under the profile) is the full-stack harness under
+//! `FS_HARDENING=full`.
 //!
-//! Gated on the `hardening-canary` feature so `CARGO_BIN_EXE_hardening-canary`
-//! exists; the gate runs `--all-features`, so it is live on every PR.
+//! Gated on the `hardening-canary` feature so `CARGO_BIN_EXE_hardening-canary` exists;
+//! the gate runs `--all-features`, so it is live on every PR.
 #![cfg(all(feature = "hardening-canary", target_os = "linux"))]
 
 use std::os::unix::process::ExitStatusExt;

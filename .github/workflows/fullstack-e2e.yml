@@ -1,20 +1,5 @@
 name: fullstack-e2e
 
-# Cross-repo integration gate. Runs the REAL Control Plane jar +
-# REAL Gateway binary + REAL Agent binary + a real Debian-13 node + a real stock ssh
-# client together, driving a session through the real CP `Authorize` decision and
-# asserting the scenario matrix + the audit-dimension searches. This is the only
-# test that exercises the real CP end to end — every per-repo Docker E2E uses a MockCp,
-# which cannot surface a genuine cross-repo bug like the inner-leg cert
-# source-address one this harness catches. The harness itself lives in
-# `tests/fullstack/run.sh` (committed here so it is version-controlled + CI-runnable).
-#
-# All four SessionLayer repos are PUBLIC, so the default GITHUB_TOKEN checks out the
-# ControlPlane + Agent siblings with no org secret. This runs as an on-demand +
-# nightly integration gate on `main` (the standard cross-repo pattern: per-repo CI gates
-# each PR; this confirms the merged whole). To prove a pre-merge set, dispatch it with the
-# matching `cp_ref`/`agent_ref`.
-
 on:
   workflow_dispatch:
     inputs:
@@ -41,7 +26,7 @@ on:
       - "tests/fullstack/**"
       - "deploy/**"
   schedule:
-    - cron: "0 6 * * *" # nightly integration on the merged main (FS_HARDENING=full)
+    - cron: "0 6 * * *"
 
 permissions:
   contents: read
@@ -54,11 +39,6 @@ jobs:
   fullstack-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # Both topologies run, in parallel jobs. `core` is the agentless install and the
-    # key-service CA legs; `agent` is the outbound-agent leg, which proves the one thing
-    # core structurally cannot — a node the Gateway never dials, and the node `health` the
-    # API derives from that node's presence claim. A dispatch that names a topology runs
-    # only that one.
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +70,7 @@ jobs:
           java-version: "25"
 
       - name: Install Rust toolchain (Gateway + Agent)
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.95.0 pinned
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.95.0"
 
@@ -106,9 +86,6 @@ jobs:
         with:
           tool: protoc
 
-      # `package -DskipTests` needs only JDK 25 — the ascopes protobuf plugin fetches its
-      # own protoc and the openapi-generator is pure Java (no Node/buf here; those gate the
-      # contract separately).
       - name: Build the real CP boot jar
         working-directory: ControlPlane
         run: ./mvnw -B -ntp -DskipTests package
@@ -121,11 +98,6 @@ jobs:
         working-directory: Gateway
         run: cargo build --release --bin gateway
 
-      # The harness stands up its own infra (Postgres + MinIO via infra-compose.yml), builds
-      # the node/client fixture images, launches the real CP/Gateway/Agent, provisions via
-      # the REST APIs, and asserts the scenario matrix. No build lock needed on a fresh
-      # dedicated runner (the lock only matters on a shared box where a concurrent gate would
-      # starve the CP JVM). Exit 0 = every asserted scenario green.
       - name: Run the full-stack cross-repo E2E
         working-directory: Gateway
         env:

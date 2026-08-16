@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
 #
-# Vendor the frozen CP <-> Gateway proto (+ wire-conformance golden frames)
-# from SessionLayer/Contracts, pinned by contracts.lock (tag + resolved
-# commit SHA). A sibling-checkout-path sync would be a silent no-op in CI,
-# which checks out one repo at a time, so a sibling path never exists there.
-# This script instead does a REAL git clone of the pinned tag
-# and verifies the resolved commit SHA matches contracts.lock before copying
-# anything, so a moved/re-pushed tag can't silently swap content. Git-only:
-# no GitHub API token, no hosted registry, works fully offline once the tag
-# is fetched.
-#
-# Usage:
-#   scripts/vendor-contracts.sh          # fetch + re-vendor, then review + commit + rebuild
-#   scripts/vendor-contracts.sh --check  # fetch + diff only; exit non-zero on drift
+# Vendor the frozen CP <-> Gateway proto (+ wire-conformance golden frames) from
+# SessionLayer/Contracts, pinned by contracts.lock. A sibling-checkout-path sync would be
+# a silent no-op in CI, which checks out one repo at a time, so a sibling path never
+# exists there; this does a REAL clone of the pinned tag and verifies the resolved commit
+# SHA before copying anything, so a moved or re-pushed tag cannot silently swap content.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -50,10 +42,10 @@ PAIRS=(
 )
 
 
-# Shared Rust sources (Contracts/rust/, a sibling of contracts/ — see its README).
-# mtls.rs/tls.rs/secret.rs were duplicated byte-for-byte in this repo and the
-# other Rust consumer; a fix to the pinned-cert verifier in one did not reach the
-# other. Vendored as plain source, so nothing enters [dependencies] or the SBOM.
+# Shared Rust sources from the Contracts repo (rust/, a sibling of contracts/).
+# mtls.rs/tls.rs/secret.rs were duplicated byte-for-byte here and in the other Rust
+# consumer; a fix to the pinned-cert verifier in one did not reach the other. Vendored
+# as plain source, so nothing enters [dependencies] or the SBOM.
 EXTRAS=(
   "$tmp/src/rust/mtls.rs|gateway-core/src/mtls.rs"
   "$tmp/src/rust/tls.rs|gateway-core/src/tls.rs"

@@ -24,7 +24,6 @@ use crate::pb::{
     SignGatewayHostCertificateRequest, SignGatewayHostCertificateResponse,
 };
 
-/// Fail-closed at every variant.
 #[derive(Debug, thiserror::Error)]
 pub enum CpError {
     #[error("Control Plane unreachable")]
@@ -138,17 +137,14 @@ impl CpAuthClient {
 
     /// Connect without holding the channel lock to avoid serializing on a partitioned CP.
     async fn channel(&self) -> Result<Channel, CpError> {
-        // Fast path: a channel is already cached.
         if let Some(ch) = self.channel.lock().await.as_ref() {
             return Ok(ch.clone());
         }
-        // Circuit breaker: a very recent connect failed → fail fast.
         if let Some(at) = *self.breaker.lock().await {
             if at.elapsed() < BREAKER_COOLDOWN {
                 return Err(CpError::CircuitOpen);
             }
         }
-        // Build the channel WITHOUT holding the channel lock.
         match self.factory.connect().await {
             Ok(ch) => {
                 *self.breaker.lock().await = None;
@@ -171,7 +167,6 @@ impl CpAuthClient {
         *self.channel.lock().await = None;
     }
 
-    /// W3C trace context injected into gRPC metadata.
     async fn call<T, F, Fut>(&self, f: F) -> Result<T, CpError>
     where
         F: FnOnce(crate::telemetry::TracedChannel) -> Fut,
@@ -226,7 +221,6 @@ impl CpAuthClient {
         Ok(resp.identity.unwrap_or_default())
     }
 
-    /// `otp` is a secret (never logged); validated constant-time.
     pub async fn resolve_otp(
         &self,
         otp: &str,
@@ -268,7 +262,6 @@ impl CpAuthClient {
         Ok(resp.resolution.unwrap_or_default())
     }
 
-    /// `code` is a SECRET (keyboard-interactive, echo off) — NEVER logged.
     pub async fn resolve_break_glass_code(
         &self,
         code: &str,
@@ -346,7 +339,6 @@ impl CpAuthClient {
         .await
     }
 
-    /// Idempotent: no-op unless this Gateway owns the node.
     pub async fn presence_release(
         &self,
         node_name: &str,
@@ -359,7 +351,6 @@ impl CpAuthClient {
         .await
     }
 
-    /// Only CSR sent; server key generated locally and never leaves.
     pub async fn issue_gateway_server_certificate(
         &self,
         pkcs10_csr: Vec<u8>,
@@ -378,7 +369,6 @@ impl CpAuthClient {
         .await
     }
 
-    /// Consume recording_token; receive WORM key + customer pubkey. Fail-closed on error.
     pub async fn begin_recording(
         &self,
         req: BeginRecordingRequest,
@@ -387,7 +377,6 @@ impl CpAuthClient {
             .await
     }
 
-    /// Single-object WORM credential at UPLOAD time. Fail-closed on error.
     pub async fn request_upload(
         &self,
         recording_id: &str,
@@ -400,7 +389,6 @@ impl CpAuthClient {
         .await
     }
 
-    /// Commit hash-chain head + digest + audit. Fail-closed.
     pub async fn finalize_recording(
         &self,
         req: FinalizeRecordingRequest,
@@ -409,7 +397,6 @@ impl CpAuthClient {
             .await
     }
 
-    /// Release concurrency lease at teardown. Best-effort: never block on error.
     pub async fn notify_session_end(
         &self,
         session_id: &str,
@@ -426,7 +413,6 @@ impl CpAuthClient {
         .await
     }
 
-    /// Extend lease. Window is SERVER-authoritative; failure never affects session.
     pub async fn extend_session_lease(
         &self,
         session_id: &str,
@@ -464,7 +450,6 @@ impl CpAuthClient {
         result
     }
 
-    /// Authenticated by mTLS (not session-bound). CP signs key; private key never leaves.
     pub async fn sign_gateway_host_certificate(
         &self,
         host_public_key: Vec<u8>,
@@ -514,7 +499,6 @@ mod tests {
         assert!(CpError::Rpc(tonic::Status::unavailable("x")).is_cp_down());
         assert!(CpError::Rpc(tonic::Status::internal("x")).is_cp_down());
         assert!(CpError::Rpc(tonic::Status::unauthenticated("x")).is_cp_down());
-        // A clean policy-shaped status is NOT CP-down (degrade / deny, not unavailable).
         assert!(!CpError::Rpc(tonic::Status::permission_denied("x")).is_cp_down());
         assert!(!CpError::Rpc(tonic::Status::resource_exhausted("x")).is_cp_down());
     }

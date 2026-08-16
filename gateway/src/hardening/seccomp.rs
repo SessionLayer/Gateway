@@ -1,11 +1,8 @@
-//! seccomp allow-list (fixed in code; posture configurable; hard-deny + allow+EPERM).
-
 use anyhow::Context;
 use gateway_core::config::SeccompMode;
 use seccompiler::{apply_filter_all_threads, BpfProgram, SeccompAction, SeccompFilter};
 use std::collections::BTreeMap;
 
-/// Install filter (io_uring_active gates io_uring_* syscalls: prefer hard-deny).
 pub fn install(mode: SeccompMode, io_uring_active: bool) -> anyhow::Result<()> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -59,8 +56,6 @@ fn apply(filter: SeccompFilter) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The allow-list filter: listed syscalls → ALLOW, everything else → `mismatch`
-/// (EPERM in enforce, LOG in log mode).
 fn build_filter(mismatch: SeccompAction, io_uring_active: bool) -> anyhow::Result<SeccompFilter> {
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = allowed_syscalls(io_uring_active)
         .into_iter()
@@ -70,8 +65,6 @@ fn build_filter(mismatch: SeccompAction, io_uring_active: bool) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("constructing seccomp allow-list: {e}"))
 }
 
-/// The hard-deny filter: the exploitation set → KILL_PROCESS, everything else →
-/// ALLOW (so this filter only ever escalates the dangerous syscalls).
 fn build_kill_filter(io_uring_active: bool) -> anyhow::Result<SeccompFilter> {
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = dangerous_syscalls(io_uring_active)
         .into_iter()
@@ -94,9 +87,6 @@ fn target_arch() -> seccompiler::TargetArch {
 fn target_arch() -> seccompiler::TargetArch {
     seccompiler::TargetArch::aarch64
 }
-// The allow-list is only defined for x86_64/aarch64; on any other Linux arch
-// `install` bails BEFORE this is reached (fail closed, mirroring the Agent). This
-// stub only satisfies the type-checker so the crate still compiles there.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn target_arch() -> seccompiler::TargetArch {
     unreachable!("seccomp is only applied on x86_64/aarch64 — install() bails otherwise")
@@ -173,7 +163,6 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_landlock_create_ruleset,
         libc::SYS_landlock_add_rule,
         libc::SYS_landlock_restrict_self,
-        // ---- memory ----
         libc::SYS_mmap,
         libc::SYS_munmap,
         libc::SYS_mremap,
@@ -183,9 +172,8 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_mlock,
         libc::SYS_mlock2,
         libc::SYS_munlock,
-        // mlockall/munlockall + madvise(MADV_DONTDUMP) below are the swap/coredump
-        // key-buffer hygiene that the sibling zeroization+coredump work relies on;
-        // kept allowed so this sandbox never blocks it.
+        // mlockall/munlockall + madvise(MADV_DONTDUMP) below are the key-buffer
+        // swap/coredump hygiene; kept allowed so this sandbox never blocks it.
         libc::SYS_mlockall,
         libc::SYS_munlockall,
         libc::SYS_msync,
@@ -227,7 +215,7 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_sysinfo,
         libc::SYS_uname,
         libc::SYS_getrandom,
-        // ---- credentials (read-only; the drop already happened) ----
+        // Credential syscalls here are read-only: the privilege drop already happened.
         libc::SYS_getuid,
         libc::SYS_geteuid,
         libc::SYS_getgid,
@@ -256,7 +244,6 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
 
     #[cfg(target_arch = "x86_64")]
     v.extend_from_slice(&[
-        // Legacy non-`*at` syscalls glibc still prefers on x86_64.
         libc::SYS_open,
         libc::SYS_poll,
         libc::SYS_select,
@@ -301,11 +288,9 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
     v
 }
 
-/// Unambiguously-exploitation syscalls the Gateway never issues: attempting one
-/// is a compromise. They are hard-denied with `KILL_PROCESS`. Namespace *creation*
-/// via `clone`/`clone3` flags is left to the capability drop + `no_new_privs`
-/// (which make it impossible without CAP_SYS_ADMIN) rather than argument-filtering
-/// the thread-spawn path the runtime depends on.
+/// Namespace *creation* via `clone`/`clone3` flags is deliberately NOT argument-filtered
+/// here — the runtime depends on that thread-spawn path; the capability drop plus
+/// `no_new_privs` make it impossible without CAP_SYS_ADMIN.
 fn dangerous_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
     let mut v = vec![
         libc::SYS_execve,
@@ -313,7 +298,6 @@ fn dangerous_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
-        // Cross-process memory manipulation the Gateway never does.
         libc::SYS_process_madvise,
         libc::SYS_move_pages,
         libc::SYS_kexec_load,
@@ -354,8 +338,6 @@ fn dangerous_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_uselib,
     ]);
 
-    // Hard-deny io_uring unless the reactor is actually selected (a favourite
-    // exploit/sandbox-escape primitive). When active it moves to the allow-list.
     if !io_uring_active {
         v.extend_from_slice(&[
             libc::SYS_io_uring_setup,
@@ -386,18 +368,14 @@ mod tests {
 
     #[test]
     fn io_uring_syscalls_are_gated_on_the_backend() {
-        // Off (default): io_uring is hard-denied, not allowed.
         assert!(dangerous_syscalls(false).contains(&libc::SYS_io_uring_setup));
         assert!(!allowed_syscalls(false).contains(&libc::SYS_io_uring_enter));
-        // On: it moves to the allow-list and out of the kill set.
         assert!(allowed_syscalls(true).contains(&libc::SYS_io_uring_enter));
         assert!(!dangerous_syscalls(true).contains(&libc::SYS_io_uring_setup));
     }
 
     #[test]
     fn filters_compile() {
-        // The BPF must assemble for the host arch (catches a bad syscall number or
-        // an oversized program) without installing anything.
         for io_uring in [false, true] {
             let allow = build_filter(SeccompAction::Errno(libc::EPERM as u32), io_uring).unwrap();
             let _: BpfProgram = allow.try_into().unwrap();

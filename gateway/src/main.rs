@@ -1,5 +1,3 @@
-//! SessionLayer Gateway daemon (Tier-0: plaintext SSH MITM).
-
 use clap::{Parser, Subcommand, ValueEnum};
 use gateway::hardening;
 use gateway_core::{
@@ -76,7 +74,6 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Run the daemon (fail-closed: enrollment/load failure aborts; SSH server needs CP identity).
 fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let cfg = GatewayConfig::load(config_path.as_deref())?;
 
@@ -110,8 +107,6 @@ fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             "SessionLayer Gateway starting"
         );
 
-        // Establish (or load) the renewable mTLS identity if bootstrap is
-        // configured; the renew-ahead loop then runs for the process lifetime.
         let renew = bootstrap_identity(&cfg).await?;
         if renew.is_none() {
             tracing::info!(
@@ -366,8 +361,6 @@ async fn start_outer_leg(
         rpc_timeout: Duration::from_secs(cfg.ssh.cp_rpc_timeout_secs),
     };
 
-    // Republish the renewing credential as channel snapshots so the CP auth
-    // client always dials with the current identity.
     let (snap_tx, snap_rx) = tokio::sync::watch::channel(snapshot(&renew.current()));
     let mut cred_rx = renew.subscribe();
     tokio::spawn(async move {
@@ -442,7 +435,7 @@ async fn start_outer_leg(
                 Some(Arc::new(state))
             }
             Err(e) => {
-                tracing::error!(error = %e, "ProxyJump enabled but outer host key generation failed; ProxyJump DISABLED (direct-tcpip refused)");
+                tracing::error!(error = %e, "ProxyJump enabled but outer host key generation failed; ProxyJump DISABLED (direct-tcpip is handled as an ordinary local port-forward, still gated on port_forward_local)");
                 None
             }
         }
@@ -653,10 +646,8 @@ fn host_from_endpoint(endpoint: &str) -> Option<String> {
     let after_scheme = endpoint.split("://").nth(1).unwrap_or(endpoint);
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
     let host = if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literal: the host is between the brackets; a `:port` may follow.
         rest.split(']').next().unwrap_or(rest)
     } else {
-        // host or host:port — the host has no colons, so strip a trailing :port.
         authority.rsplit_once(':').map_or(authority, |(h, _)| h)
     };
     (!host.is_empty()).then(|| host.to_string())
@@ -686,7 +677,6 @@ mod tests {
             host_from_endpoint("https://cp.internal").as_deref(),
             Some("cp.internal")
         );
-        // Bracketed IPv6 literal, with and without a port.
         assert_eq!(
             host_from_endpoint("https://[::1]:9443").as_deref(),
             Some("::1")
@@ -701,34 +691,28 @@ mod tests {
 
     #[test]
     fn default_config_bootstraps_no_identity() {
-        // The default (un-enrolled) config must not attempt enrollment.
         let cfg = GatewayConfig::default();
         assert!(cfg.bootstrap.is_none());
     }
 
-    /// The bounded drain wait (used by both the relay drain and the teardown-settle wait)
-    /// must actually BLOCK until the tracked in-flight count reaches zero, and then return
-    /// PROMPTLY — not sit until the deadline. This is its load-bearing property:
-    /// waiting for `live_sessions.len() == 0` after `terminate_all()` is only safe if the wait
-    /// genuinely observes the count draining. (A faithful live-session variant needs a real russh
-    /// `Handle` in `SessionControl`, which only the Docker E2E provides.)
+    /// Waiting for `live_sessions.len() == 0` after `terminate_all()` is only safe if this
+    /// wait genuinely observes the count draining — so returning PROMPTLY matters as much
+    /// as blocking. (A faithful live-session variant needs a real russh `Handle` in
+    /// `SessionControl`, which only the Docker E2E provides.)
     #[tokio::test]
     async fn drain_blocks_until_in_flight_reaches_zero_then_returns_promptly() {
         let live = ssh::locks::LiveSessionRegistry::default();
         let relays = Arc::new(ha::peer_client::ServedRelays::default());
 
-        // Nothing in flight ⇒ return at once (well under the deadline).
         let t0 = std::time::Instant::now();
         drain_live_sessions(&live, Some(&relays), Duration::from_secs(30)).await;
         assert!(t0.elapsed() < Duration::from_secs(1));
 
-        // One in-flight relay held for 400ms; the drain must wait for it and then return, NOT
-        // block to the deadline.
         let slot = relays.begin("web-01").expect("slot");
         assert_eq!(relays.active(), 1);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
-            drop(slot); // releases ⇒ active() == 0
+            drop(slot);
         });
         let t1 = std::time::Instant::now();
         drain_live_sessions(&live, Some(&relays), Duration::from_secs(30)).await;

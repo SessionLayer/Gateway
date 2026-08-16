@@ -10,19 +10,12 @@ license = "GPL-3.0-only"
 repository = "https://github.com/SessionLayer/Gateway"
 authors = ["SessionLayer"]
 
-# Tier-0 invariant, uniform across every crate (lib and binaries): no first-party
-# `unsafe`. `forbid` cannot be locally overridden. Dependencies are unaffected
-# (that is expected — this governs our code only).
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.dependencies]
 gateway-core = { path = "gateway-core", version = "0.0.2" }
 
-# Async runtime. Multi-threaded tokio is the process base; the io_uring reactor
-# (behind gateway-core's `io-uring` feature) is a per-connection concern behind
-# the AsyncIo seam, not the runtime. `sync` carries the renew-ahead loop's
-# manual-trigger / shutdown channels.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
@@ -35,35 +28,19 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
 
-# TLS. The CP<->GW mTLS channel runs on the *ring* provider (no aws-lc-rs).
-# `logging`/`std` are the non-provider bits we rely on.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 
-# X.509 identity: local ECDSA P-256 keypair + PKCS#10 CSR generation (the
-# Gateway sends only a CSR; its mTLS private key never leaves the process). Also the
-# mock-CP internal CA in tests. `ring` backend (NOT aws_lc_rs); `pem` for the
-# tonic client-identity PEM.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
-# Outer SSH leg: the Gateway's SSH server (accept + transport + auth handshake).
-# `ring` crypto backend to match the rest of the TLS stack (no aws-lc-rs C/asm
-# toolchain); no default features to keep the surface minimal.
 russh = { version = "0.62", default-features = false, features = ["ring"] }
 
-# Inner-leg SSH keypair + OpenSSH wire encoding (the ecdsa-sha2-nistp256 public
-# blob the CP signs) + OpenSSH certificate assembly (mock session CA in tests).
-# `ed25519` powers the outer-leg host key (the standard SSH host-key algorithm).
 ssh-key = { version = "0.6", default-features = false, features = ["ecdsa", "ed25519", "p256", "std", "getrandom"] }
 # `OsRng` for inner-keypair generation + renew-ahead jitter (rand_core 0.6, the
 # version ssh-key 0.6 speaks — kept aligned deliberately).
 rand_core = { version = "0.6", features = ["getrandom"] }
 
-# Single-writer advisory lock on the credential data-dir: two Gateway
-# processes must not race the generation counter.
 fd-lock = "4"
-# Scrub private-key / secret buffers (Tier-0 caution).
 zeroize = "1"
-# DER -> PEM for the tonic client Identity (enrollment returns cert DER).
 pem = "3"
 
 # Recorder crypto. All RustCrypto (MIT/Apache), already in
@@ -80,11 +57,6 @@ hkdf = "0.13"
 sha2 = "0.11"
 aes-gcm = { version = "0.11", features = ["zeroize"] }
 
-# Parse + PKIX-validate the CONTEXT_SIGNER X.509 leaf (SAN URI marker,
-# codeSigning EKU, validity, chain to the pinned internal mTLS CA) when verifying a
-# signed decision context. Pure-Rust (MIT/Apache), already vetted in the graph as a
-# dev dep; `verify` enables ring-backed chain-signature checks (ring is already the
-# rustls provider). See decisionctx.rs; mirrors the Java DecisionContextVerifier.
 x509-parser = { version = "0.18", features = ["verify"] }
 
 # WORM upload: a dumb HTTP PUT of the ciphertext object to the
@@ -102,13 +74,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # is our own `tokio_rustls` (ring) stream, handed to tungstenite already
 # established, so tungstenite never selects a crypto stack of its own.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
-# Sink/Stream polling for the WsByteStream hot path (poll_ready IS the backpressure
-# signal — see agent/stream.rs).
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-# base64url (no padding) for the SLDB1 dial-back token envelope (contract §6).
 base64 = "0.23"
 
-# Observability.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
@@ -126,7 +94,6 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
 tracing-opentelemetry = "0.33"
 
-# Ser/de, errors, CLI.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

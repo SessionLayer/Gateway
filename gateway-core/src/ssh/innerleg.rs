@@ -1,5 +1,3 @@
-//! Inner-leg SSH client (no TOFU, zeroized key that never leaves the Gateway, per-channel split).
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,9 +69,6 @@ impl ReverseAllowed {
         self.x11.store(true, Ordering::SeqCst);
     }
 
-    /// Claim one inbound x11 open. `false` means refuse: either x11 was never
-    /// requested, or it was requested `single_connection` and one has already
-    /// been admitted.
     pub fn try_admit_x11(&self) -> bool {
         if !self.x11.load(Ordering::SeqCst) {
             return false;
@@ -95,7 +90,6 @@ pub(crate) struct X11Params {
     pub screen_number: u32,
 }
 
-/// Inner-leg bounds (fail-closed timeouts).
 #[derive(Debug, Clone)]
 pub(crate) struct InnerLegConfig {
     pub handshake_timeout: Duration,
@@ -138,7 +132,6 @@ pub(crate) enum InnerLegError {
 pub(crate) struct InnerClient {
     handle: Handle<InnerHandler>,
     verified: HostVerified,
-    /// Fail-closed bound on post-transport node round-trips.
     op_timeout: Duration,
     reverse_allowed: Arc<ReverseAllowed>,
 }
@@ -148,7 +141,6 @@ impl InnerClient {
         self.verified
     }
 
-    /// Verify host identity (no TOFU), authenticate with ephemeral cert, zeroize private key immediately after.
     pub async fn establish(
         stream: Box<dyn ByteStream>,
         verifier: HostVerifier,
@@ -418,9 +410,6 @@ impl client::Handler for InnerHandler {
         let Some(tx) = &self.reverse_tx else {
             return Ok(());
         };
-        // `try_admit_x11` enforces `single_connection` here rather than trusting the
-        // node's own compliance with the flag we relayed to it: refuses both an
-        // unsolicited open and a second one past a claimed single-connection grant.
         if !self.reverse_allowed.try_admit_x11() {
             tracing::warn!(
                 outcome = "reverse_refused",
@@ -536,9 +525,6 @@ mod tests {
 
     #[test]
     fn x11_single_connection_admits_exactly_once() {
-        // `single_connection` must be enforced here, not merely relayed to the
-        // node and trusted -- a compromised node must not be able to ride the
-        // forwarded cookie past its first use by simply ignoring the flag.
         let a = ReverseAllowed::default();
         assert!(!a.try_admit_x11(), "nothing requested → nothing admitted");
 
@@ -571,8 +557,6 @@ mod tests {
 
     #[test]
     fn shared_port_number_survives_one_cancel() {
-        // Two binds sharing a port number (e.g. v4+v6 addresses): one cancel must
-        // not close the gate for the other.
         let a = ReverseAllowed::default();
         a.bind(8080);
         a.bind(8080);
@@ -580,16 +564,10 @@ mod tests {
         assert!(a.port_bound(8080));
         a.unbind(8080);
         assert!(!a.port_bound(8080));
-        // A spurious extra cancel is a no-op, not a panic/underflow.
         a.unbind(8080);
         assert!(!a.port_bound(8080));
     }
 
-    // russh's client-role channel-open defaults ACCEPT, while its server-role
-    // defaults reject by dropping `reply`. Any callback we leave unimplemented
-    // therefore silently admits a channel the node invented. Scraping the
-    // vendored source keeps this honest across a russh bump: a new accepting
-    // callback upstream fails here instead of becoming a silent open door.
     #[test]
     fn every_accepting_client_callback_is_overridden() {
         const RUSSH_CLIENT: &str = include_str!("../../../third_party/russh/src/client/mod.rs");

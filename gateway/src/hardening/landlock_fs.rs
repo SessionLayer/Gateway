@@ -1,5 +1,3 @@
-//! Landlock FS confinement (unprivileged, additive-only; no re-grant access ever).
-
 use anyhow::Context;
 use gateway_core::config::LandlockConfig;
 use landlock::{
@@ -102,8 +100,6 @@ fn open_rule_path(path: &Path) -> anyhow::Result<Option<PathFd>> {
 mod tests {
     use super::*;
 
-    // With landlock.required set, anything short of full enforcement must abort
-    // startup; unset, the best-effort degrade never blocks.
     #[test]
     fn required_fails_closed_unless_fully_enforced() {
         assert!(enforce_required(true, RulesetStatus::NotEnforced).is_err());

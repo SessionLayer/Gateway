@@ -1,5 +1,3 @@
-//! SLGW1 single-use relay token: ingress-signed, ECDSA P-256 / SHA-256, verify-then-decode.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,13 +14,11 @@ use tokio::sync::oneshot;
 use crate::pbgw::RelayTokenPayload;
 use crate::ssh::connector::ByteStream;
 
-/// Envelope prefix. A token that does not start with this is refused unparsed.
 const ENVELOPE: &str = "SLGW1";
 
-/// Domain separation for the signature (`gateway-relay-v1.md` §6 — note the NUL).
+/// Domain separation for the signature — the trailing NUL is part of the domain.
 const DOMAIN: &[u8] = b"sessionlayer-gw-relay-v1\0";
 
-/// Bindings a relay is tied to (all required; a mismatch fails closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayBinding {
     pub node_id: String,
@@ -156,7 +152,6 @@ impl RelaySigner {
     }
 }
 
-/// `DOMAIN || payload_bytes` — the exact bytes signed and verified.
 fn signing_input(payload_bytes: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(DOMAIN.len() + payload_bytes.len());
     msg.extend_from_slice(DOMAIN);
@@ -175,7 +170,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Removal is consumption.
 struct PendingRelay {
     binding: RelayBinding,
     expires_at_ms: i64,
@@ -184,8 +178,6 @@ struct PendingRelay {
 
 const DEFAULT_MAX_PENDING: usize = 4096;
 
-/// Single-use ledger (keyed by `jti`). Never holds token material; a replay finds nothing.
-/// At capacity, insert fails closed.
 pub struct PendingRelays {
     inner: Mutex<HashMap<String, PendingRelay>>,
     max_pending: usize,
@@ -210,7 +202,6 @@ impl PendingRelays {
         }
     }
 
-    /// Returns `false` at capacity (fail closed).
     #[must_use]
     pub fn insert(
         &self,
@@ -234,7 +225,6 @@ impl PendingRelays {
         true
     }
 
-    /// Removal is consumption. Returns sender if all bindings match.
     pub fn consume(
         &self,
         payload: &RelayTokenPayload,
@@ -277,7 +267,6 @@ impl PendingRelays {
     }
 }
 
-/// Current Unix time in milliseconds (the clock the token window is judged by).
 pub fn now_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -344,7 +333,7 @@ mod tests {
         let mut payload =
             RelayTokenPayload::decode(URL_SAFE_NO_PAD.decode(payload_b64).unwrap().as_ref())
                 .unwrap();
-        payload.owner_nonce = 999; // try to lift the fencing nonce
+        payload.owner_nonce = 999;
         let forged = format!(
             "SLGW1.{}.{sig_b64}",
             URL_SAFE_NO_PAD.encode(payload.encode_to_vec())
@@ -398,18 +387,15 @@ mod tests {
 
     #[test]
     fn the_ledger_is_bounded_and_fails_closed_at_capacity() {
-        // A signal storm cannot grow the ledger without limit.
         let pending = PendingRelays::new(2);
         pending_with(&pending, "a", binding());
         pending_with(&pending, "b", binding());
-        // The 3rd insert is refused (fail closed); its sender is dropped.
         let (tx, _rx) = oneshot::channel();
         assert!(
             !pending.insert("c".into(), binding(), NOW + TTL, tx),
             "at capacity, insert must fail closed"
         );
         assert_eq!(pending.len(), 2);
-        // gc frees room again.
         pending.gc(NOW + TTL);
         assert!(pending.is_empty());
         pending_with(&pending, "d", binding());

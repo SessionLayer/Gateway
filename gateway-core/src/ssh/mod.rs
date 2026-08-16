@@ -35,7 +35,6 @@ use crate::ssh::proxy::resolve_source_ip;
 pub use crate::cpauth::{CpAuthClient, CpChannelFactory, CredentialSnapshot};
 pub use crate::ssh::handler::HandlerDeps as OuterLegDeps;
 
-/// Outer SSH leg startup failure (fail-closed).
 #[derive(Debug, thiserror::Error)]
 pub enum SshServerError {
     #[error("outer-leg SSH server I/O error: {0}")]
@@ -183,7 +182,6 @@ async fn run_ssh_connection(
     }
 }
 
-/// Bind the outer SSH leg per `config`, wiring in the CP-delegating `deps` (fail-closed).
 pub async fn bind(
     config: Arc<SshServerConfig>,
     deps: HandlerDeps,
@@ -264,7 +262,6 @@ fn validate_config(config: &SshServerConfig) -> Result<(), SshServerError> {
             config.inner.max_session_idle_secs, config.login_grace_secs
         )));
     }
-    // Inner-leg bounds must be fail-closed: non-zero timeouts, window ≥ packet size, at least one channel.
     let inner = &config.inner;
     if inner.connect_timeout_secs == 0 || inner.handshake_timeout_secs == 0 {
         return Err(SshServerError::Config(
@@ -418,7 +415,7 @@ mod tests {
             login_grace_secs: 30,
             device_flow: DeviceFlowConfig {
                 heartbeat_interval_secs: 10,
-                poll_timeout_secs: 60, // >= login_grace
+                poll_timeout_secs: 60,
             },
             ..Default::default()
         };
@@ -461,7 +458,6 @@ mod tests {
     fn agent_transport_bounds_fail_closed() {
         use crate::config::AgentTransportConfig;
 
-        // Disabled (the default): nothing to validate.
         assert!(validate_config(&SshServerConfig::default()).is_ok());
 
         let enabled = |agent: AgentTransportConfig| SshServerConfig {
@@ -474,33 +470,32 @@ mod tests {
         };
         assert!(validate_config(&enabled(on.clone())).is_ok());
 
-        // A frame smaller than an inner-leg packet could not carry one.
         assert!(matches!(
             validate_config(&enabled(AgentTransportConfig {
-                max_frame_bytes: 32 * 1024, // == inner.max_packet_bytes
+                max_frame_bytes: 32 * 1024,
                 ..on.clone()
             })),
             Err(SshServerError::Config(_))
         ));
 
-        // Wire-contract §3 bounds on the two values HELLO_ACK proposes. The Agent enforces
-        // the SAME range, so a Gateway outside it would boot healthy and then be refused by
+        // Bounds on the two values HELLO_ACK proposes. The Agent enforces the SAME
+        // range, so a Gateway outside it would boot healthy and then be refused by
         // every Agent in the fleet — reject it at startup, loudly.
         for outside in [
             AgentTransportConfig {
-                max_frame_bytes: 2 * 1024 * 1024, // > 1 MiB
+                max_frame_bytes: 2 * 1024 * 1024,
                 ..on.clone()
             },
             AgentTransportConfig {
-                max_frame_bytes: 2048, // < 4 KiB
+                max_frame_bytes: 2048,
                 ..on.clone()
             },
             AgentTransportConfig {
-                heartbeat_interval_secs: 600, // > 300 s: a dead peer goes unnoticed
+                heartbeat_interval_secs: 600,
                 ..on.clone()
             },
             AgentTransportConfig {
-                heartbeat_interval_secs: 0, // < 1 s
+                heartbeat_interval_secs: 0,
                 ..on.clone()
             },
         ] {
@@ -532,8 +527,6 @@ mod tests {
                 "the contract range is inclusive: {edge:?}"
             );
         }
-        // A dial-back deadline at/over the token TTL would expire a token still in
-        // legitimate flight.
         assert!(matches!(
             validate_config(&enabled(AgentTransportConfig {
                 dial_back_timeout_secs: 30,
@@ -542,7 +535,6 @@ mod tests {
             })),
             Err(SshServerError::Config(_))
         ));
-        // Zero bounds are unbounded waits / busy loops.
         for zeroed in [
             AgentTransportConfig {
                 dial_back_timeout_secs: 0,
@@ -560,8 +552,6 @@ mod tests {
                 max_agents: 0,
                 ..on.clone()
             },
-            // Fewer connection slots than registrable nodes: a full fleet could never all
-            // be connected.
             AgentTransportConfig {
                 max_connections: 512,
                 max_agents: 1024,

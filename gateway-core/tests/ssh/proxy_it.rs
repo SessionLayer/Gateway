@@ -1,5 +1,3 @@
-//! PROXY v2 + source-IP gate: fail-closed, the connection dropped before any SSH banner.
-
 use std::sync::Arc;
 use std::time::Duration;
 

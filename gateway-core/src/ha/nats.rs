@@ -1,5 +1,3 @@
-//! Hand-rolled minimal NATS core pub/sub client, zero-dep reference backend.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,9 +16,6 @@ const CHANNEL_CAPACITY: usize = 256;
 
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Bounds a single connect attempt so a wedged/black-holed broker cannot pin the
-/// reconnect loop open indefinitely (every other connect call in the fleet
-/// is timeout-wrapped; this one was the exception).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const CMD_QUEUE_CAP: usize = 1024;
@@ -41,7 +36,6 @@ fn dialback_subject(prefix: &str, gateway_id: &str) -> String {
     format!("{prefix}.dialback.{gateway_id}")
 }
 
-/// NATS coordination backend with automatic reconnect.
 pub struct NatsBackend {
     subject_prefix: String,
     cmd_tx: mpsc::Sender<Cmd>,
@@ -146,7 +140,6 @@ fn broadcast_stream(
     })
 }
 
-/// Fail-closed: recover a poisoned lock (critical section runs no user code).
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -190,7 +183,7 @@ async fn connection_manager(
                 match run_connection(stream, &mut cmd_rx, &subs, &connected).await {
                     Ok(BackendDropped) => {
                         connected.store(false, Ordering::SeqCst);
-                        return; // the NatsBackend was dropped: stop the manager
+                        return;
                     }
                     Err(NatsError::Fatal(reason)) => {
                         connected.store(false, Ordering::SeqCst);
@@ -210,9 +203,6 @@ async fn connection_manager(
                 tracing::info!(addr = %addr, timeout = ?CONNECT_TIMEOUT, "NATS connect timed out; retrying");
             }
         }
-        // Jittered: a CP/broker restart must not resync the whole fleet's
-        // reconnects in lockstep, the same ±50% convention as the fleet's other
-        // reconnect loops (identity renew uses a smaller ±10% for a different reason).
         tokio::time::sleep(jittered_backoff(RECONNECT_BACKOFF, random_sample())).await;
     }
 }
@@ -289,7 +279,7 @@ async fn run_connection(
                         }
                     }
                 }
-                None => break Ok(BackendDropped), // the backend was dropped
+                None => break Ok(BackendDropped),
             }
         }
     };
@@ -324,7 +314,7 @@ async fn reader_loop<R: AsyncBufRead + Unpin>(
                 }
             }
             LineKind::Err => tracing::warn!(error = %line.trim(), "NATS -ERR"),
-            LineKind::Other => {} // +OK / INFO updates: ignore
+            LineKind::Other => {}
         }
     }
 }
@@ -408,13 +398,11 @@ async fn handle_msg<R: tokio::io::AsyncRead + Unpin>(
     let len: usize = len_str
         .parse()
         .map_err(|_| std::io::Error::other("bad NATS payload length"))?;
-    // Bound the payload (the signal is small; a huge length is a broken/hostile server).
     if len > 1024 * 1024 {
         return Err(std::io::Error::other("oversized NATS payload"));
     }
     let mut buf = vec![0u8; len];
     rd.read_exact(&mut buf).await?;
-    // Trailing CRLF after the payload.
     let mut crlf = [0u8; 2];
     let _ = rd.read_exact(&mut crlf).await;
 
@@ -441,21 +429,18 @@ mod tests {
         assert!(NatsBackend::connect("nats://", "sl").is_err());
     }
 
-    /// Reconnect jitter stays within ±50% of the base backoff.
     #[test]
     fn jittered_backoff_stays_within_half_bounds() {
         let base = Duration::from_secs(1);
         assert_eq!(jittered_backoff(base, 0.0), base);
         assert_eq!(jittered_backoff(base, -1.0), Duration::from_millis(500));
         assert_eq!(jittered_backoff(base, 1.0), Duration::from_millis(1500));
-        // Out-of-range samples clamp rather than invert or overshoot.
         assert_eq!(jittered_backoff(base, -9.0), Duration::from_millis(500));
         assert_eq!(jittered_backoff(base, 9.0), Duration::from_millis(1500));
     }
 
     #[test]
     fn control_lines_are_classified() {
-        // The PING/PONG/MSG parse gated without a live broker.
         assert_eq!(classify_line("PING"), LineKind::Ping);
         assert_eq!(classify_line("PING\r"), LineKind::Ping);
         assert_eq!(classify_line("PONG"), LineKind::Pong);
@@ -467,36 +452,30 @@ mod tests {
 
     #[test]
     fn info_flags_tls_and_auth_requirements_as_fatal() {
-        // The plaintext client must fail loud, not loop, when the broker demands TLS/auth.
         assert!(
             info_requires_unsupported("INFO {\"server_id\":\"a\",\"tls_required\":true}").is_some()
         );
         assert!(info_requires_unsupported("INFO {\"auth_required\":true}").is_some());
-        // A vanilla trusted-network broker is fine.
         assert!(
             info_requires_unsupported("INFO {\"server_id\":\"a\",\"max_payload\":1048576}")
                 .is_none()
         );
     }
 
-    /// An oversized, unterminated control line errors at the bound rather than growing.
     #[tokio::test]
     async fn an_unterminated_control_line_is_bounded() {
         let flood = vec![b'x'; MAX_CONTROL_LINE + 4096];
-        let mut reader: &[u8] = &flood; // never a '\n'
+        let mut reader: &[u8] = &flood;
         let err = read_control_line(&mut reader).await.unwrap_err();
         assert_eq!(err.to_string(), "oversized NATS control line");
     }
 
-    /// A well-formed line reads and trims its CRLF.
     #[tokio::test]
     async fn a_control_line_reads_and_trims_crlf() {
         let mut reader: &[u8] = b"PING\r\nrest";
         assert_eq!(read_control_line(&mut reader).await.unwrap(), "PING");
     }
 
-    /// The MSG frame parser reassembles the payload and decodes the signal end-to-end against a
-    /// real prost-encoded `DialBackSignal` (the risk-carrying part of the hand-rolled codec).
     #[tokio::test]
     async fn msg_frame_decodes_and_dispatches_the_signal() {
         let subs: Arc<Mutex<HashMap<String, broadcast::Sender<DialBackSignal>>>> =
@@ -512,8 +491,6 @@ mod tests {
             ..Default::default()
         };
         let payload = signal.encode_to_vec();
-        // The caller consumes the control line; handle_msg reads the payload + trailing CRLF
-        // from the reader. `&[u8]` implements tokio's AsyncRead.
         let line = format!("MSG sl.dialback.gw-B 1 {}", payload.len());
         let mut body = payload.clone();
         body.extend_from_slice(b"\r\n");
@@ -526,8 +503,6 @@ mod tests {
         assert_eq!(got.relay_token, "SLGW1.x.y");
     }
 
-    /// A subject with no local subscriber drops the signal (⇒ the ingress times out and fails
-    /// closed), never a panic.
     #[tokio::test]
     async fn msg_for_an_unknown_subject_is_dropped() {
         let subs: Arc<Mutex<HashMap<String, broadcast::Sender<DialBackSignal>>>> =
@@ -537,6 +512,6 @@ mod tests {
         let mut body = payload.clone();
         body.extend_from_slice(b"\r\n");
         let mut reader: &[u8] = &body;
-        handle_msg(&line, &mut reader, &subs).await.unwrap(); // must not panic
+        handle_msg(&line, &mut reader, &subs).await.unwrap();
     }
 }

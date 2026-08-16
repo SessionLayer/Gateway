@@ -22,7 +22,6 @@ const CERT_REFRESH_SKEW_SECS: u64 = 60;
 
 const MAX_CACHED_HOST_CERTS: usize = 256;
 
-/// ProxyJump setup failure: fail-closed (no TOFU fallback).
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyJumpError {
     #[error("outer host certificate unavailable")]
@@ -49,7 +48,6 @@ impl std::fmt::Debug for ProxyJumpState {
 }
 
 impl ProxyJumpState {
-    /// Generates ECDSA P-256 host keypair (key never leaves, fail-closed on error).
     pub fn new() -> Result<Self, ProxyJumpError> {
         let generated = ssh_key::PrivateKey::random(
             &mut rand_core::OsRng,
@@ -73,7 +71,6 @@ impl ProxyJumpState {
         })
     }
 
-    /// Returns cached or fresh host cert; fail-closed on CP/parse failure.
     async fn cert_for(
         &self,
         cpauth: &CpAuthClient,
@@ -123,7 +120,6 @@ impl ProxyJumpState {
     }
 }
 
-/// Terminates inner hop: presents host-CA cert, runs full session seam.
 pub async fn serve_inner_hop<S>(
     deps: HandlerDeps,
     pj: Arc<ProxyJumpState>,

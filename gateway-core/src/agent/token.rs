@@ -1,5 +1,3 @@
-//! SLDB1 single-use dial-back token: ECDSA P-256 / SHA-256, verify-then-decode, per-process key.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,26 +14,20 @@ use tokio::sync::oneshot;
 use crate::pbagent::DialBackTokenPayload;
 use crate::ssh::connector::ByteStream;
 
-/// Envelope prefix. A token that does not start with this is refused unparsed.
 const ENVELOPE: &str = "SLDB1";
 const DOMAIN: &[u8] = b"sessionlayer-dialback-v1:";
 const ISSUED_AT_SKEW_SECS: i64 = 5;
 
-/// The five bindings (plus the agent binding) a dial-back is tied to. Held
-/// in the pending map at issue and compared against the presented token's payload.
+/// The four bindings a dial-back is tied to. Held in the pending map at issue
+/// and compared against the presented token's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialBackBinding {
     pub node_name: String,
     pub session_id: String,
     pub principal: String,
-    /// The agent the token was issued to. The dial-back connection's mTLS identity
-    /// must resolve to exactly this agent.
     pub agent_id: String,
 }
 
-/// A dial-back token rejection. Every variant is reported to the peer as the single
-/// coarse `UNAUTHORIZED`, disclosing nothing about which check failed; the specific
-/// reason is operator-log only.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TokenError {
     #[error("malformed dial-back token envelope")]
@@ -60,8 +52,8 @@ pub enum TokenError {
     Locked,
 }
 
-/// The per-process dial-back signing key (contract §6). Never persisted; a token
-/// from a previous boot is unverifiable by construction.
+/// The per-process dial-back signing key. Never persisted; a token from a previous boot
+/// is unverifiable by construction.
 pub struct DialBackSigner {
     key: SigningKey,
     fingerprint: Vec<u8>,
@@ -122,7 +114,7 @@ impl DialBackSigner {
     }
 
     /// Verify a presented token's envelope, signature, signer, gateway and validity
-    /// window (contract §6 checks 1–3) and return the decoded payload.
+    /// window, and return the decoded payload.
     ///
     /// The signature is verified over the **transmitted bytes** first; only then are
     /// they decoded. The signer-fingerprint equality that follows is defense in
@@ -173,7 +165,6 @@ impl DialBackSigner {
     }
 }
 
-/// `DOMAIN || payload_bytes` — the exact bytes signed and verified.
 fn signing_input(payload_bytes: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(DOMAIN.len() + payload_bytes.len());
     msg.extend_from_slice(DOMAIN);
@@ -199,10 +190,6 @@ struct PendingDialBack {
     ready: oneshot::Sender<Box<dyn ByteStream>>,
 }
 
-/// The in-memory single-use ledger for issued dial-back tokens.
-///
-/// Only the `jti` and its bindings are held — never token material — so there is no
-/// store of secrets to steal. A replay finds nothing here and is refused.
 #[derive(Default)]
 pub struct PendingDialBacks {
     inner: Mutex<Inner>,
@@ -238,9 +225,6 @@ impl PendingDialBacks {
         );
     }
 
-    /// **Consume** a pending dial-back (removal is consumption — a replay of the same
-    /// `jti` finds nothing). Returns the sender to hand the spliced stream to, only
-    /// if every binding matches the presented payload.
     pub fn consume(
         &self,
         payload: &DialBackTokenPayload,
@@ -273,7 +257,6 @@ impl PendingDialBacks {
         }
     }
 
-    /// Dropping the entry drops its sender, which wakes the waiting connector.
     #[cfg(test)]
     pub fn fail_request(&self, request_id: &str) {
         let jti = self
@@ -376,7 +359,6 @@ mod tests {
     fn tampered_payload_fails_the_signature() {
         let signer = DialBackSigner::generate();
         let (_, token) = signer.mint(GW, &binding(), TTL, NOW);
-        // Re-encode a payload with a different node, keeping the original signature.
         let mut parts = token.split('.');
         let (_, payload_b64, sig_b64) = (
             parts.next().unwrap(),
@@ -399,8 +381,6 @@ mod tests {
 
     #[test]
     fn a_token_from_another_gateway_process_never_verifies() {
-        // A different process = a different per-process key. Its token is worthless
-        // here (it fails the signature before the fingerprint is even compared).
         let ours = DialBackSigner::generate();
         let theirs = DialBackSigner::generate();
         let (_, token) = theirs.mint(GW, &binding(), TTL, NOW);
@@ -427,7 +407,6 @@ mod tests {
             signer.verify(&token, GW, NOW + TTL),
             Err(TokenError::Expired)
         );
-        // A clock that jumped far back: outside the small issued_at tolerance.
         assert_eq!(
             signer.verify(&token, GW, NOW - 3600),
             Err(TokenError::Expired)
@@ -469,7 +448,6 @@ mod tests {
 
         let payload = signer.verify(&token, GW, NOW).unwrap();
         assert!(pending.consume(&payload).is_ok(), "first use redeems");
-        // The very same, still-unexpired, still-signature-valid token: refused.
         let payload = signer.verify(&token, GW, NOW).unwrap();
         assert!(matches!(
             pending.consume(&payload),
@@ -499,8 +477,6 @@ mod tests {
                 ..binding()
             },
         ] {
-            // The token is signed for `tamper`, but the Gateway's pending entry (the
-            // authoritative record of what it asked for) holds `binding()`.
             let pending = PendingDialBacks::default();
             let (jti, token) = signer.mint(GW, &tamper, TTL, NOW);
             pending_with(&pending, &jti, binding());
@@ -509,7 +485,6 @@ mod tests {
                 matches!(pending.consume(&payload), Err(TokenError::BindingMismatch)),
                 "must refuse {tamper:?}"
             );
-            // …and the jti is burned, not left redeemable for a second attempt.
             assert!(pending.is_empty());
         }
     }
@@ -535,8 +510,6 @@ mod tests {
 
     #[test]
     fn a_dropped_pending_entry_wakes_the_waiting_connector() {
-        // The connector awaits the oneshot; abandoning must not leave it hanging
-        // until its own timeout (that is the point of the fast-fail).
         let pending = PendingDialBacks::default();
         let (tx, rx) = oneshot::channel();
         pending.insert("j".into(), "req-j".into(), binding(), NOW + TTL, tx);
@@ -549,13 +522,9 @@ mod tests {
 
     #[test]
     fn fail_request_for_only_cancels_the_reporting_agents_own_dial_back() {
-        // request_id is peer-supplied and by_request spans the whole map, so
-        // the fast-fail cancel MUST be scoped to the reporting agent's own binding.
         let pending = PendingDialBacks::default();
-        // binding() is {node-a, sess-1, deploy, agent-1}.
         pending_with(&pending, "victim", binding());
 
-        // Another agent, knowing the request_id, tries to cancel it.
         pending.fail_request_for("req-victim", "agent-2", "node-b");
         assert_eq!(
             pending.len(),
@@ -569,7 +538,6 @@ mod tests {
             "the node must match too, not just the agent"
         );
 
-        // The rightful owner (matching agent AND node) cancels it.
         pending.fail_request_for("req-victim", "agent-1", "node-a");
         assert!(
             pending.is_empty(),

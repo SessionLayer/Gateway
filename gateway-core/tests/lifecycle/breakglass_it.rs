@@ -1,5 +1,3 @@
-//! Break-glass: FIDO2 + offline code, idempotent recording, deny wins, lock teardown.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,7 +78,6 @@ async fn sk_ecdsa_publickey_resolves_to_break_glass() {
         "the CP minted exactly one single-use break-glass token"
     );
 
-    // An UNREGISTERED security key degrades to the next method (no break-glass).
     let other = make_sk_ecdsa_pubkey();
     let auth2 = handler
         .auth_publickey("deploy%node-bg", &other)
@@ -136,10 +133,6 @@ async fn break_glass_probe_costs_the_same_rpcs_whether_or_not_the_key_is_registe
     );
 }
 
-/// A normal sk-ecdsa USER key (registered as a PIN, not a break-glass
-/// credential) must FALL THROUGH the break-glass resolver to the ordinary pin path
-/// and authenticate — never a hard reject. sk-ed25519 and every other algorithm skip
-/// the break-glass branch entirely and go straight to the pin path.
 #[tokio::test]
 async fn sk_ecdsa_non_breakglass_key_falls_through_to_pin() {
     let cp = MockCp::start().await;
@@ -150,7 +143,6 @@ async fn sk_ecdsa_non_breakglass_key_falls_through_to_pin() {
     });
     let deps = crate::support::outer_leg_deps(&cp, config).await;
 
-    // A normal sk-ecdsa user key: a PIN, NOT a registered break-glass credential.
     let sk = make_sk_ecdsa_pubkey();
     let fp = sk.fingerprint(russh::keys::HashAlg::Sha256).to_string();
     cp.register_pin(&fp, "alice", &["deploy"]);
@@ -352,8 +344,9 @@ async fn start_gateway(
     (port, tx)
 }
 
-/// A Gateway config whose recorder is DELIBERATELY non-strict, to prove break-glass
-/// forces strict on top of it. `require_https=false` for the plain-http MinIO E2E.
+/// A Gateway config carrying the caller's recorder, with `require_https=false`
+/// for the plain-http MinIO E2E. Callers pass a non-strict recorder to prove
+/// break-glass forces strict on top of it.
 fn gw_config(recorder: RecorderConfig) -> SshServerConfig {
     let recorder = RecorderConfig {
         require_https: false,
@@ -381,8 +374,6 @@ fn gw_config(recorder: RecorderConfig) -> SshServerConfig {
     }
 }
 
-/// A client container with an askpass helper that echoes `$SL_CODE` (used to answer
-/// the keyboard-interactive break-glass offline-code prompt non-interactively).
 async fn client_container() -> ContainerAsync<GenericImage> {
     GenericImage::new(CLIENT_IMAGE, CLIENT_TAG)
         .with_network("host")
@@ -452,8 +443,6 @@ async fn ssh_exec(
     (code, stdout, stderr)
 }
 
-/// Keyboard-interactive ssh args (no publickey, no BatchMode) for the offline-code
-/// break-glass path; the code is answered via the askpass helper (see `code_env`).
 fn ki_ssh(port: u16, target: &str, command: &str) -> Vec<String> {
     let mut a = vec![
         "ssh".into(),
@@ -528,7 +517,6 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
     let (node, node_port) = start_node(&cp, &host_key).await?;
     wire_node(&cp, &host_key, node_port);
 
-    // recorder.strict = FALSE; break-glass must force strict on top of it.
     let recorder = RecorderConfig {
         strict: false,
         ..RecorderConfig::default()
@@ -538,7 +526,7 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
 
     // Enroll a REAL FIDO2 ecdsa-sk key with the virtual authenticator. It is
     // TOUCH-REQUIRED (no `-O no-touch-required`) — the correct break-glass deployment
-    // (BG-1: UP is authenticator-enforced, so prod keys must require touch). sk-dummy
+    // (UP is authenticator-enforced, so prod keys must require touch). sk-dummy
     // auto-asserts user-presence, so the touch key still drives non-interactively.
     let (code, _out, stderr) = ssh_exec(
         &client,
@@ -562,7 +550,6 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
         "the software SK provider must enroll a touch-required ecdsa-sk key; stderr={stderr}"
     );
 
-    // Register the enrolled PUBLIC key as the break-glass credential at the CP.
     let (code, pub_line, _e) = ssh_exec(
         &client,
         vec!["cat".into(), "/root/sk_key.pub".into()],
@@ -626,8 +613,6 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
         "no FIDO assertion → russh rejects → no Authorize → no activation"
     );
 
-    // Log in with the FIDO2 key: the client signs via the authenticator, russh
-    // verifies the FIDO signature, and the Gateway resolves it as break-glass.
     let (code, stdout, stderr) = ssh_exec(
         &client,
         vec![
@@ -671,7 +656,6 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
         vec![("breakglass-admin".to_string(), NODE_ID.to_string())],
         "the FIDO2 break-glass use is recorded as an activation"
     );
-    // Break-glass FORCED strict recording despite config strict=false.
     let fin = await_finalized(&cp).await;
     assert_eq!(
         fin.status,
@@ -686,9 +670,6 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── E2E 1: offline-code break-glass runs, forces strict, is single-use, and
-//    works with the primary IdP down ──────────────────────────────────────────
-
 #[tokio::test]
 async fn offline_code_break_glass_runs_forces_strict_single_use_idp_down() -> anyhow::Result<()> {
     build_images().await?;
@@ -701,10 +682,7 @@ async fn offline_code_break_glass_runs_forces_strict_single_use_idp_down() -> an
         KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
     );
 
-    // Primary IdP is DOWN: the device flow is configured to DENY (as if the IdP
-    // rejected). Break-glass must remain available regardless (IdP-independent).
     cp.set_device_flow_denied("BG-DOWN", "https://idp.invalid/device");
-    // A break-glass offline code; NO standing dp_rule grant (break-glass bypasses it).
     cp.register_offline_code("break-glass-code-XYZ", "breakglass-admin", &["deploy"]);
     cp.register_node(NODE_ID);
 
@@ -712,7 +690,6 @@ async fn offline_code_break_glass_runs_forces_strict_single_use_idp_down() -> an
     let (node, node_port) = start_node(&cp, &host_key).await?;
     wire_node(&cp, &host_key, node_port);
 
-    // recorder.strict = FALSE in config; break-glass must force strict on top.
     let recorder = RecorderConfig {
         strict: false,
         ..RecorderConfig::default()
@@ -745,8 +722,6 @@ async fn offline_code_break_glass_runs_forces_strict_single_use_idp_down() -> an
         vec![("breakglass-admin".to_string(), NODE_ID.to_string())]
     );
 
-    // Break-glass FORCED strict recording even though config strict=false: the
-    // session was recorded + finalized in WORM.
     let fin = await_finalized(&cp).await;
     assert_eq!(
         fin.status,
@@ -755,7 +730,6 @@ async fn offline_code_break_glass_runs_forces_strict_single_use_idp_down() -> an
     );
     assert!(fin.byte_len > 0);
 
-    // Single-use: a REPLAY of the same code is rejected (generic auth failure).
     let (code2, stdout2, _stderr2) = ssh_exec(
         &client,
         ki_ssh(gw_port, "deploy%node-bg", "echo SHOULD_NOT_RUN"),
@@ -775,9 +749,6 @@ async fn offline_code_break_glass_runs_forces_strict_single_use_idp_down() -> an
     drop(minio);
     Ok(())
 }
-
-// ── E2E 1b: a break-glass session serves new channels without re-authorizing
-//    (decision_ttl=0, healthy feed) — no single-use-token replay-DENY ───────────
 
 #[tokio::test]
 async fn break_glass_serves_channels_when_decision_ttl_zero() -> anyhow::Result<()> {
@@ -830,8 +801,6 @@ async fn break_glass_serves_channels_when_decision_ttl_zero() -> anyhow::Result<
     Ok(())
 }
 
-// ── E2E 2: break-glass forces strict — recording unavailable ⇒ session refused ─
-
 #[tokio::test]
 async fn break_glass_forces_strict_refused_when_recording_unavailable() -> anyhow::Result<()> {
     build_images().await?;
@@ -846,7 +815,7 @@ async fn break_glass_forces_strict_refused_when_recording_unavailable() -> anyho
     wire_node(&cp, &host_key, node_port);
 
     let recorder = RecorderConfig {
-        strict: false, // NON-strict config; break-glass must force strict anyway.
+        strict: false,
         ..RecorderConfig::default()
     };
     let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(recorder))).await;
@@ -924,8 +893,6 @@ async fn gw_enforces_signed_access_model_not_unsigned_context() -> anyhow::Resul
     Ok(())
 }
 
-// ── A break-glass ALLOW with grant_expiry==0 is refused (must be time-boxed) ─
-
 #[tokio::test]
 async fn break_glass_without_grant_expiry_is_refused() -> anyhow::Result<()> {
     build_images().await?;
@@ -979,9 +946,6 @@ async fn break_glass_refused_when_lock_feed_unhealthy() -> anyhow::Result<()> {
         customer_keypair(),
         KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
     );
-    // The lock feed is DOWN so the Gateway's deny-set is never healthy: a break-glass
-    // session cannot confirm the absence of a Lock, so it must refuse NEW privileged
-    // channels (fail closed). A REAL node → without the fix the session would run.
     cp.set_lock_feed_down(true);
     cp.register_offline_code("bg-feeddown", "breakglass-admin", &["deploy"]);
 
@@ -1029,8 +993,6 @@ async fn locked_target_refuses_break_glass() -> anyhow::Result<()> {
     let (node, node_port) = start_node(&cp, &host_key).await?;
     wire_node(&cp, &host_key, node_port);
 
-    // A lock on the node is in effect BEFORE the connection: a matching Lock refuses
-    // break-glass (deny wins), even though break-glass bypasses the standing deny.
     cp.add_lock(gateway_core::pb::Lock {
         lock_id: "bg-quarantine".into(),
         target: Some(gateway_core::pb::LockTarget {
@@ -1057,8 +1019,6 @@ async fn locked_target_refuses_break_glass() -> anyhow::Result<()> {
         !stdout.contains("SHOULD_NOT_RUN"),
         "the command must never run on a locked target"
     );
-    // Deny-wins-after-activation: the CP consumed the token + recorded the activation
-    // (fires the alert ON USE), THEN the top-tier Lock denied.
     assert_eq!(
         cp.breakglass_activation_count(),
         1,
@@ -1091,8 +1051,6 @@ async fn revoke_tears_down_a_live_break_glass_session() -> anyhow::Result<()> {
     let (gw_port, _sd) = start_gateway(&cp, Arc::new(gw_config(RecorderConfig::default()))).await;
     let client = client_container().await;
 
-    // Once the break-glass session is live (recording begun), push a lock (the CP's
-    // revoke-as-lock) matching the node → the live session is torn down.
     cp.push_lock_after_recording_begins(gateway_core::pb::Lock {
         lock_id: "bg-revoke".into(),
         target: Some(gateway_core::pb::LockTarget {
@@ -1117,7 +1075,6 @@ async fn revoke_tears_down_a_live_break_glass_session() -> anyhow::Result<()> {
         "a revoked (locked) live break-glass session must be torn down"
     );
 
-    // The torn-down break-glass session's recording is still finalized.
     let fin = await_finalized(&cp).await;
     assert_eq!(
         fin.status,

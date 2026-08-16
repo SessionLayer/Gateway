@@ -1,33 +1,5 @@
-# SessionLayer — OpenTelemetry Collector config deriving Gateway/Agent RED metrics
-# from spans.
-#
-# WHY span-derived: the Gateway and Agent are Tier-0 Rust binaries that scrape nothing
-# and expose no Prometheus endpoint of their own, deliberately (fewer moving parts on the
-# plaintext data plane; no extra listener on Tier-0). Their Rate/Errors/Duration is
-# therefore derived centrally by the collector's `spanmetrics` connector off the span
-# inventory below, with zero code change to the hardened binaries. The CP's own SLOs come
-# from its Micrometer meters (ControlPlane/deploy/observability/prometheus-slo-rules.yaml);
-# these span-metrics complete the data-path half.
-#
-# Span-derived is not the whole story, though: `register_gateway_gauges_on`
-# (gateway-core/src/telemetry.rs) also pushes two OTLP *gauges* —
-# `sessionlayer.gateway.live_sessions` and `sessionlayer.gateway.lock_feed_healthy` — which
-# no span can express, because they are levels rather than events. Those arrive on the same
-# OTLP receiver and need the `metrics` pipeline below to reach Prometheus; without it they
-# are received and dropped, and the two signals the runbook pages on have no data path at
-# all. A pipeline that silently discards what it accepts is the failure this file has to
-# avoid, so the receiver, the pipelines and this comment are one unit — change one and
-# check the other two.
-#
-# Span inventory, spelled exactly as emitted, because the name is
-# carried verbatim as the `span_name` label value and a selector that drops the
-# prefix matches nothing: gateway.session / gateway.outer_leg.auth /
-# gateway.node.connect / gateway.host_verify / gateway.bridge_setup (Gateway root)
-# → cp.authorize / cp.cert_sign (CP, gRPC children) → agent.dial_back /
-# agent.splice (Agent, session-correlated).
-# Attributes are IDs + closed enums + outcomes only — NEVER plaintext (proven by
-# ObservabilityIT + telemetry_no_content.rs), so promoting them to metric dimensions
-# is safe.
+# Span names are carried verbatim as the `span_name` label value, so a selector that drops
+# the `gateway.` / `cp.` / `agent.` prefix matches nothing.
 
 receivers:
   otlp:
@@ -54,7 +26,6 @@ connectors:
 exporters:
   prometheus:
     endpoint: 0.0.0.0:9464
-    # Keep the resource service.name as a metric label so Gateway vs Agent split.
     resource_to_telemetry_conversion:
       enabled: true
 

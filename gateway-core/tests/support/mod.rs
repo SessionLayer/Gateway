@@ -1,4 +1,4 @@
-#![allow(dead_code)] // shared across several test binaries; not all use every item.
+#![allow(dead_code)]
 
 pub mod docker;
 pub mod sigv4;
@@ -145,7 +145,6 @@ impl TestCa {
         ttl: Duration,
     ) -> Result<Vec<u8>, rcgen::Error> {
         let mut csr = Self::parse_csr(csr_der)?;
-        // The CP discards every name the CSR asks for and stamps its own.
         csr.params.distinguished_name = rcgen::DistinguishedName::new();
         csr.params
             .distinguished_name
@@ -285,8 +284,6 @@ struct AllowRule {
     principal: String,
 }
 
-/// A minted single-use break-glass token: the resolution binds
-/// {gateway, identity, node, source_ip}; Authorize consumes it once.
 struct BreakglassTokenRecord {
     gateway_id: String,
     identity: String,
@@ -380,31 +377,18 @@ struct MockState {
     /// truth for the Authorize-side assertion that the Gateway forwarded the scope of
     /// the credential the client actually authenticated with.
     resolved_scopes: Mutex<HashMap<String, Vec<Vec<String>>>>,
-    /// Models a CP that predates `credential_principals`, or ignores it: the mock skips
-    /// the reduction and can ALLOW an out-of-scope login. The Gateway's backstop is the
-    /// only thing that refuses then.
     ignore_credential_scope: Mutex<bool>,
 
-    // ---- concurrency-lease lifecycle -----------------------------
     /// Concurrency leases taken on a standing/JIT ALLOW (break-glass takes none),
     /// keyed by session_id. NotifySessionEnd releases; ExtendSessionLease re-stamps.
     leases: Mutex<HashMap<String, LeaseRecord>>,
-    /// Every NotifySessionEnd received (assertions: exactly-once, right reason).
     session_end_notifications: Mutex<Vec<NotifySessionEndRequest>>,
-    /// session_ids of every ExtendSessionLease ATTEMPT — recorded before the
-    /// failure gate so failure-injection tests still see the Gateway trying.
     lease_extensions: Mutex<Vec<String>>,
-    /// The server-authoritative extension window ExtendSessionLease grants (secs).
     extend_window_secs: Mutex<i64>,
-    /// When set, ExtendSessionLease returns UNAVAILABLE (a transient CP fault).
     extend_unavailable: Mutex<bool>,
-    /// The per-identity idle timeout signed into every decision context
-    /// (`idle_timeout_seconds`; 0 = no per-identity idle policy).
     idle_timeout_secs: Mutex<i64>,
 }
 
-/// One session's concurrency lease: released exactly once by the
-/// brokering gateway's NotifySessionEnd; re-stamped by ExtendSessionLease.
 struct LeaseRecord {
     gateway_id: String,
     released: bool,
@@ -433,8 +417,8 @@ impl MockState {
             .map_err(|_| Status::internal("session CA unavailable"))?;
 
         let now = unix_now();
-        let valid_after = now.saturating_sub(60); // backdate for clock skew
-        let valid_before = now + 300; // ~5-minute handshake-scoped TTL
+        let valid_after = now.saturating_sub(60);
+        let valid_before = now + 300;
         let key_id = format!("{session_id}+{principal}");
 
         let mut rng = rand_core::OsRng;
@@ -450,10 +434,6 @@ impl MockState {
             .and_then(|b| b.key_id(&key_id))
             .and_then(|b| b.valid_principal(principal))
             .map_err(|_| Status::internal("cert builder fields"))?;
-        // Mirror the real CP's CertificateProfiles.extensionsFor: only granted
-        // capabilities become permit-* extensions (default-deny). Without
-        // permit-port-forwarding / permit-X11-forwarding the node's sshd refuses
-        // the corresponding forward.
         for ext in extensions {
             builder
                 .extension(*ext, "")
@@ -472,9 +452,6 @@ impl MockState {
         })
     }
 
-    /// Sign a decision context exactly as the CP does: the ECDSA-P256/SHA-256
-    /// signature over `DOMAIN_PREFIX || canonical(context)`, returning
-    /// `(signed_context, signature, signer_cert_der, signer_ca_chain)`.
     fn sign_context(&self, context: &DecisionContext) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<u8>>) {
         let signed = decisionctx::canonical_bytes(context);
         let mut msg = decisionctx::DOMAIN_PREFIX.to_vec();
@@ -490,9 +467,6 @@ impl MockState {
     }
 }
 
-/// Local newtype wrapping the shared state so the generated gRPC server traits
-/// can be implemented here (orphan rule). Derefs to [`MockState`] so the handler
-/// bodies read naturally. Cheap to clone (an `Arc` bump), as tonic requires.
 #[derive(Clone)]
 struct MockSvc(Arc<MockState>);
 
@@ -534,7 +508,6 @@ impl GatewayIdentity for MockSvc {
         request: Request<EnrollGatewayRequest>,
     ) -> Result<Response<EnrollGatewayResponse>, Status> {
         let r = request.into_inner();
-        // Atomic single-use token consumption.
         {
             let mut toks = self.enrollment_tokens.lock().unwrap();
             if !toks.remove(&r.enrollment_token) {
@@ -546,7 +519,9 @@ impl GatewayIdentity for MockSvc {
             *id += 1;
             format!("gw-{id:08}")
         };
-        // Stamp the gateway URI SAN + dNSName exactly as the real CP does (F10a faithfulness).
+        // Stamp the gateway URI SAN alongside the dNSName, exactly as the real CP does:
+        // the peer-relay path requires the URI SAN's PRESENCE as the positive gateway
+        // check, not merely the absence of an agent URI SAN.
         let leaf_der = self
             .ca
             .sign_csr_as_gateway_identity(&r.pkcs10_csr, &r.gateway_name, &gateway_id)
@@ -577,7 +552,6 @@ impl GatewayIdentity for MockSvc {
         &self,
         request: Request<RenewGatewayIdentityRequest>,
     ) -> Result<Response<RenewGatewayIdentityResponse>, Status> {
-        // mTLS client cert is REQUIRED for renewal (no bootstrap exception).
         let peer = request
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
@@ -688,9 +662,6 @@ impl SessionSigning for MockSvc {
         &self,
         request: Request<SignSessionCertificateRequest>,
     ) -> Result<Response<SignSessionCertificateResponse>, Status> {
-        // Simulate a hung CP (never respond) to exercise the client's timeout.
-        // Read the flag into a local so the (non-Send) guard is not held across
-        // the await point.
         let hang = *self.hang_sign.lock().unwrap();
         if hang {
             std::future::pending::<()>().await;
@@ -705,7 +676,6 @@ impl SessionSigning for MockSvc {
             .to_vec();
         let gid = self.resolve_gateway_id(&leaf)?;
 
-        // Locked principal is refused (generic denial — no information leak).
         {
             let gws = self.gateways.lock().unwrap();
             if gws.get(&gid).map(|r| r.locked).unwrap_or(true) {
@@ -719,12 +689,9 @@ impl SessionSigning for MockSvc {
             let rec = toks
                 .get_mut(&r.session_token)
                 .ok_or_else(|| Status::permission_denied("access denied by policy"))?;
-            // Single-use, bound-to-this-gateway, unexpired — every failure is the
-            // same generic denial, disclosing nothing about which check failed.
             if rec.used || rec.exp <= SystemTime::now() || rec.gateway_id != gid {
                 return Err(Status::permission_denied("access denied by policy"));
             }
-            // Advisory context must not disagree with the (authoritative) token.
             if let Some(ctx) = &r.context {
                 if (!ctx.session_id.is_empty() && ctx.session_id != rec.session_id)
                     || (!ctx.node_id.is_empty() && ctx.node_id != rec.node_id)
@@ -734,7 +701,7 @@ impl SessionSigning for MockSvc {
                     return Err(Status::permission_denied("access denied by policy"));
                 }
             }
-            rec.used = true; // atomic mark-used
+            rec.used = true;
             (
                 rec.session_id.clone(),
                 rec.principal.clone(),
@@ -767,8 +734,6 @@ impl SessionSigning for MockSvc {
         }
 
         let resp = self.sign_inner(&r.subject_public_key, &principal, &session_id, &extensions)?;
-        // The key-id the node's own sshd will log on this certificate — the
-        // join between the CP's trail and the node-local one.
         self.signed_key_ids
             .lock()
             .unwrap()
@@ -776,8 +741,6 @@ impl SessionSigning for MockSvc {
         Ok(Response::new(resp))
     }
 }
-
-// ---- outer-leg auth helpers ---------------------------------
 
 fn not_resolved() -> ResolvedIdentity {
     ResolvedIdentity {
@@ -797,8 +760,6 @@ fn resolved(rec: &ResolvedRecord) -> ResolvedIdentity {
     }
 }
 
-/// Enforce the mTLS tier: every OuterLegAuth/Authorize RPC requires the caller's
-/// Gateway client certificate; resolve it to a known gateway_id.
 fn require_gateway<T>(request: &Request<T>, state: &MockState) -> Result<String, Status> {
     let peer = request
         .peer_certs()
@@ -834,7 +795,7 @@ impl MockState {
     fn check_credential_scope_forwarded(&self, r: &AuthorizeRequest) -> Result<(), Status> {
         let scopes = self.resolved_scopes.lock().unwrap();
         let Some(handed_out) = scopes.get(&r.identity) else {
-            return Ok(()); // an identity this mock never resolved: nothing to check against
+            return Ok(());
         };
         if handed_out.contains(&r.credential_principals) {
             return Ok(());
@@ -856,7 +817,6 @@ impl MockState {
             && !r.credential_principals.contains(&r.requested_principal)
     }
 
-    /// Resolve a pin/OTP record honouring the optional deny-only source binding.
     fn resolve_map(&self, rec: Option<&ResolvedRecord>, source_ip: &str) -> ResolvedIdentity {
         let id = match rec {
             Some(r) if r.source_ip.as_deref().is_none_or(|s| s == source_ip) => resolved(r),
@@ -865,8 +825,6 @@ impl MockState {
         self.remember_scope(id)
     }
 
-    /// Validate a presented OpenSSH user certificate against the user-facing CA
-    /// (signature + validity window) and resolve identity from its key-id.
     fn resolve_cert(&self, blob: &[u8], _source_ip: &str) -> ResolvedIdentity {
         let cert = match ssh_key::Certificate::from_bytes(blob) {
             Ok(c) => c,
@@ -888,8 +846,6 @@ impl MockState {
         })
     }
 
-    /// Sign an OpenSSH user certificate with the user-facing CA (for the
-    /// `ResolveUserCert` happy-path test).
     fn sign_user_cert(
         &self,
         pubkey_openssh_line: &str,
@@ -920,8 +876,6 @@ impl MockState {
     }
 }
 
-/// Simulate a CP-down during authentication: every resolve RPC returns
-/// UNAVAILABLE when the knob is set.
 fn resolve_down(state: &MockState) -> Result<(), Status> {
     if *state.resolve_unavailable.lock().unwrap() {
         return Err(Status::unavailable("control plane temporarily unavailable"));
@@ -935,8 +889,6 @@ impl HostCertSigning for MockSvc {
         &self,
         request: Request<SignGatewayHostCertificateRequest>,
     ) -> Result<Response<SignGatewayHostCertificateResponse>, Status> {
-        // mTLS-required tier: resolve the caller and refuse a locked one (mirrors the
-        // real HostCertSigningService; generic denial, no leak).
         let peer = request
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
@@ -1026,7 +978,6 @@ impl OuterLegAuth for MockSvc {
         require_gateway(&request, self)?;
         resolve_down(self)?;
         let r = request.into_inner();
-        // Single-use: consume (atomic mark-used) on a source-matched hit.
         let identity = {
             let mut otps = self.otps.lock().unwrap();
             match otps.get(&r.otp) {
@@ -1148,7 +1099,6 @@ impl OuterLegAuth for MockSvc {
         let gid = require_gateway(&request, self)?;
         resolve_down(self)?;
         let r = request.into_inner();
-        // Single-use: consume (atomic mark-used) on a source-matched hit.
         let resolution = {
             let mut codes = self.offline_codes.lock().unwrap();
             match codes.get(&r.code) {
@@ -1165,7 +1115,6 @@ impl OuterLegAuth for MockSvc {
     }
 }
 
-/// The generic non-resolution for a break-glass resolve (no identity, no token).
 fn not_resolved_break_glass() -> BreakglassResolution {
     BreakglassResolution {
         identity: Some(not_resolved()),
@@ -1174,8 +1123,6 @@ fn not_resolved_break_glass() -> BreakglassResolution {
 }
 
 impl MockState {
-    /// Mint a single-use break-glass token bound to {gateway, identity, node,
-    /// source_ip} and return the resolution (identity + token).
     fn mint_break_glass(
         &self,
         gid: &str,
@@ -1201,8 +1148,6 @@ impl MockState {
         }
     }
 
-    /// Build the decision context for a resolved, authorized target (shared by the
-    /// standing and break-glass ALLOW paths). `access_model` is signed into it.
     fn context_for(
         &self,
         gid: &str,
@@ -1334,7 +1279,6 @@ impl MockState {
         r: &AuthorizeRequest,
         access_model: AccessModel,
     ) -> AuthorizeResponse {
-        // Optionally SIGN a stronger access_model than the unsigned copy carries.
         let signed_model = if access_model == AccessModel::Standing
             && *self.force_signed_breakglass.lock().unwrap()
         {
@@ -1353,8 +1297,6 @@ impl MockState {
         resp
     }
 
-    /// Whether any active lock matches this context's bindings — deny wins even in
-    /// break-glass: a locked target refuses break-glass too.
     fn lock_denies(&self, context: &DecisionContext) -> bool {
         let bindings = LockBindings::from_context(context);
         self.locks.lock().unwrap().iter().any(|l| {
@@ -1365,10 +1307,6 @@ impl MockState {
         })
     }
 
-    /// The break-glass Authorize path: consume the single-use
-    /// token (replay → fail closed), record the activation + fire the alert ON USE,
-    /// force access_model = BREAKGLASS, and evaluate the always-available break-glass
-    /// allow SUBJECT TO the top-tier Lock (a matching Lock still denies — deny wins).
     fn authorize_break_glass(&self, gid: &str, r: &AuthorizeRequest) -> AuthorizeResponse {
         let consumed = {
             let mut toks = self.breakglass_tokens.lock().unwrap();
@@ -1381,7 +1319,6 @@ impl MockState {
             }
         };
         if !consumed {
-            // Replay / unknown / wrong-gateway token → generic DENY (fail closed).
             return deny_response();
         }
         // The activation + high-priority alert happen ON USE, before the decision.
@@ -1395,13 +1332,10 @@ impl MockState {
         if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
             return deny_response();
         }
-        // The reduction precedes break-glass too: an emergency credential scoped to a
-        // login does not become unscoped by being an emergency credential.
         if self.credential_scope_denies(r) {
             return deny_response();
         }
         let context = self.context_for(gid, r, AccessModel::Breakglass);
-        // Deny wins: a top-tier Lock refuses break-glass on a locked target.
         if self.lock_denies(&context) {
             return deny_response();
         }
@@ -1432,20 +1366,13 @@ impl Authorization for MockSvc {
             r.node_id = self.resolve_node_name(&r.node_name);
         }
 
-        // Break-glass connect: a present token routes to the
-        // always-available break-glass path (consume token + activation/alert + force
-        // BREAKGLASS + Lock-checked allow). Empty ⇒ the standing/JIT path below.
         if !r.breakglass_token.is_empty() {
             return Ok(Response::new(self.authorize_break_glass(&gid, &r)));
         }
 
-        // Unknown node → generic DENY (no existence disclosure).
         if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
             return Ok(Response::new(deny_response()));
         }
-        // Deny-only credential scope, before any grant evaluation. The DENY is
-        // indistinguishable to the client and fully recorded server-side — which is the
-        // whole point of the Gateway forwarding the scope instead of pre-empting.
         if self.credential_scope_denies(&r) {
             return Ok(Response::new(deny_response()));
         }
@@ -1458,10 +1385,6 @@ impl Authorization for MockSvc {
             return Ok(Response::new(deny_response()));
         }
 
-        // ALLOW (standing): mint the single-use session + recording tokens + the
-        // SIGNED decision context (node connection attached if registered).
-        // The concurrency lease is taken inside the ALLOW;
-        // break-glass (above) is cap-exempt and takes none.
         let resp = self.allow_response(&gid, &r, AccessModel::Standing);
         self.create_lease(&r.session_id, &gid);
         Ok(Response::new(resp))
@@ -1477,8 +1400,6 @@ impl Authorization for MockSvc {
             .lock()
             .unwrap()
             .push(r.clone());
-        // Caller-bound + idempotent, like the real CP: only the brokering
-        // gateway's FIRST signal releases a still-live lease.
         let released = match self.leases.lock().unwrap().get_mut(&r.session_id) {
             Some(l) if !l.released && l.gateway_id == gid => {
                 l.released = true;
@@ -1512,17 +1433,12 @@ impl Authorization for MockSvc {
                     expires_at_epoch_seconds: l.expires_at,
                 }))
             }
-            // Released / unknown / another gateway's lease: refused (the window is
-            // server-authoritative and caller-bound).
             _ => Err(Status::failed_precondition("no live lease for this caller")),
         }
     }
 }
 
 impl MockState {
-    /// Resolve a node NAME to its CP id. A mapped name
-    /// returns the mapped id; an unmapped name resolves to itself (pass-through, the
-    /// shape where the mock inventory is keyed by name).
     fn resolve_node_name(&self, name: &str) -> String {
         self.node_name_to_id
             .lock()
@@ -1532,7 +1448,6 @@ impl MockState {
             .unwrap_or_else(|| name.to_string())
     }
 
-    /// The owner NAME for a caller gateway id (the HA routing key), or `None` if unknown.
     fn gateway_name_of(&self, gid: &str) -> Option<String> {
         self.gateways
             .lock()
@@ -1541,9 +1456,6 @@ impl MockState {
             .map(|r| r.name.clone())
     }
 
-    /// The presence row for `node_id` iff it is FRESH (heartbeated within the staleness TTL).
-    /// This is what the Authorize read path folds into `NodeConnection` (owner fields ride
-    /// only when a fresh owner exists — else the node is offline).
     fn fresh_presence(&self, node_id: &str) -> Option<PresenceRow> {
         let now = SystemTime::now();
         self.presence
@@ -1582,13 +1494,11 @@ impl Presence for MockSvc {
         let now = SystemTime::now();
         let mut map = self.presence.lock().unwrap();
         let row = match map.get(&r.node_name) {
-            // Refresh: we are the owner → bump last_seen (nonce unchanged).
             Some(existing) if existing.owner == owner => PresenceRow {
                 gateway_addr: r.gateway_addr.clone(),
                 last_seen: now,
                 ..existing.clone()
             },
-            // Takeover: the owner is stale → claim with nonce+1 and a new nonce_id.
             Some(existing)
                 if now
                     .duration_since(existing.last_seen)
@@ -1603,9 +1513,7 @@ impl Presence for MockSvc {
                     last_seen: now,
                 }
             }
-            // Standby: a fresh owner that is not us → NO write; return the authoritative owner.
             Some(existing) => existing.clone(),
-            // Claim a node with no current owner (nonce 1).
             None => PresenceRow {
                 owner: owner.clone(),
                 gateway_addr: r.gateway_addr.clone(),
@@ -1647,7 +1555,7 @@ impl Presence for MockSvc {
                 map.insert(r.node_name.clone(), relinquished);
                 true
             }
-            _ => false, // idempotent: not the recorded owner
+            _ => false,
         };
         Ok(Response::new(PresenceReleaseResponse { released }))
     }
@@ -1662,8 +1570,6 @@ impl LockFeed for MockSvc {
         request: Request<StreamLocksRequest>,
     ) -> Result<Response<Self::StreamLocksStream>, Status> {
         require_gateway(&request, self)?;
-        // Simulate an unhealthy lock feed — refuse the stream so the Gateway's feed
-        // never delivers a snapshot and stays !healthy (no connection).
         if *self.lock_feed_down.lock().unwrap() {
             return Err(Status::unavailable("lock feed unavailable"));
         }
@@ -1716,7 +1622,6 @@ impl Recording for MockSvc {
         let gid = require_gateway(&request, self)?;
         let r = request.into_inner();
 
-        // Consume the single-use recording token (bound to this gateway; unexpired).
         {
             let mut toks = self.recording_tokens.lock().unwrap();
             let rec = toks
@@ -1739,8 +1644,6 @@ impl Recording for MockSvc {
             .unwrap()
             .insert(recording_id.clone(), (gid, object_key.clone()));
 
-        // BeginRecording does NOT return an upload credential — that is issued
-        // short-lived at upload time via RequestUpload.
         Ok(Response::new(BeginRecordingResponse {
             recording_id,
             object_key,
@@ -1755,7 +1658,6 @@ impl Recording for MockSvc {
     ) -> Result<Response<RequestUploadResponse>, Status> {
         let gid = require_gateway(&request, self)?;
         let r = request.into_inner();
-        // Ownership check + resolve the object key registered at BeginRecording.
         let object_key = {
             let recs = self.recordings.lock().unwrap();
             match recs.get(&r.recording_id) {
@@ -1799,7 +1701,6 @@ impl Recording for MockSvc {
     ) -> Result<Response<FinalizeRecordingResponse>, Status> {
         let gid = require_gateway(&request, self)?;
         let r = request.into_inner();
-        // Ownership check: the recording must have been created by this caller.
         {
             let recs = self.recordings.lock().unwrap();
             match recs.get(&r.recording_id) {
@@ -1816,7 +1717,6 @@ impl Recording for MockSvc {
     }
 }
 
-/// The generic DENY: no context, no token, no connection (fail closed).
 fn deny_response() -> AuthorizeResponse {
     AuthorizeResponse {
         decision: Decision::Deny as i32,
@@ -1831,7 +1731,6 @@ fn deny_response() -> AuthorizeResponse {
     }
 }
 
-/// `time::OffsetDateTime::now_utc()`, for rcgen validity windows.
 fn offset_now() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
 }
@@ -1849,17 +1748,14 @@ fn epoch_ms(t: SystemTime) -> i64 {
 impl MockState {
     fn validity_window(&self) -> (i64, i64) {
         let now = unix_now();
-        let nb = now.saturating_sub(5); // small backdate for local skew
+        let nb = now.saturating_sub(5);
         let na = now + self.cert_ttl.as_secs();
         (nb as i64, na as i64)
     }
 }
 
-/// A running mock Control Plane. Aborts its server task on drop.
 pub struct MockCp {
-    /// The CP mTLS endpoint (`https://127.0.0.1:port`).
     pub endpoint: String,
-    /// The server name / SAN the CP server certificate carries.
     pub server_name: String,
     state: Arc<MockState>,
     server: tokio::task::JoinHandle<()>,
@@ -1871,7 +1767,6 @@ impl Drop for MockCp {
     }
 }
 
-/// Builder for a [`MockCp`] with adjustable server range + cert TTL.
 pub struct MockCpBuilder {
     server_range: ((u32, u32), (u32, u32)),
     cert_ttl: Duration,
@@ -1891,31 +1786,25 @@ impl Default for MockCpBuilder {
 }
 
 impl MockCpBuilder {
-    /// Override the advertised server protocol range.
     pub fn server_range(mut self, min: (u32, u32), max: (u32, u32)) -> Self {
         self.server_range = (min, max);
         self
     }
 
-    /// Override the issued Gateway leaf-certificate TTL (drives renew-ahead).
     pub fn cert_ttl(mut self, ttl: Duration) -> Self {
         self.cert_ttl = ttl;
         self
     }
 
-    /// Override the HA presence staleness TTL (an owner un-heartbeated this long is taken
-    /// over; short values let a failover test observe re-ownership quickly).
     pub fn presence_staleness(mut self, ttl: Duration) -> Self {
         self.presence_staleness = ttl;
         self
     }
 
-    /// Start the mock CP on an ephemeral loopback port over real TLS 1.3.
     pub async fn start(self) -> MockCp {
         gateway_core::tls::install_ring_provider();
 
         let ca = TestCa::generate("SessionLayer Internal mTLS CA");
-        // Long-lived server cert with a serverAuth EKU and the CP SAN.
         let server_leaf = ca.issue_leaf(
             &self.server_san,
             vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
@@ -1925,8 +1814,6 @@ impl MockCpBuilder {
         let server_cert_pem = mtls::cert_der_to_pem(&server_leaf.cert_der);
         let server_key_pem = server_leaf.key_pem;
 
-        // The CONTEXT_SIGNER leaf (chained to `ca`) + its P-256 key,
-        // used to sign decision contexts the Gateway verifier accepts.
         let context_signer_leaf = ca.issue_context_signer(
             rcgen::date_time_ymd(2020, 1, 1),
             rcgen::date_time_ymd(2100, 1, 1),
@@ -1935,7 +1822,6 @@ impl MockCpBuilder {
         let context_signer_key =
             SigningKey::from_pkcs8_der(&context_signer_leaf.key_pkcs8_der).unwrap();
 
-        // Session CA (SSH) for signing inner-leg certs.
         let mut rng = rand_core::OsRng;
         let session_ca = ssh_key::PrivateKey::random(
             &mut rng,
@@ -1950,7 +1836,6 @@ impl MockCpBuilder {
             .unwrap()
             .to_string();
 
-        // User-facing CA (SSH) for signing / validating outer-leg user certs.
         let user_ca = ssh_key::PrivateKey::random(
             &mut rng,
             ssh_key::Algorithm::Ecdsa {
@@ -1963,7 +1848,6 @@ impl MockCpBuilder {
             .unwrap()
             .to_string();
 
-        // Host CA (SSH) for signing node host certs.
         let host_ca = ssh_key::PrivateKey::random(
             &mut rng,
             ssh_key::Algorithm::Ecdsa {
@@ -2182,10 +2066,6 @@ impl MockCp {
         *self.state.hang_sign.lock().unwrap() = true;
     }
 
-    // ---- outer-leg knobs -------------------------------------
-
-    /// Register a pin: a public-key fingerprint resolves to `{identity,
-    /// principals}` (no source binding).
     pub fn register_pin(&self, fingerprint: &str, identity: &str, principals: &[&str]) {
         self.state.pins.lock().unwrap().insert(
             fingerprint.to_string(),
@@ -2198,10 +2078,6 @@ impl MockCp {
         );
     }
 
-    /// Register a pin **bound to a source IP** (the pin's `{fingerprint, identity,
-    /// source-cidr, …}` binding). It resolves ONLY when the connection's
-    /// source matches; from any other source it does not resolve, so the outer leg
-    /// falls through to the next method (the source-change fallback).
     pub fn register_pin_source_bound(
         &self,
         fingerprint: &str,
@@ -2220,7 +2096,6 @@ impl MockCp {
         );
     }
 
-    /// Register a single-use OTP resolving to `{identity, principals}`.
     pub fn register_otp(&self, otp: &str, identity: &str, principals: &[&str]) {
         self.state.otps.lock().unwrap().insert(
             otp.to_string(),
@@ -2233,9 +2108,6 @@ impl MockCp {
         );
     }
 
-    /// Configure the outcome the next device flow(s) will produce: PENDING for
-    /// `approve_after_polls` polls, then APPROVED resolving to `identity` (with
-    /// empty principals/groups, as the real CP does — RBAC decides the logins).
     pub fn set_device_flow(
         &self,
         user_code: &str,
@@ -2252,7 +2124,6 @@ impl MockCp {
         });
     }
 
-    /// Configure the next device flow to be DENIED.
     pub fn set_device_flow_denied(&self, user_code: &str, verification_uri: &str) {
         *self.state.device_flow_template.lock().unwrap() = Some(DeviceFlowTemplate {
             user_code: user_code.to_string(),
@@ -2263,8 +2134,6 @@ impl MockCp {
         });
     }
 
-    /// Mark a node as existing in inventory (so `Authorize` doesn't DENY it
-    /// for non-existence) without granting any access.
     pub fn register_node(&self, node_id: &str) {
         self.state
             .known_nodes
@@ -2293,8 +2162,6 @@ impl MockCp {
         *self.state.ignore_credential_scope.lock().unwrap() = true;
     }
 
-    /// The most recent `AuthorizeRequest` the mock received (assertions:
-    /// node_name populated). `None` if none arrived yet.
     pub fn last_authorize_request(&self) -> Option<AuthorizeRequest> {
         self.state
             .authorize_requests
@@ -2304,7 +2171,6 @@ impl MockCp {
             .cloned()
     }
 
-    /// Grant `{identity, node, principal}` (also registers the node as existing).
     pub fn allow(&self, identity: &str, node_id: &str, principal: &str) {
         self.register_node(node_id);
         self.state.allow_rules.lock().unwrap().push(AllowRule {
@@ -2314,9 +2180,6 @@ impl MockCp {
         });
     }
 
-    /// Register the agentless node connection (dial address + host trust) the
-    /// `Authorize` ALLOW returns for `node_id`. Without this, an
-    /// authorized node has no connection → the Gateway fails closed.
     pub fn set_node_connection(&self, node_id: &str, dial_address: &str, host: HostVerification) {
         self.state.node_connections.lock().unwrap().insert(
             node_id.to_string(),
@@ -2363,17 +2226,10 @@ impl MockCp {
             .map(|r| r.owner.clone())
     }
 
-    /// The owner NAME of a FRESH presence claim, by the same staleness rule the real CP
-    /// derives `health` from: a claim heartbeated within the TTL reads as `healthy`, a
-    /// stale one as `unreachable`. A row that merely EXISTS is not the same answer, so a
-    /// test asking "is this node healthy" has to ask through here.
     pub fn fresh_presence_owner(&self, node_name: &str) -> Option<String> {
         self.state.fresh_presence(node_name).map(|r| r.owner)
     }
 
-    /// Issue an **agent identity** leaf from this CP's internal mTLS CA: the
-    /// credential an Agent presents on both wire roles (URI SAN
-    /// `sessionlayer://agent/<agent_id>` + dNSName SAN = the node's enrollment name).
     pub fn issue_agent_identity(&self, agent_id: &str, node_name: &str) -> IssuedLeaf {
         self.state.ca.issue_agent_leaf(agent_id, node_name)
     }
@@ -2386,7 +2242,6 @@ impl MockCp {
         self.state.signed_key_ids.lock().unwrap().clone()
     }
 
-    /// Override the granted capabilities for `node_id` (default shell+exec).
     pub fn set_capabilities(&self, node_id: &str, caps: &[Capability]) {
         self.state.node_capabilities.lock().unwrap().insert(
             node_id.to_string(),
@@ -2394,8 +2249,6 @@ impl MockCp {
         );
     }
 
-    /// Set a node's inventory labels ("key=value"), signed into the decision
-    /// context (so node-label locks can be exercised).
     pub fn set_node_labels(&self, node_id: &str, labels: &[&str]) {
         self.state.node_labels.lock().unwrap().insert(
             node_id.to_string(),
@@ -2403,8 +2256,6 @@ impl MockCp {
         );
     }
 
-    /// Push a lock onto the deny-list feed (create): it lands in the snapshot AND
-    /// is broadcast to live `StreamLocks` subscribers (which tear down matches).
     pub fn add_lock(&self, lock: Lock) {
         {
             let mut locks = self.state.locks.lock().unwrap();
@@ -2417,12 +2268,6 @@ impl MockCp {
         });
     }
 
-    /// Push `lock` onto the feed as soon as `is_live` reports true, from a
-    /// background task, polling on a short interval up to a bound rather than
-    /// guessing a fixed delay. Lets the test call a blocking `ssh_exec` and
-    /// still deliver the lock mid-session, once the session actually is one.
-    /// `is_live` is polled every 25ms; `FnMut` so a caller can require the condition to
-    /// HOLD across several polls rather than fire on its first instant.
     pub fn push_lock_when(&self, lock: Lock, mut is_live: impl FnMut() -> bool + Send + 'static) {
         let state = self.state.clone();
         tokio::spawn(async move {
@@ -2444,20 +2289,15 @@ impl MockCp {
         });
     }
 
-    /// For the teardown E2E: push `lock` onto the feed as soon as a recording has
-    /// begun (i.e. the session is live). Lets the test call a blocking `ssh_exec`
-    /// and still deliver the lock mid-session.
     pub fn push_lock_after_recording_begins(&self, lock: Lock) {
         let state = self.state.clone();
         self.push_lock_when(lock, move || !state.recordings.lock().unwrap().is_empty());
     }
 
-    /// The number of recordings that have begun (test synchronization).
     pub fn began_recording_count(&self) -> usize {
         self.state.recordings.lock().unwrap().len()
     }
 
-    /// Release a lock (delete): drop it from the snapshot + broadcast a removal.
     pub fn remove_lock(&self, lock_id: &str) {
         self.state
             .locks
@@ -2472,14 +2312,10 @@ impl MockCp {
         });
     }
 
-    /// The host CA public key (OpenSSH wire): a node host cert signed by this CA
-    /// verifies against it.
     pub fn host_ca_public_wire(&self) -> Vec<u8> {
         self.state.host_ca_public_wire.clone()
     }
 
-    /// Sign a node **host** certificate over `host_pubkey_wire` with the host CA,
-    /// carrying `principals`. Returns `(cert_line, cert_wire)`.
     pub fn sign_host_cert(
         &self,
         host_pubkey_wire: &[u8],
@@ -2508,8 +2344,6 @@ impl MockCp {
         (cert.to_openssh().unwrap(), cert.to_bytes().unwrap())
     }
 
-    /// A host-CA `HostVerification`: the node's host cert + the trusted host CA +
-    /// the expected principal(s).
     pub fn host_ca_verification(
         &self,
         host_cert_wire: Vec<u8>,
@@ -2523,7 +2357,6 @@ impl MockCp {
         }
     }
 
-    /// A pinned-key `HostVerification` (the fallback path).
     pub fn pinned_verification(&self, host_pubkey_wire: Vec<u8>) -> HostVerification {
         HostVerification {
             host_ca_keys: Vec::new(),
@@ -2533,22 +2366,14 @@ impl MockCp {
         }
     }
 
-    /// Toggle the CP-unreachable simulation for `Authorize` (returns UNAVAILABLE).
     pub fn set_authorize_unavailable(&self, on: bool) {
         *self.state.authorize_unavailable.lock().unwrap() = on;
     }
 
-    /// Toggle the CP-unreachable simulation for the OuterLegAuth **resolve** RPCs
-    /// (they return UNAVAILABLE) — CP-down during authentication.
     pub fn set_resolve_unavailable(&self, on: bool) {
         *self.state.resolve_unavailable.lock().unwrap() = on;
     }
 
-    // ---- break-glass knobs ---------------------------------
-
-    /// Register a break-glass FIDO2 key: the OpenSSH wire blob of an `sk-ecdsa`/
-    /// `sk-ed25519` public key resolves to `{identity, principals}` (no source
-    /// binding). The key is public; the CP maps it to a break-glass credential.
     pub fn register_break_glass_key(
         &self,
         sk_public_key_blob: Vec<u8>,
@@ -2566,8 +2391,6 @@ impl MockCp {
         );
     }
 
-    /// Register a single-use break-glass OFFLINE CODE resolving to `{identity,
-    /// principals}` (consumed on validate, single-use).
     pub fn register_offline_code(&self, code: &str, identity: &str, principals: &[&str]) {
         self.state.offline_codes.lock().unwrap().insert(
             code.to_string(),
@@ -2587,9 +2410,6 @@ impl MockCp {
         *self.state.decision_ttl_secs.lock().unwrap() = secs;
     }
 
-    /// On a STANDING allow, SIGN access_model=BREAKGLASS while shipping a
-    /// downgraded unsigned `context` (STANDING). Proves the Gateway enforces the
-    /// SIGNED access_model, never the unsigned convenience copy.
     pub fn set_force_signed_breakglass(&self, on: bool) {
         *self.state.force_signed_breakglass.lock().unwrap() = on;
     }
@@ -2600,23 +2420,18 @@ impl MockCp {
         *self.state.grant_expiry_override.lock().unwrap() = Some(epoch_seconds);
     }
 
-    /// Sign a per-identity idle timeout into every
-    /// decision context (0 = no per-identity idle policy).
     pub fn set_idle_timeout(&self, secs: i64) {
         *self.state.idle_timeout_secs.lock().unwrap() = secs;
     }
 
-    /// Every NotifySessionEnd received, in order (session_id + reason).
     pub fn session_end_notifications(&self) -> Vec<NotifySessionEndRequest> {
         self.state.session_end_notifications.lock().unwrap().clone()
     }
 
-    /// ExtendSessionLease attempts observed (including injected failures).
     pub fn lease_extension_count(&self) -> usize {
         self.state.lease_extensions.lock().unwrap().len()
     }
 
-    /// ExtendSessionLease attempts for ONE session (including refused ones).
     pub fn lease_extensions_for(&self, session_id: &str) -> usize {
         self.state
             .lease_extensions
@@ -2627,11 +2442,6 @@ impl MockCp {
             .count()
     }
 
-    /// Simulate the CP lease reaper: once a session NEWER than
-    /// `prior_session_id` has recorded its first extension attempt, release its
-    /// lease out from under it — the next extension is then refused while the
-    /// session is still live (the keeper must stop loudly; the session must not
-    /// be touched).
     pub fn reap_next_lease_after_first_extension(&self, prior_session_id: Option<String>) {
         let state = self.state.clone();
         tokio::spawn(async move {
@@ -2658,17 +2468,14 @@ impl MockCp {
         });
     }
 
-    /// Make ExtendSessionLease fail UNAVAILABLE (a transient CP fault).
     pub fn set_extend_unavailable(&self, on: bool) {
         *self.state.extend_unavailable.lock().unwrap() = on;
     }
 
-    /// The server-authoritative window ExtendSessionLease re-stamps (seconds).
     pub fn set_extend_window(&self, secs: i64) {
         *self.state.extend_window_secs.lock().unwrap() = secs;
     }
 
-    /// Whether the session's lease is released (`None` = no lease was taken).
     pub fn lease_released(&self, session_id: &str) -> Option<bool> {
         self.state
             .leases
@@ -2678,14 +2485,10 @@ impl MockCp {
             .map(|l| l.released)
     }
 
-    /// Make the lock feed unavailable so the Gateway's feed never becomes healthy.
     pub fn set_lock_feed_down(&self, on: bool) {
         *self.state.lock_feed_down.lock().unwrap() = on;
     }
 
-    /// CP round-trips the Gateway spent resolving a pin, and resolving a break-glass
-    /// security key. Their sum is the observable an attacker times: it must not depend on
-    /// whether the offered key is a registered emergency credential.
     pub fn auth_rpc_counts(&self) -> (usize, usize) {
         use std::sync::atomic::Ordering;
         (
@@ -2696,19 +2499,14 @@ impl MockCp {
         )
     }
 
-    /// The number of break-glass tokens minted by a resolve (test assertion for the
-    /// FIDO2/offline-code resolution path).
     pub fn breakglass_token_count(&self) -> usize {
         self.state.breakglass_tokens.lock().unwrap().len()
     }
 
-    /// The number of break-glass activations recorded at Authorize (the alert fires
-    /// once per activation, ON USE).
     pub fn breakglass_activation_count(&self) -> usize {
         self.state.breakglass_activations.lock().unwrap().len()
     }
 
-    /// The {identity, node_id} pairs of the recorded break-glass activations.
     pub fn breakglass_activations(&self) -> Vec<(String, String)> {
         self.state
             .breakglass_activations
@@ -2719,11 +2517,6 @@ impl MockCp {
             .collect()
     }
 
-    // ---- recorder knobs ----------------------------------------
-
-    /// Configure the operator's customer PUBLIC key (DER SPKI) the Gateway seals
-    /// the recording data key to. Without this, BeginRecording returns no customer
-    /// key and the Gateway refuses the session (strict).
     pub fn set_customer_key(
         &self,
         key_ref: &str,
@@ -2737,12 +2530,10 @@ impl MockCp {
         });
     }
 
-    /// Point the WORM upload credential at a MinIO/S3 target (the container).
     pub fn set_s3_target(&self, target: S3Target) {
         *self.state.s3.lock().unwrap() = Some(target);
     }
 
-    /// The object keys of recordings BeginRecording has registered.
     pub fn recorded_object_keys(&self) -> Vec<String> {
         self.state
             .recordings
@@ -2753,7 +2544,6 @@ impl MockCp {
             .collect()
     }
 
-    /// The FinalizeRecording payloads the Gateway has committed (test assertions).
     pub fn finalized_recordings(&self) -> Vec<FinalizeRecordingRequest> {
         self.state
             .finalized
@@ -2764,22 +2554,14 @@ impl MockCp {
             .collect()
     }
 
-    /// Set the TTL (seconds) baked into each RequestUpload presigned PUT. A short
-    /// value proves the credential is issued at upload time (a long session would
-    /// have expired a begin-time credential).
     pub fn set_upload_ttl_secs(&self, ttl: u64) {
         *self.state.upload_ttl_secs.lock().unwrap() = ttl;
     }
 
-    /// How many times RequestUpload has been called (the credential is fetched at
-    /// session end, not at BeginRecording).
     pub fn request_upload_count(&self) -> usize {
         self.state.request_uploads.lock().unwrap().len()
     }
 
-    /// Sign an OpenSSH user certificate with the user-facing CA (for the
-    /// `ResolveUserCert` happy path). `pubkey_openssh_line` is an authorized-keys
-    /// line; returns the cert as an authorized-keys line.
     pub fn sign_user_cert(
         &self,
         pubkey_openssh_line: &str,
@@ -2792,7 +2574,6 @@ impl MockCp {
             .sign_user_cert(pubkey_openssh_line, identity, &principals, valid_secs)
     }
 
-    /// The CP-recorded generation for a gateway (test assertions).
     pub fn recorded_generation(&self, gateway_id: &str) -> Option<u64> {
         self.state
             .gateways
@@ -2802,8 +2583,6 @@ impl MockCp {
             .map(|r| r.generation)
     }
 
-    /// Issue a server-auth leaf from this CP's internal CA, for building a raw
-    /// TLS server the Gateway will still trust (the rejection matrix).
     pub fn issue_server_material(
         &self,
         san: &str,
@@ -2819,17 +2598,9 @@ impl MockCp {
     }
 }
 
-/// Enroll a Gateway against `cp` and assemble outer-leg [`HandlerDeps`] (a
-/// CP-delegating auth client + the `PendingInnerLeg` connector +
-/// the pass-through target resolver) for the given SSH server `config`. The
-/// enrolled credential is snapshotted into the channel factory, so the temp
-/// data-dir can be dropped immediately.
 /// Which recorder a set of [`HandlerDeps`] wires in.
 pub enum RecorderChoice {
-    /// No recording (the agentless E2E cases; no MinIO needed).
     Null,
-    /// The real recorder (asciicast + customer-key seal + WORM upload), built over
-    /// the same enrolled CP client and `config.recorder`.
     Real,
 }
 
@@ -2840,9 +2611,6 @@ pub async fn outer_leg_deps(cp: &MockCp, config: Arc<SshServerConfig>) -> Handle
     outer_leg_deps_with(cp, config, connector, RecorderChoice::Null).await
 }
 
-/// Like [`outer_leg_deps`] but with an explicit connector + recorder choice, for
-/// the inner-leg E2E (a real agentless dial to the Docker node) and the recorder
-/// E2E (asciicast/WORM).
 pub async fn outer_leg_deps_with(
     cp: &MockCp,
     config: Arc<SshServerConfig>,
@@ -2854,9 +2622,6 @@ pub async fn outer_leg_deps_with(
         .0
 }
 
-/// Like [`outer_leg_deps_with`], but enrolls under an explicit Gateway **name** and also
-/// returns the credential — the agent transport needs both (its serverAuth leaf carries
-/// the name, and every dial-back token is bound to the gateway id).
 pub async fn outer_leg_deps_named(
     cp: &MockCp,
     config: Arc<SshServerConfig>,
@@ -2898,10 +2663,6 @@ pub async fn outer_leg_deps_named(
         ),
     };
 
-    // The lock deny-set + live-session registry, plus the background
-    // lock-feed client streaming from the mock CP's LockFeed. The feed keeps the
-    // set healthy (so per-channel checks serve cached allows within decision_ttl)
-    // and pushes locks that tear down matching live sessions.
     let lock_set = Arc::new(LockSet::new(
         config.reeval.lock_feed_unhealthy_after_secs,
         config.reeval.lock_expiry_skew_secs,
@@ -2949,12 +2710,6 @@ pub async fn outer_leg_deps_named(
     )
 }
 
-/// Spawn a bare TLS listener that presents `server_config` and completes (or
-/// fails) exactly one TLS handshake, then hangs — enough for a client `connect()`
-/// to observe accept/reject at the TLS layer. Used for the expired-cert and
-/// TLS-1.2-only rejection cases (a plaintext peer is tested with a plain TCP
-/// listener instead). Returns the `https://` endpoint. Aborts on drop of the
-/// returned guard.
 pub async fn spawn_raw_tls_server(
     server_config: std::sync::Arc<rustls::ServerConfig>,
 ) -> (String, AbortOnDrop) {
@@ -2966,8 +2721,6 @@ pub async fn spawn_raw_tls_server(
             if let Ok((stream, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    // Drive the handshake; on success just idle so the client's
-                    // own bound governs, on failure the client sees the alert.
                     if let Ok(tls) = acceptor.accept(stream).await {
                         let _ = tls;
                         std::future::pending::<()>().await;
@@ -2979,8 +2732,6 @@ pub async fn spawn_raw_tls_server(
     (format!("https://{addr}"), AbortOnDrop(handle))
 }
 
-/// Spawn a plaintext TCP listener that accepts and idles — a non-TLS peer, to
-/// prove the client refuses to fall back to plaintext.
 pub async fn spawn_plaintext_server() -> (String, AbortOnDrop) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2997,7 +2748,6 @@ pub async fn spawn_plaintext_server() -> (String, AbortOnDrop) {
     (format!("https://{addr}"), AbortOnDrop(handle))
 }
 
-/// Spawn a TCP listener that accepts a connection but never speaks — a hung peer.
 pub async fn spawn_silent_server() -> (String, AbortOnDrop) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3008,8 +2758,6 @@ pub async fn spawn_silent_server() -> (String, AbortOnDrop) {
     (format!("https://{addr}"), AbortOnDrop(handle))
 }
 
-/// Build a rustls `ServerConfig` from DER material, optionally pinned to a
-/// specific protocol version (e.g. TLS 1.2 only). No client auth.
 pub fn raw_server_config(
     cert_der: Vec<u8>,
     key_pkcs8_der: Vec<u8>,
@@ -3040,8 +2788,6 @@ pub fn raw_server_config(
     std::sync::Arc::new(config)
 }
 
-/// A spawned task that is aborted when this guard drops (keeps helper servers
-/// alive for the duration of a test).
 pub struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {

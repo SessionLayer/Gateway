@@ -145,23 +145,23 @@ mod tests {
 
     fn v4_header(src: [u8; 4]) -> Vec<u8> {
         let mut h = V2_SIGNATURE.to_vec();
-        h.push(0x21); // v2 | PROXY
-        h.push(0x11); // INET | STREAM
-        h.extend_from_slice(&12u16.to_be_bytes()); // addr block length
-        h.extend_from_slice(&src); // src ip
-        h.extend_from_slice(&[10, 0, 0, 1]); // dst ip
-        h.extend_from_slice(&[0x1F, 0x90]); // sport
-        h.extend_from_slice(&[0x00, 0x16]); // dport
+        h.push(0x21);
+        h.push(0x11);
+        h.extend_from_slice(&12u16.to_be_bytes());
+        h.extend_from_slice(&src);
+        h.extend_from_slice(&[10, 0, 0, 1]);
+        h.extend_from_slice(&[0x1F, 0x90]);
+        h.extend_from_slice(&[0x00, 0x16]);
         h
     }
 
     fn v6_header(src: [u8; 16]) -> Vec<u8> {
         let mut h = V2_SIGNATURE.to_vec();
-        h.push(0x21); // v2 | PROXY
-        h.push(0x21); // INET6 | STREAM
+        h.push(0x21);
+        h.push(0x21);
         h.extend_from_slice(&36u16.to_be_bytes());
         h.extend_from_slice(&src);
-        h.extend_from_slice(&[0u8; 16]); // dst
+        h.extend_from_slice(&[0u8; 16]);
         h.extend_from_slice(&[0x1F, 0x90]);
         h.extend_from_slice(&[0x00, 0x16]);
         h
@@ -191,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn valid_v6_header_from_lb_yields_client_ip() {
         let mut src = [0u8; 16];
-        src[0..2].copy_from_slice(&[0x20, 0x01]); // 2001:db8::7
+        src[0..2].copy_from_slice(&[0x20, 0x01]);
         src[2..4].copy_from_slice(&[0x0d, 0xb8]);
         src[15] = 7;
         let got = resolve(&v6_header(src), "10.1.1.1".parse().unwrap(), &lb())
@@ -202,7 +202,6 @@ mod tests {
 
     #[tokio::test]
     async fn missing_header_from_lb_is_rejected() {
-        // Raw SSH bytes (no PROXY header) from an LB peer → BadSignature.
         let err = resolve(b"SSH-2.0-client\r\n", "10.1.1.1".parse().unwrap(), &lb())
             .await
             .unwrap_err();
@@ -211,7 +210,6 @@ mod tests {
 
     #[tokio::test]
     async fn header_from_non_lb_peer_is_rejected() {
-        // Even a well-formed header, if the immediate peer is not an LB, is a spoof.
         let err = resolve(
             &v4_header([203, 0, 113, 7]),
             "192.0.2.9".parse().unwrap(),
@@ -241,7 +239,7 @@ mod tests {
     fn prefix_rejects_wrong_version() {
         let mut buf = [0u8; PREFIX_LEN];
         buf[..12].copy_from_slice(&V2_SIGNATURE);
-        buf[12] = 0x11; // version 1
+        buf[12] = 0x11;
         assert!(matches!(parse_prefix(&buf), Err(ProxyError::BadVersion)));
     }
 
@@ -249,7 +247,7 @@ mod tests {
     fn prefix_rejects_bad_command() {
         let mut buf = [0u8; PREFIX_LEN];
         buf[..12].copy_from_slice(&V2_SIGNATURE);
-        buf[12] = 0x2F; // v2, command 0xF
+        buf[12] = 0x2F;
         assert!(matches!(parse_prefix(&buf), Err(ProxyError::BadCommand)));
     }
 
@@ -265,7 +263,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_address_block_is_rejected() {
-        // Declares 12 bytes of addresses but supplies only 4.
         let mut h = V2_SIGNATURE.to_vec();
         h.push(0x21);
         h.push(0x11);
@@ -281,8 +278,8 @@ mod tests {
     fn unspec_family_falls_back_to_peer() {
         let mut buf = [0u8; PREFIX_LEN];
         buf[..12].copy_from_slice(&V2_SIGNATURE);
-        buf[12] = 0x21; // v2 PROXY
-        buf[13] = 0x00; // UNSPEC
+        buf[12] = 0x21;
+        buf[13] = 0x00;
         let prefix = parse_prefix(&buf).unwrap();
         let peer: IpAddr = "10.9.9.9".parse().unwrap();
         assert_eq!(source_from_block(&prefix, &[], peer).unwrap(), peer);
@@ -290,10 +287,9 @@ mod tests {
 
     #[test]
     fn local_command_falls_back_to_peer() {
-        // A LOCAL command (LB health check) uses the real connection peer.
         let mut buf = [0u8; PREFIX_LEN];
         buf[..12].copy_from_slice(&V2_SIGNATURE);
-        buf[12] = 0x20; // v2 LOCAL
+        buf[12] = 0x20;
         buf[13] = 0x11;
         let prefix = parse_prefix(&buf).unwrap();
         let peer: IpAddr = "10.9.9.9".parse().unwrap();

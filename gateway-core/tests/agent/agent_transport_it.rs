@@ -1,4 +1,3 @@
-//! Agent transport: real WSS+mTLS peer, adversarial cases fail closed.
 #![cfg(feature = "test-agent")]
 
 use std::sync::Arc;
@@ -237,7 +236,6 @@ async fn an_agent_registers_over_real_mtls_and_the_dial_back_splices_bytes() {
 #[tokio::test]
 async fn a_locked_agent_cannot_register() {
     let h = Harness::start().await;
-    // The clone-detection lock: an agent identity the CP has locked.
     h.lock_set.add(Lock {
         lock_id: "l1".into(),
         target: Some(LockTarget {
@@ -254,7 +252,6 @@ async fn a_locked_agent_cannot_register() {
     let mut ws = client.connect(&h.endpoint, CONTROL_PATH).await.unwrap();
     let negotiated = client.hello(&mut ws).await.unwrap();
 
-    // Deny wins: the coarse UNAUTHORIZED, and no registration.
     let frame = client.next_frame(&mut ws, negotiated.ver).await.unwrap();
     assert_eq!(frame.msg_type, MsgType::Error);
     assert_eq!(
@@ -274,9 +271,6 @@ async fn a_locked_agent_cannot_register() {
 
 #[tokio::test]
 async fn the_transport_does_not_serve_agents_until_the_lock_feed_is_ready() {
-    // Readiness gate: a Gateway that cannot yet confirm the deny-set must not
-    // serve agents (a locked agent reconnecting during boot must not be admitted). Deny
-    // fails closed → the node is simply "offline" until the feed lands.
     let h = Harness::start_unready().await;
     let client = h.agent(AGENT, NODE);
     let (_task, _sd) = h.spawn_control(&client);
@@ -539,8 +533,6 @@ async fn a_locked_agent_cannot_redeem_a_dial_back_issued_before_the_lock() {
 
     let req = capture_dial_back(&h, &client, "sess-lock").await;
 
-    // …and a lock pushed before it is redeemed. Deny wins at the dial-back too, which is
-    // why the lock is re-checked here and not only at registration.
     h.lock_set.add(Lock {
         lock_id: "l2".into(),
         target: Some(LockTarget {
@@ -612,7 +604,6 @@ async fn an_oversized_frame_is_rejected_without_buffering_it() {
                     return;
                 }
                 Ok(f) => panic!("gateway accepted an oversized frame: {:?}", f.msg_type),
-                // A hard close without the courtesy error is equally fail-closed.
                 Err(_) => return,
             }
         }
@@ -660,8 +651,6 @@ async fn a_peer_with_no_common_protocol_version_is_rejected() {
 #[tokio::test]
 async fn a_node_whose_agent_never_connected_is_offline_immediately() {
     let h = Harness::start().await;
-    // No agent has ever registered: the connector fails closed at once (it does not
-    // wait out the dial-back deadline).
     let started = std::time::Instant::now();
     assert!(matches!(
         h.dialer().connect(&node_dial("node-ghost", "sess-x")).await,

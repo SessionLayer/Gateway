@@ -2,8 +2,6 @@ apiVersion: v2
 name: sessionlayer-gateway
 description: SessionLayer Gateway, the policy-enforced SSH proxy that records every session.
 type: application
-# Versions the chart, not the component. appVersion tracks the Gateway release
-# the default image tag resolves to.
 version: 0.1.0
 appVersion: "v0.0.2"
 # policy/v1 PodDisruptionBudget.

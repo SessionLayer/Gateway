@@ -75,7 +75,7 @@ pub fn presign(
         .collect::<Vec<_>>()
         .join("&");
 
-    let canonical_uri = uri_encode(path, false); // keep '/'
+    let canonical_uri = uri_encode(path, false);
     let canonical_request = format!(
         "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers_str}\nUNSIGNED-PAYLOAD"
     );

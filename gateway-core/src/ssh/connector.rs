@@ -1,5 +1,3 @@
-//! NodeConnector seam: pluggable node-reach strategy (agentless or outbound-agent).
-
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -30,7 +28,6 @@ pub struct NodeTarget {
 pub struct NodeDial {
     pub node_id: String,
     pub dial_address: String,
-    /// CP-declared connector model; UNSPECIFIED or unknown value is explicit deny.
     pub connector_kind: i32,
     pub node_name: String,
     pub session_id: String,
@@ -69,7 +66,6 @@ pub enum NodeConnectError {
     NoNodeName,
     #[error("no agent is connected for this node")]
     NoAgent,
-    /// The Agent is covered by a Lock (deny wins).
     #[error("the node's agent is locked")]
     AgentLocked,
     #[error("the agent refused or could not serve the dial-back")]
@@ -129,7 +125,6 @@ impl NodeConnector for AgentlessDial {
 
 pub struct DispatchConnector {
     agentless: Arc<dyn NodeConnector>,
-    /// `None` when this Gateway has no agent transport configured.
     agent: Option<Arc<dyn NodeConnector>>,
 }
 
@@ -189,7 +184,6 @@ mod tests {
 
     #[tokio::test]
     async fn agentless_dial_to_dead_port_fails_closed() {
-        // Reserve a port then drop the listener so the connect is refused.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -238,7 +232,6 @@ mod tests {
     #[tokio::test]
     async fn dispatch_selects_the_connector_declared_per_node() {
         let d = dispatcher(true);
-        // A mixed fleet: each node reaches its own model, in the same process.
         assert!(matches!(
             d.connect(&dial_of_kind(ConnectorKind::Agentless as i32)).await,
             Err(NodeConnectError::BadAddress(w)) if w == "agentless"

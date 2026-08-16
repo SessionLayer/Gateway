@@ -1,5 +1,3 @@
-//! HA session routing: local vs. remote gateway connector.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,7 +57,6 @@ impl NodeConnector for AgentRouter {
     }
 }
 
-/// Signals owner to dial a direct relay back. Bytes never traverse the bus.
 pub struct RemoteGatewayConnector {
     coordination: Arc<dyn CoordinationBackend>,
     signer: Arc<RelaySigner>,
@@ -179,7 +176,6 @@ mod tests {
         }
     }
 
-    /// A connector that records whether it was reached and returns a trivial stream.
     struct Spy(std::sync::atomic::AtomicBool);
     impl NodeConnector for Spy {
         fn connect<'a>(&'a self, _dial: &'a NodeDial) -> ConnectFuture<'a> {
@@ -212,7 +208,6 @@ mod tests {
         assert!(router.connect(&dial(SELF)).await.is_ok());
         assert!(local.0.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!remote.0.load(std::sync::atomic::Ordering::SeqCst));
-        // Keyed by node NAME (consistent with the owner side), not the UUID.
         assert_eq!(cache.get("node-a").unwrap().owner_id, SELF);
     }
 
@@ -229,9 +224,6 @@ mod tests {
 
     #[tokio::test]
     async fn remote_publishes_a_signal_and_the_relay_stream_is_returned_on_accept() {
-        // Prove the whole ingress side: mint→publish→await, resolved by the peer-relay
-        // server's oneshot. Also prove NO session bytes are on the bus (the signal carries
-        // only ids + the token).
         let bus: Arc<dyn CoordinationBackend> = Arc::new(InProcessBackend::new());
         let signer = Arc::new(RelaySigner::generate());
         let pending = Arc::new(PendingRelays::default());
@@ -245,14 +237,11 @@ mod tests {
             Duration::from_secs(30),
         );
 
-        // Stand in for the owner: subscribe, receive the signal, verify the token, then
-        // resolve the pending oneshot as the peer-relay server would on RELAY_ACCEPT.
         let mut owner_sub = bus.subscribe("gw-B");
         let pending2 = pending.clone();
         let signer2 = signer.clone();
         let owner = tokio::spawn(async move {
             let sig = owner_sub.next().await.unwrap();
-            // The bus carries only the signal — no session plaintext/ciphertext.
             assert_eq!(sig.node_name, "node-a");
             assert!(sig.relay_token.starts_with("SLGW1."));
             let payload = signer2
@@ -284,7 +273,6 @@ mod tests {
             Duration::from_millis(200),
             Duration::from_secs(30),
         );
-        // Nobody subscribed as gw-B ⇒ publish fails ⇒ fail closed at once.
         let err = remote.connect(&dial("gw-B")).await.unwrap_err();
         assert!(matches!(err, NodeConnectError::RelayUnavailable));
     }
@@ -302,7 +290,6 @@ mod tests {
             Duration::from_millis(150),
             Duration::from_secs(30),
         );
-        // Subscribe so the publish succeeds, but never resolve the relay.
         let _owner_sub = bus.subscribe("gw-B");
         let err = remote.connect(&dial("gw-B")).await.unwrap_err();
         assert!(matches!(err, NodeConnectError::Timeout(_)));
@@ -312,8 +299,6 @@ mod tests {
         );
     }
 
-    /// The route-layer `node_unreachable` counter moves on the two HA routing failures an
-    /// operator pages on, driven through the real connectors — not through the helper.
     #[tokio::test]
     async fn routing_failures_increment_the_node_unreachable_counter() {
         use crate::telemetry::metrics::testutil::CounterProbe;

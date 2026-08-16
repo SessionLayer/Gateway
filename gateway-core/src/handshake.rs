@@ -1,5 +1,6 @@
 //! CP ↔ Gateway version-negotiation client (Handshake.Negotiate); the ONLY RPC per frozen handshake.proto.
-//! SECURITY: mTLS + per-RPC authorization arrives later. Dev-only plaintext localhost smoke test; no secrets in messages.
+//! Runs on the production boot path over the mTLS channel `main.rs` builds with
+//! `mtls::connect_bootstrap`; no secrets in the messages either way.
 
 use crate::pb::handshake_client::HandshakeClient;
 use crate::pb::{ClientHello, ProtocolVersion, ServerHello};
@@ -7,13 +8,10 @@ use crate::version;
 use std::time::Duration;
 use tonic::transport::Channel;
 
-/// Default bound on establishing the transport to the Control Plane.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Default per-RPC deadline for `Negotiate`.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A failure while negotiating the protocol version with the Control Plane.
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
     #[error("failed to connect to Control Plane at {endpoint}: {source}")]

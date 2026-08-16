@@ -1,5 +1,3 @@
-//! Agent-facing WSS server (mTLS, two paths, deny-wins lock gate, no TOFU).
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +32,6 @@ use crate::pbgw::{RelayAccept, RelayReject};
 use crate::ssh::locks::{LockBindings, LockSet};
 use crate::version;
 
-/// The connection kind, decided by the WebSocket request path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     Control,
@@ -42,14 +39,11 @@ enum Role {
     PeerRelay,
 }
 
-/// The authenticated peer, resolved from its mTLS client certificate by role: an agent
-/// (control/dial-back) or a peer gateway (relay).
 enum Peer {
     Agent(AgentPeer),
     Gateway(String),
 }
 
-/// A failure standing up the agent transport (fail-closed at startup).
 #[derive(Debug, thiserror::Error)]
 pub enum AgentTransportError {
     #[error("agent transport I/O error: {0}")]
@@ -60,7 +54,6 @@ pub enum AgentTransportError {
     Tls(String),
 }
 
-/// Everything the transport needs from the rest of the Gateway.
 #[derive(Clone)]
 pub struct AgentTransportDeps {
     pub cpauth: Arc<CpAuthClient>,
@@ -69,11 +62,7 @@ pub struct AgentTransportDeps {
     pub registry: Arc<AgentRegistry>,
     pub pending: Arc<PendingDialBacks>,
     pub signer: Arc<DialBackSigner>,
-    /// The actively-pushed lock deny-set — consulted at registration and at
-    /// every dial-back.
     pub lock_set: Arc<LockSet>,
-    /// HA peer-relay machinery. `Some` enables the `/peer/v1/relay` path — the ingress side
-    /// that verifies an SLGW1 token. `None` leaves the path refused (fail closed).
     pub peer_relay: Option<PeerRelayServerDeps>,
     pub config: AgentTransportConfig,
 }
@@ -93,10 +82,10 @@ struct Inner {
     handshake_timeout: Duration,
     heartbeat: Duration,
     max_frame_bytes: usize,
-    /// Caps concurrently-handshaking connections, preventing unauthenticated peers from
-    /// exhausting the Gateway before presenting a certificate.
+    /// Caps concurrent connections — the permit is held for the whole connection,
+    /// not just the handshake — so unauthenticated peers cannot exhaust the Gateway
+    /// before presenting a certificate.
     connection_slots: Arc<tokio::sync::Semaphore>,
-    /// Begin-drain signal; control channels watch it and close to allow failover.
     shutdown: watch::Receiver<bool>,
 }
 
@@ -171,7 +160,6 @@ pub async fn bind(
     let issued = issue_server_config(&deps).await?;
     let (tls_tx, tls_rx) = watch::channel(issued.config);
     spawn_server_cert_renewal(deps.clone(), tls_tx, issued.not_after, shutdown.clone());
-    // Sweep signalled-but-never-redeemed relay tokens so the (bounded) ledger drains.
     if let Some(pr) = &deps.peer_relay {
         spawn_relay_pending_gc(pr.pending_relays.clone(), shutdown.clone());
     }
@@ -251,8 +239,6 @@ async fn issue_server_config(
         return Err(AgentTransportError::ServerCertificate);
     }
 
-    // The client-cert trust anchors are the SAME internal mTLS CA the Gateway already
-    // pins for the CP channel — no new trust distribution, and renewal-aware.
     let anchors = deps.cpauth.current_ca_chain();
     let config = server_config(
         issued.certificate,
@@ -380,8 +366,6 @@ fn spawn_relay_pending_gc(
     });
 }
 
-/// Why an agent connection was refused. Reported to the peer as a coarse code only,
-/// disclosing nothing about which check failed; the specific reason stays in the operator log.
 #[derive(Debug, thiserror::Error)]
 enum ConnError {
     #[error("TLS handshake failed: {0}")]
@@ -434,7 +418,6 @@ async fn accept_agent(inner: Arc<Inner>, tcp: TcpStream) -> Result<(), ConnError
         (Role::Control, Peer::Agent(p)) => run_control(ws, inner, p, ver).await,
         (Role::DialBack, Peer::Agent(p)) => run_dial_back(ws, inner, p, ver).await,
         (Role::PeerRelay, Peer::Gateway(name)) => run_peer_relay(ws, inner, name, ver).await,
-        // The role fixes the identity kind in `handshake`; a mismatch is impossible.
         _ => Err(ConnError::UnknownPath),
     }
 }
@@ -471,7 +454,6 @@ async fn handshake(
             .to_vec()
     };
 
-    // Only the contracted paths exist; anything else is refused at the upgrade.
     let mut role = None;
     let ws = accept_hdr_async_with_config(
         tls,
@@ -499,7 +481,6 @@ async fn handshake(
     let ver = match preface(&mut ws, inner).await {
         Ok(ver) => ver,
         Err(e) => {
-            // Pre-negotiation error: stamp it with our wire major (contract §3).
             let _ = send_error(&mut ws, wire_reject_ver(), &e).await;
             return Err(e);
         }
@@ -507,17 +488,17 @@ async fn handshake(
     Ok((ws, peer, role, ver))
 }
 
-/// The agent-surface Lock gate (contract §1/§6 check 7/§8). Used at registration, on every
-/// heartbeat tick, and at dial-back redemption.
+/// The agent-surface Lock gate. Used at registration, on every heartbeat tick, and at
+/// dial-back redemption.
 ///
-/// **Deny fails closed.** An unhealthy deny-feed — before the
-/// first snapshot at boot, or after the CP stream drops — cannot confirm the ABSENCE of a
-/// lock, and an empty `LockSet` is indistinguishable from "no lock applies". So an
-/// unconfirmable deny-set is treated as a deny, exactly as the session path does
-/// (`handler.rs` local_recheck). The availability cost is deliberate: while the feed is down
-/// this Gateway serves NO agent nodes — they are simply "offline", the correct
-/// deny-wins trade. In practice the cost is small: a down lock stream usually means the CP is
-/// down, and `Authorize` already fails closed, so few new sessions were possible anyway.
+/// **Deny fails closed.** An unhealthy deny-feed — before the first snapshot at boot, or
+/// after the CP stream drops — cannot confirm the ABSENCE of a lock, and an empty
+/// `LockSet` is indistinguishable from "no lock applies". So an unconfirmable deny-set is
+/// treated as a deny, exactly as the session path does (`handler.rs` local_recheck). The
+/// availability cost is deliberate: while the feed is down this Gateway serves NO agent
+/// nodes — they are simply "offline", the correct deny-wins trade. In practice the cost is
+/// small: a down lock stream usually means the CP is down, and `Authorize` already fails
+/// closed, so few new sessions were possible anyway.
 fn refuse_if_locked(inner: &Inner, peer: &AgentPeer) -> Result<(), ConnError> {
     if !inner.deps.lock_set.healthy() {
         tracing::warn!(
@@ -541,8 +522,6 @@ fn refuse_if_locked(inner: &Inner, peer: &AgentPeer) -> Result<(), ConnError> {
     Ok(())
 }
 
-/// The connection preface (contract §3): the Agent's `HELLO`, then either a
-/// `HELLO_ACK` fixing the negotiated bounds or a `VERSION_REJECT` and close.
 async fn preface<S>(ws: &mut WebSocketStream<S>, inner: &Inner) -> Result<u8, ConnError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -582,9 +561,6 @@ where
     Ok(ver)
 }
 
-/// The `VER` byte for a frame sent before a version is negotiated (a `VERSION_REJECT` or a
-/// pre-preface error): the sender's own **wire** protocol major (contract §3), NOT the gRPC
-/// plane's.
 fn wire_reject_ver() -> u8 {
     crate::agent::WIRE_PROTOCOL_MAX.0 as u8
 }
@@ -593,7 +569,7 @@ fn negotiate(client: &ComponentInfo) -> Option<(u32, u32)> {
     let min = client.protocol_min.as_ref().map(|v| (v.major, v.minor))?;
     let max = client.protocol_max.as_ref().map(|v| (v.major, v.minor))?;
     if min.0 != max.0 {
-        return None; // a range must never straddle majors (VERSIONING §3)
+        return None;
     }
     version::resolve_common_version(
         crate::agent::WIRE_PROTOCOL_MIN,
@@ -602,8 +578,6 @@ fn negotiate(client: &ComponentInfo) -> Option<(u32, u32)> {
         max,
     )
 }
-
-// ---- control role -------------------------------------------------------------
 
 async fn run_control<S>(
     mut ws: WebSocketStream<S>,
@@ -614,8 +588,6 @@ async fn run_control<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // Deny wins: a locked agent identity cannot register — and, re-checked at
-    // every dial-back and on every heartbeat, cannot stay registered either.
     if let Err(e) = refuse_if_locked(&inner, &peer) {
         let _ = send_error(&mut ws, ver, &e).await;
         let _ = ws.close(None).await;
@@ -653,7 +625,6 @@ where
 
     let outcome = loop {
         tokio::select! {
-            // Begin-drain: close the control channel so the agent fails over promptly.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
                     tracing::info!(node = %sanitize(&peer.node_name), "gateway draining; closing the agent control channel so it fails over");
@@ -661,8 +632,8 @@ where
                 }
             }
             _ = ticker.tick() => {
-                // Two missed intervals ⇒ the peer is dead (contract §7): a ping unanswered
-                // across two ticks, NOT merely "the latest ping is unanswered".
+                // Two missed intervals ⇒ the peer is dead: a ping unanswered across two
+                // ticks, NOT merely "the latest ping is unanswered".
                 if outstanding.len() >= 2 {
                     let m = crate::telemetry::metrics::node_unreachable(
                         crate::telemetry::metrics::UnreachableReason::MissedHeartbeats,
@@ -670,7 +641,6 @@ where
                     tracing::info!(agent_id = %sanitize(&peer.agent_id), node = %sanitize(&peer.node_name), outcome = m.outcome(), reason = m.reason(), "agent missed two heartbeats; deregistering (node becomes unreachable)");
                     break Ok(());
                 }
-                // A lock pushed after registration must not leave the channel live.
                 if refuse_if_locked(&inner, &peer).is_err() {
                     let _ = send_error(&mut ws, ver, &ConnError::Locked).await;
                     break Err(ConnError::Locked);
@@ -701,7 +671,7 @@ where
                 let Some(msg) = msg else { break Ok(()) };
                 let frame = match to_frame(msg, inner.max_frame_bytes, ver) {
                     Ok(Some(f)) => f,
-                    Ok(None) => continue,            // a WebSocket control frame
+                    Ok(None) => continue,
                     Err(ConnError::Closed) => break Ok(()),
                     Err(e) => {
                         let _ = send_error(&mut ws, ver, &e).await;
@@ -711,7 +681,6 @@ where
                 match frame.msg_type {
                     MsgType::Pong => {
                         let acked = wire::as_pong(&frame)?.nonce;
-                        // A PONG for ping N acks N and every still-outstanding older ping.
                         if outstanding.contains(&acked) {
                             while outstanding.front().is_some_and(|&n| n <= acked) {
                                 outstanding.pop_front();
@@ -746,7 +715,7 @@ where
                     }
                     MsgType::Error => {
                         // Peer-supplied text is untrusted: log it escaped, never
-                        // interpolate it into an error chain (contract §8).
+                        // interpolate it into an error chain.
                         let err = wire::as_wire_error(&frame)?;
                         tracing::info!(agent_id = %sanitize(&peer.agent_id), code = err.code, message = %sanitize(&err.message), "agent reported a wire error");
                         break Ok(());
@@ -766,8 +735,6 @@ where
     outcome
 }
 
-// ---- dial-back role -----------------------------------------------------------
-
 async fn run_dial_back<S>(
     mut ws: WebSocketStream<S>,
     inner: Arc<Inner>,
@@ -777,8 +744,6 @@ async fn run_dial_back<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Every pre-splice round-trip with the Agent is bounded: a peer that
-    // opens a dial-back and then stalls must not hold the pending session open.
     let authorized = tokio::time::timeout(
         inner.handshake_timeout,
         authorize_dial_back(&mut ws, &inner, &peer, ver),
@@ -789,8 +754,6 @@ where
     let ready = match authorized {
         Ok(ready) => ready,
         Err(e) => {
-            // Any failure ⇒ ERROR(UNAUTHORIZED) + close. The specific reason goes to
-            // the operator log ONLY, and the token itself is never echoed.
             tracing::warn!(
                 agent_id = %sanitize(&peer.agent_id),
                 node = %sanitize(&peer.node_name),
@@ -803,9 +766,6 @@ where
         }
     };
 
-    // The stream is handed to the inner leg ONLY after STREAM_OPEN — i.e. only once
-    // the Agent's loopback splice is actually live, never before. Bounded: an Agent that
-    // accepts the token and then never opens must not park the session.
     let frame = tokio::time::timeout(
         inner.handshake_timeout,
         next_frame(&mut ws, inner.max_frame_bytes, ver),
@@ -821,7 +781,6 @@ where
 
     let stream = WsByteStream::new(ws, ver, inner.max_frame_bytes);
     if ready.send(Box::new(stream)).is_err() {
-        // The connector gave up (its deadline elapsed) — drop the splice.
         tracing::info!(node = %sanitize(&peer.node_name), "dial-back arrived after the connector gave up; dropping");
     }
     Ok(())
@@ -842,17 +801,12 @@ where
     }
     let auth = wire::as_dial_back_auth(&frame)?;
 
-    // (1)(2)(3) Envelope + signature over the transmitted bytes + this process's
-    // signer + this Gateway + the validity window. Verify-then-decode.
     let payload =
         inner
             .deps
             .signer
             .verify(&auth.token, &inner.deps.gateway_id, now_epoch_secs())?;
 
-    // (5) The connection's mTLS identity IS the agent the token was issued to, and
-    // that agent owns the node. A token captured by a different Agent — even a valid,
-    // unlocked one — is worthless to it.
     if payload.agent_id != peer.agent_id
         || payload.node_name != peer.node_name
         || !inner.deps.registry.owns(&peer.agent_id, &payload.node_name)
@@ -860,12 +814,11 @@ where
         return Err(ConnError::Token(TokenError::WrongAgent));
     }
 
-    // (7) Not locked — re-checked here, not just at registration.
     refuse_if_locked(inner, peer)?;
 
-    // (4)(6) The jti is pending — and removing it IS consumption — and the pending
-    // entry's {node, session, principal, agent} equal the payload's. Consumed LAST so
-    // a rogue presentation cannot burn a legitimate agent's token.
+    // The jti is pending — and removing it IS consumption — and the pending entry's
+    // {node, session, principal, agent} equal the payload's. Consumed LAST so a rogue
+    // presentation cannot burn a legitimate agent's token.
     let ready = inner.deps.pending.consume(&payload)?;
 
     ws.send(Message::Binary(WsBytes::from(wire::encode_msg(
@@ -878,12 +831,10 @@ where
     Ok(ready)
 }
 
-// ---- peer-relay role (HA) ------------------------------------
-
-/// Serve one Gateway↔Gateway byte relay (`gateway-relay-v1.md` §5). The peer is the OWNER
-/// (gw-B) dialling this ingress (gw-A) back; on a verified SLGW1 token the WS becomes the
-/// session byte stream handed to the awaiting `RemoteGatewayConnector::connect`. gw-A owns
-/// the session + recording; the owner is a dumb relay.
+/// Serve one Gateway↔Gateway byte relay. The peer is the OWNER (gw-B) dialling this
+/// ingress (gw-A) back; on a verified SLGW1 token the WS becomes the session byte stream
+/// handed to the awaiting `RemoteGatewayConnector::connect`. gw-A owns the session +
+/// recording; the owner is a dumb relay.
 async fn run_peer_relay<S>(
     mut ws: WebSocketStream<S>,
     inner: Arc<Inner>,
@@ -894,14 +845,11 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let Some(deps) = inner.deps.peer_relay.clone() else {
-        // No HA routing wired on this Gateway: the path exists but is refused (fail closed).
         let _ = send_relay_reject(&mut ws, ver).await;
         let _ = ws.close(None).await;
         return Err(ConnError::RelayNotConfigured);
     };
 
-    // Every pre-splice round-trip is bounded: a peer that opens the relay
-    // and then stalls must not hold the pending session open.
     let authorized = tokio::time::timeout(
         inner.handshake_timeout,
         authorize_relay(&mut ws, &inner, &deps, &gateway_name, ver),
@@ -912,8 +860,6 @@ where
     let ready = match authorized {
         Ok(ready) => ready,
         Err(e) => {
-            // Any failure ⇒ RELAY_REJECT + close (fail closed). The specific reason goes to
-            // the operator log ONLY; the token is never echoed.
             tracing::warn!(
                 peer_gateway = %sanitize(&gateway_name),
                 reason = %e,
@@ -925,8 +871,6 @@ where
         }
     };
 
-    // The WS is the session byte stream now — hand it to the inner leg. gw-B frames the node
-    // bytes as STREAM_DATA; this ingress unwraps them via the same `WsByteStream`.
     let stream = WsByteStream::new(ws, ver, inner.max_frame_bytes);
     if ready.send(Box::new(stream)).is_err() {
         tracing::info!(peer_gateway = %sanitize(&gateway_name), "peer relay arrived after the ingress gave up; dropping");
@@ -950,21 +894,14 @@ where
     }
     let open = wire::as_relay_open(&frame)?;
 
-    // Envelope + signature over the transmitted bytes + this ingress + the validity window
-    // (verify-then-decode). The signer fingerprint pins it to this process's key.
     let payload =
         deps.relay_signer
             .verify(&open.token, &inner.deps.gateway_name, now_epoch_ms())?;
 
-    // The authenticated mTLS peer IS the owner the token names — a token captured by a
-    // different, even valid, gateway is worthless to it (`gateway-relay-v1.md` §6/§7).
     if payload.owner_gateway_id != gateway_name {
         return Err(ConnError::Relay(RelayTokenError::WrongOwner));
     }
 
-    // Single-use: consuming the pending entry IS the token's redemption, and the entry's
-    // bindings must equal the payload's. Consumed LAST so a rogue presentation cannot burn a
-    // legitimate session's token.
     let ready = deps.pending_relays.consume(&payload)?;
 
     ws.send(Message::Binary(WsBytes::from(wire::encode_msg(
@@ -994,8 +931,6 @@ where
     );
     ws.send(Message::Binary(WsBytes::from(payload))).await
 }
-
-// ---- frame plumbing -----------------------------------------------------------
 
 fn to_frame(
     msg: Result<Message, tokio_tungstenite::tungstenite::Error>,
@@ -1068,15 +1003,15 @@ where
 }
 
 /// Strip characters that could forge or corrupt an operator log line from untrusted
-/// peer-supplied text (contract §8: "log it escaped").
+/// peer-supplied text.
 ///
 /// `char::is_control()` covers only category **Cc** (C0/C1 + DEL) — it misses the four
 /// classes that actually enable log/terminal attacks, so we strip them too:
-/// line/paragraph separators (Zl/Zp — new-line forging in JSON/log
-/// pipelines), bidi controls (reorder the rendered line to read as something else),
-/// zero-width/format characters (defeat grep and alerting), and the BOM. The inputs on
-/// this surface are short cert-derived identifiers and diagnostic strings, so dropping the
-/// (rare, non-load-bearing) format characters is harmless.
+/// line/paragraph separators (Zl/Zp — new-line forging in JSON/log pipelines), bidi
+/// controls (reorder the rendered line to read as something else), zero-width/format
+/// characters (defeat grep and alerting), and the BOM. The inputs on this surface are
+/// short cert-derived identifiers and diagnostic strings, so dropping the (rare,
+/// non-load-bearing) format characters is harmless.
 fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|&c| !is_log_unsafe(c))
@@ -1085,7 +1020,7 @@ fn sanitize(s: &str) -> String {
 }
 
 fn is_log_unsafe(c: char) -> bool {
-    c.is_control() // Cc: C0/C1 controls incl. \n \r \t ESC and DEL
+    c.is_control()
         || matches!(c,
             '\u{00AD}'                 // soft hyphen
             | '\u{061C}'               // arabic letter mark (bidi)
@@ -1123,12 +1058,8 @@ mod tests {
 
     #[test]
     fn negotiation_uses_the_wire_range_not_the_grpc_range() {
-        // The wire protocol is pinned at 1.0 (contract §3). The gRPC plane is already at
-        // 1.1 — negotiation MUST NOT leak that here: an Agent advertising [1.0, 1.1] gets
-        // 1.0, never 1.1, because 1.1 does not exist on the wire.
         assert_eq!(negotiate(&info((1, 0), (1, 1))), Some((1, 0)));
         assert_eq!(negotiate(&info((1, 0), (1, 0))), Some((1, 0)));
-        // Guard the decoupling explicitly: our wire max is below the gRPC max.
         assert_eq!(crate::agent::WIRE_PROTOCOL_MAX, (1, 0));
         assert!(crate::agent::WIRE_PROTOCOL_MAX < crate::version::PROTOCOL_MAX);
         assert_eq!(
@@ -1139,14 +1070,9 @@ mod tests {
 
     #[test]
     fn no_common_version_fails_closed() {
-        // A peer offering ONLY 1.1 shares nothing with our wire [1.0, 1.0] → reject, never
-        // a silent downgrade to a wire minor we do not actually speak.
         assert_eq!(negotiate(&info((1, 1), (1, 1))), None);
-        // A different major has no overlap → VERSION_REJECT, never a guess.
         assert_eq!(negotiate(&info((2, 0), (2, 0))), None);
-        // A range that straddles majors is malformed.
         assert_eq!(negotiate(&info((1, 0), (2, 0))), None);
-        // A HELLO with no version range at all.
         assert_eq!(negotiate(&ComponentInfo::default()), None);
     }
 
@@ -1173,16 +1099,13 @@ mod tests {
 
     #[test]
     fn peer_error_text_is_sanitized_before_logging() {
-        // C0 control + ANSI CSI (the ESC is a C0 control).
         assert_eq!(sanitize("evil\n\u{1b}[2Jinjected"), "evil[2Jinjected");
-        // The Cf/Zl/Zp classes char::is_control() misses are stripped too.
         assert_eq!(sanitize("ok\u{202e}dezirohtuanu"), "okdezirohtuanu"); // RTL override
         assert_eq!(sanitize("a\u{200b}b\u{feff}c"), "abc"); // zero-width + BOM
         assert_eq!(
             sanitize("line1\u{2028}line2\u{2029}line3"),
             "line1line2line3"
         );
-        // Ordinary non-ASCII text is preserved (this is a log guard, not ASCII-only).
         assert_eq!(sanitize("café-node"), "café-node");
     }
 

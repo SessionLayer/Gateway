@@ -1,14 +1,9 @@
-# SessionLayer Gateway — egress restriction.
+# seccomp cannot filter by destination, so egress confinement is enforced at the network
+# layer: this default-deny-egress policy permits ONLY the connections the Gateway
+# legitimately makes, and drops everything else — the metadata service, and arbitrary
+# internet hosts a compromised process might exfiltrate to.
 #
-# "Restricted egress (node + CP only)". seccomp cannot filter by destination, so
-# egress confinement is enforced at the network layer: this default-deny-egress
-# policy permits ONLY the connections the Gateway legitimately makes — the Control
-# Plane mTLS gRPC, the SSH nodes it bridges to, cluster DNS, and (if recording is
-# on) the WORM object store. Everything else — the metadata service, arbitrary
-# internet hosts a compromised process might exfiltrate to — is dropped.
-#
-# Ingress is separately restricted to the SSH + agent + readyz ports. Requires a
-# CNI that enforces NetworkPolicy (Cilium, Calico, …).
+# Requires a CNI that enforces NetworkPolicy (Cilium, Calico, …).
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -22,12 +17,11 @@ spec:
 
   ingress:
     - ports:
-        - { protocol: TCP, port: 2222 } # outer SSH leg
-        - { protocol: TCP, port: 9444 } # agent transport (agents dial in)
-        - { protocol: TCP, port: 8081 } # /readyz (kubelet + LB health)
+        - { protocol: TCP, port: 2222 }
+        - { protocol: TCP, port: 9444 }
+        - { protocol: TCP, port: 8081 }
 
   egress:
-    # Cluster DNS (getaddrinfo for the CP + node names).
     - to:
         - namespaceSelector: {}
           podSelector:
@@ -35,7 +29,6 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
-    # The Control Plane mTLS gRPC (Authorize / lock feed / recording / renew).
     - to:
         - podSelector:
             matchLabels: { app.kubernetes.io/name: sessionlayer-controlplane }
@@ -48,7 +41,6 @@ spec:
         - ipBlock: { cidr: 10.20.0.0/16 }
       ports:
         - { protocol: TCP, port: 22 }
-    # WORM object store for recordings (drop this rule if recording is disabled).
     - to:
         - ipBlock: { cidr: 10.30.0.0/16 }
       ports:

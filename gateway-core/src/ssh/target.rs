@@ -1,6 +1,3 @@
-//! Target resolution: username encoding `login%node` into login + node identifier.
-//! Parser never decides access; malformed/unknown targets yield generic pre-auth denial (no disclosure).
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub login: String,
@@ -35,7 +32,6 @@ pub fn strip_dns_suffix(node: &str, suffixes: &[String]) -> String {
             continue;
         }
         let dotted = format!(".{bare}");
-        // Non-empty bare name required (node strictly longer than `.suffix`).
         if node_lower.ends_with(&dotted) && node.len() > dotted.len() {
             let cut = node.len() - dotted.len();
             if best_cut.is_none_or(|b| cut < b) {
@@ -122,7 +118,6 @@ mod tests {
             strip_dns_suffix("web-01.ssh.corp", &suffixes(&[".ssh.corp"])),
             "web-01"
         );
-        // DNS is case-insensitive on the SUFFIX; the bare name keeps its original case.
         assert_eq!(
             strip_dns_suffix("Web-01.SSH.Corp", &suffixes(&["ssh.corp"])),
             "Web-01"
@@ -131,7 +126,6 @@ mod tests {
 
     #[test]
     fn strip_prefers_the_most_specific_suffix() {
-        // Both match; the longest (most specific) wins.
         assert_eq!(
             strip_dns_suffix(
                 "db.prod.ssh.corp",
@@ -143,24 +137,19 @@ mod tests {
 
     #[test]
     fn strip_is_a_noop_when_nothing_matches() {
-        // A bare name (the plain login%node path) is untouched.
         assert_eq!(
             strip_dns_suffix("web-01", &suffixes(&["ssh.corp"])),
             "web-01"
         );
-        // A different domain is untouched (only configured suffixes strip).
         assert_eq!(
             strip_dns_suffix("web-01.other.net", &suffixes(&["ssh.corp"])),
             "web-01.other.net"
         );
-        // No configured suffixes ⇒ wildcard DNS disabled ⇒ untouched.
         assert_eq!(strip_dns_suffix("web-01.ssh.corp", &[]), "web-01.ssh.corp");
-        // A node EQUAL to the suffix would leave an empty bare name ⇒ left unchanged.
         assert_eq!(
             strip_dns_suffix("ssh.corp", &suffixes(&["ssh.corp"])),
             "ssh.corp"
         );
-        // Blank/whitespace suffix entries are ignored.
         assert_eq!(
             strip_dns_suffix("web-01.ssh.corp", &suffixes(&["", "  ", "."])),
             "web-01.ssh.corp"

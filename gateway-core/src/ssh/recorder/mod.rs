@@ -1,5 +1,3 @@
-//! Session recorder: asciicast v2 + file-transfer audit + hash-chain + WORM upload under customer key (fail-closed).
-
 pub mod asciicast;
 pub mod chain;
 pub mod scp;
@@ -379,10 +377,6 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
         }
     }
 
-    /// Record a file-transfer audit BOTH as an asciicast `m` marker in the sealed
-    /// stream (so the hash-chain — computed over the sealed line stream — commits
-    /// to it and the object is independently verifiable, #7) AND as a cleartext
-    /// convenience copy for the CP's audit correlation (FinalizeRecording).
     fn push_audit(&mut self, a: FileTransferAudit) -> Result<(), String> {
         let label = audit_marker_label(&a);
         let line = asciicast::event_line(self.elapsed(), EventCode::Marker, &label);
@@ -393,7 +387,6 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
 
     fn seal_ready_frames(&mut self) -> Result<(), String> {
         while self.pending_pt.len() >= self.frame_size {
-            // The drained plaintext is scrubbed on drop of this frame buffer.
             let frame = Zeroizing::new(
                 self.pending_pt
                     .drain(..self.frame_size)
@@ -428,8 +421,6 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
 /// payload). A replay verifier reconstructs the file-transfer records from these,
 /// and the hash-chain (over the sealed stream) commits to them.
 fn audit_marker_label(a: &FileTransferAudit) -> Zeroizing<String> {
-    // The label carries the transferred path — treat as sensitive; scrub the
-    // transient copy once folded into the sealed marker stream.
     Zeroizing::new(
         serde_json::to_string(&serde_json::json!({
             "type": "file-transfer",
@@ -443,9 +434,6 @@ fn audit_marker_label(a: &FileTransferAudit) -> Zeroizing<String> {
     )
 }
 
-/// The `<family>.opened` audit marker for a forwarded tunnel. A
-/// metadata-only asciicast `m` event — target + direction + capability, never the
-/// forwarded bytes. The hash-chain (over the sealed stream) commits to it.
 fn tunnel_marker_open(direction: TunnelDirection, target: &str) -> String {
     serde_json::to_string(&serde_json::json!({
         "type": format!("{}.opened", direction.audit_family()),
@@ -677,8 +665,6 @@ impl SessionRecorder for Recorder {
                     (false, None, None)
                 }
             };
-            // Unlinking a spool file that grew to gigabytes can block; the recorder
-            // never does filesystem work on a runtime worker.
             if let Some(path) = spooled {
                 let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
             }
@@ -712,8 +698,6 @@ impl SessionRecorder for Recorder {
                     byte_len = prepared.byte_len,
                     "recording finalized"
                 ),
-                // A non-final status is committed (never silently dropped) but logged
-                // loudly at warn so the incomplete recording is visible.
                 Ok(_) => tracing::warn!(
                     session_id = %self.session_id,
                     recording_id = %self.recording_id,
@@ -733,7 +717,6 @@ impl SessionRecorder for Recorder {
     }
 }
 
-/// Builds real [`Recorder`] instances per authorized session.
 pub struct RecorderFactoryImpl {
     cpauth: Arc<CpAuthClient>,
     uploader: Arc<HttpUploader>,
@@ -741,7 +724,6 @@ pub struct RecorderFactoryImpl {
 }
 
 impl RecorderFactoryImpl {
-    /// Builds the factory (fail-closed on misconfigured upload-CA).
     pub fn new(cpauth: Arc<CpAuthClient>, config: RecorderConfig) -> io::Result<Self> {
         let tls = match &config.upload_ca_pem_path {
             Some(path) => {
@@ -789,8 +771,6 @@ impl RecorderFactory for RecorderFactoryImpl {
             let sealer = RecordingCipher::seal_to_customer(algorithm, &customer_key.public_key)
                 .map_err(|_| RecorderError::Setup)?;
 
-            // The WORM upload credential is NOT issued here — it is fetched at
-            // session end via RequestUpload (short-lived, covers only the PUT).
             let spool_dir = self.config.spool_dir.clone();
             let spool_file = tokio::task::spawn_blocking(move || create_spool_file(spool_dir))
                 .await
@@ -801,8 +781,6 @@ impl RecorderFactory for RecorderFactoryImpl {
 
             Ok(Arc::new(Recorder {
                 cap: Mutex::new(cap),
-                // A break-glass session forces strict regardless of config;
-                // `force_strict` can only tighten the configured strict mode.
                 strict: self.config.strict || params.force_strict,
                 teardown: params.teardown,
                 torn: AtomicBool::new(false),
@@ -933,8 +911,6 @@ impl CipherSpool {
         }
     }
 
-    /// Hands the pre-opened file to a dedicated writer thread. Issues no filesystem
-    /// syscall of its own: this runs inline on the byte path.
     fn spill(&mut self) -> io::Result<()> {
         let SpoolFile { file, .. } = self
             .file
@@ -974,7 +950,7 @@ impl CipherSpool {
         match &mut self.state {
             SpoolState::Mem(buf) => ClosedSpool::Mem(bytes::Bytes::from(std::mem::take(buf))),
             SpoolState::File(sink) => {
-                drop(sink.tx.take()); // close the channel → writer flushes + exits
+                drop(sink.tx.take());
                 match sink.handle.take() {
                     Some(writer) => ClosedSpool::Spilled { writer, path, len },
                     None => ClosedSpool::Broken("recording spool already finalized"),
@@ -995,9 +971,6 @@ impl CipherSpool {
     }
 }
 
-/// Last-resort cleanup for a session that never reached `finalize` (abort, panic,
-/// shutdown). The normal path unlinks off the executor once the upload is done, so
-/// this usually finds nothing.
 impl Drop for CipherSpool {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -1071,9 +1044,6 @@ mod tests {
         (header, events)
     }
 
-    /// A scripted terminal session's recording replays to the exact
-    /// original output/keystroke bytes, records a resize, seals under the customer
-    /// key, and the hash-chain head commits to the content.
     #[tokio::test]
     async fn terminal_round_trips_through_seal_and_chain() {
         let (pub_der, secret) = customer_keypair();
@@ -1107,16 +1077,13 @@ mod tests {
         assert_eq!(byte_len as usize, object.len());
         assert_eq!(content_digest, chain::sha256_hex(&object));
 
-        // Decrypt with the customer private key → the exact asciicast v2 file.
         let header = seal::parse_header(&object).unwrap();
         let key = seal::unseal_data_key(&header, &secret).unwrap();
         let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
-        // #7: the hash-chain head is recomputable from the decrypted object alone.
         assert_eq!(recompute_chain(&plaintext), chain_head);
         let (hdr, events) = parse_asciicast(&plaintext);
         assert!(hdr.contains("\"version\":2"));
 
-        // Output events concatenate to the exact node output; input to the keystrokes.
         let out: String = events
             .iter()
             .filter(|(c, _)| c == "o")
@@ -1135,9 +1102,6 @@ mod tests {
         );
     }
 
-    /// An exec whose command LOOKS like a legacy scp still records
-    /// asciicast for ALL I/O — the command string can never suppress mandatory
-    /// content capture (the SCP decoder runs additively, not instead of).
     #[tokio::test]
     async fn scp_classified_exec_still_records_asciicast() {
         let (pub_der, secret) = customer_keypair();
@@ -1156,7 +1120,6 @@ mod tests {
             },
         )
         .unwrap();
-        // Output that a command-string-driven capture bypass would have hidden.
         cap.tap(1, TapDirection::Output, None, b"pwned\n").unwrap();
         cap.close_channel(1);
 
@@ -1185,10 +1148,6 @@ mod tests {
         );
     }
 
-    /// A forwarded tunnel is recorded METADATA-ONLY — the
-    /// sealed object carries an `opened`/`closed` marker pair (target, direction,
-    /// capability, byte counts, duration) and NO forwarded byte content, and the
-    /// hash-chain commits to them.
     #[tokio::test]
     async fn tunnel_channel_records_metadata_only() {
         let (pub_der, secret) = customer_keypair();
@@ -1205,8 +1164,6 @@ mod tests {
             },
         )
         .unwrap();
-        // Bytes moved by the (real) forward pumps; here we set the shared counters
-        // directly, then a stray content tap MUST be ignored (no capture).
         counters.bytes_in.store(4096, Ordering::Relaxed);
         counters.bytes_out.store(8192, Ordering::Relaxed);
         cap.tap(7, TapDirection::Input, None, b"\x00\x01\x02 binary payload")
@@ -1221,7 +1178,6 @@ mod tests {
         let plaintext = seal::decrypt_frames(&object, &header, &key).unwrap();
         let text = String::from_utf8(plaintext).unwrap();
 
-        // No forwarded byte content anywhere in the sealed object.
         assert!(
             !text.contains("binary payload") && !text.contains("opaque bytes"),
             "forwarded bytes MUST NOT be captured"
@@ -1274,9 +1230,6 @@ mod tests {
         assert_ne!(head_a, head_b, "a changed record must change the head");
     }
 
-    /// An SFTP upload over the tap yields a per-op file-transfer audit
-    /// (cleartext copy) AND folds it into the sealed stream as an `m` marker, so
-    /// the decrypted object carries the transfer record and no terminal I/O.
     #[tokio::test]
     async fn sftp_channel_produces_file_transfer_audit_only() {
         let (pub_der, secret) = customer_keypair();
@@ -1314,8 +1267,6 @@ mod tests {
         assert_eq!(fin.audits[0].size, content.len() as i64);
         assert_eq!(fin.audits[0].sha256, chain::sha256_hex(content));
 
-        // The object decrypts to an asciicast whose only event is the `m` marker
-        // for the transfer (no terminal I/O), and the head recomputes from it.
         let object = object_bytes(fin.source).await;
         let header = seal::parse_header(&object).unwrap();
         let key = seal::unseal_data_key(&header, &secret).unwrap();
@@ -1327,10 +1278,6 @@ mod tests {
         assert!(events[0].1.contains("upload"), "marker carries the audit");
     }
 
-    /// An unusable spool must be refused at setup, before the session runs. Strict
-    /// mode turns this into "no recording, no session" (`recorder_it.rs`'s
-    /// `strict_mode_refuses_when_spool_is_unwritable` drives the same path end to
-    /// end), so it must fail here and not somewhere down the byte path.
     #[test]
     fn an_unusable_spool_dir_fails_before_the_session_starts() {
         let err = match create_spool_file(Some(PathBuf::from("/nonexistent/sessionlayer-spill"))) {
@@ -1340,10 +1287,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
-    /// The byte path is synchronous and runs inline on a runtime worker, so it must
-    /// never issue a filesystem open. Proven by making a new file at the configured
-    /// spool path impossible *after* setup: the parent directory is renamed away, so
-    /// only the descriptor opened up front can still reach the object.
     #[tokio::test]
     async fn spilling_opens_no_file_because_the_byte_path_may_not_block() {
         let (pub_der, secret) = customer_keypair();
@@ -1385,9 +1328,6 @@ mod tests {
         );
         fin.source.resolve().await.expect("writer drained cleanly");
 
-        // Nothing was lost or reordered on the way to disk: the object still decrypts
-        // to the recorded stream under the customer key, and its hash-chain head is
-        // recomputable from the decrypted bytes alone.
         let entries: Vec<_> = std::fs::read_dir(&moved).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1, "exactly one spool object");
         let object = std::fs::read(entries[0].path()).unwrap();
@@ -1527,9 +1467,6 @@ mod tests {
             result.is_err(),
             "an unreachable Control Plane must still surface as an error once retries are exhausted"
         );
-        // finalize_max_attempts=3 with 200ms/400ms backoff between attempts: a
-        // single-shot call fails in a few ms, so this floor only holds if the retry
-        // loop actually slept between attempts instead of giving up after the first.
         assert!(
             elapsed >= std::time::Duration::from_millis(550),
             "expected the bounded retry loop's backoff sleeps to elapse (>=550ms), took {elapsed:?}"

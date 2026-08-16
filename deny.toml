@@ -1,16 +1,9 @@
-# cargo-deny configuration for the SessionLayer Gateway.
-#
-# Strict but passing. Run via `cargo deny check`, in CI and locally.
-# Four checks: advisories (RustSec), licenses, bans, sources.
-
 [graph]
 # Evaluate all targets so a Linux-only dependency (tokio-uring) can't smuggle in
 # an unaudited transitive crate on another platform.
 all-features = true
 
 [advisories]
-# Deny on any security advisory or unmaintained crate. `ignore` holds explicit,
-# justified exceptions (none today).
 db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = []
 yanked = "deny"
@@ -32,19 +25,15 @@ allow = [
     "Unicode-3.0",
 ]
 confidence-threshold = 0.9
-# Per-crate license clarifications/exceptions go here as they arise (none today).
 exceptions = []
 
 [bans]
-# Warn (do not fail) on duplicate versions — common and low-risk in a large
-# transitive graph — but forbid wildcard version requirements in our manifests.
 multiple-versions = "warn"
 wildcards = "deny"
 allow = []
 deny = []
 
 [sources]
-# Only crates.io. No git or alternate-registry dependencies.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,15 +1,3 @@
-# SessionLayer Gateway — hardened Kubernetes deployment.
-#
-# The security-context here is the OUTER layer; the binary applies its own
-# in-process seccomp + Landlock at startup (hardening.* in the Secret below).
-# Together: a non-root, read-only-rootfs, all-capabilities-dropped, no-privilege-
-# escalation, seccomp-confined process whose egress is restricted by the
-# NetworkPolicy in networkpolicy.yaml.
-#
-# This uses the cloud-native port model: the container listens on a high port and
-# a Service maps :22 -> :2222, so no privileged bind (and therefore no in-process
-# privilege drop) is needed. For a bind-:22 host deployment use deploy/systemd/,
-# which exercises the in-process privilege-drop-after-bind instead.
 ---
 apiVersion: v1
 kind: Secret
@@ -66,11 +54,10 @@ stringData:
       }
     }
 ---
-# The anchor `bootstrap.ca_cert_path` names. Without it enrollment fails the
-# no-TOFU check, and the manifest previously mounted only the config over that
-# directory — so the path resolved to nothing and the failure looked like a
-# Control Plane problem. Fill it with the CA served by
-# `GET /v1/cas/mtls/public-key`.
+# The anchor `bootstrap.ca_cert_path` names. Both this ConfigMap and the config Secret must
+# be projected into /etc/sessionlayer: project only one and the path resolves to nothing,
+# enrollment fails the no-TOFU check, and the failure looks like a Control Plane problem.
+# Fill it with the CA served by `GET /v1/cas/mtls/public-key`.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -115,24 +102,17 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: ghcr.io/sessionlayer/gateway:v0.0.2 # pin by digest in production
+          image: ghcr.io/sessionlayer/gateway:v0.0.2
           args: ["--config", "/etc/sessionlayer/gateway.json"]
           ports:
             - { name: ssh, containerPort: 2222 }
             - { name: agent, containerPort: 9444 }
-          # Without requests the Gateway lands in BestEffort and is the first thing the
-          # kubelet evicts under node memory pressure — which drops live sessions, since
-          # this is the process the session bytes flow through. Requests only: a CPU limit
-          # throttles the data path under exactly the load that earned it, and a memory
-          # limit turns a burst of concurrent sessions into an OOMKill mid-session. These
-          # are a scheduling and eviction-ranking floor, not a sizing exercise — size a
-          # real deployment from Capacity planning.
           resources:
             requests:
               cpu: 100m
               memory: 128Mi
           securityContext:
-            allowPrivilegeEscalation: false # sets no_new_privs
+            allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
@@ -143,12 +123,10 @@ spec:
           readinessProbe:
             httpGet: { path: /readyz, port: 8081 }
             periodSeconds: 5
-          # Liveness on the SSH port: restart a wedged (accepting-nothing) Gateway.
           livenessProbe:
             tcpSocket: { port: 2222 }
             periodSeconds: 15
             failureThreshold: 3
-          # Startup slack for enrollment (mTLS bootstrap can take a while).
           startupProbe:
             tcpSocket: { port: 2222 }
             periodSeconds: 5
@@ -158,8 +136,6 @@ spec:
         # PVC (or a StatefulSet) to persist the enrolled identity + generation.
         - name: data
           emptyDir: {}
-        # Both files land in /etc/sessionlayer: the config carries the
-        # enrollment token, the anchor is public.
         - name: config
           projected:
             sources:
@@ -168,10 +144,6 @@ spec:
         - name: tmp
           emptyDir: { medium: Memory }
 ---
-# Without this, a drain of two nodes can evict both replicas at once and take the whole
-# data path with them — every live session, not merely a slower one, because the Gateway
-# is what carries the session bytes. Voluntary disruption only: a real outage still takes
-# what it takes, and the drain budget above is what makes each individual eviction clean.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

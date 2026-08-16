@@ -1,5 +1,3 @@
-//! SFTP decode (metadata only; best-effort, bounded buffers guard hostile client).
-
 use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};

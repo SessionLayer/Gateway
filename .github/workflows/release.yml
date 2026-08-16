@@ -23,9 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: write # gh release upload
-      id-token: write # keyless OIDC for cosign + provenance
-      attestations: write # build-provenance attestation
+      contents: write
+      id-token: write
+      attestations: write
     env:
       BIN: gateway
     steps:
@@ -54,7 +54,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned commit
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.95.0"
 
@@ -94,9 +94,6 @@ jobs:
       - name: Generate SBOM (CycloneDX 1.5, reproducible)
         run: |
           cargo cyclonedx -f json --spec-version 1.5 --all --describe binaries
-          # Strip the nondeterministic metadata.timestamp + random serialNumber so
-          # the SBOM is byte-reproducible (cargo-cyclonedx has no reproducible flag;
-          # 0.5.9 also caps at spec 1.5). The workspace emits per-package SBOMs.
           jq -S 'del(.metadata.timestamp) | del(.serialNumber)' "gateway/${BIN}_bin.cdx.json" > "${BIN}.cdx.json"
           jq -e '.bomFormat=="CycloneDX" and .specVersion=="1.5" and (.components|length>0)' "${BIN}.cdx.json" >/dev/null
 
@@ -153,16 +150,17 @@ jobs:
 
   # The container image carries the same integrity story as the binary: keyless
   # signatures, SLSA provenance and an SBOM, all verified here before the tag is
-  # considered released. No QEMU — the arm64 binary is cross-compiled from the
-  # amd64 runner inside the Dockerfile.
+  # considered released. The arm64 binary is cross-compiled from the amd64 runner
+  # inside the Dockerfile rather than emulated; QEMU is registered below only so
+  # the published arm64 child can be EXECUTED during verification.
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: write # push to GHCR
-      id-token: write # keyless cosign + provenance via ambient GitHub OIDC
-      attestations: write # actions/attest-build-provenance
+      packages: write
+      id-token: write
+      attestations: write
     env:
       IMAGE: ghcr.io/sessionlayer/gateway
     steps:
@@ -191,8 +189,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # sbom + provenance attach an SPDX document and SLSA provenance to the
-      # index as in-toto attestations, one per platform.
       - name: Build and push (linux/amd64 + linux/arm64)
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -208,8 +204,6 @@ jobs:
           sbom: true
           provenance: mode=max
 
-      # --recursive signs each platform manifest, not only the index: a consumer
-      # that resolves the index to its own architecture verifies what it pulled.
       - name: Keyless cosign signature (image index + per-platform manifests)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -222,9 +216,6 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      # A signature nobody verifies is a claim. Every assertion below compares a
-      # specific value; a bare exit code would pass just as happily on an empty
-      # index, an unsigned image, or an SBOM with no components.
       - name: Verify the published image
         env:
           GH_TOKEN: ${{ github.token }}
@@ -259,16 +250,13 @@ jobs:
           [ -n "$CHILDREN" ] || { echo "::error::the index lists no linux platform manifests"; exit 1; }
           for child in $CHILDREN; do verify_signature "${IMAGE}@${child}"; done
 
-          # 2. Exactly the platforms the release claims — not "at least". An unexpected
-          #    third platform means something published that nobody reviewed.
           PLATFORMS=$(jq -r '[.manifests[].platform | select(.os == "linux" and .architecture != "unknown") | .architecture] | sort | unique | join(",")' <<<"$INDEX")
           [ "$PLATFORMS" = "amd64,arm64" ] || { echo "::error::index platforms are '$PLATFORMS', expected exactly 'amd64,arm64'"; exit 1; }
           echo "platforms: $PLATFORMS"
 
           # 3. Provenance, pinned to this workflow on this tag. The bare
           #    `gh attestation verify --repo` form accepts an attestation from any
-          #    workflow in the repository, which is the weaker form our own supply-chain
-          #    guide tells operators not to rely on.
+          #    workflow in the repository, which is the weaker form.
           gh attestation verify "oci://${REF}" \
           	--repo "$GITHUB_REPOSITORY" \
           	--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
@@ -286,29 +274,20 @@ jobs:
           	|| { echo "::error::an SBOM attestation is missing or lists no components"; exit 1; }
           echo "SBOM packages per platform: $(jq -c "$SBOM_COUNTS" sbom.json)"
 
-          # 5. The tag an operator is told to pull resolves to the digest just verified.
-          #    Everything above addresses the image by digest, so a tag that never landed
-          #    or that a concurrent push moved would go unnoticed — and the tag is the
-          #    first hop of the procedure the installation guides document.
           TAG_DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${GITHUB_REF_NAME}" --format '{{json .Manifest}}' | jq -r '.digest')
           [ "$TAG_DIGEST" = "$DIGEST" ] \
           	|| { echo "::error::${IMAGE}:${GITHUB_REF_NAME} resolves to $TAG_DIGEST, not the verified $DIGEST"; exit 1; }
           echo "tag ${GITHUB_REF_NAME} -> $TAG_DIGEST"
 
-
-          # 6. The arm64 child manifest, actually executed. Everything above reads
-          #    index metadata; this is the only step that proves the platform we
-          #    publish for runs at all.
           docker run --rm --platform linux/arm64 "$REF" --version
           echo "arm64 entrypoint ran"
 
           # 7. And an operator holding no credential can obtain it. A GHCR package
           #    created by a workflow is private until its visibility is set, and nothing
           #    in this pipeline sets it — so without this check the whole release goes
-          #    green over an image no one can pull, while the installation guides open
-          #    with `docker pull`. Use the registry's own anonymous token endpoint rather
-          #    than `docker logout`, which does not account for credentials buildx may
-          #    hold elsewhere.
+          #    green over an image no one can pull. Use the registry's own anonymous
+          #    token endpoint rather than `docker logout`, which does not account for
+          #    credentials buildx may hold elsewhere.
           #
           #    "Unreachable" and "refused" must not collapse into one message. A blamed
           #    cause the check cannot actually distinguish is the same defect this whole

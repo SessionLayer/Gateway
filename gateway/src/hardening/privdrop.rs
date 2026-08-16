@@ -1,4 +1,5 @@
-//! Privilege drop (bind:22 as root, run unprivileged; setxid broadcasts to all threads).
+//! Privilege drop: setgroups/setgid/setuid through the glibc/musl `setxid` wrappers,
+//! which broadcast the drop to ALL threads.
 
 use anyhow::{bail, Context};
 use nix::unistd::{setgid, setgroups, setuid, Gid, Group, Uid, User};
@@ -13,7 +14,6 @@ struct ResolvedUser {
     primary_gid: Gid,
 }
 
-/// Drop to user (fail-closed: not root / resolve fail / drop fails reversibility check).
 pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
     let target = resolve_user(user).with_context(|| format!("resolving run_as_user {user:?}"))?;
     let uid = target.uid;
@@ -56,7 +56,6 @@ pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
         bail!("privilege drop is reversible (regained root after setuid); aborting");
     }
 
-    // Confirm the dumpable re-assert held (fail closed).
     if nix::sys::prctl::get_dumpable().context("reading PR_GET_DUMPABLE")? {
         bail!(
             "process still dumpable after privilege drop (setuid re-enabled coredumps); aborting"
@@ -69,7 +68,6 @@ pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
     })
 }
 
-/// Resolve a user by name (NSS) or, failing that, as a bare numeric uid.
 fn resolve_user(spec: &str) -> anyhow::Result<ResolvedUser> {
     if let Some(u) = User::from_name(spec).context("looking up user by name")? {
         return Ok(ResolvedUser {
@@ -95,7 +93,6 @@ fn resolve_user(spec: &str) -> anyhow::Result<ResolvedUser> {
     bail!("no such user {spec:?}")
 }
 
-/// Resolve a group by name (NSS) or as a bare numeric gid.
 fn resolve_group(spec: &str) -> anyhow::Result<Gid> {
     if let Some(g) = Group::from_name(spec).context("looking up group by name")? {
         return Ok(g.gid);

@@ -1,5 +1,5 @@
-# SessionLayer test-node sshd config. Cert-only, non-root, SFTP enabled, VERBOSE
-# logging so the cert key-id (session_id+identity) appears in the node-local log.
+# LogLevel VERBOSE so the cert key-id (session_id+identity) appears in the
+# node-local log.
 Port 22
 AddressFamily any
 
@@ -9,24 +9,19 @@ HostKey /etc/ssh/ssh_host_rsa_key
 
 LogLevel VERBOSE
 
-# Access is short-lived certs only — no passwords, no root, no keyboard-interactive.
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 
-# The crux: the node trusts ONLY the session CA. The presented user
-# certificate must be signed by this CA and carry a principal == the login user.
 TrustedUserCAKeys /etc/ssh/trusted_user_ca.pub
 AuthorizedKeysFile .ssh/authorized_keys
 
-# SFTP subsystem for file-transfer audit tests (both SCP modes + SFTP).
 Subsystem sftp internal-sftp
 
-# X11 + TCP forwarding enabled so the port-forward / X11 data-plane E2E can
-# drive real -L/-R/-X through the Gateway. AllowTcpForwarding is OpenSSH's
-# default (yes) but stated explicitly here; X11 forwarding needs xauth (installed
-# in the image) — DISPLAY is set on the node when the Gateway relays the x11-req.
+# X11 + TCP forwarding are deliberately enabled so the port-forward / X11 E2E
+# can drive real -L/-R/-X through the Gateway; X11 forwarding needs xauth,
+# installed in the image.
 AllowTcpForwarding yes
 X11Forwarding yes
 X11UseLocalhost yes

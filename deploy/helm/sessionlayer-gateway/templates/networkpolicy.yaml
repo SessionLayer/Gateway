@@ -14,8 +14,6 @@ spec:
     - Egress
   ingress:
     - ports:
-        # The outer SSH leg, the agent transport agents dial in on, and /readyz
-        # for the load balancer and the kubelet.
         - protocol: TCP
           port: {{ .Values.ssh.listenPort }}
         - protocol: TCP
@@ -39,7 +37,6 @@ spec:
           port: 53
     {{- end }}
     {{- with .Values.networkPolicy.controlPlanePodSelector }}
-    # Authorize, the lock feed, recording lifecycle, certificate signing, renew.
     - to:
         - podSelector:
             matchLabels:
@@ -49,8 +46,6 @@ spec:
           port: {{ $.Values.networkPolicy.controlPlaneGrpcPort }}
     {{- end }}
     {{- with .Values.networkPolicy.nodeCidrs }}
-    # The SSH nodes this Gateway bridges to, on top of the in-process
-    # loopback-only splice and the node-dial validation.
     - to:
         {{- range . }}
         - ipBlock:
@@ -61,7 +56,6 @@ spec:
           port: 22
     {{- end }}
     {{- with .Values.networkPolicy.wormCidrs }}
-    # Recording uploads. The bytes go straight from here to the object store.
     - to:
         {{- range . }}
         - ipBlock:

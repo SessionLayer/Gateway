@@ -1,9 +1,3 @@
-# The second configuration path: the chart renders gateway.json from these
-# values into a Secret it owns. Everything here is a placeholder.
-#
-# This path puts the enrollment token into a values file and into Helm's own
-# release storage. It suits a one-shot bring-up; for anything longer-lived,
-# ci/production-values.yaml shows the config.existingSecret path instead.
 replicaCount: 1
 
 image:
@@ -27,8 +21,6 @@ ssh:
   listenPort: 2222
   sourceIpAllowlist:
     - 10.0.0.0/8
-  # The load balancer in front of this Gateway sends PROXY protocol v2, so the
-  # allowlist above compares against the client's own address.
   proxy:
     lbCidrs:
       - 10.99.0.0/16

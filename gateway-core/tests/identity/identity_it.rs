@@ -1,5 +1,3 @@
-//! Identity: enroll, renew, generation counter, lockable, renew-ahead loop.
-
 use crate::support::MockCp;
 use gateway_core::identity;
 use std::time::Duration;
@@ -48,7 +46,6 @@ async fn enrollment_token_is_single_use() {
     .await
     .expect("first enrollment succeeds");
 
-    // Replaying the same token is refused (atomic single-use).
     let dir2 = tempfile::tempdir().unwrap();
     let store2 = identity::IdentityStore::open(dir2.path()).unwrap();
     let err = identity::enroll(
@@ -106,14 +103,12 @@ async fn locked_identity_is_refused_and_credential_unchanged() {
     .await
     .unwrap();
 
-    // A lockable principal: a locked identity cannot renew (fail closed).
     cp.lock_gateway(&c0.gateway_id);
     let err = identity::renew(&store, &params, &c0)
         .await
         .expect_err("a locked identity must be refused");
     assert!(matches!(err, identity::IdentityError::Rpc(_)));
 
-    // The on-disk credential is unchanged — we never adopted anything.
     assert_eq!(store.load().unwrap().unwrap().generation, 0);
 }
 
@@ -298,7 +293,6 @@ async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past()
             .await;
     });
 
-    // Real state, not a fixed sleep: wait for the immediate trigger to actually renew once.
     tokio::time::timeout(Duration::from_secs(5), async {
         while rx.borrow_and_update().generation < 1 {
             rx.changed().await.unwrap();
@@ -315,8 +309,8 @@ async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past()
         loop {
             match rx.changed().await {
                 Ok(()) if rx.borrow().generation > 1 => return true,
-                Ok(()) => continue,     // spurious wakeup at the same generation
-                Err(_) => return false, // sender dropped with the loop (not a spin)
+                Ok(()) => continue,
+                Err(_) => return false,
             }
         }
     })
@@ -331,19 +325,17 @@ async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past()
     assert_eq!(cp.recorded_generation(&gateway_id), Some(1));
 }
 
-/// The floor closed the `base == 0` trigger but left the
-/// `remaining == 0` one open. When the CP issues a certificate that is ALREADY EXPIRED at
-/// the Gateway's clock (clock skew beyond the TTL, or a near-zero CP TTL), the `remaining/2`
-/// cap collapsed the floor to zero and the loop renewed at RPC rate — 40 generations in 2s
-/// in the reliability repro. The RPC keeps *succeeding* (the CP validates against its own
-/// clock), so nothing self-limits, and each iteration churns the generation counter, which
-/// is the clone-detection primitive.
+/// When the CP issues a certificate that is ALREADY EXPIRED at the Gateway's clock (clock
+/// skew beyond the TTL, or a near-zero CP TTL), a `remaining/2` cap on the post-renewal
+/// floor collapses it to zero and the loop renews at RPC rate. The RPC keeps *succeeding*
+/// (the CP validates against its own clock), so nothing self-limits, and each iteration
+/// churns the generation counter, which is the clone-detection primitive.
 ///
 /// This drives the real LOOP (not the helper) with `cert_ttl(0)` — `validity_window()` then
 /// returns not_after = now, i.e. "the certificate the CP issued is already expired at us".
-/// The fix bounds the renewals to ~1/min (retry-bounded, NOT terminal — a terminal exit on a
-/// fleet-wide CP misconfig would be fail-deadly; cross-repo aligned with the Agent), so a few
-/// generations over the window instead of hundreds, and the loop keeps running.
+/// The bound must be retry-bounded, NOT terminal: a terminal exit on a fleet-wide CP
+/// misconfig would be fail-deadly, so the loop keeps running at a few generations over the
+/// window instead of hundreds.
 #[tokio::test]
 async fn renew_ahead_loop_does_not_storm_when_the_cp_issues_an_already_expired_cert() {
     let cp = MockCp::builder()

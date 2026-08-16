@@ -1,5 +1,3 @@
-//! Legacy SCP-over-exec decode (metadata only; best-effort, stops on bad framing).
-
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -227,7 +225,7 @@ mod tests {
         let mut stream = Vec::new();
         stream.extend_from_slice(format!("C0644 {} greeting.txt\n", content.len()).as_bytes());
         stream.extend_from_slice(content);
-        stream.push(0); // trailing NUL
+        stream.push(0);
 
         let audits = d.feed(TapDirection::Input, &stream);
         assert_eq!(audits.len(), 1);
@@ -295,7 +293,7 @@ mod tests {
         let mut d = ScpDecoder::new(true, b"/srv/data".to_vec());
         let content = b"x";
         let mut stream = Vec::new();
-        stream.extend_from_slice(b"\x01scp: warning: something\n"); // in-band warning
+        stream.extend_from_slice(b"\x01scp: warning: something\n");
         stream.extend_from_slice(format!("C0644 {} f.txt\n", content.len()).as_bytes());
         stream.extend_from_slice(content);
         stream.push(0);

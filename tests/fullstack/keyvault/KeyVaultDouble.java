@@ -29,40 +29,16 @@ import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 
 /**
- * A standalone Azure Key Vault REST double for the full-stack harness: HTTPS,
- * a real P-256 key, and the two operations the Control Plane's Key Vault CA
- * backend performs against a live vault — fetch the public JWK at CA
- * adoption, sign a SHA-256 digest per certificate.
+ * A standalone Azure Key Vault REST double: a separate process rather than an in-JVM
+ * double, because the full-stack harness runs a packaged jar and the vault has to be
+ * reachable over a socket.
  *
- * <p>It is a separate process rather than the in-JVM double the Control
- * Plane's own unit tests use ({@code KeyVaultRestDouble}) because the
- * full-stack harness runs a packaged jar in a different process: the vault
- * has to be reachable over a socket.
- *
- * <p>It DOES issue the real {@code WWW-Authenticate} challenge: any request
- * with no {@code Authorization: Bearer} header gets a 401 naming a tenant and
- * a resource, exactly like a real vault. This is load-bearing, not
- * decorative — the SDK's challenge policy sends the very first request with
- * an empty body (an unauthenticated endpoint must never see the real
- * payload), and only replays with the real body once it has a token for the
- * scope the challenge named. A double that skipped the challenge would only
- * ever see that empty probe. See {@code README.md} in this directory for the
- * hostname requirement this implies (a real vault's challenge {@code
- * resource} can only be satisfied by a request host that is a subdomain of
- * it, which no IP literal can be).
- *
- * <p>The challenge means the Control Plane's credential now has to actually
- * obtain a token, so this double also serves the App Service managed-identity
- * protocol — a second, PLAIN HTTP listener (real Azure's own equivalent
- * endpoint is plain HTTP to a loopback address, so this is the faithful
- * choice, not a shortcut) answering {@code GET /msi/token}. It is a separate
- * {@link HttpServer}, never routed through {@link #dispatch}, so it cannot
- * end up behind the vault's own challenge — a credential would need a token
- * to fetch a token, which is unrecoverable. It hands back an unvalidated
- * token unconditionally; nothing downstream of it checks the value.
- *
- * <p>Run with the single-file source launcher:
- * {@code java KeyVaultDouble.java --keystore kv.p12 --storepass <pw> --hostname sl.vault.azure.net --key-name session-ca --request-log requests.log}
+ * <p>It DOES issue the real {@code WWW-Authenticate} challenge: any request with no
+ * {@code Authorization: Bearer} header gets a 401 naming a tenant and a resource,
+ * exactly like a real vault. This is load-bearing, not decorative — the SDK's challenge
+ * policy sends the very first request with an empty body, and only replays with the real
+ * body once it has a token for the scope the challenge named. A double that skipped the
+ * challenge would only ever see that empty probe.
  */
 public final class KeyVaultDouble {
 
@@ -70,8 +46,6 @@ public final class KeyVaultDouble {
 	private static final Base64.Encoder B64URL = Base64.getUrlEncoder().withoutPadding();
 	private static final Base64.Decoder B64URL_DEC = Base64.getUrlDecoder();
 
-	// Matches ControlPlane's own KeyVaultRestDouble (unit-tested against the genuine SDK)
-	// so both doubles exercise the identical challenge shape.
 	private static final String CHALLENGE_AUTHORIZATION =
 			"https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000";
 	private static final String CHALLENGE_RESOURCE = "https://vault.azure.net";
@@ -81,10 +55,6 @@ public final class KeyVaultDouble {
 	}
 
 	private final KeyPair caKey;
-	// Generated once, unrelated to caKey. FaultMode.WRONG_KEY signs with this instead
-	// of caKey — the fault injection (the Control Plane must verify every
-	// signature against the pinned public key and refuse, never accept a signature from
-	// whichever key actually signed it).
 	private final KeyPair wrongKey;
 	private final String keyName;
 	private final AtomicInteger signCount = new AtomicInteger();
@@ -135,11 +105,6 @@ public final class KeyVaultDouble {
 		msi.start();
 		String msiUrl = "http://127.0.0.1:" + msi.getAddress().getPort() + "/msi/token";
 
-		// This double will sit in the repo alongside real code forever, so its nature is
-		// never left to be inferred from the port it opens: it is not Azure Key Vault, it
-		// answers every request with no credential check at all, and it carries a
-		// fault-injection admin surface (/_test/fault-mode) that can make it sign with the
-		// wrong key on request. Say so loudly, every time it starts.
 		System.out.println("=================================================================");
 		System.out.println("TEST DOUBLE — this is NOT Azure Key Vault.");
 		System.out.println("It is a fake Key Vault key/crypto endpoint (plus a fake managed-");
@@ -194,10 +159,6 @@ public final class KeyVaultDouble {
 				respond(exchange, 200, setFaultMode(exchange.getRequestURI().getRawQuery()));
 				return;
 			}
-			// The real challenge dance: an unauthenticated request gets a 401 naming the tenant
-			// and resource to get a token for, never the real response — matching Key Vault
-			// means the SDK's first (deliberately bodyless) probe MUST be refused here, not
-			// quietly served.
 			if (!bearerPresent) {
 				respondChallenge(exchange);
 				return;
@@ -229,13 +190,9 @@ public final class KeyVaultDouble {
 
 	/**
 	 * The App Service managed-identity protocol (msal4j's {@code
-	 * AppServiceManagedIdentitySource}): a plain GET carrying {@code
-	 * X-IDENTITY-HEADER} and {@code resource}/{@code api-version} query params,
-	 * answered with an unvalidated bearer token. This is a genuinely different
-	 * code path from the tenant/authority-validated OAuth2 flow the vault's own
-	 * challenge triggers — no authority, no tenant, nothing here checks the
-	 * header value, matching "any token satisfies the double" for the vault
-	 * side too.
+	 * AppServiceManagedIdentitySource}): a plain GET carrying {@code X-IDENTITY-HEADER}
+	 * and {@code resource}/{@code api-version} query params, answered with an unvalidated
+	 * bearer token.
 	 */
 	private void handleMsiToken(HttpExchange exchange) throws IOException {
 		byte[] body = exchange.getRequestBody().readAllBytes();
@@ -250,12 +207,9 @@ public final class KeyVaultDouble {
 	}
 
 	/**
-	 * Test-only admin surface, not part of the Key Vault REST API: toggles
-	 * whether {@link #signResponse} signs with the real CA key or
-	 * {@link #wrongKey}. Kept as a runtime toggle rather
-	 * than a process restart with a different key so the harness never has to
-	 * rebind the vault to a new port mid-run — the Control Plane's {@code
-	 * vault-uri}/{@code keyReference} are fixed at boot.
+	 * Kept as a runtime toggle rather than a process restart with a different key, so the
+	 * harness never has to rebind the vault to a new port mid-run — the Control Plane's
+	 * {@code vault-uri}/{@code keyReference} are fixed at boot.
 	 */
 	private String setFaultMode(String rawQuery) {
 		String mode = queryParam(rawQuery, "mode");

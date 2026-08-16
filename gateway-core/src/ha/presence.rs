@@ -1,5 +1,3 @@
-//! HA ownership WRITE path and local owner cache: heartbeat loop, PresenceStore seam.
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -39,7 +37,6 @@ impl From<PresenceHeartbeatResponse> for PresenceState {
     }
 }
 
-/// Fail-closed: a failed heartbeat means this Gateway does not (yet) own the node.
 #[derive(Debug, thiserror::Error)]
 pub enum PresenceError {
     #[error("presence RPC failed: {0}")]
@@ -61,13 +58,11 @@ pub type PresenceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PresenceState, PresenceError>> + Send + 'a>>;
 pub type ReleaseFuture<'a> = Pin<Box<dyn Future<Output = Result<(), PresenceError>> + Send + 'a>>;
 
-/// Presence WRITE seam. Production: CP gRPC client. OWNER is always this Gateway (from mTLS peer).
 pub trait PresenceStore: Send + Sync {
     fn heartbeat<'a>(&'a self, node_id: &'a str, gateway_addr: &'a str) -> PresenceFuture<'a>;
     fn release<'a>(&'a self, node_id: &'a str) -> ReleaseFuture<'a>;
 }
 
-/// Production: CP `Presence` gRPC client (fail-closed). Gateway has no DB.
 pub struct CpPresenceStore {
     cpauth: Arc<CpAuthClient>,
 }
@@ -120,7 +115,6 @@ impl OwnerCache {
         }
     }
 
-    /// Lower nonce is dropped (stale owner); equal-or-higher updates. Empty owner ignored.
     pub fn observe(&self, node_id: &str, owner_id: &str, addr: &str, nonce: u64) {
         if owner_id.is_empty() {
             return;
@@ -128,7 +122,7 @@ impl OwnerCache {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get(node_id) {
             if nonce < existing.nonce {
-                return; // never overwrite a higher nonce with a lower one
+                return;
             }
         }
         map.insert(
@@ -227,7 +221,6 @@ impl HeartbeatLoop {
         }
     }
 
-    /// Returns whether this is a change (a transition), not merely the steady state.
     fn mark_self_owned(&self, node: &str) -> bool {
         self.self_owned
             .lock()
@@ -304,17 +297,14 @@ mod tests {
         cache.observe("node-a", "gw-B", "gw-b:9444", 5);
         assert_eq!(cache.get("node-a").unwrap().owner_id, "gw-B");
 
-        // A lower nonce (a superseded owner) must NOT overwrite the higher one.
         cache.observe("node-a", "gw-STALE", "gw-stale:9444", 3);
         let got = cache.get("node-a").unwrap();
         assert_eq!(got.owner_id, "gw-B");
         assert_eq!(got.nonce, 5);
 
-        // An equal-or-higher nonce updates the owner (a real failover).
         cache.observe("node-a", "gw-C", "gw-c:9444", 6);
         assert_eq!(cache.get("node-a").unwrap().owner_id, "gw-C");
 
-        // An empty owner is ignored (no fresh owner to record).
         cache.observe("node-b", "", "", 1);
         assert!(cache.get("node-b").is_none());
     }
@@ -323,7 +313,6 @@ mod tests {
     fn owner_cache_get_expires_after_ttl() {
         let cache = OwnerCache::new(Duration::from_millis(0));
         cache.observe("node-a", "gw-B", "gw-b:9444", 1);
-        // TTL is zero, so any elapsed time makes it stale.
         std::thread::sleep(Duration::from_millis(5));
         assert!(
             cache.get("node-a").is_none(),
@@ -332,8 +321,6 @@ mod tests {
         assert_eq!(cache.len(), 1, "but it remains cached until overwritten");
     }
 
-    /// An in-memory presence store recording heartbeats + releases, with a self-owner knob and
-    /// an optional per-RPC delay (to exercise the concurrency budget).
     struct FakeStore {
         heartbeats: Mutex<Vec<(String, String)>>,
         releases: Mutex<Vec<String>>,
@@ -399,7 +386,6 @@ mod tests {
     }
 
     fn registry_with(nodes: &[&str]) -> Arc<AgentRegistry> {
-        // Size the registry to the node count (the large-fleet test registers 100).
         let reg = Arc::new(AgentRegistry::new(nodes.len().max(16)));
         // Leak the receivers so the registrations stay live for the test's lifetime.
         for n in nodes {
@@ -445,7 +431,6 @@ mod tests {
             "gw-self:9444".into(),
             Duration::from_secs(10),
         );
-        // Pretend last tick owned node-a AND node-gone; node-gone is no longer registered.
         let mut prev: HashSet<String> = ["node-a".to_string(), "node-gone".to_string()]
             .into_iter()
             .collect();
@@ -469,16 +454,13 @@ mod tests {
             Duration::from_secs(10),
         );
         let mut prev = HashSet::new();
-        loop_.tick(&mut prev).await; // must not panic
+        loop_.tick(&mut prev).await;
         assert!(
             cache.get("node-a").is_none(),
             "a failed heartbeat records no owner"
         );
     }
 
-    /// Ownership transitions are edge-triggered, not per-tick: an operator watching
-    /// `presence_transitions` sees one failover, not one line per heartbeat. A failed
-    /// heartbeat is its own signal and must NOT read as a failover.
     #[tokio::test]
     async fn presence_counters_track_transitions_not_ticks() {
         use crate::telemetry::metrics::testutil::CounterProbe;
@@ -514,16 +496,13 @@ mod tests {
         );
         assert_eq!(probe.read(PRESENCE_TRANSITIONS, &standby), None);
 
-        // The CP hands the node to a peer: exactly one standby transition, however many
-        // ticks the standby log line then repeats for.
         store.self_owner.store(false, Ordering::SeqCst);
         loop_.tick(&mut prev).await;
         loop_.tick(&mut prev).await;
         assert_eq!(probe.read(PRESENCE_TRANSITIONS, &standby), Some(1));
 
-        // A heartbeat outage is counted as an outage — and must not manufacture a failover.
         store.self_owner.store(true, Ordering::SeqCst);
-        loop_.tick(&mut prev).await; // re-acquire
+        loop_.tick(&mut prev).await;
         assert_eq!(probe.read(PRESENCE_TRANSITIONS, &acquired), Some(2));
         store.fail.store(true, Ordering::SeqCst);
         loop_.tick(&mut prev).await;
@@ -544,7 +523,6 @@ mod tests {
             "recovering from an outage is not a fresh acquisition either"
         );
 
-        // Drain hands ownership back — the signal that proves a drain actually released.
         assert_eq!(probe.read(PRESENCE_TRANSITIONS, &released), None);
         loop_.release_all_owned().await;
         assert_eq!(probe.read(PRESENCE_TRANSITIONS, &released), Some(1));
