@@ -19,7 +19,7 @@ pub enum CoordinationError {
 pub type PublishFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CoordinationError>> + Send + 'a>>;
 
-/// Signalling only — the byte relay is separate and the bus never carries session bytes.
+/// Signalling only - the byte relay is separate and the bus never carries session bytes.
 pub trait CoordinationBackend: Send + Sync {
     fn publish_dial_back<'a>(
         &'a self,

@@ -1,9 +1,9 @@
-# SessionLayer Gateway — hardened production image.
+# SessionLayer Gateway - hardened production image.
 #
 # Both base images are pinned to their multi-arch INDEX digest. A per-platform
 # manifest digest would resolve on one architecture and fail the build on the
 # other; the human tag is kept alongside for legibility. Keep the rust tag equal
-# to rust-toolchain.toml's channel — when they diverge the build still succeeds,
+# to rust-toolchain.toml's channel - when they diverge the build still succeeds,
 # because rustup honours the toml and fetches the pinned toolchain over the
 # network, so the drift is invisible while defeating the pinned builder.
 
@@ -64,7 +64,7 @@ VOLUME ["/var/lib/sessionlayer-gateway"]
 # uid 65532 cannot bind :22; listen high and front it with a Service/LB that maps
 # 22 -> this port (see deploy/kubernetes/gateway.yaml). For a bind-:22 deployment
 # use the systemd unit (deploy/systemd/), which drops privileges in-process after
-# the bind — a path this image deliberately does not take, since a container that
+# the bind - a path this image deliberately does not take, since a container that
 # starts as root to drop later is a worse posture than one that is never root.
 EXPOSE 2222 9444
 

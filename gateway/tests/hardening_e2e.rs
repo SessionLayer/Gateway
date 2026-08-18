@@ -1,5 +1,5 @@
-//! Spawns the `hardening-canary` binary — which applies the REAL `gateway::hardening`
-//! seccomp/Landlock/coredump code to itself in a fresh process — and asserts on the
+//! Spawns the `hardening-canary` binary - which applies the REAL `gateway::hardening`
+//! seccomp/Landlock/coredump code to itself in a fresh process - and asserts on the
 //! outcome, so nothing sandboxes the test runner. The authoritative full-session proof
 //! (real CP + node + binary under the profile) is the full-stack harness under
 //! `FS_HARDENING=full`.

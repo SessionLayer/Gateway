@@ -15,7 +15,7 @@ connectors:
         # legs (host_verify, node.connect, bridge_setup) are queryable against it.
         buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]
     dimensions:
-      # Low-cardinality closed enums only (never session_id/correlation_id/node_id —
+      # Low-cardinality closed enums only (never session_id/correlation_id/node_id -
       # those stay on the trace, never on a metric dimension).
       - name: sessionlayer.outcome
       - name: sessionlayer.access_model
@@ -29,7 +29,7 @@ exporters:
     resource_to_telemetry_conversion:
       enabled: true
 
-  # The trace store. Substitute your own endpoint — Tempo, Jaeger and any other
+  # The trace store. Substitute your own endpoint - Tempo, Jaeger and any other
   # OTLP-native backend take this unchanged. It exists because `spanmetrics` is a
   # CONNECTOR, not an exporter: it consumes the span to derive RED metrics and stores
   # nothing. A traces pipeline exporting only to the connector therefore produces healthy

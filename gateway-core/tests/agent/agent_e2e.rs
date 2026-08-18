@@ -684,7 +684,7 @@ async fn a_live_agent_channel_makes_this_gateway_claim_fresh_presence() -> anyho
         claimed.as_deref(),
         Some(GW_NAME),
         "a registered agent control channel must produce a fresh presence claim owned by \
-         THIS gateway, by name — the CP names that owner back to the operator as \
+         THIS gateway, by name - the CP names that owner back to the operator as \
          owningGateway, so the value is the assertion"
     );
 

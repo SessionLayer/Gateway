@@ -38,7 +38,7 @@ impl<S> WsByteStream<S> {
     /// `max_frame_bytes` (the negotiated bound is on the PAYLOAD). The asymmetry is safe
     /// and intentional: each side's *receive* guard bounds the payload inclusively at
     /// `max_frame_bytes`, and each side's WebSocket message ceiling is
-    /// `max_frame_bytes + HEADER_LEN` (see [`ws_config`](super::ws_config)) — so an
+    /// `max_frame_bytes + HEADER_LEN` (see [`ws_config`](super::ws_config)) - so an
     /// Agent-sized frame (header + full payload) still clears the Gateway's receive limits.
     /// The Gateway staying a header under the bound just means its own frames never sit
     /// exactly on the ceiling; do not "align" it and churn the frozen wire behaviour for a

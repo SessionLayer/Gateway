@@ -1,7 +1,7 @@
-# SessionLayer Gateway — release supply chain.
+# SessionLayer Gateway - release supply chain.
 #
 # On a `v*` tag: build the `gateway` binary REPRODUCIBLY, emit a CycloneDX SBOM,
-# a SLSA build-provenance attestation, and keyless (OIDC) cosign signatures —
+# a SLSA build-provenance attestation, and keyless (OIDC) cosign signatures -
 # no long-lived signing key. All third-party actions are SHA-pinned; the trailing
 # `# vX.Y.Z` is the human tag. Policy: inventory + integrity, NEVER an
 # NVD/OWASP scanner.
@@ -35,7 +35,7 @@ jobs:
       # The tag is what every artifact is named and labelled after; the manifest
       # is what the binary reports about itself. Nothing forced them to agree, so
       # a tag on an unbumped tree would publish artifacts whose contents disagree
-      # with their names — and for the Agent that is the anti-rollback floor, not
+      # with their names - and for the Agent that is the anti-rollback floor, not
       # a cosmetic mismatch.
       - name: Assert the manifest version matches the tag
         run: |
@@ -67,13 +67,13 @@ jobs:
       # vendored third_party/russh), the cargo registry, AND the double-build's
       # alternate $RUNNER_TEMP/repro target dir (below) out of the binary make it
       # byte-reproducible for an independent rebuilder. The third rule exists
-      # because build.rs (tonic-prost-build) generates code under OUT_DIR — which
-      # lives under the target dir, not under $PWD — and a panic/track_caller
+      # because build.rs (tonic-prost-build) generates code under OUT_DIR - which
+      # lives under the target dir, not under $PWD - and a panic/track_caller
       # location in that generated code embeds OUT_DIR's absolute path; without
       # this rule the two builds' target dirs diverge and the digests never match
       # (the same build.rs pattern breaks reproducibility for the Agent release too,
       # since it generates code under OUT_DIR the same way). (Residual: the std
-      # sysroot path — bounded by pinning the exact toolchain, documented.)
+      # sysroot path - bounded by pinning the exact toolchain, documented.)
       - name: Compute deterministic build env
         run: |
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
@@ -131,7 +131,7 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }} # via env — never interpolate a ref into the shell
+          TAG: ${{ github.ref_name }} # via env - never interpolate a ref into the shell
         run: |
           # view-then-create, not create-then-swallow-any-error: a bare
           # `gh release create || echo "already exists"` treats an auth/API
@@ -169,7 +169,7 @@ jobs:
 
       # Registering binfmt lets the arm64 child manifest be executed on this
       # amd64 runner. Without it the arm64 half of every published index would be
-      # a platform nobody has ever run — a manifest that claims more than was
+      # a platform nobody has ever run - a manifest that claims more than was
       # checked.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -284,7 +284,7 @@ jobs:
 
           # 7. And an operator holding no credential can obtain it. A GHCR package
           #    created by a workflow is private until its visibility is set, and nothing
-          #    in this pipeline sets it — so without this check the whole release goes
+          #    in this pipeline sets it - so without this check the whole release goes
           #    green over an image no one can pull. Use the registry's own anonymous
           #    token endpoint rather than `docker logout`, which does not account for
           #    credentials buildx may hold elsewhere.
@@ -299,12 +299,12 @@ jobs:
           	"https://ghcr.io/token?scope=repository:${NAME}:pull&service=ghcr.io" || echo 000)
           case "$TOKEN_HTTP" in
           	200) ;;
-          	000) echo "::error::could not reach ghcr.io's token endpoint — this check is INCONCLUSIVE, not a pass"; exit 1 ;;
-          	*) echo "::error::ghcr.io refused an anonymous pull token for ${NAME} (HTTP $TOKEN_HTTP) — the package is private, so no operator can pull what this release published"; exit 1 ;;
+          	000) echo "::error::could not reach ghcr.io's token endpoint - this check is INCONCLUSIVE, not a pass"; exit 1 ;;
+          	*) echo "::error::ghcr.io refused an anonymous pull token for ${NAME} (HTTP $TOKEN_HTTP) - the package is private, so no operator can pull what this release published"; exit 1 ;;
           esac
           TOKEN=$(jq -r '.token // empty' /tmp/ghcr-token.json)
           [ -n "$TOKEN" ] \
-          	|| { echo "::error::ghcr.io returned 200 with no token for ${NAME} — INCONCLUSIVE"; exit 1; }
+          	|| { echo "::error::ghcr.io returned 200 with no token for ${NAME} - INCONCLUSIVE"; exit 1; }
 
           CODE=$(curl -sSL --retry 3 --retry-connrefused --max-time 30 -o /dev/null -w '%{http_code}' \
           	-H "Authorization: Bearer $TOKEN" \
@@ -312,7 +312,7 @@ jobs:
           	"https://ghcr.io/v2/${NAME}/manifests/${DIGEST}" || echo 000)
           case "$CODE" in
           	200) echo "anonymous pull: 200" ;;
-          	000) echo "::error::could not reach ghcr.io to resolve ${IMAGE}@${DIGEST} — INCONCLUSIVE, not a pass"; exit 1 ;;
-          	401|403) echo "::error::${IMAGE} is not anonymously pullable (HTTP $CODE) — the GHCR package is private"; exit 1 ;;
+          	000) echo "::error::could not reach ghcr.io to resolve ${IMAGE}@${DIGEST} - INCONCLUSIVE, not a pass"; exit 1 ;;
+          	401|403) echo "::error::${IMAGE} is not anonymously pullable (HTTP $CODE) - the GHCR package is private"; exit 1 ;;
           	*) echo "::error::anonymous resolve of ${IMAGE}@${DIGEST} returned HTTP $CODE"; exit 1 ;;
           esac

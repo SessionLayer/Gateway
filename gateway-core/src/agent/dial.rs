@@ -61,7 +61,7 @@ impl NodeConnector for AgentDial {
 
             // Deny wins, and deny fails CLOSED. An unhealthy lock feed
             // cannot confirm the ABSENCE of a lock, so an empty deny-set is NOT evidence the
-            // agent is unlocked — refuse rather than mint a single-use dial-back capability
+            // agent is unlocked - refuse rather than mint a single-use dial-back capability
             // for a peer we cannot vouch for. The session path reaches the
             // same conclusion from the same signal (handler.rs local_recheck).
             if !self.lock_set.healthy() {

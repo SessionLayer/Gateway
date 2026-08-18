@@ -118,7 +118,7 @@ impl DialBackSigner {
     ///
     /// The signature is verified over the **transmitted bytes** first; only then are
     /// they decoded. The signer-fingerprint equality that follows is defense in
-    /// depth — a token from another key already fails the signature check, since
+    /// depth - a token from another key already fails the signature check, since
     /// this process holds exactly one key and never trusts one from the wire.
     pub fn verify(
         &self,

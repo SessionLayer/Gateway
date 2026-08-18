@@ -195,7 +195,7 @@ pub async fn bind(
         tracing::warn!("outer SSH leg enabled with an EMPTY source-IP gate (allow-all); set ssh.source_ip_allowlist to restrict access");
     }
     if config.proxy.lb_cidrs.is_empty() {
-        tracing::warn!("PROXY protocol is OFF (ssh.proxy.lb_cidrs empty); behind an L4 LB the LB address would become the source IP for every client — set lb_cidrs");
+        tracing::warn!("PROXY protocol is OFF (ssh.proxy.lb_cidrs empty); behind an L4 LB the LB address would become the source IP for every client - set lb_cidrs");
     }
 
     let host_key = load_or_generate_host_key(&config.host_key_path)?;
@@ -480,7 +480,7 @@ mod tests {
 
         // Bounds on the two values HELLO_ACK proposes. The Agent enforces the SAME
         // range, so a Gateway outside it would boot healthy and then be refused by
-        // every Agent in the fleet — reject it at startup, loudly.
+        // every Agent in the fleet - reject it at startup, loudly.
         for outside in [
             AgentTransportConfig {
                 max_frame_bytes: 2 * 1024 * 1024,

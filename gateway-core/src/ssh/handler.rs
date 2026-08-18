@@ -89,7 +89,7 @@ pub struct HandlerDeps {
     pub live_sessions: Arc<LiveSessionRegistry>,
     pub config: Arc<SshServerConfig>,
     /// ProxyJump host-cert MITM state. `Some` only when `ssh.proxy_jump.enabled`;
-    /// `None` means a `direct-tcpip` is NOT terminated as a jump hop — it falls
+    /// `None` means a `direct-tcpip` is NOT terminated as a jump hop - it falls
     /// through to the ordinary local port-forward path, which still requires
     /// `Capability::PortForwardLocal`.
     pub proxy_jump: Option<Arc<crate::ssh::proxyjump::ProxyJumpState>>,
@@ -128,7 +128,7 @@ pub struct SshHandler {
     reverse_dispatcher: Option<tokio::task::JoinHandle<()>>,
     local_forward_pumps: tokio::task::JoinSet<()>,
     /// Count of credential-resolution attempts (bounds the CP-RPC amplification
-    /// per connection — russh does NOT enforce its own `max_auth_attempts`).
+    /// per connection - russh does NOT enforce its own `max_auth_attempts`).
     auth_attempts: usize,
     session_abort: Option<Arc<AtomicBool>>,
     live_guard: Option<SessionGuard>,
@@ -622,7 +622,7 @@ impl SshHandler {
 
         // Pass the shared session-abort flag DIRECTLY so the output pump observes a
         // lock/expiry teardown even for the non-strict disabled recorder (whose
-        // should_abort() is always false) — symmetric with the input path.
+        // should_abort() is always false) - symmetric with the input path.
         let abort = self
             .session_abort
             .clone()
@@ -647,7 +647,7 @@ impl SshHandler {
         let grant_expiry_skew_secs = self.deps.config.reeval.grant_expiry_skew_secs;
 
         // A BREAK-GLASS session is authorized ONCE by its single-use token and does NOT
-        // re-authorize — a re-auth would replay the consumed token (fail-closed replay-DENY).
+        // re-authorize - a re-auth would replay the consumed token (fail-closed replay-DENY).
         // Its deny-side safety comes from the pushed LockFeed + conservative
         // grant_expiry, enforced in (b)/(d). When the feed is UNHEALTHY it cannot confirm the
         // absence of a lock, so it refuses NEW privileged channel-opens (fail closed);
@@ -878,7 +878,7 @@ impl SshHandler {
                         recorder,
                         lock_set: self.deps.lock_set.clone(),
                         // The LIVE bindings (shared with SessionControl), not a frozen
-                        // clone — a mid-session re-auth relabel must gate reverse opens too.
+                        // clone - a mid-session re-auth relabel must gate reverse opens too.
                         bindings: self
                             .session_control
                             .as_ref()
@@ -926,7 +926,7 @@ impl SshHandler {
             task.abort();
         }
         // Defense in depth: a break-glass session MUST be time-boxed. A missing
-        // grant_expiry is a contract violation — tear it down rather than run unbounded.
+        // grant_expiry is a contract violation - tear it down rather than run unbounded.
         // (local_recheck (b) already refuses the channel; this is the backstop.)
         if grant_expiry == 0 && self.session_is_break_glass() {
             if let Some(control) = self.session_control.clone() {
@@ -970,7 +970,7 @@ impl SshHandler {
         let Some(control) = self.session_control.clone() else {
             return;
         };
-        // Start the idle clock now — a zero "last activity" would fire instantly.
+        // Start the idle clock now - a zero "last activity" would fire instantly.
         self.activity
             .store(now_epoch_secs().max(0) as u64, Ordering::Relaxed);
         let activity = self.activity.clone();
@@ -1093,7 +1093,7 @@ impl SshHandler {
                 };
                 // Credential-principal reducer, backstop half: sending the scope to the CP
                 // is what makes the refusal auditable, but re-checking it here is what makes
-                // it unforgeable — a CP older than the contract field, or one that ignores
+                // it unforgeable - a CP older than the contract field, or one that ignores
                 // it, still cannot hand this Gateway an out-of-scope allow. Checked against
                 // the SIGNED principal, the login everything downstream actually runs as.
                 // Its own reason: a CP allow the Gateway then refuses is an anomaly, not the
@@ -1174,7 +1174,7 @@ impl SshHandler {
                 })
             }
             _ => {
-                // DENY, a Lock, no-match, or ALLOW-without-token — one generic
+                // DENY, a Lock, no-match, or ALLOW-without-token - one generic
                 // denial to the user; the CP logged the specific reason.
                 tracing::info!(source_ip = %self.source_ip, session_id = %self.session_id, break_glass = self.break_glass, outcome = "policy_denied", reason = "authorization_denied", "generic denial");
                 Err(SshOutcome::PolicyDenied)
@@ -1301,8 +1301,8 @@ impl SshHandler {
     fn inner_leg_config(&self, context_idle_secs: i64) -> InnerLegConfig {
         let inner = &self.deps.config.inner;
         // Transport-level backstop for the per-session idle bound: the effective
-        // idle plus a small slack so the watchdog — which attributes IDLE_TIMEOUT and runs the
-        // clean teardown — is ALWAYS the enforcer. Clamping the backstop to exactly `static`
+        // idle plus a small slack so the watchdog - which attributes IDLE_TIMEOUT and runs the
+        // clean teardown - is ALWAYS the enforcer. Clamping the backstop to exactly `static`
         // let russh race the watchdog and report CLOSED.
         let idle = effective_idle_secs(inner.max_session_idle_secs, context_idle_secs)
             .saturating_add(IDLE_BACKSTOP_SLACK_SECS);
@@ -1354,9 +1354,9 @@ impl Drop for SshHandler {
         if let Some(rec) = self.recorder.take() {
             self.deps.finalize_tracker.spawn(rec.finalize());
         }
-        // Release the concurrency lease on EVERY teardown path — including the
+        // Release the concurrency lease on EVERY teardown path - including the
         // degraded ones where FinalizeRecording never fires. Drop is the one funnel every
-        // path ends in, so this single send site is the exactly-once guard. Best-effort —
+        // path ends in, so this single send site is the exactly-once guard. Best-effort -
         // the CP-side lease expiry/reaper self-heals a lost signal.
         if self.lease_expected.load(Ordering::SeqCst) {
             self.deps.finalize_tracker.spawn(Box::pin(send_session_end(
@@ -1398,7 +1398,7 @@ impl Handler for SshHandler {
         // possession check is what stops a public-key holder getting a break-glass session.
         // russh verifies POSSESSION ONLY and does NOT surface the sk assertion flags, so the
         // UP/user-presence (touch) bit is enforced by the AUTHENTICATOR, not asserted
-        // server-side — break-glass keys MUST be provisioned touch-required.
+        // server-side - break-glass keys MUST be provisioned touch-required.
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
         // Resolved eagerly alongside the break-glass lookup below so BOTH outcomes cost the
         // same number of CP round-trips. Resolving the pin only after a break-glass miss
@@ -1418,7 +1418,7 @@ impl Handler for SshHandler {
                 return Ok(auth);
             }
         } else if is_security_key_algorithm(public_key.algorithm()) {
-            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, algorithm = %public_key.algorithm().as_str(), "non-sk-ecdsa security key offered; break-glass supports only sk-ecdsa — routing to the pin path");
+            tracing::warn!(source_ip = %self.source_ip, session_id = %self.session_id, algorithm = %public_key.algorithm().as_str(), "non-sk-ecdsa security key offered; break-glass supports only sk-ecdsa - routing to the pin path");
         }
         self.conn.record_method("publickey-pin");
         let pin = match pin {
@@ -1594,7 +1594,7 @@ impl Handler for SshHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         // A lock or strict-mode teardown flips the shared abort flag; stop forwarding client
-        // bytes to the node AT ONCE — before the async disconnect lands — so no
+        // bytes to the node AT ONCE - before the async disconnect lands - so no
         // keystroke/command reaches the node after a lock. Covers both the strict recorder
         // (torn) and the non-strict/disabled recorder (which shares only session_abort).
         if self
@@ -1821,7 +1821,7 @@ impl Handler for SshHandler {
     }
 
     /// Unbind a remote-forward listener on the node (`cancel-tcpip-forward`). A
-    /// de-escalation — always honored when the inner leg is up (no capability gate).
+    /// de-escalation - always honored when the inner leg is up (no capability gate).
     async fn cancel_tcpip_forward(
         &mut self,
         address: &str,
@@ -1864,7 +1864,7 @@ impl Handler for SshHandler {
                     session.channel_failure(channel)?;
                     return Ok(());
                 }
-                // Cookie is a secret — stored to replay, NEVER logged.
+                // Cookie is a secret - stored to replay, NEVER logged.
                 self.x11_reqs.insert(
                     channel,
                     X11Params {
@@ -1886,7 +1886,7 @@ impl Handler for SshHandler {
     }
 }
 
-/// The SSH capabilities that admit a channel kind — allowed if ANY is granted.
+/// The SSH capabilities that admit a channel kind - allowed if ANY is granted.
 /// Legacy `scp` is `exec` of the `scp` binary with attacker-controlled argv (`scp -S <prog>`,
 /// shell metacharacters), so it can never be a safe standalone capability: it requires EXEC.
 /// Modern scp runs over the SFTP subsystem. An unknown subsystem has NO acceptable
@@ -1907,7 +1907,7 @@ fn capability_granted(accepts: &[Capability], authz: &Authorized) -> bool {
 }
 
 /// Classify a bridged channel for the recorder: a shell / exec is ALWAYS a
-/// terminal (asciicast v2) — a legacy scp-over-exec additionally runs the SCP decoder, but
+/// terminal (asciicast v2) - a legacy scp-over-exec additionally runs the SCP decoder, but
 /// NEVER instead of asciicast, so the exec command string can never suppress content
 /// capture. Only the sftp SUBSYSTEM is decode-only.
 fn classify_rec_kind(kind: &ChannelKind, cols: u16, rows: u16) -> RecChannelKind {
@@ -1948,7 +1948,7 @@ fn break_glass_resolved(res: &crate::pb::BreakglassResolution) -> bool {
 }
 
 /// The granted capabilities from the decision context; default shell+exec when
-/// the context declares none. This returns whatever the context grants —
+/// the context declares none. This returns whatever the context grants -
 /// agent forwarding is refused unconditionally in `agent_request`, not filtered
 /// out here.
 fn granted_capabilities(context: Option<&DecisionContext>) -> Vec<i32> {
@@ -1960,7 +1960,7 @@ fn granted_capabilities(context: Option<&DecisionContext>) -> Vec<i32> {
 
 /// The Linux login the inner leg runs as: the one the CP SIGNED, never the one the
 /// client asked for. The two agree only because the CP echoes the request back into
-/// the context, which is the CP's property and not this component's — so a context
+/// the context, which is the CP's property and not this component's - so a context
 /// naming a different login is a mis-bound decision and fails closed here rather than
 /// silently authenticating to the node as somebody else.
 fn inner_leg_principal(context: &DecisionContext, requested: &str) -> Result<String, SshOutcome> {
@@ -2034,7 +2034,7 @@ fn access_model_label(access_model: i32) -> &'static str {
 }
 
 /// A random session id for this connect: a canonical RFC 4122 v4 UUID string. The CP
-/// `parseUuid`s it — an un-dashed hex blob is rejected and denies the connect (fail-closed
+/// `parseUuid`s it - an un-dashed hex blob is rejected and denies the connect (fail-closed
 /// `missing_input`). Kept dependency-free over the existing CSPRNG.
 fn new_session_id() -> String {
     use rand_core::RngCore;
@@ -2055,7 +2055,7 @@ pub(crate) fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Whether a grant with a fixed expiry is expired against the local clock, CONSERVATIVELY —
+/// Whether a grant with a fixed expiry is expired against the local clock, CONSERVATIVELY -
 /// early, never late. With a non-negative `skew_secs` the grant is
 /// treated as expired that many seconds BEFORE `grant_expiry`, so a fast local clock never
 /// serves a new privileged channel past the real expiry. `grant_expiry == 0` means "no fixed
@@ -2077,7 +2077,7 @@ fn effective_idle_secs(static_secs: u64, context_secs: i64) -> u64 {
 /// TIMEOUT also releases it: RFC 4254 gives no way to retract the request
 /// once sent, so a stalling node must not be able to pin this slot for the rest of
 /// the connection no matter how many times the operator asks. An explicit
-/// rejection is left alone — unlike a stalling node, this one is demonstrably
+/// rejection is left alone - unlike a stalling node, this one is demonstrably
 /// still there and answering. This bounds only the per-connection listener
 /// *count*; the actual forwarded traffic remains independently gated by
 /// `allow_remote`/the lock set in the `ReverseDispatcher`, so releasing early on a
@@ -2144,7 +2144,7 @@ fn classify_lease_failure(e: &CpError) -> LeaseRefusal {
 /// Keep a live session's CP concurrency lease stamped (exact accounting): the first
 /// extension fires a lead ahead of `grant_expiry`, then re-extends at half the returned
 /// window. Accounting, never authorization: only a definitive "the lease is gone" verdict
-/// stops the keeper — quietly for an N-1 CP, LOUDLY for a lost live lease. The session itself
+/// stops the keeper - quietly for an N-1 CP, LOUDLY for a lost live lease. The session itself
 /// is never touched.
 async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant_expiry: i64) {
     let mut next_at = if grant_expiry > 0 {
@@ -2173,7 +2173,7 @@ async fn keep_lease_stamped(cpauth: Arc<CpAuthClient>, session_id: String, grant
                     return;
                 }
                 LeaseRefusal::StopLoud => {
-                    tracing::warn!(session_id = %session_id, code = ?e.code(), "live session's lease refused extension — the CP no longer holds it (reaped/released); the concurrency count under-reports until this session ends");
+                    tracing::warn!(session_id = %session_id, code = ?e.code(), "live session's lease refused extension - the CP no longer holds it (reaped/released); the concurrency count under-reports until this session ends");
                     return;
                 }
             },

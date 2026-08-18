@@ -512,7 +512,7 @@ async fn x11_request_relayed_to_node_only_when_granted() -> anyhow::Result<()> {
     .await;
     let _ = node_port;
 
-    // `ssh -Y` (TRUSTED X11) uses the local xauth cookie directly — unlike `-X`
+    // `ssh -Y` (TRUSTED X11) uses the local xauth cookie directly - unlike `-X`
     // (untrusted), which runs `xauth generate` against a live X server (absent
     // here). We set a dummy DISPLAY + cookie so the client actually SENDS the
     // x11-req; the `x11` capability is identical for -X/-Y.

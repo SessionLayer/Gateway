@@ -44,8 +44,8 @@ impl ControlHandle {
     ///
     /// A **bounded `send`, not `try_send`**: a momentary burst of
     /// concurrent sessions to a healthy agent queues and drains rather than shedding the
-    /// 17th onto the "node offline" path. Only a queue that stays full for the whole bound —
-    /// a genuinely saturated or wedged control channel — sheds, and it sheds as the distinct
+    /// 17th onto the "node offline" path. Only a queue that stays full for the whole bound -
+    /// a genuinely saturated or wedged control channel - sheds, and it sheds as the distinct
     /// [`RegistryError::Busy`], never conflated with [`RegistryError::ChannelGone`] (the
     /// agent actually disconnected). Fail-closed either way; the two just log differently.
     pub async fn send_dial_back(

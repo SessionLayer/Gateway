@@ -467,7 +467,7 @@ fn assert_unauthorized(frame: &gateway_core::agent::wire::Frame) {
     assert_eq!(
         wire::as_wire_error(frame).unwrap().code,
         WireErrorCode::Unauthorized as i32,
-        "the peer learns only UNAUTHORIZED — never which check failed"
+        "the peer learns only UNAUTHORIZED - never which check failed"
     );
 }
 

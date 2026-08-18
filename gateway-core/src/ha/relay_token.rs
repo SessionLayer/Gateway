@@ -16,7 +16,7 @@ use crate::ssh::connector::ByteStream;
 
 const ENVELOPE: &str = "SLGW1";
 
-/// Domain separation for the signature — the trailing NUL is part of the domain.
+/// Domain separation for the signature - the trailing NUL is part of the domain.
 const DOMAIN: &[u8] = b"sessionlayer-gw-relay-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

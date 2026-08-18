@@ -35,7 +35,7 @@ pub enum CpError {
     #[error("Control Plane RPC timed out after {0:?}")]
     Timeout(Duration),
 
-    /// Only the gRPC status **code** is rendered — never the CP-supplied message (untrusted wire text).
+    /// Only the gRPC status **code** is rendered - never the CP-supplied message (untrusted wire text).
     #[error("Control Plane RPC failed (gRPC status {:?})", .0.code())]
     Rpc(tonic::Status),
 }

@@ -10,7 +10,7 @@ struct Cli {
     /// `wss://host:port` of the Gateway's agent transport.
     #[arg(long)]
     endpoint: String,
-    /// The Gateway's enrolled name — the server name its certificate must present.
+    /// The Gateway's enrolled name - the server name its certificate must present.
     #[arg(long)]
     server_name: String,
     /// PEM file: the internal mTLS CA the Agent already holds.

@@ -1,6 +1,6 @@
 //! Cardinality is an operational hazard, not a style question: every attribute value here
 //! comes from a closed Rust enum. A session id, node id, node name, agent id, lock id or
-//! source IP MUST NOT reach a metric attribute — those stay on the log line.
+//! source IP MUST NOT reach a metric attribute - those stay on the log line.
 
 use std::sync::OnceLock;
 
@@ -20,7 +20,7 @@ pub const ATTR_TRANSITION: &str = "transition";
 
 /// The `outcome=` log label for a fail-closed node-reachability failure. It is private on
 /// purpose: a call site can only obtain it from [`Counted::outcome`], which only
-/// [`node_unreachable`] can mint — so the log label and the counter cannot drift apart.
+/// [`node_unreachable`] can mint - so the log label and the counter cannot drift apart.
 const OUTCOME_NODE_UNREACHABLE: &str = "node_unreachable";
 
 /// Where the failure was detected. Derived from the reason, never passed in, so no site can
@@ -153,7 +153,7 @@ impl UnreachableReason {
 
 /// Proof that a node-unreachable event was counted, and the only source of its two log
 /// labels. Its field is private to this module, so `SshOutcome::NodeUnreachable` cannot be
-/// constructed anywhere in the crate without going through [`node_unreachable`] — a new
+/// constructed anywhere in the crate without going through [`node_unreachable`] - a new
 /// fail-closed site cannot forget the counter, and the compiler says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Counted(UnreachableReason);
@@ -330,7 +330,7 @@ fn counters() -> &'static GatewayCounters {
 }
 
 /// Bind the counters to `meter`; returns whether THIS call bound them. Binding is one-shot
-/// per process because an instrument holds its provider — production binds right after
+/// per process because an instrument holds its provider - production binds right after
 /// [`super::init`] installs the OTLP meter provider, and a test must bind before any counter
 /// is touched (`cargo nextest` gives one process per test; a shared-process runner cannot
 /// isolate a process-global provider).

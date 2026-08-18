@@ -56,14 +56,14 @@ pub fn confine(cfg: &LandlockConfig, log_status: bool) -> anyhow::Result<()> {
                     read_write = cfg.read_write_paths.len(),
                     abi_target = ?LANDLOCK_ABI,
                     "Landlock partially enforced: some requested access rights were downgraded. \
-                     Filesystem confinement is active but narrower than configured — check both \
+                     Filesystem confinement is active but narrower than configured - check both \
                      the kernel's Landlock ABI and whether any configured path is a regular file \
                      rather than a directory"
                 );
             }
             RulesetStatus::NotEnforced => {
                 tracing::warn!(
-                    "Landlock is unavailable on this kernel (no LSM support); filesystem confinement DISABLED (Accepted-Risk) — rely on the container read-only rootfs + dropped capabilities"
+                    "Landlock is unavailable on this kernel (no LSM support); filesystem confinement DISABLED (Accepted-Risk) - rely on the container read-only rootfs + dropped capabilities"
                 );
             }
         }
@@ -74,7 +74,7 @@ pub fn confine(cfg: &LandlockConfig, log_status: bool) -> anyhow::Result<()> {
 fn enforce_required(required: bool, ruleset: RulesetStatus) -> anyhow::Result<()> {
     if required && !matches!(ruleset, RulesetStatus::FullyEnforced) {
         anyhow::bail!(
-            "landlock.required is set but Landlock is only {ruleset:?} on this kernel — refusing \
+            "landlock.required is set but Landlock is only {ruleset:?} on this kernel - refusing \
              to start a Tier-0 Gateway without full filesystem confinement (fail closed)"
         );
     }

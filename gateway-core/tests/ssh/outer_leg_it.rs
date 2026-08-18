@@ -591,7 +591,7 @@ async fn cp_down_during_resolution_e2e() -> anyhow::Result<()> {
 
     // CP-down during resolution: the pin resolve returns UNAVAILABLE; the
     // publickey attempt degrades to keyboard-interactive, which surfaces the generic
-    // "service temporarily unavailable" — NOT a plain auth failure. Fail closed.
+    // "service temporarily unavailable" - NOT a plain auth failure. Fail closed.
     cp.set_resolve_unavailable(true);
     let (code, _stdout, stderr) = ssh_exec(
         &container,
@@ -830,7 +830,7 @@ async fn a_long_lived_key_offered_as_a_standing_path_is_refused() -> anyhow::Res
 }
 
 /// A credential-scope refusal must be a CP DECISION, not a Gateway pre-empt. The client
-/// cannot tell the denials apart — that is intended — but the CP is the sole writer of
+/// cannot tell the denials apart - that is intended - but the CP is the sole writer of
 /// the decision log, so a refusal it never sees is a refusal no auditor can see either.
 /// What these assertions pin is that the RPC happened and carried the scope.
 #[tokio::test]
@@ -845,7 +845,7 @@ async fn a_credential_scope_denial_reaches_the_control_plane() -> anyhow::Result
     cp.register_pin(&scoped.fingerprint, "alice", &["deploy"]);
     cp.register_pin(&unscoped.fingerprint, "bob", &[]);
     // RBAC allows alice BOTH logins, so a `root` denial can only be the credential
-    // scope — never the grant evaluation in disguise.
+    // scope - never the grant evaluation in disguise.
     cp.allow("alice", "web-01", "deploy");
     cp.allow("alice", "web-01", "root");
     cp.allow("bob", "web-01", "root");
@@ -992,7 +992,7 @@ async fn the_gateway_refuses_an_out_of_scope_login_the_control_plane_allowed() -
     }
     assert!(
         released,
-        "no lease was released for {session_id}, so the CP denied rather than allowed — \
+        "no lease was released for {session_id}, so the CP denied rather than allowed - \
          the refusal under test was the ordinary deny, not the backstop"
     );
     Ok(())
@@ -1000,7 +1000,7 @@ async fn the_gateway_refuses_an_out_of_scope_login_the_control_plane_allowed() -
 
 /// An unresolvable target is the CP's decision too: it resolves `node_name` server-side
 /// and audits its own no-match, so a local pre-empt would leave a user probing for node
-/// names with no record anywhere. A MALFORMED username stays local by contrast — it
+/// names with no record anywhere. A MALFORMED username stays local by contrast - it
 /// never names a target, so there is no decision to record.
 #[tokio::test]
 async fn an_unresolvable_target_reaches_the_control_plane() -> anyhow::Result<()> {
@@ -1035,7 +1035,7 @@ async fn an_unresolvable_target_reaches_the_control_plane() -> anyhow::Result<()
     );
     let req = cp
         .last_authorize_request()
-        .expect("an unresolvable target must still call Authorize — the CP writes the record");
+        .expect("an unresolvable target must still call Authorize - the CP writes the record");
     assert_eq!(req.node_name, "ghost-node");
     assert!(
         req.node_id.is_empty(),

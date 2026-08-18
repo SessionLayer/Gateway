@@ -221,7 +221,7 @@ async fn a_superseded_owner_refuses_and_the_ingress_fails_closed() {
     assert!(matches!(err, NodeConnectError::Timeout(_)));
     assert!(
         started.elapsed() < Duration::from_secs(10),
-        "a superseded owner must not hang the ingress — fail closed within the bound"
+        "a superseded owner must not hang the ingress - fail closed within the bound"
     );
 }
 

@@ -1,4 +1,4 @@
-# SessionLayer test node — a real OpenSSH server on slim Debian 13, so tests never rely
+# SessionLayer test node - a real OpenSSH server on slim Debian 13, so tests never rely
 # on the host's ssh.
 #
 # The node trusts ONLY the session CA via TrustedUserCAKeys: inject the CA public key at

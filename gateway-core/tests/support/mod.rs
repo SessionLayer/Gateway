@@ -584,7 +584,7 @@ impl GatewayIdentity for MockSvc {
         };
         let (nb, na) = self.validity_window();
         if bad {
-            // Return an unexpected generation without mutating our record — the
+            // Return an unexpected generation without mutating our record - the
             // Gateway must refuse to adopt (security event) and keep its cert.
             return Ok(Response::new(RenewGatewayIdentityResponse {
                 certificate: new_leaf,
@@ -610,7 +610,7 @@ impl GatewayIdentity for MockSvc {
 
     /// Issue the **serverAuth** leaf for the Gateway's agent-facing
     /// WSS listener. Requires the caller's current mTLS client certificate; a locked
-    /// identity is refused. The CP — not the caller — chooses the SANs, stamping them
+    /// identity is refused. The CP - not the caller - chooses the SANs, stamping them
     /// from the gateway_identity row it already holds, so a compromised Gateway cannot
     /// obtain a server certificate for a name it does not own.
     async fn issue_gateway_server_certificate(
@@ -791,7 +791,7 @@ impl MockState {
     /// The mock-side assertion the fix exists for: the credential's login scope must
     /// REACH the CP, because the CP is the only writer of the decision log. Forwarding
     /// nothing, or some other credential's scope, is a Gateway defect rather than a
-    /// policy question, so it surfaces as an RPC error — distinct from every deny.
+    /// policy question, so it surfaces as an RPC error - distinct from every deny.
     fn check_credential_scope_forwarded(&self, r: &AuthorizeRequest) -> Result<(), Status> {
         let scopes = self.resolved_scopes.lock().unwrap();
         let Some(handed_out) = scopes.get(&r.identity) else {
@@ -1477,7 +1477,7 @@ impl Presence for MockSvc {
         &self,
         request: Request<PresenceHeartbeatRequest>,
     ) -> Result<Response<PresenceHeartbeatResponse>, Status> {
-        // The OWNER is the authenticated mTLS peer (its gateway_identity.name) — never a
+        // The OWNER is the authenticated mTLS peer (its gateway_identity.name) - never a
         // request field (the HA trust rule, exactly like the real CP).
         let gid = require_gateway(&request, self)?;
         let owner = self
@@ -1574,7 +1574,7 @@ impl LockFeed for MockSvc {
             return Err(Status::unavailable("lock feed unavailable"));
         }
         // Subscribe to live events BEFORE snapshotting, so an add/remove that races
-        // the snapshot is never lost (a duplicate is harmless — the Gateway dedups).
+        // the snapshot is never lost (a duplicate is harmless - the Gateway dedups).
         let mut events = self.lock_events.subscribe();
         let snapshot = self.locks.lock().unwrap().clone();
         let feed_epoch = self.feed_epoch.load(Ordering::SeqCst);
@@ -2145,7 +2145,7 @@ impl MockCp {
     /// Map a node NAME to a DISTINCT CP id. Without a mapping
     /// the mock resolves a name to itself (pass-through). A distinct mapping lets a test
     /// address by human name yet configure the inventory (`allow`, `set_node_connection`,
-    /// locks) by the id — proving the Gateway forwards the NAME and the whole downstream
+    /// locks) by the id - proving the Gateway forwards the NAME and the whole downstream
     /// keys on the CP-resolved id, not the raw parsed string.
     pub fn map_node_name(&self, name: &str, id: &str) {
         self.state
@@ -2155,8 +2155,8 @@ impl MockCp {
             .insert(name.to_string(), id.to_string());
     }
 
-    /// Make the mock ignore `credential_principals` — a CP older than the field, or one
-    /// that drops it — so it can ALLOW an out-of-scope login. The Gateway's backstop is
+    /// Make the mock ignore `credential_principals` - a CP older than the field, or one
+    /// that drops it - so it can ALLOW an out-of-scope login. The Gateway's backstop is
     /// then the only thing standing between that allow and the node.
     pub fn set_ignores_credential_scope(&self) {
         *self.state.ignore_credential_scope.lock().unwrap() = true;
@@ -2215,7 +2215,7 @@ impl MockCp {
     }
 
     /// The current HA presence owner NAME for `node_id` (for failover assertions), if any.
-    /// Ignores staleness — see [`Self::fresh_presence_owner`] when the claim's FRESHNESS is
+    /// Ignores staleness - see [`Self::fresh_presence_owner`] when the claim's FRESHNESS is
     /// the thing under test.
     pub fn presence_owner(&self, node_id: &str) -> Option<String> {
         self.state
@@ -2678,7 +2678,7 @@ pub async fn outer_leg_deps_named(
     )
     .spawn(shutdown_rx);
     // Wait for the first snapshot so the feed is healthy before the test drives
-    // SSH — deterministic (no spurious first-channel re-authorize).
+    // SSH - deterministic (no spurious first-channel re-authorize).
     for _ in 0..200 {
         if lock_set.healthy() {
             break;

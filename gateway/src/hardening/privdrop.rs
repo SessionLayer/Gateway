@@ -25,7 +25,7 @@ pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
     if !Uid::current().is_root() {
         bail!(
             "run_as_user is set ({user}) but the process is not root (uid {}); \
-             cannot drop privileges — either start as root to bind the privileged \
+             cannot drop privileges - either start as root to bind the privileged \
              port then drop, or clear run_as_user",
             Uid::current()
         );
@@ -50,7 +50,7 @@ pub fn drop_to(user: &str, group: &str) -> anyhow::Result<DropReport> {
     }
     // ...and that it is irreversible (a full setuid from euid 0 also sets the
     // saved-set-uid, so regaining root must now be impossible). If this somehow
-    // succeeds we are unexpectedly root again — abort rather than run on. (A failed
+    // succeeds we are unexpectedly root again - abort rather than run on. (A failed
     // setuid(0) changes no creds, so the dumpable flag set above stays 0.)
     if setuid(Uid::from_raw(0)).is_ok() {
         bail!("privilege drop is reversible (regained root after setuid); aborting");

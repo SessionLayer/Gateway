@@ -5,7 +5,7 @@
 # The agent runs as `deploy` (non-root): it therefore CANNOT read the node host key, so
 # host identity is anchored out-of-band (run.sh generates the key, places it in the
 # container before start, and registers it as the pinned host anchor). It dials OUT and
-# splices each dial-back to AGENT_SPLICE_ADDR — an address it reads from its OWN config,
+# splices each dial-back to AGENT_SPLICE_ADDR - an address it reads from its OWN config,
 # never from the wire. The default is this container's own :22; run.sh overrides it with
 # the port it started this node's sshd on, so the splice target is one the harness
 # created rather than whatever happens to answer on 22.

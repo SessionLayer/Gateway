@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(ha.drain.pre_drain_grace_secs, 5);
         assert_eq!(ha.drain.deadline_secs, 30);
         // The relay deadline must sit under the SSH login grace so a hung peer never hangs the
-        // handshake — AND above the owner's worst-case establish budget (dial-back + handshake,
+        // handshake - AND above the owner's worst-case establish budget (dial-back + handshake,
         // ~20s) so a slow-but-healthy owner is not abandoned.
         assert!((ha.routing.relay_timeout_secs) < GatewayConfig::default().ssh.login_grace_secs);
         assert!(ha.routing.relay_timeout_secs > 20);

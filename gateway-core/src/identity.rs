@@ -31,7 +31,7 @@ pub enum IdentityError {
     #[error("keypair/CSR generation failed: {0}")]
     Csr(#[from] rcgen::Error),
 
-    /// Caller fails closed. Only gRPC status **code** rendered — never CP message (log-injection guard).
+    /// Caller fails closed. Only gRPC status **code** rendered - never CP message (log-injection guard).
     #[error("Control Plane refused the identity RPC (gRPC status {:?})", .0.code())]
     Rpc(#[from] tonic::Status),
 
@@ -215,7 +215,7 @@ impl IdentityStore {
     fn persist_issued(&self, issued: IssuedCredential) -> Result<Credential, IdentityError> {
         // Persist-AFTER-validate: reject a bad CP-supplied validity window BEFORE
         // it can reach disk. Otherwise a hostile/corrupt epoch would be written,
-        // and every subsequent restart `load()` would fail — a permanent
+        // and every subsequent restart `load()` would fail - a permanent
         // crash-loop brick. Validating here keeps the bad value off disk.
         validated_window(
             issued.not_before_epoch_seconds,
@@ -429,8 +429,8 @@ pub fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), Id
 /// Minimum spacing between two *consecutive* successful renewals.
 ///
 /// After a renewal the loop re-derives its schedule from the NEW certificate. If that
-/// certificate is already past its renew trigger — a short TTL with a clock-skew
-/// backdate, or a CP clock ahead of ours — [`compute_renew_delay`] returns
+/// certificate is already past its renew trigger - a short TTL with a clock-skew
+/// backdate, or a CP clock ahead of ours - [`compute_renew_delay`] returns
 /// `ZERO` and the loop would renew back-to-back, hammering the CP and burning
 /// generations. Flooring the *post-renewal* wait bounds that.
 const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
@@ -442,7 +442,7 @@ const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// **Retry-bounded, NOT terminal.**
 /// The likeliest cause of an already-expired *issued* certificate is the **CP's** clock or
-/// TTL config, common to the whole fleet — a terminal exit here would make every Gateway and
+/// TTL config, common to the whole fleet - a terminal exit here would make every Gateway and
 /// Agent stop simultaneously on one central misconfig (fail-deadly). So the loop keeps
 /// renewing, bounded to ≈1/min, and logs the condition loudly instead; the generation
 /// counter (a clone-detection signal) stays usable rather than being churned or frozen.
@@ -546,7 +546,7 @@ impl RenewAhead {
                 random_jitter_sample(),
             );
             // A credential loaded near expiry SHOULD renew at once, so the floor applies
-            // only after a successful renewal — where a zero delay would be a hot spin
+            // only after a successful renewal - where a zero delay would be a hot spin
             // against the CP rather than a legitimate catch-up.
             let delay = if just_renewed {
                 let now = SystemTime::now();
@@ -554,7 +554,7 @@ impl RenewAhead {
                     tracing::error!(
                         gateway_id = %current.gateway_id,
                         generation = current.generation,
-                        "RENEW-STORM GUARD: adopted a certificate already expired at this Gateway's clock (clock skew beyond the certificate TTL, or a CP TTL misconfiguration) — renewal continues bounded to ~1/min; fix NTP / the CP certificate TTL (operator action required)"
+                        "RENEW-STORM GUARD: adopted a certificate already expired at this Gateway's clock (clock skew beyond the certificate TTL, or a CP TTL misconfiguration) - renewal continues bounded to ~1/min; fix NTP / the CP certificate TTL (operator action required)"
                     );
                 }
                 let remaining = current
@@ -595,14 +595,14 @@ impl RenewAhead {
                     tracing::error!(
                         expected,
                         got,
-                        "SECURITY: generation mismatch on renewal — refusing to adopt and stopping renew-ahead (identity may be cloned; operator action required)"
+                        "SECURITY: generation mismatch on renewal - refusing to adopt and stopping renew-ahead (identity may be cloned; operator action required)"
                     );
                     return;
                 }
                 Err(e) if is_repair_needed(&e) => {
                     tracing::error!(
                         error = %e,
-                        "REPAIR-NEEDED: renewal rejected by the Control Plane (locked / unknown cert / stale generation) — stopping renew-ahead; re-enrollment required"
+                        "REPAIR-NEEDED: renewal rejected by the Control Plane (locked / unknown cert / stale generation) - stopping renew-ahead; re-enrollment required"
                     );
                     return;
                 }
@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn rpc_error_and_boundary_wrap_do_not_leak_cp_message() {
         // A hostile CP status message with ANSI + newline must not reach a log or
-        // startup-stderr sink — neither via the error's own Display, nor via the
+        // startup-stderr sink - neither via the error's own Display, nor via the
         // source chain that `#[from] tonic::Status` establishes when the error is
         // wrapped for propagation to `fn main`'s Termination Debug-print.
         let hostile = "evil\n\u{1b}[2Jline";

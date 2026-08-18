@@ -199,8 +199,8 @@ impl InnerClient {
         // minimizing its residency. This is the last `Arc` ref (the auth future's
         // clone is already released), so the drop runs
         // `ssh_key::EcdsaPrivateKey`'s zeroizing `Drop`, scrubbing the P-256
-        // scalar; the source PEM is `Zeroizing`. The residual — un-scrubbed
-        // transient encode/decode scratch across the ssh_key 0.6↔0.7 PEM hand-off —
+        // scalar; the source PEM is `Zeroizing`. The residual - un-scrubbed
+        // transient encode/decode scratch across the ssh_key 0.6↔0.7 PEM hand-off -
         // is library-internal, reachable only via a coredump/swap, and covered by
         // the process hardening (PR_SET_DUMPABLE=0 + RLIMIT_CORE=0,
         // `hardening::coredump`).
@@ -593,7 +593,7 @@ mod tests {
         }
         assert!(
             accepting.len() >= 7,
-            "scraper found only {} accepting callbacks — the parse likely broke, \
+            "scraper found only {} accepting callbacks - the parse likely broke, \
              which would make this guard vacuous: {accepting:?}",
             accepting.len()
         );

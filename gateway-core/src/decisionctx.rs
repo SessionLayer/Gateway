@@ -16,7 +16,7 @@ pub const DOMAIN_PREFIX: &[u8] = b"sessionlayer:decision-context:v1\n";
 /// CP's `DecisionContextSigning.SIGNER_URI`.
 pub const SIGNER_URI: &str = "sessionlayer://decision-context-signer";
 
-/// The deterministic proto serialization of a context — the exact bytes the CP
+/// The deterministic proto serialization of a context - the exact bytes the CP
 /// signs and transmits as `signed_context` (the CP `DecisionContextCodec.canonicalBytes`
 /// analogue; no map fields, so encoding is stable across languages). Used by the
 /// mock CP harness to produce a signed context.
@@ -61,7 +61,7 @@ pub fn verify_decision_context(
     let (_, leaf) =
         X509Certificate::from_der(signer_cert_der).map_err(|_| VerifyError::LeafParse)?;
 
-    // (1) Chain to a PINNED internal mTLS CA — never the CP-supplied chain. The
+    // (1) Chain to a PINNED internal mTLS CA - never the CP-supplied chain. The
     // CONTEXT_SIGNER leaf is issued directly by the internal mTLS CA (a one-level
     // chain, matching the single-TrustAnchor PKIX path). We verify the leaf's
     // signature with each pinned anchor's public key and require the issuer name

@@ -17,7 +17,7 @@ on:
         default: full
   # Run the hardened profile on PRs that touch the data plane / hardening / harness,
   # so the seccomp/Landlock allow-list is verified against the REAL data path (russh,
-  # rustls-ring, tonic mTLS, hyper WORM, splice) continuously — not only in the
+  # rustls-ring, tonic mTLS, hyper WORM, splice) continuously - not only in the
   # subprocess canary. Repo-relative paths (CI checks this repo out into Gateway/).
   pull_request:
     paths:
@@ -104,8 +104,8 @@ jobs:
           TOPOLOGY: ${{ matrix.topology }}
           # The load-bearing hardening gate: the real session runs UNDER
           # seccomp=enforce + Landlock. Non-dispatch runs (PR/nightly) default to full.
-          # The agent topology does not take a hardening profile — its Gateway config has
-          # no hardening block — so the hardened data path is proven by the core leg.
+          # The agent topology does not take a hardening profile - its Gateway config has
+          # no hardening block - so the hardened data path is proven by the core leg.
           FS_HARDENING: ${{ github.event.inputs.fs_hardening || 'full' }}
         run: |
           set -euo pipefail

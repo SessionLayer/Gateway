@@ -491,8 +491,8 @@ async fn await_finalized(cp: &MockCp) -> gateway_core::pb::FinalizeRecordingRequ
 }
 
 //
-// The client image bakes OpenSSH's `sk-dummy.so` — a virtual FIDO2 authenticator
-// — so a genuine `ecdsa-sk` key is enrolled and the stock `ssh` client produces a
+// The client image bakes OpenSSH's `sk-dummy.so` - a virtual FIDO2 authenticator
+// - so a genuine `ecdsa-sk` key is enrolled and the stock `ssh` client produces a
 // REAL FIDO possession signature. russh verifies that signature server-side before
 // `auth_publickey`, which then resolves the key as a break-glass credential. This
 // is the primary break-glass auth path end-to-end.
@@ -525,7 +525,7 @@ async fn sk_ecdsa_fido2_break_glass_session_e2e() -> anyhow::Result<()> {
     let client = client_container().await;
 
     // Enroll a REAL FIDO2 ecdsa-sk key with the virtual authenticator. It is
-    // TOUCH-REQUIRED (no `-O no-touch-required`) — the correct break-glass deployment
+    // TOUCH-REQUIRED (no `-O no-touch-required`) - the correct break-glass deployment
     // (UP is authenticator-enforced, so prod keys must require touch). sk-dummy
     // auto-asserts user-presence, so the touch key still drives non-interactively.
     let (code, _out, stderr) = ssh_exec(
@@ -903,7 +903,7 @@ async fn break_glass_without_grant_expiry_is_refused() -> anyhow::Result<()> {
         KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
     );
     // The CP signs a break-glass ALLOW with grant_expiry==0 (a contract violation).
-    // The GW must fail closed — an always-available override MUST be time-boxed. A REAL
+    // The GW must fail closed - an always-available override MUST be time-boxed. A REAL
     // node is wired so that WITHOUT the fix the session would run (echo SHOULD_NOT_RUN).
     cp.set_grant_expiry(0);
     cp.register_offline_code("bg-noexp", "breakglass-admin", &["deploy"]);

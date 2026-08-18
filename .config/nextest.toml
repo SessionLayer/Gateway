@@ -2,7 +2,7 @@
 # the complete failure picture, and surface failing-test output inline.
 #
 # `retries = 2`: the Docker/testcontainers integration tests are subject to a
-# transient rootless-Docker infra flake — under parallelism (a 2-core box runs
+# transient rootless-Docker infra flake - under parallelism (a 2-core box runs
 # ~2 Docker tests at once, each starting MinIO + a node container) the RootlessKit
 # port manager races on ephemeral host ports and returns
 # `AddPort(): bind: address already in use`, failing container startup for a

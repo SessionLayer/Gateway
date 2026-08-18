@@ -696,7 +696,7 @@ mod tests {
     }
 
     /// Waiting for `live_sessions.len() == 0` after `terminate_all()` is only safe if this
-    /// wait genuinely observes the count draining — so returning PROMPTLY matters as much
+    /// wait genuinely observes the count draining - so returning PROMPTLY matters as much
     /// as blocking. (A faithful live-session variant needs a real russh `Handle` in
     /// `SessionControl`, which only the Docker E2E provides.)
     #[tokio::test]

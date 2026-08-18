@@ -82,8 +82,8 @@ struct Inner {
     handshake_timeout: Duration,
     heartbeat: Duration,
     max_frame_bytes: usize,
-    /// Caps concurrent connections — the permit is held for the whole connection,
-    /// not just the handshake — so unauthenticated peers cannot exhaust the Gateway
+    /// Caps concurrent connections - the permit is held for the whole connection,
+    /// not just the handshake - so unauthenticated peers cannot exhaust the Gateway
     /// before presenting a certificate.
     connection_slots: Arc<tokio::sync::Semaphore>,
     shutdown: watch::Receiver<bool>,
@@ -106,9 +106,9 @@ impl BoundAgentTransport {
 
         // Readiness gate: do NOT begin serving agents until the lock feed
         // has delivered its first snapshot. This makes the boot race structurally
-        // impossible rather than merely denied — a locked agent that reconnects during boot
+        // impossible rather than merely denied - a locked agent that reconnects during boot
         // is not even handshaked until we can evaluate the deny-set. A feed that never
-        // connects means we serve no agent nodes (they are "offline") — the correct
+        // connects means we serve no agent nodes (they are "offline") - the correct
         // deny-wins trade. `refuse_if_locked` then keeps failing closed if the feed later
         // drops mid-life.
         tokio::select! {
@@ -307,7 +307,7 @@ fn spawn_server_cert_renewal(
             let now = std::time::SystemTime::now();
             if identity::expired_at_issue(now, not_after) {
                 tracing::error!(
-                    "RENEW-STORM GUARD: the Control Plane issued an agent-facing certificate already expired at this Gateway's clock (clock skew or CP TTL misconfiguration) — reissue continues bounded to ~1/min; fix NTP / the CP certificate TTL (operator action required)"
+                    "RENEW-STORM GUARD: the Control Plane issued an agent-facing certificate already expired at this Gateway's clock (clock skew or CP TTL misconfiguration) - reissue continues bounded to ~1/min; fix NTP / the CP certificate TTL (operator action required)"
                 );
             }
             let delay = identity::reissue_delay(now, not_before, not_after);
@@ -442,7 +442,7 @@ async fn handshake(
     let tls = acceptor.accept(tcp).await.map_err(ConnError::Tls)?;
 
     // The verifier already required a client certificate; keep the leaf DER and resolve the
-    // peer identity AFTER the role (path) is known — an agent and a peer gateway resolve
+    // peer identity AFTER the role (path) is known - an agent and a peer gateway resolve
     // from different SANs. Nothing on the wire can assert an identity.
     let leaf_der = {
         let (_, conn) = tls.get_ref();
@@ -491,12 +491,12 @@ async fn handshake(
 /// The agent-surface Lock gate. Used at registration, on every heartbeat tick, and at
 /// dial-back redemption.
 ///
-/// **Deny fails closed.** An unhealthy deny-feed — before the first snapshot at boot, or
-/// after the CP stream drops — cannot confirm the ABSENCE of a lock, and an empty
+/// **Deny fails closed.** An unhealthy deny-feed - before the first snapshot at boot, or
+/// after the CP stream drops - cannot confirm the ABSENCE of a lock, and an empty
 /// `LockSet` is indistinguishable from "no lock applies". So an unconfirmable deny-set is
 /// treated as a deny, exactly as the session path does (`handler.rs` local_recheck). The
 /// availability cost is deliberate: while the feed is down this Gateway serves NO agent
-/// nodes — they are simply "offline", the correct deny-wins trade. In practice the cost is
+/// nodes - they are simply "offline", the correct deny-wins trade. In practice the cost is
 /// small: a down lock stream usually means the CP is down, and `Authorize` already fails
 /// closed, so few new sessions were possible anyway.
 fn refuse_if_locked(inner: &Inner, peer: &AgentPeer) -> Result<(), ConnError> {
@@ -695,7 +695,7 @@ where
                             // own node/agent: an agent must not be able to
                             // cancel another session's dial-back by naming its request_id.
                             // Render the error as its typed enum (a closed set), never the
-                            // raw wire value — no peer text transits this line.
+                            // raw wire value - no peer text transits this line.
                             let code = crate::pbagent::DialBackErrorCode::try_from(result.error)
                                 .unwrap_or(crate::pbagent::DialBackErrorCode::Unspecified);
                             tracing::info!(node = %sanitize(&peer.node_name), error = ?code, "agent refused a dial-back (fast-fail)");
@@ -816,7 +816,7 @@ where
 
     refuse_if_locked(inner, peer)?;
 
-    // The jti is pending — and removing it IS consumption — and the pending entry's
+    // The jti is pending - and removing it IS consumption - and the pending entry's
     // {node, session, principal, agent} equal the payload's. Consumed LAST so a rogue
     // presentation cannot burn a legitimate agent's token.
     let ready = inner.deps.pending.consume(&payload)?;
@@ -1005,9 +1005,9 @@ where
 /// Strip characters that could forge or corrupt an operator log line from untrusted
 /// peer-supplied text.
 ///
-/// `char::is_control()` covers only category **Cc** (C0/C1 + DEL) — it misses the four
+/// `char::is_control()` covers only category **Cc** (C0/C1 + DEL) - it misses the four
 /// classes that actually enable log/terminal attacks, so we strip them too:
-/// line/paragraph separators (Zl/Zp — new-line forging in JSON/log pipelines), bidi
+/// line/paragraph separators (Zl/Zp - new-line forging in JSON/log pipelines), bidi
 /// controls (reorder the rendered line to read as something else), zero-width/format
 /// characters (defeat grep and alerting), and the BOM. The inputs on this surface are
 /// short cert-derived identifiers and diagnostic strings, so dropping the (rare,

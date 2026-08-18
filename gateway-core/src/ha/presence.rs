@@ -533,7 +533,7 @@ mod tests {
         // A Gateway holding many nodes must refresh them within the staleness TTL. With a
         // per-RPC delay a SERIAL loop would take node_count * delay (well past any TTL); the
         // bounded fan-out completes in ~ceil(node_count / K) * delay. 100 nodes @ 20ms serial is
-        // 2s; concurrent (~16-wide) is ~140ms — assert we are comfortably under a 1s budget AND
+        // 2s; concurrent (~16-wide) is ~140ms - assert we are comfortably under a 1s budget AND
         // that every node was actually heartbeated.
         let store = FakeStore::with_delay(true, Duration::from_millis(20));
         let names: Vec<String> = (0..100).map(|i| format!("node-{i}")).collect();
