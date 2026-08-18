@@ -251,7 +251,7 @@ impl AgentClient {
                 return;
             }
             // Backoff WITH jitter: a fleet that dropped together (a Gateway restart) must
-            // not reconnect in lockstep. `[0.5, 1.5)` of the current backoff — a test
+            // not reconnect in lockstep. `[0.5, 1.5)` of the current backoff - a test
             // double that violated the spec would be a bad oracle.
             let jittered = {
                 use rand_core::RngCore;

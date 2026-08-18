@@ -3,7 +3,7 @@
 # RUSTSEC-2023-0071 (Marvin timing side-channel in `rsa`) is IGNORED here as a
 # permanently accepted risk, for the following reason:
 #   * The Gateway uses ONLY ECDSA P-256 (inner-leg keys, mTLS identity). `rsa`
-#     is an OPTIONAL dependency of `ssh-key` that we never enable — verified by
+#     is an OPTIONAL dependency of `ssh-key` that we never enable - verified by
 #     `cargo tree -e features -i rsa` (empty) and by `cargo build --all-features`
 #     never compiling `rsa`. `cargo deny` (feature-aware) agrees: "advisories ok".
 #   * `rsa` is only pinned in Cargo.lock's optional-dependency superset, which

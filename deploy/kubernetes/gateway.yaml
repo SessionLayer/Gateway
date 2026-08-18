@@ -76,7 +76,7 @@ spec:
   # Two replicas without an `ha.coordination` block leaves the in-process
   # backend, which cannot signal a peer pod: each Gateway is unaware of the
   # other, so a session whose Agent channel is owned by the sibling is not
-  # relayed to it. `ha.mode` does not change that — it is only logged. Set
+  # relayed to it. `ha.mode` does not change that - it is only logged. Set
   # `ha.coordination.backend` in the config above before running more than one.
   replicas: 2
   selector:

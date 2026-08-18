@@ -1,6 +1,6 @@
 # seccomp cannot filter by destination, so egress confinement is enforced at the network
 # layer: this default-deny-egress policy permits ONLY the connections the Gateway
-# legitimately makes, and drops everything else — the metadata service, and arbitrary
+# legitimately makes, and drops everything else - the metadata service, and arbitrary
 # internet hosts a compromised process might exfiltrate to.
 #
 # Requires a CNI that enforces NetworkPolicy (Cilium, Calico, …).

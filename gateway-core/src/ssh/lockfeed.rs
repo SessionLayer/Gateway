@@ -132,7 +132,7 @@ impl LockFeedClientTask {
             Event::Added(lock) => {
                 let id = crate::ssh::handler::sanitize(&lock.lock_id);
                 // Add to the deny-set FIRST, then scan the registry: this closes the
-                // teardown TOCTOU — a session that registers concurrently is caught
+                // teardown TOCTOU - a session that registers concurrently is caught
                 // by the scan, and a session whose per-channel lock-check races the
                 // add sees it in the set (pairs with the handler's post-register
                 // re-check).

@@ -57,13 +57,13 @@ const AGENT_URI_PREFIX: &str = "sessionlayer://agent/";
 
 /// The URI SAN scheme the CP stamps into a GATEWAY identity certificate
 /// (`sessionlayer://gateway/<uuid>`). Its PRESENCE is the positive gateway check on the
-/// peer-relay path: a CA never issues this SAN to a non-gateway, so requiring it — not merely
-/// the ABSENCE of an agent URI SAN — closes the residual where a leaf carrying only a
+/// peer-relay path: a CA never issues this SAN to a non-gateway, so requiring it - not merely
+/// the ABSENCE of an agent URI SAN - closes the residual where a leaf carrying only a
 /// gateway-named dNSName could be mistaken for a gateway.
 const GATEWAY_URI_PREFIX: &str = "sessionlayer://gateway/";
 
 /// The peer an agent connection resolves to, taken **only** from its mTLS client
-/// certificate — the CP stamped both SANs, so neither is self-asserted. `AgentHello`
+/// certificate - the CP stamped both SANs, so neither is self-asserted. `AgentHello`
 /// deliberately has nowhere to claim an identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPeer {
@@ -127,7 +127,7 @@ pub fn peer_identity(cert_der: &[u8]) -> Result<AgentPeer, PeerError> {
 /// The HA routing key is the gateway NAME (`gateway_identity.name`), which the CP stamps as
 /// the **dNSName SAN** alongside a `sessionlayer://gateway/<uuid>` URI SAN. A gateway peer must
 /// therefore satisfy BOTH: exactly one dNSName SAN (the name we return) AND a present gateway
-/// URI SAN (the positive check). A certificate carrying an *agent* URI SAN is an agent —
+/// URI SAN (the positive check). A certificate carrying an *agent* URI SAN is an agent -
 /// refused on this gateway-only path. The relay token binding (`owner_gateway_id == this
 /// name`) is the second, decisive check at the call site.
 pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
@@ -152,7 +152,7 @@ pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
             }
         }
     }
-    // Positive check: a gateway MUST carry the gateway URI SAN, not merely lack an agent one —
+    // Positive check: a gateway MUST carry the gateway URI SAN, not merely lack an agent one -
     // otherwise a leaf with a gateway-named dNSName but no gateway identity would pass.
     if !has_gateway_uri {
         return Err(PeerError::NotOneGateway);
@@ -169,7 +169,7 @@ pub fn gateway_peer_identity(cert_der: &[u8]) -> Result<String, PeerError> {
 /// `max_message_size`/`max_frame_size` are the DoS guard: an oversized frame is refused at
 /// its **length header**, so it is never buffered. `write_buffer_size = 0` makes every message
 /// an eager socket write, and the bounded `max_write_buffer_size` is what turns a blocked
-/// socket into `poll_ready` ⇒ `Pending` — the backpressure the byte stream relies on.
+/// socket into `poll_ready` ⇒ `Pending` - the backpressure the byte stream relies on.
 pub fn ws_config(max_frame_bytes: usize) -> WebSocketConfig {
     let max_message = max_frame_bytes.saturating_add(HEADER_LEN);
     WebSocketConfig::default()

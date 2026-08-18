@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   # The required status check is literally `gate`. Do NOT rename this job, add a
-  # matrix, or set a custom `name:` — a mismatch hangs branch-protection
+  # matrix, or set a custom `name:` - a mismatch hangs branch-protection
   # auto-merge. One job, one gate.
   gate:
     runs-on: ubuntu-latest

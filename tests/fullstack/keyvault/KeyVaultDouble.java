@@ -35,7 +35,7 @@ import javax.net.ssl.SSLContext;
  *
  * <p>It DOES issue the real {@code WWW-Authenticate} challenge: any request with no
  * {@code Authorization: Bearer} header gets a 401 naming a tenant and a resource,
- * exactly like a real vault. This is load-bearing, not decorative — the SDK's challenge
+ * exactly like a real vault. This is load-bearing, not decorative - the SDK's challenge
  * policy sends the very first request with an empty body, and only replays with the real
  * body once it has a token for the scope the challenge named. A double that skipped the
  * challenge would only ever see that empty probe.
@@ -73,7 +73,7 @@ public final class KeyVaultDouble {
 		Map<String, String> opts = parseArgs(args);
 		String keyName = opts.getOrDefault("key-name", "session-ca");
 		int port = Integer.parseInt(opts.getOrDefault("port", "0"));
-		// The socket always binds 127.0.0.1 — only the URI the double advertises (and the
+		// The socket always binds 127.0.0.1 - only the URI the double advertises (and the
 		// challenge's request-host check judges) uses the hostname. --hostname must resolve
 		// to 127.0.0.1 (the harness's /etc/hosts entry does this), because the SDK's challenge
 		// policy refuses to attach a token unless the request host is the challenge resource's
@@ -95,7 +95,7 @@ public final class KeyVaultDouble {
 
 		vault.baseUrl = "https://" + hostname + ":" + server.getAddress().getPort();
 
-		// Plain HTTP, on 127.0.0.1 — real Azure App Service's own instance-metadata
+		// Plain HTTP, on 127.0.0.1 - real Azure App Service's own instance-metadata
 		// endpoint is plain HTTP to a loopback address, so this is the faithful shape,
 		// not a shortcut. A separate HttpServer (never HttpsServer, never routed through
 		// dispatch) so it structurally cannot end up behind the vault's own challenge.
@@ -106,7 +106,7 @@ public final class KeyVaultDouble {
 		String msiUrl = "http://127.0.0.1:" + msi.getAddress().getPort() + "/msi/token";
 
 		System.out.println("=================================================================");
-		System.out.println("TEST DOUBLE — this is NOT Azure Key Vault.");
+		System.out.println("TEST DOUBLE - this is NOT Azure Key Vault.");
 		System.out.println("It is a fake Key Vault key/crypto endpoint (plus a fake managed-");
 		System.out.println("identity token endpoint) for the SessionLayer full-stack test");
 		System.out.println("harness only. It accepts every request with no credential check,");
@@ -152,7 +152,7 @@ public final class KeyVaultDouble {
 				exchange.getRequestURI(), bearerPresent, exchange.getRequestHeaders().entrySet(),
 				new String(body, StandardCharsets.UTF_8));
 		try {
-			// /_test/* is this double's own admin surface, not the Key Vault API it emulates —
+			// /_test/* is this double's own admin surface, not the Key Vault API it emulates -
 			// the harness drives it directly with curl, so it is deliberately exempt from the
 			// challenge below.
 			if ("GET".equals(exchange.getRequestMethod()) && "/_test/fault-mode".equals(path)) {
@@ -208,7 +208,7 @@ public final class KeyVaultDouble {
 
 	/**
 	 * Kept as a runtime toggle rather than a process restart with a different key, so the
-	 * harness never has to rebind the vault to a new port mid-run — the Control Plane's
+	 * harness never has to rebind the vault to a new port mid-run - the Control Plane's
 	 * {@code vault-uri}/{@code keyReference} are fixed at boot.
 	 */
 	private String setFaultMode(String rawQuery) {
@@ -233,7 +233,7 @@ public final class KeyVaultDouble {
 	private String jwkResponse() {
 		// Always the REAL CA key, regardless of faultMode: the fault this double injects
 		// is a vault that signs with the wrong key while still reporting the pinned key's
-		// coordinates honestly — the failure mode the CP's pinned-key check exists to
+		// coordinates honestly - the failure mode the CP's pinned-key check exists to
 		// catch, isolated to signing.
 		ECPublicKey pub = (ECPublicKey) caKey.getPublic();
 		String kid = baseUrl + "/keys/" + keyName + "/" + KEY_VERSION;
@@ -246,7 +246,7 @@ public final class KeyVaultDouble {
 	/**
 	 * A JWK coordinate is fixed-width unsigned big-endian, 32 bytes for P-256.
 	 * {@link BigInteger#toByteArray()} is signed and minimal, so it is 33 bytes
-	 * when the high bit is set and short when the value has leading zero bytes —
+	 * when the high bit is set and short when the value has leading zero bytes -
 	 * both of which decode to the wrong point if copied verbatim.
 	 */
 	private static byte[] coordinate(BigInteger value) {

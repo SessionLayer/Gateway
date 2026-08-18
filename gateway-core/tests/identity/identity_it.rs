@@ -331,7 +331,7 @@ async fn renew_ahead_loop_does_not_spin_when_the_renew_trigger_is_already_past()
 /// (the CP validates against its own clock), so nothing self-limits, and each iteration
 /// churns the generation counter, which is the clone-detection primitive.
 ///
-/// This drives the real LOOP (not the helper) with `cert_ttl(0)` — `validity_window()` then
+/// This drives the real LOOP (not the helper) with `cert_ttl(0)` - `validity_window()` then
 /// returns not_after = now, i.e. "the certificate the CP issued is already expired at us".
 /// The bound must be retry-bounded, NOT terminal: a terminal exit on a fleet-wide CP
 /// misconfig would be fail-deadly, so the loop keeps running at a few generations over the

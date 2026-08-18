@@ -11,7 +11,7 @@ pub enum SigningError {
     #[error("inner-leg key error: {0}")]
     Ssh(#[from] ssh_key::Error),
 
-    /// Only the gRPC status **code** is rendered — never the CP-supplied message,
+    /// Only the gRPC status **code** is rendered - never the CP-supplied message,
     /// which is untrusted wire text (log-injection / terminal-escape guard); the
     /// code is still available via the wrapped `Status`.
     #[error("Control Plane refused SignSessionCertificate (gRPC status {:?})", .0.code())]

@@ -441,7 +441,7 @@ mod tests {
     async fn a_stale_nonce_is_dropped_while_still_owner_and_fires_no_node_dial() {
         let dialed = Arc::new(AtomicBool::new(false));
 
-        // We hold a live control channel for web-01 (so the live-channel guard would pass — proving
+        // We hold a live control channel for web-01 (so the live-channel guard would pass - proving
         // the STALE-NONCE check, not the channel check, is what drops the signal).
         let registry = Arc::new(AgentRegistry::new(4));
         let (tx, rx) = tokio::sync::mpsc::channel(4);

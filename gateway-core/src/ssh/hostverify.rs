@@ -1,8 +1,8 @@
-//! Node host-identity verification — **no TOFU**.
+//! Node host-identity verification - **no TOFU**.
 //!
 //! Two anchors, checked in order: a CP-supplied host cert verified against the trusted
 //! host-CA key(s) and BOUND to the plain host key the node presents at KEX, then an
-//! explicitly pinned host key. Anything else is an abort — never trust-on-first-use.
+//! explicitly pinned host key. Anything else is an abort - never trust-on-first-use.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

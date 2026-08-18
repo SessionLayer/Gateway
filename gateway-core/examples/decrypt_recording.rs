@@ -1,6 +1,6 @@
 //! Full-stack harness helper: ECIES-open a finalized SLREC1 recording object with
 //! the customer PRIVATE key and write the decrypted asciicast to stdout, so `tests/fullstack/
-//! run.sh` can assert the real session bytes are PRESENT and recoverable — turning "no plaintext
+//! run.sh` can assert the real session bytes are PRESENT and recoverable - turning "no plaintext
 //! in the ciphertext" into a positive capture+seal+recoverability proof (an empty/header-only
 //! SLREC1 finalize would pass every negative check). Reuses the exact production `seal::` code so
 //! there is no re-implementation drift.

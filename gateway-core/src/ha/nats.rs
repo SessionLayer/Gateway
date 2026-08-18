@@ -187,7 +187,7 @@ async fn connection_manager(
                     }
                     Err(NatsError::Fatal(reason)) => {
                         connected.store(false, Ordering::SeqCst);
-                        tracing::error!(addr = %addr, reason = %reason, "NATS broker requires a capability this plaintext reference client cannot provide (run a TLS/auth sidecar or substitute a TLS-capable CoordinationBackend); stopping — HA signalling is DOWN and remote-owned sessions will fail closed");
+                        tracing::error!(addr = %addr, reason = %reason, "NATS broker requires a capability this plaintext reference client cannot provide (run a TLS/auth sidecar or substitute a TLS-capable CoordinationBackend); stopping - HA signalling is DOWN and remote-owned sessions will fail closed");
                         return;
                     }
                     Err(NatsError::Io(e)) => {

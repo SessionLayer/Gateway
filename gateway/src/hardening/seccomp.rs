@@ -20,7 +20,7 @@ pub fn install(mode: SeccompMode, io_uring_active: bool) -> anyhow::Result<()> {
                 .context("building seccomp log filter")?;
             apply(filter).context("installing seccomp log filter")?;
             tracing::warn!(
-                "seccomp installed in LOG mode: unlisted syscalls are recorded (dmesg/auditd) but NOT blocked — no protection; flip hardening.seccomp.mode to \"enforce\" once the log is clean"
+                "seccomp installed in LOG mode: unlisted syscalls are recorded (dmesg/auditd) but NOT blocked - no protection; flip hardening.seccomp.mode to \"enforce\" once the log is clean"
             );
             Ok(())
         }
@@ -44,7 +44,7 @@ pub fn install(mode: SeccompMode, io_uring_active: bool) -> anyhow::Result<()> {
     }
 }
 
-/// Compile + install one filter across ALL threads (TSYNC) — essential under a
+/// Compile + install one filter across ALL threads (TSYNC) - essential under a
 /// multi-thread tokio runtime, so the tokio worker threads are filtered too, not
 /// just the caller. `apply_filter_all_threads` also sets `PR_SET_NO_NEW_PRIVS`.
 fn apply(filter: SeccompFilter) -> anyhow::Result<()> {
@@ -89,7 +89,7 @@ fn target_arch() -> seccompiler::TargetArch {
 }
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn target_arch() -> seccompiler::TargetArch {
-    unreachable!("seccomp is only applied on x86_64/aarch64 — install() bails otherwise")
+    unreachable!("seccomp is only applied on x86_64/aarch64 - install() bails otherwise")
 }
 
 /// The steady-state syscall allow-list. Deliberately generous: the ERRNO default
@@ -158,7 +158,7 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         libc::SYS_utimensat,
         libc::SYS_fchdir,
         // Landlock self-confinement: a blocking-pool thread spawned AFTER seccomp is
-        // installed re-confines itself via `on_thread_start` — allow these so that
+        // installed re-confines itself via `on_thread_start` - allow these so that
         // self-confine actually runs (not merely inherits the parent's domain).
         libc::SYS_landlock_create_ruleset,
         libc::SYS_landlock_add_rule,
@@ -267,7 +267,7 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
         // sibling coredump-disable path that may call setrlimit directly).
         libc::SYS_setrlimit,
         // libc names SYS_sendfile/SYS_fadvise64 only on
-        // x86_64-gnu, not aarch64-gnu — keeping them in the common list breaks the
+        // x86_64-gnu, not aarch64-gnu - keeping them in the common list breaks the
         // arm64 build (E0425). The Gateway uses `splice` for the byte bridge (never
         // sendfile) and issues no posix_fadvise, so on aarch64 they are simply
         // unlisted → EPERM under the EPERM-default, harmless.
@@ -289,7 +289,7 @@ fn allowed_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
 }
 
 /// Namespace *creation* via `clone`/`clone3` flags is deliberately NOT argument-filtered
-/// here — the runtime depends on that thread-spawn path; the capability drop plus
+/// here - the runtime depends on that thread-spawn path; the capability drop plus
 /// `no_new_privs` make it impossible without CAP_SYS_ADMIN.
 fn dangerous_syscalls(io_uring_active: bool) -> Vec<libc::c_long> {
     let mut v = vec![

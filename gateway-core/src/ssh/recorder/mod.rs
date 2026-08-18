@@ -186,7 +186,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                     },
                 );
                 if let Some(cmd) = command {
-                    // Record the exec command line as an input event (ALWAYS — even
+                    // Record the exec command line as an input event (ALWAYS - even
                     // for a legacy scp-over-exec, whose content is ALSO captured). The
                     // command may itself be sensitive, so the transient copy scrubs.
                     let text = Zeroizing::new(String::from_utf8_lossy(&cmd).into_owned());
@@ -205,7 +205,7 @@ impl<K: Eq + std::hash::Hash + Copy> Capture<K> {
                 counters,
             } => {
                 // Metadata-only: emit a `<family>.opened` marker into the
-                // sealed stream — target, direction, capability, correlation id — but
+                // sealed stream - target, direction, capability, correlation id - but
                 // NEVER the forwarded bytes (arbitrary/binary, no universal decode).
                 self.ensure_header(0, 0)?;
                 let label = tunnel_marker_open(direction, &target);
@@ -647,7 +647,7 @@ impl SessionRecorder for Recorder {
             };
 
             // Upload the (possibly partial but hash-chained) ciphertext object with
-            // a FRESH short-lived credential fetched now (at session end) — a
+            // a FRESH short-lived credential fetched now (at session end) - a
             // session-long begin-time credential would expire before a long
             // session's PUT. Bounded retry with backoff. Bytes never
             // traverse the CP.

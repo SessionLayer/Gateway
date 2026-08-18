@@ -12,7 +12,7 @@ yanked = "deny"
 # Allow-list only (exact SPDX ids). GPL-3.0-only is allowed because SessionLayer
 # itself is GPL-3.0; the rest are the permissive licenses actually present in the
 # pinned dependency graph. Anything not listed here (notably strong copyleft
-# other than our own, or unknown licenses) fails the check — a new dependency
+# other than our own, or unknown licenses) fails the check - a new dependency
 # with a new license is a deliberate, reviewed addition.
 allow = [
     "GPL-3.0-only",
