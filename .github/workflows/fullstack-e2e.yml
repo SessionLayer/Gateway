@@ -82,7 +82,7 @@ jobs:
             Agent
 
       - name: Install protoc (Gateway/Agent build.rs)
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
         with:
           tool: protoc
 
