@@ -1,0 +1,48 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- $min := .Values.podDisruptionBudget.minAvailable }}
+{{- $replicas := int .Values.replicaCount }}
+{{- $at := "sessionlayer-gateway: podDisruptionBudget.minAvailable" }}
+{{- /*
+A budget that leaves no room refuses every voluntary eviction, so a node drain
+never finishes. Kubernetes decides that from desiredHealthy, which it derives
+differently for a count and for a percentage, and the percentage form rounds
+UP: at three replicas, 67% already demands all three, so 100% is nowhere near
+the threshold. A value's type also depends on how it arrived, since --set
+yields an integer where a values file yields a float and a percentage a
+string, so the type is established before anything is compared.
+*/}}
+{{- if kindIs "invalid" $min }}
+{{- fail (printf "%s is unset. Give a pod count or a percentage of replicas." $at) }}
+{{- else if kindIs "string" $min }}
+{{- if not (regexMatch "^[0-9]+%$" $min) }}
+{{- fail (printf "%s is %q, which is neither a pod count nor a percentage. Kubernetes rejects it on apply, so it is refused here where the value is still in front of you." $at $min) }}
+{{- end }}
+{{- $pct := atoi (trimSuffix "%" $min) }}
+{{- if gt $pct 100 }}
+{{- fail (printf "%s is %q, and a budget above 100%% of the replicas can never be met." $at $min) }}
+{{- end }}
+{{- $desired := div (add (mul $pct $replicas) 99) 100 }}
+{{- if ge $desired $replicas }}
+{{- fail (printf "%s is %q, which Kubernetes rounds up to %d of %d replicas and leaves no room: every voluntary eviction is refused and a node drain never finishes. Keep it at or below %d%%. replicaCount is fixed at 1 here, one release being one Gateway, so at this size the only budget that lets a drain finish is one that holds nothing back: turn podDisruptionBudget off instead." $at $min $desired $replicas (div (mul 100 (sub $replicas 1)) $replicas)) }}
+{{- end }}
+{{- else }}
+{{- $count := int $min }}
+{{- if lt $count 0 }}
+{{- fail (printf "%s is %d, and a budget cannot be negative." $at $count) }}
+{{- end }}
+{{- if ge $count $replicas }}
+{{- fail (printf "%s (%d) is not below replicaCount (%d), so every voluntary eviction is refused and a node drain never finishes. Lower minAvailable, or turn podDisruptionBudget off: replicaCount is fixed at 1 here, one release being one Gateway, and a budget over a single pod either hangs the drain or holds nothing back." $at $count $replicas) }}
+{{- end }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sessionlayer-gateway.fullname" . }}
+  labels:
+    {{- include "sessionlayer-gateway.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ $min }}
+  selector:
+    matchLabels:
+      {{- include "sessionlayer-gateway.selectorLabels" . | nindent 6 }}
+{{- end }}

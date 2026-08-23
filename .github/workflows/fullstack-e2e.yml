@@ -1,0 +1,122 @@
+name: fullstack-e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      cp_ref:
+        description: ControlPlane ref to test against
+        default: main
+      agent_ref:
+        description: Agent ref to test against
+        default: main
+      topology:
+        description: "core | agent | all"
+        default: core
+      fs_hardening:
+        description: "off | log | seccomp | full (the real-data-path under the Tier-0 profile)"
+        default: full
+  # Run the hardened profile on PRs that touch the data plane / hardening / harness,
+  # so the seccomp/Landlock allow-list is verified against the REAL data path (russh,
+  # rustls-ring, tonic mTLS, hyper WORM, splice) continuously - not only in the
+  # subprocess canary. Repo-relative paths (CI checks this repo out into Gateway/).
+  pull_request:
+    paths:
+      - "gateway/**"
+      - "gateway-core/**"
+      - "tests/fullstack/**"
+      - "deploy/**"
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fullstack-e2e-${{ github.ref }}-${{ github.event.inputs.topology || 'matrix' }}
+  cancel-in-progress: true
+
+jobs:
+  fullstack-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: ${{ github.event.inputs.topology && fromJSON(format('["{0}"]', github.event.inputs.topology)) || fromJSON('["core","agent"]') }}
+    steps:
+      - name: Checkout Gateway (self, holds the harness)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: Gateway
+
+      - name: Checkout ControlPlane (real CP)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: SessionLayer/ControlPlane
+          ref: ${{ github.event.inputs.cp_ref || 'main' }}
+          path: ControlPlane
+
+      - name: Checkout Agent (real agent binary)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: SessionLayer/Agent
+          ref: ${{ github.event.inputs.agent_ref || 'main' }}
+          path: Agent
+
+      - name: Set up JDK 25 (CP jar)
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Install Rust toolchain (Gateway + Agent)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.97.1"
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: |
+            Gateway
+            Agent
+
+      - name: Install protoc (Gateway/Agent build.rs)
+        uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2
+        with:
+          tool: protoc
+
+      - name: Build the real CP boot jar
+        working-directory: ControlPlane
+        run: ./mvnw -B -ntp -DskipTests package
+
+      - name: Build the real Agent binary
+        working-directory: Agent
+        run: cargo build --release --bin sessionlayer-agent
+
+      - name: Build the real Gateway binary
+        working-directory: Gateway
+        run: cargo build --release --bin gateway
+
+      - name: Run the full-stack cross-repo E2E
+        working-directory: Gateway
+        env:
+          TOPOLOGY: ${{ matrix.topology }}
+          # The load-bearing hardening gate: the real session runs UNDER
+          # seccomp=enforce + Landlock. Non-dispatch runs (PR/nightly) default to full.
+          # The agent topology does not take a hardening profile - its Gateway config has
+          # no hardening block - so the hardened data path is proven by the core leg.
+          FS_HARDENING: ${{ github.event.inputs.fs_hardening || 'full' }}
+        run: |
+          set -euo pipefail
+          CP_JAR="$(ls "$GITHUB_WORKSPACE"/ControlPlane/target/*.jar | grep -vE 'sources|javadoc' | head -1)"
+          AGENT_BIN="$GITHUB_WORKSPACE/Agent/target/release/sessionlayer-agent"
+          GATEWAY_BIN="$GITHUB_WORKSPACE/Gateway/target/release/gateway"
+          test -f "$CP_JAR" || { echo "CP jar not found"; exit 1; }
+          test -x "$AGENT_BIN" || { echo "agent binary not found/executable"; exit 1; }
+          test -x "$GATEWAY_BIN" || { echo "gateway binary not found/executable"; exit 1; }
+          export CP_JAR AGENT_BIN GATEWAY_BIN
+          echo "CP_JAR=$CP_JAR"
+          echo "AGENT_BIN=$AGENT_BIN"
+          echo "GATEWAY_BIN=$GATEWAY_BIN"
+          bash tests/fullstack/run.sh

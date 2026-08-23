@@ -1,0 +1,34 @@
+{
+  "cp_mtls_endpoint": "${CP_MTLS_ENDPOINT}",
+  "data_dir": "${GW_DATA_DIR}",
+  "bootstrap": {
+    "enrollment_token": "${GW_ENROLL_TOKEN}",
+    "ca_cert_path": "${GW_CA_PEM}",
+    "gateway_name": "${GW_NAME}",
+    "server_name": "${CP_SERVER_NAME}"
+  },
+  "identity": {
+    "connect_timeout_secs": 30,
+    "rpc_timeout_secs": 30
+  },
+  "ssh": {
+    "listen_addr": "${GW_SSH_ADDR}",
+    "cp_connect_timeout_secs": 30,
+    "cp_rpc_timeout_secs": 30,
+    "inner": {
+      "connect_timeout_secs": 5,
+      "handshake_timeout_secs": 10
+    },
+    "reeval": {
+      "max_decision_ttl_secs": ${GW_MAX_DECISION_TTL_SECS}
+    },
+    "recorder": {
+      "require_https": false,
+      "spool_memory_threshold_bytes": ${GW_SPOOL_THRESHOLD}
+    }
+  },
+  "ha": {
+    "mode": "single_instance"
+  },
+  "hardening": ${GW_HARDENING}
+}

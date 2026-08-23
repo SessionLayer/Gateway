@@ -1,0 +1,193 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "RecordingProto";
+
+// The Gateway captures AND ENCRYPTS the recording under a customer-held key and
+// uploads the ciphertext DIRECTLY to the WORM store with the credential this
+// service issues - bytes NEVER proxy through the Control Plane. The CP owns
+// metadata, policy (WORM mode + retention), the customer-key reference, and the
+// correlated audit trail; it never sees recording plaintext nor the data key.
+//
+// PER-RPC, SESSION-BOUND AUTHORIZATION. mTLS authenticates the calling Gateway.
+// BeginRecording additionally consumes the single-use recording_token minted by
+// Authorize ALLOW (bound to {gateway_id, session_id, node, principal, exp}) -
+// the sole per-request authority, so a Gateway can never register a recording
+// for a session it does not broker. FinalizeRecording is authorized by the mTLS
+// caller owning the recording_id it created.
+// Lifecycle: BeginRecording (at session start - the Gateway needs the customer
+// key to encrypt from the first byte) → RequestUpload (at session end, just
+// before the PUT - so the single-object upload credential is issued SHORT-LIVED
+// at upload time, never a session-long credential) → the Gateway PUTs the
+// ciphertext directly to the WORM store → FinalizeRecording.
+service Recording {
+  rpc BeginRecording(BeginRecordingRequest) returns (BeginRecordingResponse);
+
+  rpc RequestUpload(RequestUploadRequest) returns (RequestUploadResponse);
+
+  rpc FinalizeRecording(FinalizeRecordingRequest) returns (FinalizeRecordingResponse);
+}
+
+enum WormMode {
+  WORM_MODE_UNSPECIFIED = 0;
+  WORM_MODE_COMPLIANCE = 1;
+  WORM_MODE_GOVERNANCE = 2;
+}
+
+// How the per-recording AES-256-GCM data key is sealed to the customer-held
+// public key so no platform-held key can unwrap it. ECIES over P-256 is the
+// default (portable, no RSA on the Gateway's hot path).
+enum KeySealAlgorithm {
+  KEY_SEAL_ALGORITHM_UNSPECIFIED = 0;
+  KEY_SEAL_ALGORITHM_ECIES_P256_HKDF_SHA256_AES256GCM = 1;
+  KEY_SEAL_ALGORITHM_RSA_OAEP_SHA256 = 2;
+}
+
+enum RecordingStatus {
+  RECORDING_STATUS_UNSPECIFIED = 0;
+  RECORDING_STATUS_FINALIZED = 1;
+  RECORDING_STATUS_TRUNCATED = 2;
+  // Capture or upload failed; there is no usable object (the session's failure is
+  // recorded loudly in the audit stream - never silently dropped).
+  RECORDING_STATUS_FAILED = 3;
+}
+
+message BeginRecordingRequest {
+  string recording_token = 1;
+
+  // Advisory correlation only; the token is authoritative for
+  // {session, node, principal}. If a field is set and disagrees with the token,
+  // the request fails closed.
+  RecordingContext context = 2;
+}
+
+message RecordingContext {
+  string session_id = 1;
+  string node_id = 2;
+  string principal = 3;
+}
+
+message BeginRecordingResponse {
+  string recording_id = 1;
+
+  // The WORM object-store key the ENCRYPTED recording MUST be written to. The
+  // upload credential is scoped to exactly this key.
+  string object_key = 2;
+
+  WormMode worm_mode = 3;
+
+  // The customer-held PUBLIC key the Gateway seals the per-recording data key to.
+  // MANDATORY: keystroke capture is always on, so encryption is always required;
+  // if the operator configured none this RPC fails closed rather than return a
+  // session that would store keystrokes in the clear.
+  CustomerKey customer_key = 4;
+
+  reserved 5;
+  reserved "upload";
+}
+
+message RequestUploadRequest {
+  // The recording id returned by BeginRecording (ownership-checked against the
+  // mTLS caller).
+  string recording_id = 1;
+}
+
+message RequestUploadResponse {
+  UploadCredential upload = 1;
+}
+
+// CustomerKey is the operator-configured customer public key material. Public
+// material only - the CP never holds the private half, so a platform operator
+// cannot decrypt the recording (the crown-jewels invariant).
+message CustomerKey {
+  string key_ref = 1;
+
+  // The customer PUBLIC key, DER SubjectPublicKeyInfo (an EC P-256 point for
+  // ECIES; an RSA public key for RSA-OAEP). Public material only.
+  bytes public_key = 2;
+
+  KeySealAlgorithm algorithm = 3;
+}
+
+message UploadCredential {
+  string url = 1;
+
+  string method = 2;
+
+  // Headers the Gateway MUST send verbatim - they are part of the signature
+  // (e.g. the object-lock mode + retain-until-date that make the object WORM, and
+  // any content headers). Sending a different value breaks the signature, so the
+  // WORM lock cannot be stripped by the uploader (fail closed).
+  map<string, string> required_headers = 3;
+
+  int64 expires_at_epoch_seconds = 4;
+}
+
+message FinalizeRecordingRequest {
+  string recording_id = 1;
+
+  RecordingStatus status = 2;
+
+  // The recording's hash-chain head, "sha256:<64-hex>", committing to its
+  // content. Written write-once to recording_ref.hash_chain_head.
+  string hash_chain_head = 3;
+
+  // Streaming SHA-256 over the CIPHERTEXT object actually uploaded,
+  // "sha256:<hex>". Written write-once to recording_ref.content_digest.
+  string content_digest = 4;
+
+  int64 byte_len = 5;
+
+  // Per-operation SFTP/SCP file-transfer audit - path, direction, size, streaming
+  // SHA-256 of the transferred content. METADATA ONLY; file content is never
+  // captured. Correlated into the audit_event stream.
+  repeated FileTransferAudit sftp_audit = 6;
+
+  // The object-store version id (S3 `x-amz-version-id`) of the ciphertext object
+  // the Gateway actually PUT. Written write-once to recording_ref.object_version_id
+  // and pinned by replay/export so they serve THIS finalized version - not a later
+  // shadow PUT to the same key by a compromised CP/Gateway (WORM Object Lock
+  // protects a version, not the key from new versions). Additive/N-1:
+  // an older Gateway omits it → the CP stores null and replay falls back to the
+  // unversioned GET (pre-fix behaviour) until both peers are upgraded.
+  string object_version_id = 7;
+
+  // Per-tunnel (port-forward/X11) audit - target/direction/capability + byte
+  // counters, correlated into the audit_event stream.
+  // METADATA ONLY: forwarded bytes are arbitrary/binary with no universal
+  // decode (unlike SFTP's known wire format), so unlike `sftp_audit` there is no
+  // content digest here - just the open/close facts.
+  repeated TunnelAudit tunnel_audit = 8;
+}
+
+message FileTransferAudit {
+  // The operation: open|read|write|close|rename|remove|mkdir|setstat|realpath|...
+  // For SCP: put|get with the negotiated mode.
+  string operation = 1;
+  string path = 2;
+  // "upload" (client→node) or "download" (node→client).
+  string direction = 3;
+  // Transferred size in bytes (best-effort; the true size is the streamed count).
+  int64 size = 4;
+  string sha256 = 5;
+}
+
+message TunnelAudit {
+  // "port_forward_local" | "port_forward_remote" | "x11" - the capability that
+  // admitted this tunnel.
+  string capability = 1;
+  string direction = 2;
+  // The forwarded target, e.g. "host:port". Empty for x11 (no client-supplied
+  // target).
+  string target = 3;
+  int64 bytes_in = 4;
+  int64 bytes_out = 5;
+  int64 duration_seconds = 6;
+}
+
+message FinalizeRecordingResponse {
+  RecordingStatus status = 1;
+}

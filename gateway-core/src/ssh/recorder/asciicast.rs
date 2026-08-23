@@ -1,0 +1,115 @@
+use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventCode {
+    Output,
+    Input,
+    Resize,
+    Marker,
+}
+
+impl EventCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventCode::Output => "o",
+            EventCode::Input => "i",
+            EventCode::Resize => "r",
+            EventCode::Marker => "m",
+        }
+    }
+}
+
+pub fn header_line(width: u16, height: u16, timestamp: u64) -> Vec<u8> {
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "version": 2,
+        "width": width,
+        "height": height,
+        "timestamp": timestamp,
+    }))
+    .expect("header serializes");
+    line.push('\n');
+    line.into_bytes()
+}
+
+pub fn event_line(elapsed_secs: f64, code: EventCode, data: &str) -> Zeroizing<Vec<u8>> {
+    let mut line =
+        serde_json::to_string(&(elapsed_secs, code.as_str(), data)).expect("event serializes");
+    line.push('\n');
+    // `into_bytes` reuses the String's buffer (no copy); wrapping it scrubs that
+    // buffer on drop. (serde_json's own growth scratch is a coredump/swap-only
+    // residual, covered by the process coredump-disable + mlock hygiene.)
+    Zeroizing::new(line.into_bytes())
+}
+
+#[derive(Debug, Default)]
+pub struct Utf8Chunker {
+    pending: Zeroizing<Vec<u8>>,
+}
+
+impl Utf8Chunker {
+    pub fn push(&mut self, chunk: &[u8]) -> Zeroizing<String> {
+        self.pending.extend_from_slice(chunk);
+        match std::str::from_utf8(&self.pending) {
+            Ok(_) => {
+                let out = std::mem::take(&mut *self.pending);
+                Zeroizing::new(String::from_utf8(out).expect("validated above"))
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                match e.error_len() {
+                    // Incomplete trailing sequence: emit the valid prefix, hold the
+                    // rest (≤3 bytes) for the next chunk (byte-exact concatenation).
+                    None => {
+                        let out = self.pending[..valid].to_vec();
+                        self.pending.drain(..valid);
+                        Zeroizing::new(String::from_utf8(out).expect("valid prefix"))
+                    }
+                    Some(_) => {
+                        let out = String::from_utf8_lossy(&self.pending).into_owned();
+                        self.pending.clear();
+                        Zeroizing::new(out)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn flush(&mut self) -> Option<Zeroizing<String>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let out = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        Some(Zeroizing::new(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_line_escapes_and_frames() {
+        let line = event_line(1.5, EventCode::Output, "a\"b\n");
+        let s = String::from_utf8(line.to_vec()).unwrap();
+        assert_eq!(s, "[1.5,\"o\",\"a\\\"b\\n\"]\n");
+    }
+
+    #[test]
+    fn chunker_preserves_split_multibyte_char() {
+        let mut c = Utf8Chunker::default();
+        let a = c.push(&[b'x', 0xC3]);
+        let b = c.push(&[0xA9, b'y']);
+        assert_eq!(a.as_str(), "x");
+        assert_eq!(b.as_str(), "\u{e9}y");
+        assert!(c.flush().is_none());
+        assert_eq!(format!("{}{}", a.as_str(), b.as_str()), "x\u{e9}y");
+    }
+
+    #[test]
+    fn chunker_flushes_trailing_incomplete_lossily() {
+        let mut c = Utf8Chunker::default();
+        assert_eq!(c.push(&[0xC3]).as_str(), "");
+        assert!(c.flush().is_some(), "an incomplete tail flushes (lossy)");
+    }
+}

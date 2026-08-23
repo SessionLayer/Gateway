@@ -1,0 +1,2827 @@
+#![allow(dead_code)]
+
+pub mod docker;
+pub mod sigv4;
+
+use gateway_core::config::SshServerConfig;
+use gateway_core::cpauth::{CpAuthClient, CpChannelFactory};
+use gateway_core::identity;
+use gateway_core::pb::authorization_server::{Authorization, AuthorizationServer};
+use gateway_core::pb::gateway_identity_server::{GatewayIdentity, GatewayIdentityServer};
+use gateway_core::pb::handshake_server::{Handshake, HandshakeServer};
+use gateway_core::pb::host_cert_signing_server::{HostCertSigning, HostCertSigningServer};
+use gateway_core::pb::lock_feed_server::{LockFeed, LockFeedServer};
+use gateway_core::pb::outer_leg_auth_server::{OuterLegAuth, OuterLegAuthServer};
+use gateway_core::pb::presence_server::{Presence, PresenceServer};
+use gateway_core::pb::recording_server::{Recording, RecordingServer};
+use gateway_core::pb::session_signing_server::{SessionSigning, SessionSigningServer};
+use gateway_core::pb::{
+    lock_event, AccessModel, AuthorizeRequest, AuthorizeResponse, BeginDeviceFlowRequest,
+    BeginDeviceFlowResponse, BeginRecordingRequest, BeginRecordingResponse, BreakglassResolution,
+    Capability, ClientHello, ComponentInfo, ConnectorKind, CustomerKey, Decision, DecisionContext,
+    DeviceFlowStatus, EnrollGatewayRequest, EnrollGatewayResponse, ExtendSessionLeaseRequest,
+    ExtendSessionLeaseResponse, FinalizeRecordingRequest, FinalizeRecordingResponse, Heartbeat,
+    HostVerification, IssueGatewayServerCertificateRequest, IssueGatewayServerCertificateResponse,
+    KeySealAlgorithm, Lock, LockEvent, LockRemoval, LockSnapshot, NodeConnection,
+    NotifySessionEndRequest, NotifySessionEndResponse, PollDeviceFlowRequest,
+    PollDeviceFlowResponse, PresenceHeartbeatRequest, PresenceHeartbeatResponse,
+    PresenceReleaseRequest, PresenceReleaseResponse, ProtocolVersion, RenewGatewayIdentityRequest,
+    RenewGatewayIdentityResponse, RequestUploadRequest, RequestUploadResponse,
+    ResolveBreakglassCodeRequest, ResolveBreakglassCodeResponse, ResolveBreakglassKeyRequest,
+    ResolveBreakglassKeyResponse, ResolveOtpRequest, ResolveOtpResponse, ResolvePinRequest,
+    ResolvePinResponse, ResolveUserCertRequest, ResolveUserCertResponse, ResolvedIdentity,
+    ServerHello, SignGatewayHostCertificateRequest, SignGatewayHostCertificateResponse,
+    SignSessionCertificateRequest, SignSessionCertificateResponse, StreamLocksRequest,
+    UploadCredential, WormMode,
+};
+use gateway_core::ssh::bridge::{NullRecorderFactory, RecorderFactory};
+use gateway_core::ssh::connector::{AgentlessDial, NodeConnector};
+use gateway_core::ssh::handler::HandlerDeps;
+use gateway_core::ssh::lockfeed::LockFeedClientTask;
+use gateway_core::ssh::locks::{target_matches, LiveSessionRegistry, LockBindings, LockSet};
+use gateway_core::ssh::target::IdentityResolver;
+use gateway_core::{decisionctx, mtls, version};
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::SigningKey;
+use p256::pkcs8::DecodePrivateKey;
+use sigv4::S3Target;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::{Request, Response, Status};
+
+pub struct TestCa {
+    params: rcgen::CertificateParams,
+    key_pem: String,
+    cert_der: Vec<u8>,
+}
+
+impl TestCa {
+    pub fn generate(cn: &str) -> Self {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let cert = params.self_signed(&key).unwrap();
+        Self {
+            cert_der: cert.der().to_vec(),
+            key_pem: key.serialize_pem(),
+            params,
+        }
+    }
+
+    pub fn cert_der(&self) -> &[u8] {
+        &self.cert_der
+    }
+
+    pub fn cert_pem(&self) -> Vec<u8> {
+        mtls::cert_der_to_pem(&self.cert_der)
+    }
+
+    fn issuer(&self) -> rcgen::Issuer<'static, rcgen::KeyPair> {
+        let key = rcgen::KeyPair::from_pem(&self.key_pem).unwrap();
+        rcgen::Issuer::new(self.params.clone(), key)
+    }
+
+    fn parse_csr(csr_der: &[u8]) -> Result<rcgen::CertificateSigningRequestParams, rcgen::Error> {
+        let typed = rustls::pki_types::CertificateSigningRequestDer::from(csr_der.to_vec());
+        let csr = rcgen::CertificateSigningRequestParams::from_der(&typed)?;
+        let has_cn = csr
+            .params
+            .distinguished_name
+            .get(&rcgen::DnType::CommonName)
+            .map(|cn| match cn {
+                rcgen::DnValue::Utf8String(s) => !s.trim().is_empty(),
+                rcgen::DnValue::PrintableString(s) => !s.as_str().trim().is_empty(),
+                _ => true,
+            })
+            .unwrap_or(false);
+        if !has_cn {
+            return Err(rcgen::Error::CouldNotParseCertificationRequest);
+        }
+        Ok(csr)
+    }
+
+    pub fn sign_csr(&self, csr_der: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+        let csr = Self::parse_csr(csr_der)?;
+        let cert = csr.signed_by(&self.issuer())?;
+        Ok(cert.der().to_vec())
+    }
+
+    pub fn issue_leaf(
+        &self,
+        san: &str,
+        ekus: Vec<rcgen::ExtendedKeyUsagePurpose>,
+        nb: time::OffsetDateTime,
+        na: time::OffsetDateTime,
+    ) -> IssuedLeaf {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![san.to_string()]).unwrap();
+        params.not_before = nb;
+        params.not_after = na;
+        params.extended_key_usages = ekus;
+        let cert = params.signed_by(&key, &self.issuer()).unwrap();
+        IssuedLeaf {
+            cert_der: cert.der().to_vec(),
+            key_pem: key.serialize_pem(),
+            key_pkcs8_der: key.serialize_der(),
+        }
+    }
+
+    pub fn sign_csr_as_server(
+        &self,
+        csr_der: &[u8],
+        gateway_name: &str,
+        gateway_id: &str,
+        ttl: Duration,
+    ) -> Result<Vec<u8>, rcgen::Error> {
+        let mut csr = Self::parse_csr(csr_der)?;
+        csr.params.distinguished_name = rcgen::DistinguishedName::new();
+        csr.params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, gateway_name);
+        csr.params.subject_alt_names = vec![
+            rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(gateway_name).unwrap()),
+            rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("sessionlayer://gateway/{gateway_id}"))
+                    .unwrap(),
+            ),
+        ];
+        csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        csr.params.not_before = offset_now() - time::Duration::minutes(5);
+        csr.params.not_after = offset_now() + time::Duration::seconds(ttl.as_secs() as i64);
+        Ok(csr.signed_by(&self.issuer())?.der().to_vec())
+    }
+
+    pub fn sign_csr_as_gateway_identity(
+        &self,
+        csr_der: &[u8],
+        gateway_name: &str,
+        gateway_id: &str,
+    ) -> Result<Vec<u8>, rcgen::Error> {
+        let mut csr = Self::parse_csr(csr_der)?;
+        csr.params.distinguished_name = rcgen::DistinguishedName::new();
+        csr.params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, gateway_name);
+        csr.params.subject_alt_names = vec![
+            rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(gateway_name).unwrap()),
+            rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("sessionlayer://gateway/{gateway_id}"))
+                    .unwrap(),
+            ),
+        ];
+        csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        Ok(csr.signed_by(&self.issuer())?.der().to_vec())
+    }
+
+    pub fn issue_agent_leaf(&self, agent_id: &str, node_name: &str) -> IssuedLeaf {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.not_before = offset_now() - time::Duration::minutes(5);
+        params.not_after = offset_now() + time::Duration::hours(1);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, agent_id);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        params.subject_alt_names = vec![
+            rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("sessionlayer://agent/{agent_id}"))
+                    .unwrap(),
+            ),
+            rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(node_name).unwrap()),
+        ];
+        let cert = params.signed_by(&key, &self.issuer()).unwrap();
+        IssuedLeaf {
+            cert_der: cert.der().to_vec(),
+            key_pem: key.serialize_pem(),
+            key_pkcs8_der: key.serialize_der(),
+        }
+    }
+
+    pub fn issue_context_signer(
+        &self,
+        nb: time::OffsetDateTime,
+        na: time::OffsetDateTime,
+    ) -> IssuedLeaf {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.not_before = nb;
+        params.not_after = na;
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "decision-context-signer");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::CodeSigning];
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(decisionctx::SIGNER_URI).unwrap(),
+        )];
+        let cert = params.signed_by(&key, &self.issuer()).unwrap();
+        IssuedLeaf {
+            cert_der: cert.der().to_vec(),
+            key_pem: key.serialize_pem(),
+            key_pkcs8_der: key.serialize_der(),
+        }
+    }
+}
+
+pub struct IssuedLeaf {
+    pub cert_der: Vec<u8>,
+    pub key_pem: String,
+    pub key_pkcs8_der: Vec<u8>,
+}
+
+struct GatewayRecord {
+    leaf_der: Vec<u8>,
+    generation: u64,
+    locked: bool,
+    name: String,
+}
+
+struct TokenRecord {
+    gateway_id: String,
+    session_id: String,
+    node_id: String,
+    principal: String,
+    exp: SystemTime,
+    used: bool,
+}
+
+#[derive(Clone)]
+struct ResolvedRecord {
+    identity: String,
+    principals: Vec<String>,
+    groups: Vec<String>,
+    source_ip: Option<String>,
+}
+
+#[derive(Clone)]
+struct DeviceFlowTemplate {
+    user_code: String,
+    verification_uri: String,
+    identity: String,
+    approve_after_polls: u32,
+    deny: bool,
+}
+
+struct DeviceFlowRecord {
+    template: DeviceFlowTemplate,
+    polls: u32,
+    expires_at: SystemTime,
+}
+
+struct AllowRule {
+    identity: String,
+    node_id: String,
+    principal: String,
+}
+
+struct BreakglassTokenRecord {
+    gateway_id: String,
+    identity: String,
+    principals: Vec<String>,
+    node_id: String,
+    source_ip: String,
+    used: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BreakglassActivation {
+    identity: String,
+    node_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct PresenceRow {
+    owner: String,
+    gateway_addr: String,
+    nonce: u64,
+    nonce_id: String,
+    last_seen: SystemTime,
+}
+
+/// Mutable + immutable mock CP state shared by the three service handlers.
+struct MockState {
+    ca: TestCa,
+    session_ca_pem: String,
+    session_ca_public_line: String,
+    server_range: ((u32, u32), (u32, u32)),
+    cert_ttl: Duration,
+    enrollment_tokens: Mutex<HashSet<String>>,
+    gateways: Mutex<HashMap<String, GatewayRecord>>,
+    tokens: Mutex<HashMap<String, TokenRecord>>,
+    next_id: Mutex<u64>,
+    force_bad_renew_generation: Mutex<bool>,
+    hang_sign: Mutex<bool>,
+
+    user_ca_pem: String,
+    // Per-RPC counters: the break-glass security-key path must cost the SAME number
+    // of round-trips whether or not the key is a registered emergency credential,
+    // otherwise latency alone discloses that fact.
+    resolve_pin_calls: std::sync::atomic::AtomicUsize,
+    resolve_breakglass_key_calls: std::sync::atomic::AtomicUsize,
+    pins: Mutex<HashMap<String, ResolvedRecord>>,
+    otps: Mutex<HashMap<String, ResolvedRecord>>,
+    device_flow_template: Mutex<Option<DeviceFlowTemplate>>,
+    device_flows: Mutex<HashMap<String, DeviceFlowRecord>>,
+    allow_rules: Mutex<Vec<AllowRule>>,
+    known_nodes: Mutex<HashSet<String>>,
+    host_ca_pem: String,
+    host_ca_public_wire: Vec<u8>,
+    node_connections: Mutex<HashMap<String, NodeConnection>>,
+    node_capabilities: Mutex<HashMap<String, Vec<i32>>>,
+    decision_ttl_secs: Mutex<i64>,
+    force_signed_breakglass: Mutex<bool>,
+    grant_expiry_override: Mutex<Option<i64>>,
+    lock_feed_down: Mutex<bool>,
+    authorize_unavailable: Mutex<bool>,
+    resolve_unavailable: Mutex<bool>,
+
+    break_glass_keys: Mutex<HashMap<Vec<u8>, ResolvedRecord>>,
+    offline_codes: Mutex<HashMap<String, ResolvedRecord>>,
+    breakglass_tokens: Mutex<HashMap<String, BreakglassTokenRecord>>,
+    breakglass_activations: Mutex<Vec<BreakglassActivation>>,
+
+    recording_tokens: Mutex<HashMap<String, TokenRecord>>,
+    customer_key: Mutex<Option<CustomerKey>>,
+    s3: Mutex<Option<S3Target>>,
+    recordings: Mutex<HashMap<String, (String, String)>>,
+    finalized: Mutex<HashMap<String, FinalizeRecordingRequest>>,
+    upload_ttl_secs: Mutex<u64>,
+    request_uploads: Mutex<Vec<String>>,
+
+    context_signer_der: Vec<u8>,
+    context_signer_key: SigningKey,
+    node_labels: Mutex<HashMap<String, Vec<String>>>,
+    locks: Mutex<Vec<Lock>>,
+    server_cert_ttl: Mutex<Duration>,
+    signed_key_ids: Mutex<Vec<String>>,
+    lock_events: tokio::sync::broadcast::Sender<LockEvent>,
+    feed_epoch: AtomicU64,
+
+    presence: Mutex<HashMap<String, PresenceRow>>,
+    presence_staleness: Duration,
+
+    node_name_to_id: Mutex<HashMap<String, String>>,
+    authorize_requests: Mutex<Vec<AuthorizeRequest>>,
+
+    /// Every credential scope this mock has handed out, keyed by identity. Ground
+    /// truth for the Authorize-side assertion that the Gateway forwarded the scope of
+    /// the credential the client actually authenticated with.
+    resolved_scopes: Mutex<HashMap<String, Vec<Vec<String>>>>,
+    ignore_credential_scope: Mutex<bool>,
+
+    /// Concurrency leases taken on a standing/JIT ALLOW (break-glass takes none),
+    /// keyed by session_id. NotifySessionEnd releases; ExtendSessionLease re-stamps.
+    leases: Mutex<HashMap<String, LeaseRecord>>,
+    session_end_notifications: Mutex<Vec<NotifySessionEndRequest>>,
+    lease_extensions: Mutex<Vec<String>>,
+    extend_window_secs: Mutex<i64>,
+    extend_unavailable: Mutex<bool>,
+    idle_timeout_secs: Mutex<i64>,
+}
+
+struct LeaseRecord {
+    gateway_id: String,
+    released: bool,
+    expires_at: i64,
+}
+
+impl MockState {
+    fn resolve_gateway_id(&self, presented_leaf: &[u8]) -> Result<String, Status> {
+        let gws = self.gateways.lock().unwrap();
+        gws.iter()
+            .find(|(_, rec)| rec.leaf_der == presented_leaf)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| Status::unauthenticated("unknown client certificate"))
+    }
+
+    fn sign_inner(
+        &self,
+        subject_pub_wire: &[u8],
+        principal: &str,
+        session_id: &str,
+        extensions: &[&'static str],
+    ) -> Result<SignSessionCertificateResponse, Status> {
+        let pubkey = ssh_key::PublicKey::from_bytes(subject_pub_wire)
+            .map_err(|_| Status::invalid_argument("subject public key is not an SSH public key"))?;
+        let ca = ssh_key::PrivateKey::from_openssh(&self.session_ca_pem)
+            .map_err(|_| Status::internal("session CA unavailable"))?;
+
+        let now = unix_now();
+        let valid_after = now.saturating_sub(60);
+        let valid_before = now + 300;
+        let key_id = format!("{session_id}+{principal}");
+
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            valid_after,
+            valid_before,
+        )
+        .map_err(|_| Status::internal("cert builder"))?;
+        builder
+            .cert_type(ssh_key::certificate::CertType::User)
+            .and_then(|b| b.key_id(&key_id))
+            .and_then(|b| b.valid_principal(principal))
+            .map_err(|_| Status::internal("cert builder fields"))?;
+        for ext in extensions {
+            builder
+                .extension(*ext, "")
+                .map_err(|_| Status::internal("cert extension"))?;
+        }
+        let cert = builder
+            .sign(&ca)
+            .map_err(|_| Status::internal("session CA signing failed"))?;
+
+        Ok(SignSessionCertificateResponse {
+            certificate_line: cert.to_openssh().map_err(|_| Status::internal("encode"))?,
+            certificate_blob: cert.to_bytes().map_err(|_| Status::internal("encode"))?,
+            key_id,
+            valid_after_epoch_seconds: valid_after as i64,
+            valid_before_epoch_seconds: valid_before as i64,
+        })
+    }
+
+    fn sign_context(&self, context: &DecisionContext) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<u8>>) {
+        let signed = decisionctx::canonical_bytes(context);
+        let mut msg = decisionctx::DOMAIN_PREFIX.to_vec();
+        msg.extend_from_slice(&signed);
+        let sig: p256::ecdsa::Signature = self.context_signer_key.sign(&msg);
+        let sig_der = sig.to_der().as_bytes().to_vec();
+        (
+            signed,
+            sig_der,
+            self.context_signer_der.clone(),
+            vec![self.ca.cert_der().to_vec()],
+        )
+    }
+}
+
+#[derive(Clone)]
+struct MockSvc(Arc<MockState>);
+
+impl std::ops::Deref for MockSvc {
+    type Target = MockState;
+    fn deref(&self) -> &MockState {
+        self.0.as_ref()
+    }
+}
+
+#[tonic::async_trait]
+impl Handshake for MockSvc {
+    async fn negotiate(
+        &self,
+        request: Request<ClientHello>,
+    ) -> Result<Response<ServerHello>, Status> {
+        let client = request.into_inner().client.unwrap_or_default();
+        let cmin = client.protocol_min.unwrap_or_default();
+        let cmax = client.protocol_max.unwrap_or_default();
+        match version::resolve_common_version(
+            (cmin.major, cmin.minor),
+            (cmax.major, cmax.minor),
+            self.server_range.0,
+            self.server_range.1,
+        ) {
+            Some((major, minor)) => Ok(Response::new(ServerHello {
+                server: Some(server_info(self.server_range)),
+                selected: Some(ProtocolVersion { major, minor }),
+            })),
+            None => Err(Status::failed_precondition("no common version")),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl GatewayIdentity for MockSvc {
+    async fn enroll_gateway(
+        &self,
+        request: Request<EnrollGatewayRequest>,
+    ) -> Result<Response<EnrollGatewayResponse>, Status> {
+        let r = request.into_inner();
+        {
+            let mut toks = self.enrollment_tokens.lock().unwrap();
+            if !toks.remove(&r.enrollment_token) {
+                return Err(Status::permission_denied("enrollment denied"));
+            }
+        }
+        let gateway_id = {
+            let mut id = self.next_id.lock().unwrap();
+            *id += 1;
+            format!("gw-{id:08}")
+        };
+        // Stamp the gateway URI SAN alongside the dNSName, exactly as the real CP does:
+        // the peer-relay path requires the URI SAN's PRESENCE as the positive gateway
+        // check, not merely the absence of an agent URI SAN.
+        let leaf_der = self
+            .ca
+            .sign_csr_as_gateway_identity(&r.pkcs10_csr, &r.gateway_name, &gateway_id)
+            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
+
+        self.gateways.lock().unwrap().insert(
+            gateway_id.clone(),
+            GatewayRecord {
+                leaf_der: leaf_der.clone(),
+                generation: 0,
+                locked: false,
+                name: r.gateway_name,
+            },
+        );
+
+        let (nb, na) = self.validity_window();
+        Ok(Response::new(EnrollGatewayResponse {
+            certificate: leaf_der,
+            ca_chain: vec![self.ca.cert_der().to_vec()],
+            gateway_id,
+            generation: 0,
+            not_before_epoch_seconds: nb,
+            not_after_epoch_seconds: na,
+        }))
+    }
+
+    async fn renew_gateway_identity(
+        &self,
+        request: Request<RenewGatewayIdentityRequest>,
+    ) -> Result<Response<RenewGatewayIdentityResponse>, Status> {
+        let peer = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = peer
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+            .as_ref()
+            .to_vec();
+        let gid = self.resolve_gateway_id(&leaf)?;
+        let r = request.into_inner();
+
+        let mut gws = self.gateways.lock().unwrap();
+        let rec = gws.get_mut(&gid).unwrap();
+        if rec.locked {
+            return Err(Status::permission_denied("identity locked"));
+        }
+        if r.current_generation != rec.generation {
+            return Err(Status::failed_precondition("stale generation"));
+        }
+
+        let gateway_name = rec.name.clone();
+        let new_leaf = self
+            .ca
+            .sign_csr_as_gateway_identity(&r.pkcs10_csr, &gateway_name, &gid)
+            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
+
+        let bad = {
+            let mut b = self.force_bad_renew_generation.lock().unwrap();
+            std::mem::replace(&mut *b, false)
+        };
+        let (nb, na) = self.validity_window();
+        if bad {
+            // Return an unexpected generation without mutating our record - the
+            // Gateway must refuse to adopt (security event) and keep its cert.
+            return Ok(Response::new(RenewGatewayIdentityResponse {
+                certificate: new_leaf,
+                ca_chain: vec![self.ca.cert_der().to_vec()],
+                gateway_id: gid,
+                generation: rec.generation + 2,
+                not_before_epoch_seconds: nb,
+                not_after_epoch_seconds: na,
+            }));
+        }
+
+        rec.generation += 1;
+        rec.leaf_der = new_leaf.clone();
+        Ok(Response::new(RenewGatewayIdentityResponse {
+            certificate: new_leaf,
+            ca_chain: vec![self.ca.cert_der().to_vec()],
+            gateway_id: gid,
+            generation: rec.generation,
+            not_before_epoch_seconds: nb,
+            not_after_epoch_seconds: na,
+        }))
+    }
+
+    /// Issue the **serverAuth** leaf for the Gateway's agent-facing
+    /// WSS listener. Requires the caller's current mTLS client certificate; a locked
+    /// identity is refused. The CP - not the caller - chooses the SANs, stamping them
+    /// from the gateway_identity row it already holds, so a compromised Gateway cannot
+    /// obtain a server certificate for a name it does not own.
+    async fn issue_gateway_server_certificate(
+        &self,
+        request: Request<IssueGatewayServerCertificateRequest>,
+    ) -> Result<Response<IssueGatewayServerCertificateResponse>, Status> {
+        let peer = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = peer
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+            .as_ref()
+            .to_vec();
+        let gid = self.resolve_gateway_id(&leaf)?;
+
+        let gateway_name = {
+            let gws = self.gateways.lock().unwrap();
+            let rec = gws
+                .get(&gid)
+                .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
+            if rec.locked {
+                return Err(Status::permission_denied("identity locked"));
+            }
+            rec.name.clone()
+        };
+
+        let r = request.into_inner();
+        let ttl = *self.server_cert_ttl.lock().unwrap();
+        let certificate = self
+            .ca
+            .sign_csr_as_server(&r.pkcs10_csr, &gateway_name, &gid, ttl)
+            .map_err(|_| Status::invalid_argument("invalid CSR"))?;
+
+        let now = SystemTime::now();
+        Ok(Response::new(IssueGatewayServerCertificateResponse {
+            certificate,
+            ca_chain: vec![self.ca.cert_der().to_vec()],
+            gateway_name,
+            not_before_epoch_seconds: epoch_of(now),
+            not_after_epoch_seconds: epoch_of(now + ttl),
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl SessionSigning for MockSvc {
+    async fn sign_session_certificate(
+        &self,
+        request: Request<SignSessionCertificateRequest>,
+    ) -> Result<Response<SignSessionCertificateResponse>, Status> {
+        let hang = *self.hang_sign.lock().unwrap();
+        if hang {
+            std::future::pending::<()>().await;
+        }
+        let peer = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = peer
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+            .as_ref()
+            .to_vec();
+        let gid = self.resolve_gateway_id(&leaf)?;
+
+        {
+            let gws = self.gateways.lock().unwrap();
+            if gws.get(&gid).map(|r| r.locked).unwrap_or(true) {
+                return Err(Status::permission_denied("access denied by policy"));
+            }
+        }
+
+        let r = request.into_inner();
+        let (session_id, principal, node_id) = {
+            let mut toks = self.tokens.lock().unwrap();
+            let rec = toks
+                .get_mut(&r.session_token)
+                .ok_or_else(|| Status::permission_denied("access denied by policy"))?;
+            if rec.used || rec.exp <= SystemTime::now() || rec.gateway_id != gid {
+                return Err(Status::permission_denied("access denied by policy"));
+            }
+            if let Some(ctx) = &r.context {
+                if (!ctx.session_id.is_empty() && ctx.session_id != rec.session_id)
+                    || (!ctx.node_id.is_empty() && ctx.node_id != rec.node_id)
+                    || (!ctx.requested_principal.is_empty()
+                        && ctx.requested_principal != rec.principal)
+                {
+                    return Err(Status::permission_denied("access denied by policy"));
+                }
+            }
+            rec.used = true;
+            (
+                rec.session_id.clone(),
+                rec.principal.clone(),
+                rec.node_id.clone(),
+            )
+        };
+
+        // Map the node's granted capabilities to cert extensions, mirroring the
+        // real CP (CertificateProfiles.extensionsFor): shell→permit-pty,
+        // port_forward_*→permit-port-forwarding, x11→permit-X11-forwarding; NEVER
+        // permit-agent-forwarding (agent forwarding is always refused).
+        let caps = self
+            .node_capabilities
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Capability::Shell as i32, Capability::Exec as i32]);
+        let mut extensions: Vec<&'static str> = Vec::new();
+        if caps.contains(&(Capability::Shell as i32)) {
+            extensions.push("permit-pty");
+        }
+        if caps.contains(&(Capability::PortForwardLocal as i32))
+            || caps.contains(&(Capability::PortForwardRemote as i32))
+        {
+            extensions.push("permit-port-forwarding");
+        }
+        if caps.contains(&(Capability::X11 as i32)) {
+            extensions.push("permit-X11-forwarding");
+        }
+
+        let resp = self.sign_inner(&r.subject_public_key, &principal, &session_id, &extensions)?;
+        self.signed_key_ids
+            .lock()
+            .unwrap()
+            .push(resp.key_id.clone());
+        Ok(Response::new(resp))
+    }
+}
+
+fn not_resolved() -> ResolvedIdentity {
+    ResolvedIdentity {
+        resolved: false,
+        identity: String::new(),
+        principals: Vec::new(),
+        groups: Vec::new(),
+    }
+}
+
+fn resolved(rec: &ResolvedRecord) -> ResolvedIdentity {
+    ResolvedIdentity {
+        resolved: true,
+        identity: rec.identity.clone(),
+        principals: rec.principals.clone(),
+        groups: rec.groups.clone(),
+    }
+}
+
+fn require_gateway<T>(request: &Request<T>, state: &MockState) -> Result<String, Status> {
+    let peer = request
+        .peer_certs()
+        .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+    let leaf = peer
+        .first()
+        .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+        .as_ref()
+        .to_vec();
+    state.resolve_gateway_id(&leaf)
+}
+
+impl MockState {
+    /// Remember what scope this identity was just handed, then pass the resolution
+    /// through. Every outer-leg resolve path funnels through here so Authorize can
+    /// check the Gateway forwarded THIS credential's scope.
+    fn remember_scope(&self, id: ResolvedIdentity) -> ResolvedIdentity {
+        if id.resolved {
+            self.resolved_scopes
+                .lock()
+                .unwrap()
+                .entry(id.identity.clone())
+                .or_default()
+                .push(id.principals.clone());
+        }
+        id
+    }
+
+    /// The mock-side assertion the fix exists for: the credential's login scope must
+    /// REACH the CP, because the CP is the only writer of the decision log. Forwarding
+    /// nothing, or some other credential's scope, is a Gateway defect rather than a
+    /// policy question, so it surfaces as an RPC error - distinct from every deny.
+    fn check_credential_scope_forwarded(&self, r: &AuthorizeRequest) -> Result<(), Status> {
+        let scopes = self.resolved_scopes.lock().unwrap();
+        let Some(handed_out) = scopes.get(&r.identity) else {
+            return Ok(());
+        };
+        if handed_out.contains(&r.credential_principals) {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "AuthorizeRequest.credential_principals {:?} matches no credential resolved for {:?} (handed out: {handed_out:?})",
+            r.credential_principals, r.identity
+        )))
+    }
+
+    /// The CP-side credential-principal reduction: deny-only, applied after the
+    /// node-status gate and before any grant / JIT / break-glass evaluation, exactly
+    /// where the real CP applies it.
+    fn credential_scope_denies(&self, r: &AuthorizeRequest) -> bool {
+        if *self.ignore_credential_scope.lock().unwrap() {
+            return false;
+        }
+        !r.credential_principals.is_empty()
+            && !r.credential_principals.contains(&r.requested_principal)
+    }
+
+    fn resolve_map(&self, rec: Option<&ResolvedRecord>, source_ip: &str) -> ResolvedIdentity {
+        let id = match rec {
+            Some(r) if r.source_ip.as_deref().is_none_or(|s| s == source_ip) => resolved(r),
+            _ => not_resolved(),
+        };
+        self.remember_scope(id)
+    }
+
+    fn resolve_cert(&self, blob: &[u8], _source_ip: &str) -> ResolvedIdentity {
+        let cert = match ssh_key::Certificate::from_bytes(blob) {
+            Ok(c) => c,
+            Err(_) => return not_resolved(),
+        };
+        let ca = match ssh_key::PrivateKey::from_openssh(&self.user_ca_pem) {
+            Ok(k) => k,
+            Err(_) => return not_resolved(),
+        };
+        let ca_fp = ca.public_key().fingerprint(ssh_key::HashAlg::Sha256);
+        if cert.validate_at(unix_now(), [&ca_fp]).is_err() {
+            return not_resolved();
+        }
+        self.remember_scope(ResolvedIdentity {
+            resolved: true,
+            identity: cert.key_id().to_string(),
+            principals: cert.valid_principals().to_vec(),
+            groups: Vec::new(),
+        })
+    }
+
+    fn sign_user_cert(
+        &self,
+        pubkey_openssh_line: &str,
+        identity: &str,
+        principals: &[String],
+        valid_secs: u64,
+    ) -> String {
+        let pubkey = ssh_key::PublicKey::from_openssh(pubkey_openssh_line).unwrap();
+        let ca = ssh_key::PrivateKey::from_openssh(&self.user_ca_pem).unwrap();
+        let now = unix_now();
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            now.saturating_sub(60),
+            now + valid_secs,
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::User)
+            .unwrap();
+        builder.key_id(identity).unwrap();
+        for p in principals {
+            builder.valid_principal(p).unwrap();
+        }
+        let cert = builder.sign(&ca).unwrap();
+        cert.to_openssh().unwrap()
+    }
+}
+
+fn resolve_down(state: &MockState) -> Result<(), Status> {
+    if *state.resolve_unavailable.lock().unwrap() {
+        return Err(Status::unavailable("control plane temporarily unavailable"));
+    }
+    Ok(())
+}
+
+#[tonic::async_trait]
+impl HostCertSigning for MockSvc {
+    async fn sign_gateway_host_certificate(
+        &self,
+        request: Request<SignGatewayHostCertificateRequest>,
+    ) -> Result<Response<SignGatewayHostCertificateResponse>, Status> {
+        let peer = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = peer
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?
+            .as_ref()
+            .to_vec();
+        let gid = self.resolve_gateway_id(&leaf)?;
+        {
+            let gws = self.gateways.lock().unwrap();
+            if gws.get(&gid).map(|r| r.locked).unwrap_or(true) {
+                return Err(Status::permission_denied("access denied by policy"));
+            }
+        }
+        let r = request.into_inner();
+        if r.host_principals.is_empty() {
+            return Err(Status::invalid_argument("host_principals required"));
+        }
+        let pubkey = ssh_key::PublicKey::from_bytes(&r.host_public_key)
+            .map_err(|_| Status::invalid_argument("bad host public key"))?;
+        let ca = ssh_key::PrivateKey::from_openssh(&self.host_ca_pem).unwrap();
+        let now = unix_now();
+        let valid_secs = 3600u64;
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            now.saturating_sub(60),
+            now + valid_secs,
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .unwrap();
+        for p in &r.host_principals {
+            builder.valid_principal(p).unwrap();
+        }
+        builder.key_id("sessionlayer-gateway-host-cert").unwrap();
+        let cert = builder.sign(&ca).unwrap();
+        Ok(Response::new(SignGatewayHostCertificateResponse {
+            certificate_line: cert.to_openssh().unwrap(),
+            certificate_blob: cert.to_bytes().unwrap(),
+            valid_after_epoch_seconds: now.saturating_sub(60) as i64,
+            valid_before_epoch_seconds: (now + valid_secs) as i64,
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl OuterLegAuth for MockSvc {
+    async fn resolve_user_cert(
+        &self,
+        request: Request<ResolveUserCertRequest>,
+    ) -> Result<Response<ResolveUserCertResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let identity = self.resolve_cert(&r.certificate_blob, &r.source_ip);
+        Ok(Response::new(ResolveUserCertResponse {
+            identity: Some(identity),
+        }))
+    }
+
+    async fn resolve_pin(
+        &self,
+        request: Request<ResolvePinRequest>,
+    ) -> Result<Response<ResolvePinResponse>, Status> {
+        self.resolve_pin_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let identity = {
+            let pins = self.pins.lock().unwrap();
+            self.resolve_map(pins.get(&r.public_key_fingerprint), &r.source_ip)
+        };
+        Ok(Response::new(ResolvePinResponse {
+            identity: Some(identity),
+        }))
+    }
+
+    async fn resolve_otp(
+        &self,
+        request: Request<ResolveOtpRequest>,
+    ) -> Result<Response<ResolveOtpResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let identity = {
+            let mut otps = self.otps.lock().unwrap();
+            match otps.get(&r.otp) {
+                Some(rec) if rec.source_ip.as_deref().is_none_or(|s| s == r.source_ip) => {
+                    let rec = otps.remove(&r.otp).unwrap();
+                    self.remember_scope(resolved(&rec))
+                }
+                _ => not_resolved(),
+            }
+        };
+        Ok(Response::new(ResolveOtpResponse {
+            identity: Some(identity),
+        }))
+    }
+
+    async fn begin_device_flow(
+        &self,
+        request: Request<BeginDeviceFlowRequest>,
+    ) -> Result<Response<BeginDeviceFlowResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let template = self
+            .device_flow_template
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("no device flow configured"))?;
+        let device_code = random_token("dev");
+        let resp = BeginDeviceFlowResponse {
+            device_code: device_code.clone(),
+            user_code: template.user_code.clone(),
+            verification_uri: template.verification_uri.clone(),
+            interval_seconds: 1,
+            expires_in_seconds: 120,
+        };
+        self.device_flows.lock().unwrap().insert(
+            device_code,
+            DeviceFlowRecord {
+                template,
+                polls: 0,
+                expires_at: SystemTime::now() + Duration::from_secs(120),
+            },
+        );
+        Ok(Response::new(resp))
+    }
+
+    async fn poll_device_flow(
+        &self,
+        request: Request<PollDeviceFlowRequest>,
+    ) -> Result<Response<PollDeviceFlowResponse>, Status> {
+        require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let mut flows = self.device_flows.lock().unwrap();
+        let Some(rec) = flows.get_mut(&r.device_code) else {
+            // Unknown device_code → EXPIRED (generic, no existence disclosure).
+            return Ok(Response::new(PollDeviceFlowResponse {
+                status: DeviceFlowStatus::Expired as i32,
+                identity: Some(not_resolved()),
+            }));
+        };
+        if SystemTime::now() >= rec.expires_at {
+            return Ok(Response::new(PollDeviceFlowResponse {
+                status: DeviceFlowStatus::Expired as i32,
+                identity: Some(not_resolved()),
+            }));
+        }
+        rec.polls += 1;
+        let (status, identity) = if rec.template.deny {
+            (DeviceFlowStatus::Denied, not_resolved())
+        } else if rec.polls > rec.template.approve_after_polls {
+            (
+                DeviceFlowStatus::Approved,
+                // Real CP: device-flow APPROVED carries identity only; RBAC
+                // decides the logins, so principals/groups are empty.
+                self.remember_scope(ResolvedIdentity {
+                    resolved: true,
+                    identity: rec.template.identity.clone(),
+                    principals: Vec::new(),
+                    groups: Vec::new(),
+                }),
+            )
+        } else {
+            (DeviceFlowStatus::Pending, not_resolved())
+        };
+        Ok(Response::new(PollDeviceFlowResponse {
+            status: status as i32,
+            identity: Some(identity),
+        }))
+    }
+
+    async fn resolve_breakglass_key(
+        &self,
+        request: Request<ResolveBreakglassKeyRequest>,
+    ) -> Result<Response<ResolveBreakglassKeyResponse>, Status> {
+        self.resolve_breakglass_key_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let gid = require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let resolution = {
+            let keys = self.break_glass_keys.lock().unwrap();
+            match keys.get(&r.sk_public_key_blob) {
+                Some(rec) if rec.source_ip.as_deref().is_none_or(|s| s == r.source_ip) => {
+                    self.mint_break_glass(&gid, rec, &r.source_ip, &r.node_id)
+                }
+                _ => not_resolved_break_glass(),
+            }
+        };
+        Ok(Response::new(ResolveBreakglassKeyResponse {
+            resolution: Some(resolution),
+        }))
+    }
+
+    async fn resolve_breakglass_code(
+        &self,
+        request: Request<ResolveBreakglassCodeRequest>,
+    ) -> Result<Response<ResolveBreakglassCodeResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        resolve_down(self)?;
+        let r = request.into_inner();
+        let resolution = {
+            let mut codes = self.offline_codes.lock().unwrap();
+            match codes.get(&r.code) {
+                Some(rec) if rec.source_ip.as_deref().is_none_or(|s| s == r.source_ip) => {
+                    let rec = codes.remove(&r.code).unwrap();
+                    self.mint_break_glass(&gid, &rec, &r.source_ip, &r.node_id)
+                }
+                _ => not_resolved_break_glass(),
+            }
+        };
+        Ok(Response::new(ResolveBreakglassCodeResponse {
+            resolution: Some(resolution),
+        }))
+    }
+}
+
+fn not_resolved_break_glass() -> BreakglassResolution {
+    BreakglassResolution {
+        identity: Some(not_resolved()),
+        breakglass_token: String::new(),
+    }
+}
+
+impl MockState {
+    fn mint_break_glass(
+        &self,
+        gid: &str,
+        rec: &ResolvedRecord,
+        source_ip: &str,
+        node_id: &str,
+    ) -> BreakglassResolution {
+        let token = random_token("bg");
+        self.breakglass_tokens.lock().unwrap().insert(
+            token.clone(),
+            BreakglassTokenRecord {
+                gateway_id: gid.to_string(),
+                identity: rec.identity.clone(),
+                principals: rec.principals.clone(),
+                node_id: node_id.to_string(),
+                source_ip: source_ip.to_string(),
+                used: false,
+            },
+        );
+        BreakglassResolution {
+            identity: Some(self.remember_scope(resolved(rec))),
+            breakglass_token: token,
+        }
+    }
+
+    fn context_for(
+        &self,
+        gid: &str,
+        r: &AuthorizeRequest,
+        access_model: AccessModel,
+    ) -> DecisionContext {
+        let now = unix_now() as i64;
+        let capabilities = self
+            .node_capabilities
+            .lock()
+            .unwrap()
+            .get(&r.node_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Capability::Shell as i32, Capability::Exec as i32]);
+        let node_labels = self
+            .node_labels
+            .lock()
+            .unwrap()
+            .get(&r.node_id)
+            .cloned()
+            .unwrap_or_default();
+        DecisionContext {
+            node_id: r.node_id.clone(),
+            node_name: r.node_id.clone(),
+            allowed_logins: vec![r.requested_principal.clone()],
+            capabilities,
+            principal: r.requested_principal.clone(),
+            grant_expiry_epoch_seconds: self
+                .grant_expiry_override
+                .lock()
+                .unwrap()
+                .unwrap_or(now + 3600),
+            policy_epoch: 1,
+            decision_ttl_seconds: *self.decision_ttl_secs.lock().unwrap(),
+            gateway_id: gid.to_string(),
+            session_id: r.session_id.clone(),
+            source_address: r.source_ip.clone(),
+            issued_at_epoch_seconds: now,
+            identity: r.identity.clone(),
+            identity_groups: r.identity_groups.clone(),
+            node_labels,
+            access_model: access_model as i32,
+            idle_timeout_seconds: *self.idle_timeout_secs.lock().unwrap(),
+        }
+    }
+
+    fn create_lease(&self, session_id: &str, gateway_id: &str) {
+        let expires = self
+            .grant_expiry_override
+            .lock()
+            .unwrap()
+            .unwrap_or(unix_now() as i64 + 3600);
+        self.leases.lock().unwrap().insert(
+            session_id.to_string(),
+            LeaseRecord {
+                gateway_id: gateway_id.to_string(),
+                released: false,
+                expires_at: expires,
+            },
+        );
+    }
+
+    fn allow_response_with_context(
+        &self,
+        gid: &str,
+        r: &AuthorizeRequest,
+        context: DecisionContext,
+    ) -> AuthorizeResponse {
+        let token = random_token("sess");
+        self.tokens.lock().unwrap().insert(
+            token.clone(),
+            TokenRecord {
+                gateway_id: gid.to_string(),
+                session_id: r.session_id.clone(),
+                node_id: r.node_id.clone(),
+                principal: r.requested_principal.clone(),
+                exp: SystemTime::now() + Duration::from_secs(120),
+                used: false,
+            },
+        );
+        let recording_token = random_token("rec");
+        self.recording_tokens.lock().unwrap().insert(
+            recording_token.clone(),
+            TokenRecord {
+                gateway_id: gid.to_string(),
+                session_id: r.session_id.clone(),
+                node_id: r.node_id.clone(),
+                principal: r.requested_principal.clone(),
+                exp: SystemTime::now() + Duration::from_secs(120),
+                used: false,
+            },
+        );
+        // Fold the FRESH presence owner into the node connection (HA read
+        // path): the owner fields ride only when a live Gateway heartbeated ownership, so an
+        // OUTBOUND_AGENT node with no fresh owner comes back empty ⇒ "node offline".
+        let node_connection = self
+            .node_connections
+            .lock()
+            .unwrap()
+            .get(&r.node_id)
+            .cloned()
+            .map(|mut nc| {
+                if let Some(row) = self.fresh_presence(&r.node_id) {
+                    nc.owning_gateway_id = row.owner;
+                    nc.owning_gateway_addr = row.gateway_addr;
+                    nc.owner_nonce = row.nonce;
+                    nc.owner_nonce_id = row.nonce_id;
+                }
+                nc
+            });
+        let (signed_context, signature, signer_certificate, signer_ca_chain) =
+            self.sign_context(&context);
+        AuthorizeResponse {
+            decision: Decision::Allow as i32,
+            context: Some(context),
+            signed_context,
+            signature,
+            signer_certificate,
+            signer_ca_chain,
+            session_token: token,
+            node_connection,
+            recording_token,
+        }
+    }
+
+    fn allow_response(
+        &self,
+        gid: &str,
+        r: &AuthorizeRequest,
+        access_model: AccessModel,
+    ) -> AuthorizeResponse {
+        let signed_model = if access_model == AccessModel::Standing
+            && *self.force_signed_breakglass.lock().unwrap()
+        {
+            AccessModel::Breakglass
+        } else {
+            access_model
+        };
+        let signed_context = self.context_for(gid, r, signed_model);
+        let mut resp = self.allow_response_with_context(gid, r, signed_context);
+        // Ship a DOWNGRADED unsigned convenience copy (access_model = the requested,
+        // weaker model). A GW reading the unsigned `context` would be fooled; a correct
+        // GW ignores it and enforces the SIGNED access_model.
+        if signed_model != access_model {
+            resp.context = Some(self.context_for(gid, r, access_model));
+        }
+        resp
+    }
+
+    fn lock_denies(&self, context: &DecisionContext) -> bool {
+        let bindings = LockBindings::from_context(context);
+        self.locks.lock().unwrap().iter().any(|l| {
+            l.target
+                .as_ref()
+                .map(|t| target_matches(t, &bindings))
+                .unwrap_or(false)
+        })
+    }
+
+    fn authorize_break_glass(&self, gid: &str, r: &AuthorizeRequest) -> AuthorizeResponse {
+        let consumed = {
+            let mut toks = self.breakglass_tokens.lock().unwrap();
+            match toks.get_mut(&r.breakglass_token) {
+                Some(t) if !t.used && t.gateway_id == gid => {
+                    t.used = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !consumed {
+            return deny_response();
+        }
+        // The activation + high-priority alert happen ON USE, before the decision.
+        self.breakglass_activations
+            .lock()
+            .unwrap()
+            .push(BreakglassActivation {
+                identity: r.identity.clone(),
+                node_id: r.node_id.clone(),
+            });
+        if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
+            return deny_response();
+        }
+        if self.credential_scope_denies(r) {
+            return deny_response();
+        }
+        let context = self.context_for(gid, r, AccessModel::Breakglass);
+        if self.lock_denies(&context) {
+            return deny_response();
+        }
+        // Break-glass BYPASSES the standing dp_rule deny (always-available path).
+        self.allow_response_with_context(gid, r, context)
+    }
+}
+
+#[tonic::async_trait]
+impl Authorization for MockSvc {
+    async fn authorize(
+        &self,
+        request: Request<AuthorizeRequest>,
+    ) -> Result<Response<AuthorizeResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        if *self.authorize_unavailable.lock().unwrap() {
+            return Err(Status::unavailable("control plane temporarily unavailable"));
+        }
+        let mut r = request.into_inner();
+        self.authorize_requests.lock().unwrap().push(r.clone());
+        self.check_credential_scope_forwarded(&r)?;
+        // Name resolution is server-side authoritative: resolve
+        // node_name to the node's id/key and IGNORE the client-asserted node_id, so a
+        // client cannot smuggle an id past the resolved name. Empty node_name falls
+        // back to node_id (a direct-id caller). Everything below keys on the resolved
+        // r.node_id.
+        if !r.node_name.is_empty() {
+            r.node_id = self.resolve_node_name(&r.node_name);
+        }
+
+        if !r.breakglass_token.is_empty() {
+            return Ok(Response::new(self.authorize_break_glass(&gid, &r)));
+        }
+
+        if !self.known_nodes.lock().unwrap().contains(&r.node_id) {
+            return Ok(Response::new(deny_response()));
+        }
+        if self.credential_scope_denies(&r) {
+            return Ok(Response::new(deny_response()));
+        }
+        let allowed = self.allow_rules.lock().unwrap().iter().any(|rule| {
+            rule.identity == r.identity
+                && rule.node_id == r.node_id
+                && rule.principal == r.requested_principal
+        });
+        if !allowed {
+            return Ok(Response::new(deny_response()));
+        }
+
+        let resp = self.allow_response(&gid, &r, AccessModel::Standing);
+        self.create_lease(&r.session_id, &gid);
+        Ok(Response::new(resp))
+    }
+
+    async fn notify_session_end(
+        &self,
+        request: Request<NotifySessionEndRequest>,
+    ) -> Result<Response<NotifySessionEndResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        self.session_end_notifications
+            .lock()
+            .unwrap()
+            .push(r.clone());
+        let released = match self.leases.lock().unwrap().get_mut(&r.session_id) {
+            Some(l) if !l.released && l.gateway_id == gid => {
+                l.released = true;
+                true
+            }
+            _ => false,
+        };
+        Ok(Response::new(NotifySessionEndResponse { released }))
+    }
+
+    async fn extend_session_lease(
+        &self,
+        request: Request<ExtendSessionLeaseRequest>,
+    ) -> Result<Response<ExtendSessionLeaseResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        // Attempts are recorded BEFORE the failure gate so a failure-injection
+        // test can still assert the Gateway kept trying.
+        self.lease_extensions
+            .lock()
+            .unwrap()
+            .push(r.session_id.clone());
+        if *self.extend_unavailable.lock().unwrap() {
+            return Err(Status::unavailable("control plane temporarily unavailable"));
+        }
+        let window = *self.extend_window_secs.lock().unwrap();
+        match self.leases.lock().unwrap().get_mut(&r.session_id) {
+            Some(l) if !l.released && l.gateway_id == gid => {
+                l.expires_at = unix_now() as i64 + window;
+                Ok(Response::new(ExtendSessionLeaseResponse {
+                    expires_at_epoch_seconds: l.expires_at,
+                }))
+            }
+            _ => Err(Status::failed_precondition("no live lease for this caller")),
+        }
+    }
+}
+
+impl MockState {
+    fn resolve_node_name(&self, name: &str) -> String {
+        self.node_name_to_id
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    fn gateway_name_of(&self, gid: &str) -> Option<String> {
+        self.gateways
+            .lock()
+            .unwrap()
+            .get(gid)
+            .map(|r| r.name.clone())
+    }
+
+    fn fresh_presence(&self, node_id: &str) -> Option<PresenceRow> {
+        let now = SystemTime::now();
+        self.presence
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .filter(|row| {
+                now.duration_since(row.last_seen)
+                    .map(|d| d < self.presence_staleness)
+                    .unwrap_or(false)
+            })
+            .cloned()
+    }
+}
+
+#[tonic::async_trait]
+impl Presence for MockSvc {
+    async fn heartbeat(
+        &self,
+        request: Request<PresenceHeartbeatRequest>,
+    ) -> Result<Response<PresenceHeartbeatResponse>, Status> {
+        // The OWNER is the authenticated mTLS peer (its gateway_identity.name) - never a
+        // request field (the HA trust rule, exactly like the real CP).
+        let gid = require_gateway(&request, self)?;
+        let owner = self
+            .gateway_name_of(&gid)
+            .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
+        let r = request.into_inner();
+        if r.node_name.is_empty() {
+            return Err(Status::invalid_argument("node name required"));
+        }
+        if r.gateway_addr.is_empty() {
+            return Err(Status::invalid_argument("gateway address required"));
+        }
+
+        let now = SystemTime::now();
+        let mut map = self.presence.lock().unwrap();
+        let row = match map.get(&r.node_name) {
+            Some(existing) if existing.owner == owner => PresenceRow {
+                gateway_addr: r.gateway_addr.clone(),
+                last_seen: now,
+                ..existing.clone()
+            },
+            Some(existing)
+                if now
+                    .duration_since(existing.last_seen)
+                    .map(|d| d >= self.presence_staleness)
+                    .unwrap_or(true) =>
+            {
+                PresenceRow {
+                    owner: owner.clone(),
+                    gateway_addr: r.gateway_addr.clone(),
+                    nonce: existing.nonce + 1,
+                    nonce_id: random_token("nonce"),
+                    last_seen: now,
+                }
+            }
+            Some(existing) => existing.clone(),
+            None => PresenceRow {
+                owner: owner.clone(),
+                gateway_addr: r.gateway_addr.clone(),
+                nonce: 1,
+                nonce_id: random_token("nonce"),
+                last_seen: now,
+            },
+        };
+        map.insert(r.node_name.clone(), row.clone());
+
+        Ok(Response::new(PresenceHeartbeatResponse {
+            owning_gateway_id: row.owner.clone(),
+            gateway_addr: row.gateway_addr,
+            nonce: row.nonce,
+            nonce_id: row.nonce_id,
+            last_seen_epoch_ms: epoch_ms(row.last_seen),
+            is_self_owner: row.owner == owner,
+        }))
+    }
+
+    async fn release(
+        &self,
+        request: Request<PresenceReleaseRequest>,
+    ) -> Result<Response<PresenceReleaseResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let owner = self
+            .gateway_name_of(&gid)
+            .ok_or_else(|| Status::unauthenticated("unknown gateway"))?;
+        let r = request.into_inner();
+        let mut map = self.presence.lock().unwrap();
+        let released = match map.get(&r.node_name) {
+            Some(existing) if existing.owner == owner => {
+                // Age last_seen far into the past so a standby claims immediately (the nonce
+                // chain is preserved), closing the planned-drain failover window.
+                let relinquished = PresenceRow {
+                    last_seen: UNIX_EPOCH,
+                    ..existing.clone()
+                };
+                map.insert(r.node_name.clone(), relinquished);
+                true
+            }
+            _ => false,
+        };
+        Ok(Response::new(PresenceReleaseResponse { released }))
+    }
+}
+
+#[tonic::async_trait]
+impl LockFeed for MockSvc {
+    type StreamLocksStream = Pin<Box<dyn Stream<Item = Result<LockEvent, Status>> + Send>>;
+
+    async fn stream_locks(
+        &self,
+        request: Request<StreamLocksRequest>,
+    ) -> Result<Response<Self::StreamLocksStream>, Status> {
+        require_gateway(&request, self)?;
+        if *self.lock_feed_down.lock().unwrap() {
+            return Err(Status::unavailable("lock feed unavailable"));
+        }
+        // Subscribe to live events BEFORE snapshotting, so an add/remove that races
+        // the snapshot is never lost (a duplicate is harmless - the Gateway dedups).
+        let mut events = self.lock_events.subscribe();
+        let snapshot = self.locks.lock().unwrap().clone();
+        let feed_epoch = self.feed_epoch.load(Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<LockEvent, Status>>(64);
+        tokio::spawn(async move {
+            let snap = LockEvent {
+                event: Some(lock_event::Event::Snapshot(LockSnapshot {
+                    locks: snapshot,
+                    feed_epoch,
+                })),
+            };
+            if tx.send(Ok(snap)).await.is_err() {
+                return;
+            }
+            let mut hb = tokio::time::interval(Duration::from_secs(1));
+            hb.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    ev = events.recv() => match ev {
+                        Ok(e) => { if tx.send(Ok(e)).await.is_err() { return; } }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => return,
+                    },
+                    _ = hb.tick() => {
+                        let beat = LockEvent {
+                            event: Some(lock_event::Event::Heartbeat(Heartbeat {
+                                sent_at_epoch_seconds: unix_now() as i64,
+                            })),
+                        };
+                        if tx.send(Ok(beat)).await.is_err() { return; }
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+#[tonic::async_trait]
+impl Recording for MockSvc {
+    async fn begin_recording(
+        &self,
+        request: Request<BeginRecordingRequest>,
+    ) -> Result<Response<BeginRecordingResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+
+        {
+            let mut toks = self.recording_tokens.lock().unwrap();
+            let rec = toks
+                .get_mut(&r.recording_token)
+                .ok_or_else(|| Status::permission_denied("access denied by policy"))?;
+            if rec.used || rec.exp <= SystemTime::now() || rec.gateway_id != gid {
+                return Err(Status::permission_denied("access denied by policy"));
+            }
+            rec.used = true;
+        }
+
+        // The customer key is mandatory: if the operator configured none, return a
+        // response WITHOUT a customer key so the Gateway refuses (strict).
+        let customer_key = self.customer_key.lock().unwrap().clone();
+
+        let recording_id = random_token("recid");
+        let object_key = format!("recordings/{recording_id}");
+        self.recordings
+            .lock()
+            .unwrap()
+            .insert(recording_id.clone(), (gid, object_key.clone()));
+
+        Ok(Response::new(BeginRecordingResponse {
+            recording_id,
+            object_key,
+            worm_mode: WormMode::Compliance as i32,
+            customer_key,
+        }))
+    }
+
+    async fn request_upload(
+        &self,
+        request: Request<RequestUploadRequest>,
+    ) -> Result<Response<RequestUploadResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        let object_key = {
+            let recs = self.recordings.lock().unwrap();
+            match recs.get(&r.recording_id) {
+                Some((owner, key)) if *owner == gid => key.clone(),
+                _ => return Err(Status::permission_denied("access denied by policy")),
+            }
+        };
+        self.request_uploads.lock().unwrap().push(r.recording_id);
+
+        // Presign a FRESH single-object PUT under COMPLIANCE object-lock (the
+        // object-lock headers are SIGNED, so the uploader cannot strip the WORM
+        // lock). The TTL covers only the PUT.
+        let ttl = *self.upload_ttl_secs.lock().unwrap();
+        let upload = self.s3.lock().unwrap().as_ref().map(|s3| {
+            let retain = sigv4::retain_until_days(1);
+            let path = format!("/{}/{}", s3.bucket, object_key);
+            let (url, headers) = sigv4::presign(
+                s3,
+                "PUT",
+                &path,
+                &[],
+                &[
+                    ("x-amz-object-lock-mode", "COMPLIANCE"),
+                    ("x-amz-object-lock-retain-until-date", &retain),
+                ],
+                ttl,
+            );
+            UploadCredential {
+                url,
+                method: "PUT".to_string(),
+                required_headers: headers.into_iter().collect(),
+                expires_at_epoch_seconds: (unix_now() + ttl) as i64,
+            }
+        });
+        Ok(Response::new(RequestUploadResponse { upload }))
+    }
+
+    async fn finalize_recording(
+        &self,
+        request: Request<FinalizeRecordingRequest>,
+    ) -> Result<Response<FinalizeRecordingResponse>, Status> {
+        let gid = require_gateway(&request, self)?;
+        let r = request.into_inner();
+        {
+            let recs = self.recordings.lock().unwrap();
+            match recs.get(&r.recording_id) {
+                Some((owner, _)) if *owner == gid => {}
+                _ => return Err(Status::permission_denied("access denied by policy")),
+            }
+        }
+        let status = r.status;
+        self.finalized
+            .lock()
+            .unwrap()
+            .insert(r.recording_id.clone(), r);
+        Ok(Response::new(FinalizeRecordingResponse { status }))
+    }
+}
+
+fn deny_response() -> AuthorizeResponse {
+    AuthorizeResponse {
+        decision: Decision::Deny as i32,
+        context: None,
+        signed_context: Vec::new(),
+        signature: Vec::new(),
+        signer_certificate: Vec::new(),
+        signer_ca_chain: Vec::new(),
+        session_token: String::new(),
+        node_connection: None,
+        recording_token: String::new(),
+    }
+}
+
+fn offset_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
+}
+
+fn epoch_of(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+fn epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+impl MockState {
+    fn validity_window(&self) -> (i64, i64) {
+        let now = unix_now();
+        let nb = now.saturating_sub(5);
+        let na = now + self.cert_ttl.as_secs();
+        (nb as i64, na as i64)
+    }
+}
+
+pub struct MockCp {
+    pub endpoint: String,
+    pub server_name: String,
+    state: Arc<MockState>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MockCp {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+pub struct MockCpBuilder {
+    server_range: ((u32, u32), (u32, u32)),
+    cert_ttl: Duration,
+    server_san: String,
+    presence_staleness: Duration,
+}
+
+impl Default for MockCpBuilder {
+    fn default() -> Self {
+        Self {
+            server_range: ((1, 0), (1, 1)),
+            cert_ttl: Duration::from_secs(3600),
+            server_san: "cp.internal".to_string(),
+            presence_staleness: Duration::from_secs(30),
+        }
+    }
+}
+
+impl MockCpBuilder {
+    pub fn server_range(mut self, min: (u32, u32), max: (u32, u32)) -> Self {
+        self.server_range = (min, max);
+        self
+    }
+
+    pub fn cert_ttl(mut self, ttl: Duration) -> Self {
+        self.cert_ttl = ttl;
+        self
+    }
+
+    pub fn presence_staleness(mut self, ttl: Duration) -> Self {
+        self.presence_staleness = ttl;
+        self
+    }
+
+    pub async fn start(self) -> MockCp {
+        gateway_core::tls::install_ring_provider();
+
+        let ca = TestCa::generate("SessionLayer Internal mTLS CA");
+        let server_leaf = ca.issue_leaf(
+            &self.server_san,
+            vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+            rcgen::date_time_ymd(2020, 1, 1),
+            rcgen::date_time_ymd(2100, 1, 1),
+        );
+        let server_cert_pem = mtls::cert_der_to_pem(&server_leaf.cert_der);
+        let server_key_pem = server_leaf.key_pem;
+
+        let context_signer_leaf = ca.issue_context_signer(
+            rcgen::date_time_ymd(2020, 1, 1),
+            rcgen::date_time_ymd(2100, 1, 1),
+        );
+        let context_signer_der = context_signer_leaf.cert_der.clone();
+        let context_signer_key =
+            SigningKey::from_pkcs8_der(&context_signer_leaf.key_pkcs8_der).unwrap();
+
+        let mut rng = rand_core::OsRng;
+        let session_ca = ssh_key::PrivateKey::random(
+            &mut rng,
+            ssh_key::Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let session_ca_public_line = session_ca.public_key().to_openssh().unwrap();
+        let session_ca_pem = session_ca
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+
+        let user_ca = ssh_key::PrivateKey::random(
+            &mut rng,
+            ssh_key::Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let user_ca_pem = user_ca
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+
+        let host_ca = ssh_key::PrivateKey::random(
+            &mut rng,
+            ssh_key::Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let host_ca_pem = host_ca
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let host_ca_public_wire = host_ca.public_key().to_bytes().unwrap();
+
+        let ca_pem = ca.cert_pem();
+        let state = Arc::new(MockState {
+            ca,
+            session_ca_pem,
+            session_ca_public_line: session_ca_public_line.clone(),
+            server_range: self.server_range,
+            cert_ttl: self.cert_ttl,
+            enrollment_tokens: Mutex::new(HashSet::new()),
+            gateways: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(HashMap::new()),
+            next_id: Mutex::new(0),
+            force_bad_renew_generation: Mutex::new(false),
+            hang_sign: Mutex::new(false),
+            user_ca_pem,
+            resolve_pin_calls: std::sync::atomic::AtomicUsize::new(0),
+            resolve_breakglass_key_calls: std::sync::atomic::AtomicUsize::new(0),
+            pins: Mutex::new(HashMap::new()),
+            otps: Mutex::new(HashMap::new()),
+            device_flow_template: Mutex::new(None),
+            device_flows: Mutex::new(HashMap::new()),
+            allow_rules: Mutex::new(Vec::new()),
+            known_nodes: Mutex::new(HashSet::new()),
+            host_ca_pem,
+            host_ca_public_wire,
+            node_connections: Mutex::new(HashMap::new()),
+            node_capabilities: Mutex::new(HashMap::new()),
+            decision_ttl_secs: Mutex::new(45),
+            force_signed_breakglass: Mutex::new(false),
+            grant_expiry_override: Mutex::new(None),
+            lock_feed_down: Mutex::new(false),
+            authorize_unavailable: Mutex::new(false),
+            resolve_unavailable: Mutex::new(false),
+            break_glass_keys: Mutex::new(HashMap::new()),
+            offline_codes: Mutex::new(HashMap::new()),
+            breakglass_tokens: Mutex::new(HashMap::new()),
+            breakglass_activations: Mutex::new(Vec::new()),
+            recording_tokens: Mutex::new(HashMap::new()),
+            customer_key: Mutex::new(None),
+            s3: Mutex::new(None),
+            recordings: Mutex::new(HashMap::new()),
+            finalized: Mutex::new(HashMap::new()),
+            upload_ttl_secs: Mutex::new(900),
+            request_uploads: Mutex::new(Vec::new()),
+            context_signer_der,
+            context_signer_key,
+            node_labels: Mutex::new(HashMap::new()),
+            locks: Mutex::new(Vec::new()),
+            server_cert_ttl: Mutex::new(Duration::from_secs(3600)),
+            signed_key_ids: Mutex::new(Vec::new()),
+            lock_events: tokio::sync::broadcast::channel(64).0,
+            feed_epoch: AtomicU64::new(1),
+            presence: Mutex::new(HashMap::new()),
+            presence_staleness: self.presence_staleness,
+            node_name_to_id: Mutex::new(HashMap::new()),
+            authorize_requests: Mutex::new(Vec::new()),
+            resolved_scopes: Mutex::new(HashMap::new()),
+            ignore_credential_scope: Mutex::new(false),
+            leases: Mutex::new(HashMap::new()),
+            session_end_notifications: Mutex::new(Vec::new()),
+            lease_extensions: Mutex::new(Vec::new()),
+            extend_window_secs: Mutex::new(60),
+            extend_unavailable: Mutex::new(false),
+            idle_timeout_secs: Mutex::new(0),
+        });
+
+        let tls = ServerTlsConfig::new()
+            .identity(Identity::from_pem(
+                &server_cert_pem,
+                server_key_pem.as_bytes(),
+            ))
+            .client_ca_root(Certificate::from_pem(&ca_pem))
+            // Optional: EnrollGateway + Negotiate have no client cert; the
+            // authenticated RPCs enforce the cert per-RPC via peer_certs.
+            .client_auth_optional(true);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let svc_state = state.clone();
+        let server = tokio::spawn(async move {
+            let _ = Server::builder()
+                .tls_config(tls)
+                .expect("server tls config")
+                .add_service(HandshakeServer::new(MockSvc(svc_state.clone())))
+                .add_service(GatewayIdentityServer::new(MockSvc(svc_state.clone())))
+                .add_service(SessionSigningServer::new(MockSvc(svc_state.clone())))
+                .add_service(HostCertSigningServer::new(MockSvc(svc_state.clone())))
+                .add_service(OuterLegAuthServer::new(MockSvc(svc_state.clone())))
+                .add_service(AuthorizationServer::new(MockSvc(svc_state.clone())))
+                .add_service(RecordingServer::new(MockSvc(svc_state.clone())))
+                .add_service(LockFeedServer::new(MockSvc(svc_state.clone())))
+                .add_service(PresenceServer::new(MockSvc(svc_state.clone())))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        MockCp {
+            endpoint: format!("https://{addr}"),
+            server_name: self.server_san,
+            state,
+            server,
+        }
+    }
+}
+
+impl MockCp {
+    pub async fn start() -> MockCp {
+        MockCpBuilder::default().start().await
+    }
+
+    pub fn builder() -> MockCpBuilder {
+        MockCpBuilder::default()
+    }
+
+    pub fn bootstrap_anchors(&self) -> Vec<Vec<u8>> {
+        vec![self.state.ca.cert_der().to_vec()]
+    }
+
+    pub fn ca_pem(&self) -> Vec<u8> {
+        self.state.ca.cert_pem()
+    }
+
+    pub fn session_ca_public_line(&self) -> &str {
+        &self.state.session_ca_public_line
+    }
+
+    pub fn channel_params(&self, connect: Duration, rpc: Duration) -> mtls::ChannelParams {
+        mtls::ChannelParams {
+            endpoint: self.endpoint.clone(),
+            server_name: self.server_name.clone(),
+            connect_timeout: connect,
+            rpc_timeout: rpc,
+        }
+    }
+
+    pub fn mint_enrollment_token(&self) -> String {
+        let tok = random_token("enroll");
+        self.state
+            .enrollment_tokens
+            .lock()
+            .unwrap()
+            .insert(tok.clone());
+        tok
+    }
+
+    pub fn mint_session_token(
+        &self,
+        gateway_id: &str,
+        session_id: &str,
+        node_id: &str,
+        principal: &str,
+        ttl: Duration,
+    ) -> String {
+        let tok = random_token("sess");
+        self.state.tokens.lock().unwrap().insert(
+            tok.clone(),
+            TokenRecord {
+                gateway_id: gateway_id.to_string(),
+                session_id: session_id.to_string(),
+                node_id: node_id.to_string(),
+                principal: principal.to_string(),
+                exp: SystemTime::now() + ttl,
+                used: false,
+            },
+        );
+        tok
+    }
+
+    pub fn mint_expired_session_token(
+        &self,
+        gateway_id: &str,
+        session_id: &str,
+        node_id: &str,
+        principal: &str,
+    ) -> String {
+        let tok = random_token("sess-exp");
+        self.state.tokens.lock().unwrap().insert(
+            tok.clone(),
+            TokenRecord {
+                gateway_id: gateway_id.to_string(),
+                session_id: session_id.to_string(),
+                node_id: node_id.to_string(),
+                principal: principal.to_string(),
+                exp: SystemTime::now() - Duration::from_secs(1),
+                used: false,
+            },
+        );
+        tok
+    }
+
+    pub fn lock_gateway(&self, gateway_id: &str) {
+        if let Some(rec) = self.state.gateways.lock().unwrap().get_mut(gateway_id) {
+            rec.locked = true;
+        }
+    }
+
+    pub fn force_next_renew_bad_generation(&self) {
+        *self.state.force_bad_renew_generation.lock().unwrap() = true;
+    }
+
+    pub fn set_sign_hangs(&self) {
+        *self.state.hang_sign.lock().unwrap() = true;
+    }
+
+    pub fn register_pin(&self, fingerprint: &str, identity: &str, principals: &[&str]) {
+        self.state.pins.lock().unwrap().insert(
+            fingerprint.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    pub fn register_pin_source_bound(
+        &self,
+        fingerprint: &str,
+        identity: &str,
+        principals: &[&str],
+        source_ip: &str,
+    ) {
+        self.state.pins.lock().unwrap().insert(
+            fingerprint.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: Some(source_ip.to_string()),
+            },
+        );
+    }
+
+    pub fn register_otp(&self, otp: &str, identity: &str, principals: &[&str]) {
+        self.state.otps.lock().unwrap().insert(
+            otp.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    pub fn set_device_flow(
+        &self,
+        user_code: &str,
+        verification_uri: &str,
+        identity: &str,
+        approve_after_polls: u32,
+    ) {
+        *self.state.device_flow_template.lock().unwrap() = Some(DeviceFlowTemplate {
+            user_code: user_code.to_string(),
+            verification_uri: verification_uri.to_string(),
+            identity: identity.to_string(),
+            approve_after_polls,
+            deny: false,
+        });
+    }
+
+    pub fn set_device_flow_denied(&self, user_code: &str, verification_uri: &str) {
+        *self.state.device_flow_template.lock().unwrap() = Some(DeviceFlowTemplate {
+            user_code: user_code.to_string(),
+            verification_uri: verification_uri.to_string(),
+            identity: String::new(),
+            approve_after_polls: u32::MAX,
+            deny: true,
+        });
+    }
+
+    pub fn register_node(&self, node_id: &str) {
+        self.state
+            .known_nodes
+            .lock()
+            .unwrap()
+            .insert(node_id.to_string());
+    }
+
+    /// Map a node NAME to a DISTINCT CP id. Without a mapping
+    /// the mock resolves a name to itself (pass-through). A distinct mapping lets a test
+    /// address by human name yet configure the inventory (`allow`, `set_node_connection`,
+    /// locks) by the id - proving the Gateway forwards the NAME and the whole downstream
+    /// keys on the CP-resolved id, not the raw parsed string.
+    pub fn map_node_name(&self, name: &str, id: &str) {
+        self.state
+            .node_name_to_id
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), id.to_string());
+    }
+
+    /// Make the mock ignore `credential_principals` - a CP older than the field, or one
+    /// that drops it - so it can ALLOW an out-of-scope login. The Gateway's backstop is
+    /// then the only thing standing between that allow and the node.
+    pub fn set_ignores_credential_scope(&self) {
+        *self.state.ignore_credential_scope.lock().unwrap() = true;
+    }
+
+    pub fn last_authorize_request(&self) -> Option<AuthorizeRequest> {
+        self.state
+            .authorize_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+    }
+
+    pub fn allow(&self, identity: &str, node_id: &str, principal: &str) {
+        self.register_node(node_id);
+        self.state.allow_rules.lock().unwrap().push(AllowRule {
+            identity: identity.to_string(),
+            node_id: node_id.to_string(),
+            principal: principal.to_string(),
+        });
+    }
+
+    pub fn set_node_connection(&self, node_id: &str, dial_address: &str, host: HostVerification) {
+        self.state.node_connections.lock().unwrap().insert(
+            node_id.to_string(),
+            NodeConnection {
+                connector_kind: ConnectorKind::Agentless as i32,
+                dial_address: dial_address.to_string(),
+                host_verification: Some(host),
+                node_name: node_id.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Declare `node_id` an **outbound-agent** node:
+    /// no dial address, and the enrollment `node_name` the Gateway joins to the
+    /// agent's control channel by (its certificate's dNSName SAN).
+    pub fn set_agent_node_connection(
+        &self,
+        node_id: &str,
+        node_name: &str,
+        host: HostVerification,
+    ) {
+        self.state.node_connections.lock().unwrap().insert(
+            node_id.to_string(),
+            NodeConnection {
+                connector_kind: ConnectorKind::OutboundAgent as i32,
+                dial_address: String::new(),
+                host_verification: Some(host),
+                node_name: node_name.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The current HA presence owner NAME for `node_id` (for failover assertions), if any.
+    /// Ignores staleness - see [`Self::fresh_presence_owner`] when the claim's FRESHNESS is
+    /// the thing under test.
+    pub fn presence_owner(&self, node_id: &str) -> Option<String> {
+        self.state
+            .presence
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(|r| r.owner.clone())
+    }
+
+    pub fn fresh_presence_owner(&self, node_name: &str) -> Option<String> {
+        self.state.fresh_presence(node_name).map(|r| r.owner)
+    }
+
+    pub fn issue_agent_identity(&self, agent_id: &str, node_name: &str) -> IssuedLeaf {
+        self.state.ca.issue_agent_leaf(agent_id, node_name)
+    }
+
+    /// The key-ids (`session_id + principal`) of every inner-leg certificate this CP
+    /// has signed. The node's own `sshd` VERBOSE log records the same value on every
+    /// accepted certificate, which is what makes the node-local trail an independent
+    /// second record.
+    pub fn signed_key_ids(&self) -> Vec<String> {
+        self.state.signed_key_ids.lock().unwrap().clone()
+    }
+
+    pub fn set_capabilities(&self, node_id: &str, caps: &[Capability]) {
+        self.state.node_capabilities.lock().unwrap().insert(
+            node_id.to_string(),
+            caps.iter().map(|c| *c as i32).collect(),
+        );
+    }
+
+    pub fn set_node_labels(&self, node_id: &str, labels: &[&str]) {
+        self.state.node_labels.lock().unwrap().insert(
+            node_id.to_string(),
+            labels.iter().map(|l| l.to_string()).collect(),
+        );
+    }
+
+    pub fn add_lock(&self, lock: Lock) {
+        {
+            let mut locks = self.state.locks.lock().unwrap();
+            locks.retain(|l| l.lock_id != lock.lock_id);
+            locks.push(lock.clone());
+        }
+        self.state.feed_epoch.fetch_add(1, Ordering::SeqCst);
+        let _ = self.state.lock_events.send(LockEvent {
+            event: Some(lock_event::Event::Added(lock)),
+        });
+    }
+
+    pub fn push_lock_when(&self, lock: Lock, mut is_live: impl FnMut() -> bool + Send + 'static) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                if is_live() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            {
+                let mut locks = state.locks.lock().unwrap();
+                locks.retain(|l| l.lock_id != lock.lock_id);
+                locks.push(lock.clone());
+            }
+            state.feed_epoch.fetch_add(1, Ordering::SeqCst);
+            let _ = state.lock_events.send(LockEvent {
+                event: Some(lock_event::Event::Added(lock)),
+            });
+        });
+    }
+
+    pub fn push_lock_after_recording_begins(&self, lock: Lock) {
+        let state = self.state.clone();
+        self.push_lock_when(lock, move || !state.recordings.lock().unwrap().is_empty());
+    }
+
+    pub fn began_recording_count(&self) -> usize {
+        self.state.recordings.lock().unwrap().len()
+    }
+
+    pub fn remove_lock(&self, lock_id: &str) {
+        self.state
+            .locks
+            .lock()
+            .unwrap()
+            .retain(|l| l.lock_id != lock_id);
+        self.state.feed_epoch.fetch_add(1, Ordering::SeqCst);
+        let _ = self.state.lock_events.send(LockEvent {
+            event: Some(lock_event::Event::Removed(LockRemoval {
+                lock_id: lock_id.to_string(),
+            })),
+        });
+    }
+
+    pub fn host_ca_public_wire(&self) -> Vec<u8> {
+        self.state.host_ca_public_wire.clone()
+    }
+
+    pub fn sign_host_cert(
+        &self,
+        host_pubkey_wire: &[u8],
+        principals: &[&str],
+        valid_secs: u64,
+    ) -> (String, Vec<u8>) {
+        let pubkey = ssh_key::PublicKey::from_bytes(host_pubkey_wire).unwrap();
+        let ca = ssh_key::PrivateKey::from_openssh(&self.state.host_ca_pem).unwrap();
+        let now = unix_now();
+        let mut rng = rand_core::OsRng;
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            pubkey.key_data().clone(),
+            now.saturating_sub(60),
+            now + valid_secs,
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .unwrap();
+        for p in principals {
+            builder.valid_principal(*p).unwrap();
+        }
+        builder.key_id("sessionlayer-host-cert").unwrap();
+        let cert = builder.sign(&ca).unwrap();
+        (cert.to_openssh().unwrap(), cert.to_bytes().unwrap())
+    }
+
+    pub fn host_ca_verification(
+        &self,
+        host_cert_wire: Vec<u8>,
+        principals: &[&str],
+    ) -> HostVerification {
+        HostVerification {
+            host_ca_keys: vec![self.host_ca_public_wire()],
+            expected_host_principals: principals.iter().map(|s| s.to_string()).collect(),
+            pinned_host_keys: Vec::new(),
+            host_certificates: vec![host_cert_wire],
+        }
+    }
+
+    pub fn pinned_verification(&self, host_pubkey_wire: Vec<u8>) -> HostVerification {
+        HostVerification {
+            host_ca_keys: Vec::new(),
+            expected_host_principals: Vec::new(),
+            pinned_host_keys: vec![host_pubkey_wire],
+            host_certificates: Vec::new(),
+        }
+    }
+
+    pub fn set_authorize_unavailable(&self, on: bool) {
+        *self.state.authorize_unavailable.lock().unwrap() = on;
+    }
+
+    pub fn set_resolve_unavailable(&self, on: bool) {
+        *self.state.resolve_unavailable.lock().unwrap() = on;
+    }
+
+    pub fn register_break_glass_key(
+        &self,
+        sk_public_key_blob: Vec<u8>,
+        identity: &str,
+        principals: &[&str],
+    ) {
+        self.state.break_glass_keys.lock().unwrap().insert(
+            sk_public_key_blob,
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    pub fn register_offline_code(&self, code: &str, identity: &str, principals: &[&str]) {
+        self.state.offline_codes.lock().unwrap().insert(
+            code.to_string(),
+            ResolvedRecord {
+                identity: identity.to_string(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+                groups: Vec::new(),
+                source_ip: None,
+            },
+        );
+    }
+
+    /// Set the `decision_ttl_seconds` baked into signed contexts. `0` forces the
+    /// Gateway to re-validate every channel-open (exercises the break-glass
+    /// no-replay re-auth posture).
+    pub fn set_decision_ttl(&self, secs: i64) {
+        *self.state.decision_ttl_secs.lock().unwrap() = secs;
+    }
+
+    pub fn set_force_signed_breakglass(&self, on: bool) {
+        *self.state.force_signed_breakglass.lock().unwrap() = on;
+    }
+
+    /// Force the exact `grant_expiry_epoch_seconds` signed into contexts (0 makes a
+    /// break-glass ALLOW un-time-boxed → the GW must fail closed).
+    pub fn set_grant_expiry(&self, epoch_seconds: i64) {
+        *self.state.grant_expiry_override.lock().unwrap() = Some(epoch_seconds);
+    }
+
+    pub fn set_idle_timeout(&self, secs: i64) {
+        *self.state.idle_timeout_secs.lock().unwrap() = secs;
+    }
+
+    pub fn session_end_notifications(&self) -> Vec<NotifySessionEndRequest> {
+        self.state.session_end_notifications.lock().unwrap().clone()
+    }
+
+    pub fn lease_extension_count(&self) -> usize {
+        self.state.lease_extensions.lock().unwrap().len()
+    }
+
+    pub fn lease_extensions_for(&self, session_id: &str) -> usize {
+        self.state
+            .lease_extensions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| *s == session_id)
+            .count()
+    }
+
+    pub fn reap_next_lease_after_first_extension(&self, prior_session_id: Option<String>) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let sid = state
+                    .authorize_requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map(|r| r.session_id.clone());
+                let Some(sid) = sid else { continue };
+                if prior_session_id.as_deref() == Some(sid.as_str()) {
+                    continue;
+                }
+                if !state.lease_extensions.lock().unwrap().contains(&sid) {
+                    continue;
+                }
+                if let Some(l) = state.leases.lock().unwrap().get_mut(&sid) {
+                    l.released = true;
+                }
+                return;
+            }
+        });
+    }
+
+    pub fn set_extend_unavailable(&self, on: bool) {
+        *self.state.extend_unavailable.lock().unwrap() = on;
+    }
+
+    pub fn set_extend_window(&self, secs: i64) {
+        *self.state.extend_window_secs.lock().unwrap() = secs;
+    }
+
+    pub fn lease_released(&self, session_id: &str) -> Option<bool> {
+        self.state
+            .leases
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|l| l.released)
+    }
+
+    pub fn set_lock_feed_down(&self, on: bool) {
+        *self.state.lock_feed_down.lock().unwrap() = on;
+    }
+
+    pub fn auth_rpc_counts(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.state.resolve_pin_calls.load(Ordering::SeqCst),
+            self.state
+                .resolve_breakglass_key_calls
+                .load(Ordering::SeqCst),
+        )
+    }
+
+    pub fn breakglass_token_count(&self) -> usize {
+        self.state.breakglass_tokens.lock().unwrap().len()
+    }
+
+    pub fn breakglass_activation_count(&self) -> usize {
+        self.state.breakglass_activations.lock().unwrap().len()
+    }
+
+    pub fn breakglass_activations(&self) -> Vec<(String, String)> {
+        self.state
+            .breakglass_activations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| (a.identity.clone(), a.node_id.clone()))
+            .collect()
+    }
+
+    pub fn set_customer_key(
+        &self,
+        key_ref: &str,
+        public_key_der: Vec<u8>,
+        algorithm: KeySealAlgorithm,
+    ) {
+        *self.state.customer_key.lock().unwrap() = Some(CustomerKey {
+            key_ref: key_ref.to_string(),
+            public_key: public_key_der,
+            algorithm: algorithm as i32,
+        });
+    }
+
+    pub fn set_s3_target(&self, target: S3Target) {
+        *self.state.s3.lock().unwrap() = Some(target);
+    }
+
+    pub fn recorded_object_keys(&self) -> Vec<String> {
+        self.state
+            .recordings
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(_, k)| k.clone())
+            .collect()
+    }
+
+    pub fn finalized_recordings(&self) -> Vec<FinalizeRecordingRequest> {
+        self.state
+            .finalized
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_upload_ttl_secs(&self, ttl: u64) {
+        *self.state.upload_ttl_secs.lock().unwrap() = ttl;
+    }
+
+    pub fn request_upload_count(&self) -> usize {
+        self.state.request_uploads.lock().unwrap().len()
+    }
+
+    pub fn sign_user_cert(
+        &self,
+        pubkey_openssh_line: &str,
+        identity: &str,
+        principals: &[&str],
+        valid_secs: u64,
+    ) -> String {
+        let principals: Vec<String> = principals.iter().map(|s| s.to_string()).collect();
+        self.state
+            .sign_user_cert(pubkey_openssh_line, identity, &principals, valid_secs)
+    }
+
+    pub fn recorded_generation(&self, gateway_id: &str) -> Option<u64> {
+        self.state
+            .gateways
+            .lock()
+            .unwrap()
+            .get(gateway_id)
+            .map(|r| r.generation)
+    }
+
+    pub fn issue_server_material(
+        &self,
+        san: &str,
+        nb: time::OffsetDateTime,
+        na: time::OffsetDateTime,
+    ) -> IssuedLeaf {
+        self.state.ca.issue_leaf(
+            san,
+            vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+            nb,
+            na,
+        )
+    }
+}
+
+/// Which recorder a set of [`HandlerDeps`] wires in.
+pub enum RecorderChoice {
+    Null,
+    Real,
+}
+
+pub async fn outer_leg_deps(cp: &MockCp, config: Arc<SshServerConfig>) -> HandlerDeps {
+    let connector = Arc::new(AgentlessDial::new(Duration::from_secs(
+        config.inner.connect_timeout_secs,
+    )));
+    outer_leg_deps_with(cp, config, connector, RecorderChoice::Null).await
+}
+
+pub async fn outer_leg_deps_with(
+    cp: &MockCp,
+    config: Arc<SshServerConfig>,
+    connector: Arc<dyn NodeConnector>,
+    recorder: RecorderChoice,
+) -> HandlerDeps {
+    outer_leg_deps_named(cp, config, connector, recorder, "gw-outer-leg")
+        .await
+        .0
+}
+
+pub async fn outer_leg_deps_named(
+    cp: &MockCp,
+    config: Arc<SshServerConfig>,
+    connector: Arc<dyn NodeConnector>,
+    recorder: RecorderChoice,
+    gateway_name: &str,
+) -> (HandlerDeps, identity::Credential) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = identity::IdentityStore::open(dir.path()).unwrap();
+    let params = cp.channel_params(Duration::from_secs(5), Duration::from_secs(10));
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &cp.mint_enrollment_token(),
+        gateway_name,
+    )
+    .await
+    .unwrap();
+    let credential = cred.clone();
+
+    let factory = Arc::new(CpChannelFactory::fixed(
+        cp.channel_params(Duration::from_secs(5), Duration::from_secs(10)),
+        cred.identity.clone(),
+        cred.ca_chain_der.clone(),
+    ));
+    let cpauth = Arc::new(CpAuthClient::new(
+        factory.clone(),
+        Duration::from_secs(config.cp_rpc_timeout_secs),
+    ));
+    let recorder_factory: Arc<dyn RecorderFactory> = match recorder {
+        RecorderChoice::Null => Arc::new(NullRecorderFactory),
+        RecorderChoice::Real => Arc::new(
+            gateway_core::ssh::recorder::RecorderFactoryImpl::new(
+                cpauth.clone(),
+                config.recorder.clone(),
+            )
+            .expect("build recorder factory"),
+        ),
+    };
+
+    let lock_set = Arc::new(LockSet::new(
+        config.reeval.lock_feed_unhealthy_after_secs,
+        config.reeval.lock_expiry_skew_secs,
+    ));
+    let live_sessions = Arc::new(LiveSessionRegistry::default());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    std::mem::forget(shutdown_tx); // test-only: keep the feed alive for the test.
+    LockFeedClientTask::new(
+        factory,
+        lock_set.clone(),
+        live_sessions.clone(),
+        Duration::from_secs(config.reeval.lock_feed_connect_timeout_secs),
+    )
+    .spawn(shutdown_rx);
+    // Wait for the first snapshot so the feed is healthy before the test drives
+    // SSH - deterministic (no spurious first-channel re-authorize).
+    for _ in 0..200 {
+        if lock_set.healthy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // ProxyJump host-cert MITM: build the state only when the test enabled
+    // it in config (the mock CP then serves HostCertSigning); None otherwise, so
+    // every existing test keeps a direct-tcpip refusal.
+    let proxy_jump = config.proxy_jump.enabled.then(|| {
+        Arc::new(
+            gateway_core::ssh::proxyjump::ProxyJumpState::new().expect("build proxyjump state"),
+        )
+    });
+    (
+        HandlerDeps {
+            cpauth,
+            connector,
+            resolver: Arc::new(IdentityResolver),
+            recorder_factory,
+            finalize_tracker: gateway_core::ssh::recorder::FinalizeTracker::default(),
+            lock_set,
+            live_sessions,
+            config,
+            proxy_jump,
+        },
+        credential,
+    )
+}
+
+pub async fn spawn_raw_tls_server(
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+) -> (String, AbortOnDrop) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(stream).await {
+                        let _ = tls;
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        }
+    });
+    (format!("https://{addr}"), AbortOnDrop(handle))
+}
+
+pub async fn spawn_plaintext_server() -> (String, AbortOnDrop) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        }
+    });
+    (format!("https://{addr}"), AbortOnDrop(handle))
+}
+
+pub async fn spawn_silent_server() -> (String, AbortOnDrop) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _conn = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    (format!("https://{addr}"), AbortOnDrop(handle))
+}
+
+pub fn raw_server_config(
+    cert_der: Vec<u8>,
+    key_pkcs8_der: Vec<u8>,
+    versions: Option<&[&'static rustls::SupportedProtocolVersion]>,
+) -> std::sync::Arc<rustls::ServerConfig> {
+    gateway_core::tls::install_ring_provider();
+    let certs = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_pkcs8_der,
+    ));
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ServerConfig::builder_with_provider(provider);
+    let mut config = match versions {
+        Some(v) => builder
+            .with_protocol_versions(v)
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+        None => builder
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    };
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    std::sync::Arc::new(config)
+}
+
+pub struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn server_info(range: ((u32, u32), (u32, u32))) -> ComponentInfo {
+    ComponentInfo {
+        name: "SessionLayer Control Plane".to_string(),
+        semver: "0.1.0".to_string(),
+        protocol_min: Some(ProtocolVersion {
+            major: range.0 .0,
+            minor: range.0 .1,
+        }),
+        protocol_max: Some(ProtocolVersion {
+            major: range.1 .0,
+            minor: range.1 .1,
+        }),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn random_token(prefix: &str) -> String {
+    use rand_core::RngCore;
+    let mut bytes = [0u8; 24];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{prefix}-{hex}")
+}

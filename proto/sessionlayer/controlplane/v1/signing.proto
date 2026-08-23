@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "SigningProto";
+
+// mTLS authenticates the CHANNEL (which Gateway is calling); this RPC layers
+// per-request authorization on top: the request carries a single-use, CP-minted
+// session token bound to {gateway_id, session_id, node, principal, exp}. The CP
+// resolves the caller's mTLS gateway_identity (active + unlocked), then validates
+// the token (signature/lookup, not expired, NOT already used, and bound to THIS
+// Gateway and its session/node/principal). Any mismatch fails closed with a
+// generic error. A Gateway can never obtain a certificate for a session it does
+// not own; a cross-gateway, cross-session, expired, or replayed token is rejected.
+//
+// The Gateway generates the inner-leg keypair locally and sends ONLY the public
+// key. The CP returns a certificate only and never receives or stores an inner
+// private key.
+service SessionSigning {
+  rpc SignSessionCertificate(SignSessionCertificateRequest) returns (SignSessionCertificateResponse);
+}
+
+message SignSessionCertificateRequest {
+  string session_token = 1;
+
+  // The Gateway-generated inner-leg PUBLIC key, OpenSSH wire-encoded (an
+  // `ecdsa-sha2-nistp256` public-key blob). The Gateway generates the keypair
+  // locally and sends only this public half; the private key never leaves it.
+  bytes subject_public_key = 2;
+
+  // Optional, NON-authoritative context for diagnostics and correlation. The
+  // token is the sole authority for {session, node, principal}; if a context
+  // field is set and disagrees with the token, the request fails closed.
+  SignContext context = 3;
+}
+
+message SignContext {
+  string session_id = 1;
+  string node_id = 2;
+  string requested_principal = 3;
+}
+
+// HostCertSigning issues the Gateway's OUTER SSH host certificate for the
+// ProxyJump host-cert MITM path. On that path the Gateway terminates the
+// client's inner SSH hop and must present a host certificate signed by the HOST
+// CA so a stock OpenSSH client that installed one `@cert-authority` line accepts
+// the Gateway as the target node with NO TOFU.
+//
+// AUTHORIZATION. Unlike SessionSigning this RPC is NOT session-bound (a host cert
+// is presented before the inner hop authenticates, so there is no session token
+// yet). It is authorized purely by the caller's Gateway mTLS identity, which the
+// interceptor resolves to an ACTIVE, UNLOCKED gateway_identity (a locked/revoked
+// Gateway is refused - the lock is the revocation). The host CA is the
+// operator-consented MITM trust anchor; the CP TTL-bounds and audits issuance.
+//
+// KEY CUSTODY. The Gateway generates the outer host keypair locally and
+// sends ONLY the public key; the CP returns a certificate only.
+service HostCertSigning {
+  rpc SignGatewayHostCertificate(SignGatewayHostCertificateRequest) returns (SignGatewayHostCertificateResponse);
+}
+
+message SignGatewayHostCertificateRequest {
+  // The Gateway-generated OUTER host PUBLIC key, OpenSSH wire-encoded (an
+  // `ecdsa-sha2-nistp256` public-key blob, matching the P-256 host CA). The
+  // private key never leaves the Gateway.
+  bytes host_public_key = 1;
+
+  // The host principal(s) to certify - the exact hostname(s) the client dials on
+  // the ProxyJump inner hop (the `direct-tcpip` host_to_connect, e.g. "web-01" or
+  // the wildcard-DNS "web-01.ssh.corp"). OpenSSH verifies the presented cert's
+  // principals against the hostname it connected to. Non-empty; each is
+  // length/charset-bounded by the CP.
+  repeated string host_principals = 2;
+}
+
+message SignGatewayHostCertificateResponse {
+  // The signed OpenSSH host certificate as an authorized-keys-style line
+  // (`ecdsa-sha2-nistp256-cert-v01@openssh.com AAAA... <key-id>`).
+  string certificate_line = 1;
+
+  bytes certificate_blob = 2;
+
+  // Certificate validity as Unix epoch seconds (UTC). valid_after is backdated for
+  // skew; the Gateway re-fetches before valid_before to rotate.
+  int64 valid_after_epoch_seconds = 3;
+  int64 valid_before_epoch_seconds = 4;
+}
+
+message SignSessionCertificateResponse {
+  // The signed OpenSSH inner-leg certificate as an authorized-keys line
+  // (`ecdsa-sha2-nistp256-cert-v01@openssh.com AAAA... <key-id>`). NEVER a
+  // private key.
+  string certificate_line = 1;
+
+  bytes certificate_blob = 2;
+
+  string key_id = 3;
+
+  // Certificate validity as Unix epoch seconds (UTC). valid_after is backdated
+  // for skew; the Gateway expires the grant conservatively, treating it as over
+  // early rather than late.
+  int64 valid_after_epoch_seconds = 4;
+  int64 valid_before_epoch_seconds = 5;
+}
