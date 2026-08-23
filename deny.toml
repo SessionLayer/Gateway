@@ -1,0 +1,40 @@
+[graph]
+# Evaluate all targets so a Linux-only dependency (tokio-uring) can't smuggle in
+# an unaudited transitive crate on another platform.
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+yanked = "deny"
+
+[licenses]
+# Allow-list only (exact SPDX ids). GPL-3.0-only is allowed because SessionLayer
+# itself is GPL-3.0; the rest are the permissive licenses actually present in the
+# pinned dependency graph. Anything not listed here (notably strong copyleft
+# other than our own, or unknown licenses) fails the check - a new dependency
+# with a new license is a deliberate, reviewed addition.
+allow = [
+    "GPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

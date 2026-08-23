@@ -1,0 +1,47 @@
+# seccomp cannot filter by destination, so egress confinement is enforced at the network
+# layer: this default-deny-egress policy permits ONLY the connections the Gateway
+# legitimately makes, and drops everything else - the metadata service, and arbitrary
+# internet hosts a compromised process might exfiltrate to.
+#
+# Requires a CNI that enforces NetworkPolicy (Cilium, Calico, …).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sessionlayer-gateway
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: sessionlayer-gateway }
+  policyTypes: ["Ingress", "Egress"]
+
+  ingress:
+    - ports:
+        - { protocol: TCP, port: 2222 }
+        - { protocol: TCP, port: 9444 }
+        - { protocol: TCP, port: 8081 }
+
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: sessionlayer-controlplane }
+      ports:
+        - { protocol: TCP, port: 9443 }
+    # The SSH nodes this Gateway bridges to. Scope this CIDR to your fleet's
+    # subnet (defense in depth over the in-process loopback-only splice + the
+    # node-dial validation); widen only as far as the node inventory requires.
+    - to:
+        - ipBlock: { cidr: 10.20.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 22 }
+    - to:
+        - ipBlock: { cidr: 10.30.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 443 }

@@ -1,0 +1,412 @@
+//! Plaintext/keys/OTP/tokens never enter spans: correlation only, never content.
+
+pub mod metrics;
+
+use opentelemetry::propagation::{Injector, TextMapPropagator};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
+
+pub mod attr {
+    pub const SESSION_ID: &str = "sessionlayer.session_id";
+    pub const CORRELATION_ID: &str = "sessionlayer.correlation_id";
+    pub const NODE_ID: &str = "sessionlayer.node_id";
+    pub const ACCESS_MODEL: &str = "sessionlayer.access_model";
+    pub const OUTCOME: &str = "sessionlayer.outcome";
+}
+
+const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+const SERVICE_NAME_ENV: &str = "OTEL_SERVICE_NAME";
+const DEFAULT_SERVICE_NAME: &str = "sessionlayer-gateway";
+
+pub type TracedChannel = InterceptedService<Channel, TraceContextInjector>;
+
+pub fn trace_channel(channel: Channel) -> TracedChannel {
+    InterceptedService::new(channel, TraceContextInjector)
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct TraceContextInjector;
+
+impl tonic::service::Interceptor for TraceContextInjector {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let cx = tracing::Span::current().context();
+        TraceContextPropagator::new()
+            .inject_context(&cx, &mut MetadataInjectorMut(request.metadata_mut()));
+        Ok(request)
+    }
+}
+
+struct MetadataInjectorMut<'a>(&'a mut MetadataMap);
+
+impl Injector for MetadataInjectorMut<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(k), Ok(v)) = (
+            MetadataKey::from_bytes(key.as_bytes()),
+            MetadataValue::try_from(value),
+        ) {
+            self.0.insert(k, v);
+        }
+    }
+}
+
+pub struct TelemetryGuard {
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    meter_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.provider.take() {
+            let _ = p.shutdown();
+        }
+        if let Some(m) = self.meter_provider.take() {
+            let _ = m.shutdown();
+        }
+    }
+}
+
+pub fn init() -> TelemetryGuard {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let fmt_layer = fmt::layer().with_target(false);
+
+    let endpoint = std::env::var(OTLP_ENDPOINT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let Some(endpoint) = endpoint else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .init();
+        return TelemetryGuard {
+            provider: None,
+            meter_provider: None,
+        };
+    };
+
+    match build_provider(&endpoint) {
+        Ok(provider) => {
+            use opentelemetry::trace::TracerProvider as _;
+            let tracer = provider.tracer(service_name());
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            opentelemetry::global::set_tracer_provider(provider.clone());
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .init();
+            let meter_provider = match build_meter_provider(&endpoint) {
+                Ok(mp) => {
+                    opentelemetry::global::set_meter_provider(mp.clone());
+                    // Bind the counters to THIS provider before any traffic can touch them;
+                    // an instrument keeps whichever provider was global when it was built.
+                    metrics::install_from_global();
+                    Some(mp)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, endpoint = %endpoint, "OTLP metric exporter setup failed; continuing without native gauges");
+                    None
+                }
+            };
+            tracing::info!(
+                endpoint = %endpoint,
+                service = %service_name(),
+                metrics = meter_provider.is_some(),
+                "OpenTelemetry OTLP export enabled (tonic/ring)"
+            );
+            TelemetryGuard {
+                provider: Some(provider),
+                meter_provider,
+            }
+        }
+        Err(e) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .init();
+            tracing::warn!(error = %e, endpoint = %endpoint, "OTLP exporter setup failed; continuing with local logging only (telemetry is not fail-closed)");
+            TelemetryGuard {
+                provider: None,
+                meter_provider: None,
+            }
+        }
+    }
+}
+
+fn service_name() -> String {
+    std::env::var(SERVICE_NAME_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string())
+}
+
+fn build_provider(
+    endpoint: &str,
+) -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error>> {
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()?;
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name())
+        .build();
+    Ok(opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build())
+}
+
+fn build_meter_provider(
+    endpoint: &str,
+) -> Result<opentelemetry_sdk::metrics::SdkMeterProvider, Box<dyn std::error::Error>> {
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()?;
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name())
+        .build();
+    Ok(opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .with_resource(resource)
+        .build())
+}
+
+pub fn register_gateway_gauges(
+    live_sessions: std::sync::Arc<crate::ssh::locks::LiveSessionRegistry>,
+    lock_set: std::sync::Arc<crate::ssh::locks::LockSet>,
+) {
+    let meter = opentelemetry::global::meter(DEFAULT_SERVICE_NAME);
+    register_gateway_gauges_on(
+        &meter,
+        move || live_sessions.len() as u64,
+        move || u64::from(lock_set.healthy()),
+    );
+}
+
+pub fn register_gateway_gauges_on<L, H>(
+    meter: &opentelemetry::metrics::Meter,
+    live_sessions: L,
+    lock_feed_healthy: H,
+) where
+    L: Fn() -> u64 + Send + Sync + 'static,
+    H: Fn() -> u64 + Send + Sync + 'static,
+{
+    meter
+        .u64_observable_gauge("sessionlayer.gateway.live_sessions")
+        .with_description("Active outer-leg SSH sessions on this Gateway.")
+        .with_callback(move |obs| obs.observe(live_sessions(), &[]))
+        .build();
+    meter
+        .u64_observable_gauge("sessionlayer.gateway.lock_feed_healthy")
+        .with_description("1 iff the CP lock feed is healthy, else 0 (fail-closed re-validate).")
+        .with_callback(move |obs| obs.observe(lock_feed_healthy(), &[]))
+        .build();
+}
+
+pub const OTEL_STATUS_CODE: &str = "otel.status_code";
+
+pub fn record_span_fail_closed(span: &tracing::Span, outcome: &str) {
+    span.record(attr::OUTCOME, outcome);
+    span.record(OTEL_STATUS_CODE, "error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::propagation::Injector;
+
+    #[test]
+    fn metadata_injector_sets_only_valid_ascii_keys() {
+        let mut md = MetadataMap::new();
+        let mut inj = MetadataInjectorMut(&mut md);
+        inj.set("traceparent", "00-abc-def-01".to_string());
+        inj.set("tráce", "x".to_string());
+        assert_eq!(
+            md.get("traceparent")
+                .map(|v| v.to_str().unwrap().to_string()),
+            Some("00-abc-def-01".to_string())
+        );
+        assert!(md.get("tráce").is_none());
+    }
+
+    #[test]
+    fn service_name_defaults_when_unset() {
+        if std::env::var(SERVICE_NAME_ENV).is_err() {
+            assert_eq!(service_name(), DEFAULT_SERVICE_NAME);
+        }
+    }
+
+    /// The fail-closed / error path MUST set the span **status to
+    /// error**, or the span-metrics RED error-rate is blind to denials (recording
+    /// only `sessionlayer.outcome` leaves the status Unset). Read the exported span
+    /// back and assert the status the `spanmetrics` connector reads.
+    #[test]
+    fn fail_closed_path_sets_span_status_error() {
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "gateway.session",
+                sessionlayer.outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            );
+            let entered = span.enter();
+            record_span_fail_closed(&span, "policy_denied");
+            drop(entered);
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let s = spans
+            .iter()
+            .find(|s| s.name == "gateway.session")
+            .expect("the session span was exported");
+        assert_eq!(
+            s.status,
+            Status::error(""),
+            "a fail-closed denial must mark the span status error (RED error-rate)"
+        );
+        assert!(
+            s.attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == attr::OUTCOME),
+            "the fail-closed outcome enum is recorded on the span (never content)"
+        );
+    }
+
+    /// A CP outage at the AUTH phase (`note_cp_down`, before any channel) is a
+    /// genuine fail-closed fault and MUST error the span so a CP-down storm shows in
+    /// the RED error-rate; an ordinary auth rejection (`AuthFailed`, never passed to
+    /// `record_span_fail_closed`) must NOT error the span, or the rate pegs on
+    /// internet noise and the SLO signal is lost.
+    #[test]
+    fn cp_down_at_auth_errors_the_span_but_auth_noise_does_not() {
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let cp_down = tracing::info_span!(
+                "gateway.session",
+                marker = "cp_down",
+                sessionlayer.outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            );
+            {
+                let _e = cp_down.enter();
+                record_span_fail_closed(&cp_down, "cp_unavailable");
+            }
+            let auth_noise = tracing::info_span!(
+                "gateway.session",
+                marker = "auth_noise",
+                sessionlayer.outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            );
+            let _e = auth_noise.enter();
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let by_marker = |m: &str| {
+            spans
+                .iter()
+                .find(|s| {
+                    s.attributes.iter().any(|kv| {
+                        kv.key.as_str() == "marker"
+                            && matches!(&kv.value, opentelemetry::Value::String(v) if v.as_str() == m)
+                    })
+                })
+                .unwrap_or_else(|| panic!("span {m} exported"))
+        };
+        assert_eq!(
+            by_marker("cp_down").status,
+            Status::error(""),
+            "CP-down at the auth phase must error the span so it is visible in RED error-rate"
+        );
+        assert_eq!(
+            by_marker("auth_noise").status,
+            Status::Unset,
+            "an ordinary auth rejection must NOT error the span (preserve the SLO signal)"
+        );
+    }
+
+    #[test]
+    fn native_gauges_reflect_live_state() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let meter = provider.meter("test");
+
+        let live = Arc::new(AtomicU64::new(0));
+        let lock = Arc::new(crate::ssh::locks::LockSet::new(30, 30));
+        let live_src = live.clone();
+        let lock_src = lock.clone();
+        register_gateway_gauges_on(
+            &meter,
+            move || live_src.load(Ordering::SeqCst),
+            move || u64::from(lock_src.healthy()),
+        );
+
+        let read = |name: &str| -> u64 {
+            exporter.reset();
+            provider.force_flush().unwrap();
+            let rms: Vec<ResourceMetrics> = exporter.get_finished_metrics().unwrap();
+            for rm in &rms {
+                for sm in rm.scope_metrics() {
+                    for m in sm.metrics() {
+                        if m.name() == name {
+                            if let AggregatedMetrics::U64(MetricData::Gauge(g)) = m.data() {
+                                return g.data_points().next().map(|dp| dp.value()).unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        };
+
+        assert_eq!(read("sessionlayer.gateway.live_sessions"), 0);
+        assert_eq!(read("sessionlayer.gateway.lock_feed_healthy"), 0);
+
+        live.store(3, Ordering::SeqCst);
+        lock.replace_snapshot(Vec::new(), 1);
+        assert_eq!(read("sessionlayer.gateway.live_sessions"), 3);
+        assert_eq!(read("sessionlayer.gateway.lock_feed_healthy"), 1);
+
+        lock.mark_disconnected();
+        assert_eq!(read("sessionlayer.gateway.lock_feed_healthy"), 0);
+    }
+}

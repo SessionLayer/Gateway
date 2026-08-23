@@ -1,0 +1,70 @@
+groups:
+  - name: sessionlayer-gateway-red
+    rules:
+      # SATURATION/AVAILABILITY - the pushed lock-feed gauge, not a span metric. While
+      # this is 0 the Gateway is refusing what it cannot verify (new registrations,
+      # dial-backs): correct fail-closed behaviour, and an outage from the user's side.
+      # `min_over_time` rather than the instantaneous value so a reconnect blip, which
+      # self-heals in 0.5-10s by design, does not page.
+      - alert: GatewayLockFeedUnhealthy
+        expr: >
+          min_over_time(sessionlayer_gateway_lock_feed_healthy{service_name="sessionlayer-gateway"}[5m]) == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Gateway lock feed unhealthy - deny-list stream from the Control Plane is down"
+          description: "The pushed deny-list stream has been down for 5m on {{ $labels.instance }}. The Gateway fails closed on what it cannot verify, so new registrations and agent dial-backs are being refused. Check the CP gRPC endpoint (:9443) and the LockFeed stream; persistent means the CP is down or the network is partitioned."
+          runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/gateway-runbook.md#session-and-lock-feed-reasons"
+      - alert: GatewayNoSessionTraffic
+        expr: sum(rate(calls_total{service_name="sessionlayer-gateway",span_name="gateway.session"}[10m])) == 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Gateway handled no sessions for 15m"
+          description: "Either idle or the outer SSH listener / LB path is down. Correlate with the L4 LB and PROXY-v2 rejection rate."
+          runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/troubleshooting.md#connection-dropped-before-any-ssh-banner"
+
+      - alert: GatewaySessionErrorRatioHigh
+        expr: >
+          sum(rate(calls_total{service_name="sessionlayer-gateway",span_name="gateway.session",status_code="STATUS_CODE_ERROR"}[5m]))
+          /
+          clamp_min(sum(rate(calls_total{service_name="sessionlayer-gateway",span_name="gateway.session"}[5m])), 0.001)
+          > 0.25
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "Gateway session error ratio > 25%"
+          description: "{{ $value | humanizePercentage }} of session attempts end in an error span. Deny is expected policy; a broad ERROR spike points at CP-unreachable fail-closed, CA-signer down, or host-verify failures - check cp.authorize / cp.cert_sign / host_verify child spans."
+          runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/gateway-runbook.md#session-and-lock-feed-reasons"
+
+      - alert: GatewayHostVerifyFailureSpike
+        expr: >
+          sum(rate(calls_total{service_name="sessionlayer-gateway",span_name="gateway.host_verify",status_code="STATUS_CODE_ERROR"}[10m])) > 0
+        for: 10m
+        labels: { severity: critical, security: host-identity }
+        annotations:
+          summary: "Gateway node host-identity verification is failing (no-TOFU abort)"
+          description: "host_verify spans are erroring ({{ $value | humanize }}/s). Either a node presented an unenrolled host key (possible MITM - investigate) or a node was re-keyed without re-enrollment. The Gateway correctly aborts; sessions to that node are down until trust is reconciled."
+          runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/troubleshooting.md#host-identity-verification-failures"
+
+      - alert: GatewayNodeConnectP95High
+        expr: >
+          histogram_quantile(0.95,
+            sum by (le) (rate(duration_milliseconds_bucket{service_name="sessionlayer-gateway",span_name="gateway.node.connect"}[5m]))
+          ) > 500
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Gateway node.connect p95 > 500 ms"
+          description: "Reaching node sshd (agentless dial or agent dial-back) p95 = {{ $value }}ms. Check node reachability / the coordination signal path (HA)."
+          runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/troubleshooting.md#the-target-node-is-offline-or-unavailable"
+
+      - alert: AgentDialBackErrorSpike
+        expr: >
+          sum(rate(calls_total{service_name="sessionlayer-agent",span_name="agent.dial_back",status_code="STATUS_CODE_ERROR"}[10m])) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Agent dial-back leg erroring"
+          description: "Outbound-agent nodes may be losing Gateway control channels ({{ $value | humanize }}/s dial-back errors). If an agent loses ALL its Gateways the node is correctly 'unreachable' and degrades to out-of-band tooling - verify the ≥2 failure-domain-diverse channels."
+          runbook_url: "https://github.com/SessionLayer/Documentation/blob/main/docs/operations/gateway-runbook.md#agent-transport-reasons"

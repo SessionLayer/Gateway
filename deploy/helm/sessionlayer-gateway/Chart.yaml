@@ -1,0 +1,16 @@
+apiVersion: v2
+name: sessionlayer-gateway
+description: SessionLayer Gateway, the policy-enforced SSH proxy that records every session.
+type: application
+version: 0.1.0
+appVersion: "v0.0.2"
+# policy/v1 PodDisruptionBudget.
+kubeVersion: ">=1.21.0-0"
+home: https://github.com/SessionLayer/Gateway
+sources:
+  - https://github.com/SessionLayer/Gateway
+keywords:
+  - ssh
+  - proxy
+  - zero-trust
+  - session-recording

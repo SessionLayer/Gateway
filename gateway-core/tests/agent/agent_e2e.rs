@@ -1,0 +1,707 @@
+#![cfg(feature = "test-agent")]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::support::docker::{self, build_image};
+use crate::support::{MockCp, RecorderChoice};
+use gateway_core::agent::registry::AgentRegistry;
+use gateway_core::agent::server;
+use gateway_core::agent::token::{DialBackSigner, PendingDialBacks};
+use gateway_core::config::{
+    AgentTransportConfig, DeviceFlowConfig, InnerLegServerConfig, RecorderConfig, SshServerConfig,
+};
+use gateway_core::ha::presence::{CpPresenceStore, HeartbeatLoop, OwnerCache};
+use gateway_core::pb::{Capability, KeySealAlgorithm, RecordingStatus};
+use gateway_core::ssh;
+use gateway_core::ssh::connector::{AgentlessDial, DispatchConnector, NodeConnector};
+use p256::pkcs8::EncodePublicKey;
+use rand_core::OsRng;
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey};
+use testcontainers::core::{ExecCommand, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, CopyTargetOptions, GenericImage, ImageExt};
+
+const CLIENT_IMAGE: &str = "sessionlayer-gw-sshclient:test";
+const NODE_IMAGE: &str = "sessionlayer-gw-testnode:test";
+const AGENT_NODE_IMAGE: &str = "sessionlayer-gw-agentnode:test";
+
+const AGENT_NODE: &str = "node-agent";
+const AGENT_ID: &str = "agent-1";
+const DIRECT_NODE: &str = "node-direct";
+
+const GW_NAME: &str = "gw-agent-e2e";
+
+async fn build_images() -> anyhow::Result<()> {
+    build_image("ssh-client", CLIENT_IMAGE).await?;
+    build_image("sshd", NODE_IMAGE).await?;
+    docker::build_image_with_args(
+        "agent-node",
+        AGENT_NODE_IMAGE,
+        &[("NODE_IMAGE", NODE_IMAGE)],
+    )
+    .await
+}
+
+struct KeyMat {
+    private_openssh: String,
+    public_line: String,
+    public_wire: Vec<u8>,
+    fingerprint: String,
+}
+
+fn gen_key(alg: Algorithm) -> KeyMat {
+    let key = PrivateKey::random(&mut OsRng, alg).unwrap();
+    KeyMat {
+        private_openssh: key.to_openssh(LineEnding::LF).unwrap().to_string(),
+        public_line: key.public_key().to_openssh().unwrap(),
+        public_wire: key.public_key().to_bytes().unwrap(),
+        fingerprint: key.public_key().fingerprint(HashAlg::Sha256).to_string(),
+    }
+}
+
+fn test_agent_binary() -> Vec<u8> {
+    std::fs::read(env!("CARGO_BIN_EXE_test-agent")).expect("cargo builds the test agent")
+}
+
+async fn start_agent_node(
+    cp: &MockCp,
+    host_key: &KeyMat,
+    gateway_port: u16,
+    node_name: &str,
+    agent_id: &str,
+) -> anyhow::Result<ContainerAsync<GenericImage>> {
+    let identity = cp.issue_agent_identity(agent_id, node_name);
+    let node = GenericImage::new(
+        AGENT_NODE_IMAGE.split(':').next().unwrap(),
+        AGENT_NODE_IMAGE.split(':').nth(1).unwrap(),
+    )
+    .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+    .with_startup_timeout(Duration::from_secs(120))
+    .with_env_var("TRUSTED_USER_CA", cp.session_ca_public_line())
+    .with_env_var(
+        "AGENT_ENDPOINT",
+        format!(
+            "wss://{}:{gateway_port}",
+            docker::container_reachable_host_ip()
+        ),
+    )
+    .with_env_var("AGENT_SERVER_NAME", GW_NAME)
+    .with_env_var("AGENT_NODE_NAME", node_name)
+    .with_env_var("AGENT_LOG", "info")
+    .with_copy_to(
+        CopyTargetOptions::new("/etc/ssh/ssh_host_ed25519_key").with_mode(0o600),
+        host_key.private_openssh.clone().into_bytes(),
+    )
+    .with_copy_to(
+        CopyTargetOptions::new("/etc/ssh/ssh_host_ed25519_key.pub").with_mode(0o644),
+        host_key.public_line.clone().into_bytes(),
+    )
+    .with_copy_to(
+        CopyTargetOptions::new("/agent/test-agent").with_mode(0o755),
+        test_agent_binary(),
+    )
+    .with_copy_to(
+        CopyTargetOptions::new("/agent/ca.pem").with_mode(0o644),
+        cp.ca_pem(),
+    )
+    .with_copy_to(
+        CopyTargetOptions::new("/agent/agent.pem").with_mode(0o644),
+        gateway_core::mtls::cert_der_to_pem(&identity.cert_der),
+    )
+    .with_copy_to(
+        CopyTargetOptions::new("/agent/agent.key").with_mode(0o600),
+        identity.key_pem.into_bytes(),
+    )
+    .start()
+    .await?;
+    Ok(node)
+}
+
+async fn start_direct_node(
+    cp: &MockCp,
+    host_key: &KeyMat,
+) -> anyhow::Result<(ContainerAsync<GenericImage>, u16)> {
+    let node = GenericImage::new(
+        NODE_IMAGE.split(':').next().unwrap(),
+        NODE_IMAGE.split(':').nth(1).unwrap(),
+    )
+    .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+    .with_startup_timeout(Duration::from_secs(120))
+    .with_env_var("TRUSTED_USER_CA", cp.session_ca_public_line())
+    .with_copy_to(
+        CopyTargetOptions::new("/etc/ssh/ssh_host_ed25519_key").with_mode(0o600),
+        host_key.private_openssh.clone().into_bytes(),
+    )
+    .with_copy_to(
+        CopyTargetOptions::new("/etc/ssh/ssh_host_ed25519_key.pub").with_mode(0o644),
+        host_key.public_line.clone().into_bytes(),
+    )
+    .start()
+    .await?;
+    let port = node.get_host_port_ipv4(22).await?;
+    Ok((node, port))
+}
+
+struct Gateway {
+    ssh_port: u16,
+    agent_port: u16,
+    registry: Arc<AgentRegistry>,
+    _shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+async fn start_gateway(cp: &MockCp, recorder: RecorderChoice) -> anyhow::Result<Gateway> {
+    let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    let agent_port = listener.local_addr()?.port();
+    drop(listener);
+
+    let config = Arc::new(gw_config(agent_port, recorder_config(&recorder)));
+    let (deps, cred) = crate::support::outer_leg_deps_named(
+        cp,
+        config.clone(),
+        Arc::new(AgentlessDial::new(Duration::from_secs(4))),
+        recorder,
+        GW_NAME,
+    )
+    .await;
+
+    let registry = Arc::new(AgentRegistry::new(16));
+    let pending = Arc::new(PendingDialBacks::default());
+    let signer = Arc::new(DialBackSigner::generate());
+
+    let transport = server::bind(
+        server::AgentTransportDeps {
+            cpauth: deps.cpauth.clone(),
+            gateway_id: cred.gateway_id.clone(),
+            gateway_name: GW_NAME.to_string(),
+            registry: registry.clone(),
+            pending: pending.clone(),
+            signer: signer.clone(),
+            lock_set: deps.lock_set.clone(),
+            peer_relay: None,
+            config: config.agent.clone(),
+        },
+        sd_rx.clone(),
+    )
+    .await?;
+    let agent_port = transport.local_addr().port();
+    let mut sd = sd_rx.clone();
+    tokio::spawn(transport.run(async move {
+        let _ = sd.wait_for(|v| *v).await;
+    }));
+
+    let agent_dial = Arc::new(gateway_core::agent::dial::AgentDial::new(
+        registry.clone(),
+        pending,
+        signer,
+        deps.lock_set.clone(),
+        cred.gateway_id.clone(),
+        format!(
+            "wss://{}:{agent_port}",
+            docker::container_reachable_host_ip()
+        ),
+        config.agent.dial_back_token_ttl_secs,
+        Duration::from_secs(config.agent.dial_back_timeout_secs),
+    ));
+
+    // The presence claim, wired exactly as `gateway/src/main.rs` wires it: holding an
+    // agent's control channel is what makes this Gateway tell the CP it owns the node,
+    // and that claim is what the CP's `health` answer is derived from. Without this loop
+    // the agent path here would work while the node stayed invisible to the API.
+    let presence_addr = format!("{}:0", docker::container_reachable_host_ip());
+    HeartbeatLoop::new(
+        Arc::new(CpPresenceStore::new(deps.cpauth.clone())),
+        registry.clone(),
+        Arc::new(OwnerCache::new(Duration::from_secs(30))),
+        presence_addr,
+        Duration::from_secs(1),
+    )
+    .spawn(sd_rx.clone());
+    let deps = ssh::handler::HandlerDeps {
+        connector: Arc::new(DispatchConnector::new(
+            Arc::new(AgentlessDial::new(Duration::from_secs(4))),
+            Some(agent_dial as Arc<dyn NodeConnector>),
+        )),
+        ..deps
+    };
+
+    let server = ssh::bind(config, deps).await?;
+    let ssh_port = server.local_addr().port();
+    let mut sd = sd_rx;
+    tokio::spawn(server.run(async move {
+        let _ = sd.wait_for(|v| *v).await;
+    }));
+
+    Ok(Gateway {
+        ssh_port,
+        agent_port,
+        registry,
+        _shutdown: sd_tx,
+    })
+}
+
+fn recorder_config(choice: &RecorderChoice) -> RecorderConfig {
+    match choice {
+        RecorderChoice::Real => RecorderConfig {
+            require_https: false,
+            ..Default::default()
+        },
+        RecorderChoice::Null => RecorderConfig::default(),
+    }
+}
+
+fn gw_config(agent_port: u16, recorder: RecorderConfig) -> SshServerConfig {
+    SshServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        login_grace_secs: 60,
+        device_flow: DeviceFlowConfig {
+            heartbeat_interval_secs: 1,
+            poll_timeout_secs: 20,
+        },
+        inner: InnerLegServerConfig {
+            connect_timeout_secs: 4,
+            handshake_timeout_secs: 8,
+            max_session_idle_secs: 120,
+            ..Default::default()
+        },
+        agent: AgentTransportConfig {
+            listen_addr: format!("0.0.0.0:{agent_port}"),
+            heartbeat_interval_secs: 5,
+            dial_back_timeout_secs: 10,
+            dial_back_token_ttl_secs: 30,
+            handshake_timeout_secs: 10,
+            ..Default::default()
+        },
+        recorder,
+        ..Default::default()
+    }
+}
+
+async fn await_agent(gw: &Gateway, node: &ContainerAsync<GenericImage>, node_name: &str) {
+    for _ in 0..240 {
+        if gw.registry.lookup(node_name).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let (_c, log, _e) = ssh_exec(
+        node,
+        vec!["sh".into(), "-c".into(), "cat /agent/agent.log".into()],
+    )
+    .await;
+    panic!("the node's agent never registered its control channel; agent log:\n{log}");
+}
+
+async fn client_container(pin_key: &KeyMat) -> ContainerAsync<GenericImage> {
+    GenericImage::new(
+        CLIENT_IMAGE.split(':').next().unwrap(),
+        CLIENT_IMAGE.split(':').nth(1).unwrap(),
+    )
+    .with_network("host")
+    .with_startup_timeout(Duration::from_secs(60))
+    .with_copy_to(
+        CopyTargetOptions::new("/root/pin_key").with_mode(0o600),
+        pin_key.private_openssh.clone().into_bytes(),
+    )
+    .start()
+    .await
+    .expect("start ssh-client container")
+}
+
+async fn ssh_exec(
+    container: &ContainerAsync<GenericImage>,
+    args: Vec<String>,
+) -> (Option<i64>, String, String) {
+    let mut res = container.exec(ExecCommand::new(args)).await.expect("exec");
+    let stdout = String::from_utf8_lossy(&res.stdout_to_vec().await.unwrap()).into_owned();
+    let stderr = String::from_utf8_lossy(&res.stderr_to_vec().await.unwrap()).into_owned();
+    let code = res.exit_code().await.unwrap();
+    (code, stdout, stderr)
+}
+
+fn ssh_cmd(port: u16, extra: &[&str], target: &str, command: &str) -> Vec<String> {
+    let mut a = vec![
+        "ssh".into(),
+        "-p".into(),
+        port.to_string(),
+        "-i".into(),
+        "/root/pin_key".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "PreferredAuthentications=publickey".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "ConnectTimeout=30".into(),
+    ];
+    a.extend(extra.iter().map(|s| s.to_string()));
+    a.push(format!("{target}@127.0.0.1"));
+    if !command.is_empty() {
+        a.push(command.into());
+    }
+    a
+}
+
+async fn node_sshd_log(node: &ContainerAsync<GenericImage>) -> String {
+    String::from_utf8_lossy(&node.stderr_to_vec().await.unwrap()).into_owned()
+}
+
+#[tokio::test]
+async fn ssh_runs_on_a_real_node_through_the_agent_path_in_a_mixed_fleet() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let agent_host_key = gen_key(Algorithm::Ed25519);
+    let direct_host_key = gen_key(Algorithm::Ed25519);
+
+    cp.register_pin(&pin.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", AGENT_NODE, "deploy");
+    cp.allow("alice", DIRECT_NODE, "deploy");
+    for node in [AGENT_NODE, DIRECT_NODE] {
+        cp.set_capabilities(node, &[Capability::Shell, Capability::Exec]);
+    }
+
+    let gw = start_gateway(&cp, RecorderChoice::Null).await?;
+
+    let agent_node =
+        start_agent_node(&cp, &agent_host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
+    cp.set_agent_node_connection(
+        AGENT_NODE,
+        AGENT_NODE,
+        cp.pinned_verification(agent_host_key.public_wire.clone()),
+    );
+
+    let (direct_node, direct_port) = start_direct_node(&cp, &direct_host_key).await?;
+    cp.set_node_connection(
+        DIRECT_NODE,
+        &format!("127.0.0.1:{direct_port}"),
+        cp.pinned_verification(direct_host_key.public_wire.clone()),
+    );
+
+    await_agent(&gw, &agent_node, AGENT_NODE).await;
+    let client = client_container(&pin).await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(
+            gw.ssh_port,
+            &[],
+            &format!("deploy%{AGENT_NODE}"),
+            "echo AGENT_PATH_OK; hostname",
+        ),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the agent-path session must succeed; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("AGENT_PATH_OK"),
+        "node output must return over the splice; stdout={stdout:?}"
+    );
+
+    let (code, stdout, _e) = ssh_exec(
+        &client,
+        ssh_cmd(
+            gw.ssh_port,
+            &["-tt"],
+            &format!("deploy%{AGENT_NODE}"),
+            "echo PTY_$(id -un)",
+        ),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "an interactive PTY must work over the splice"
+    );
+    assert!(
+        stdout.contains("PTY_deploy"),
+        "the PTY session runs as the inner-cert principal; stdout={stdout:?}"
+    );
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(
+            gw.ssh_port,
+            &[],
+            &format!("deploy%{DIRECT_NODE}"),
+            "echo AGENTLESS_OK",
+        ),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the agentless node must still work; stderr={stderr}"
+    );
+    assert!(stdout.contains("AGENTLESS_OK"));
+
+    let key_ids = cp.signed_key_ids();
+    assert!(!key_ids.is_empty(), "the CP signed inner certificates");
+    let log = node_sshd_log(&agent_node).await;
+    let correlated = key_ids.iter().any(|k| log.contains(k.as_str()));
+    assert!(
+        correlated,
+        "the node's sshd log must record the inner cert key-id ({key_ids:?})"
+    );
+    assert!(
+        log.contains("Accepted publickey for deploy"),
+        "the node's own log records the session; log tail:\n{}",
+        log.chars().rev().take(2000).collect::<String>()
+    );
+
+    let (code, whoami, _e) = ssh_exec(
+        &agent_node,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "ps -o user= -C test-agent | head -1".into(),
+        ],
+    )
+    .await;
+    assert_eq!(code, Some(0));
+    assert_eq!(whoami.trim(), "deploy", "the Agent must not run as root");
+
+    drop(direct_node);
+    drop(agent_node);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_untrusted_node_host_key_aborts_over_the_agent_path() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let real_host_key = gen_key(Algorithm::Ed25519);
+    let impostor = gen_key(Algorithm::Ed25519);
+
+    cp.register_pin(&pin.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", AGENT_NODE, "deploy");
+
+    let gw = start_gateway(&cp, RecorderChoice::Null).await?;
+    let agent_node =
+        start_agent_node(&cp, &real_host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
+
+    cp.set_agent_node_connection(
+        AGENT_NODE,
+        AGENT_NODE,
+        cp.pinned_verification(impostor.public_wire.clone()),
+    );
+
+    await_agent(&gw, &agent_node, AGENT_NODE).await;
+    let client = client_container(&pin).await;
+
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(
+            gw.ssh_port,
+            &[],
+            &format!("deploy%{AGENT_NODE}"),
+            "echo SHOULD_NOT_RUN",
+        ),
+    )
+    .await;
+    assert_ne!(
+        code,
+        Some(0),
+        "an untrusted host key must abort even over the agent path (never TOFU)"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_RUN"),
+        "the command must never reach the node"
+    );
+    assert!(
+        stderr.contains("offline or unavailable"),
+        "the user sees the generic outcome; stderr={stderr:?}"
+    );
+
+    drop(agent_node);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_node_whose_agent_is_disconnected_is_offline() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+
+    cp.register_pin(&pin.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", AGENT_NODE, "deploy");
+
+    let gw = start_gateway(&cp, RecorderChoice::Null).await?;
+    cp.set_agent_node_connection(
+        AGENT_NODE,
+        AGENT_NODE,
+        cp.pinned_verification(host_key.public_wire.clone()),
+    );
+
+    let client = client_container(&pin).await;
+    let (code, _stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(gw.ssh_port, &[], &format!("deploy%{AGENT_NODE}"), "true"),
+    )
+    .await;
+    assert_ne!(code, Some(0), "a node with no Agent must fail closed");
+    assert!(
+        stderr.contains("offline or unavailable"),
+        "node-offline; stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_session_over_the_agent_path_is_still_recorded() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let pin = gen_key(Algorithm::Ed25519);
+    let host_key = gen_key(Algorithm::Ed25519);
+
+    cp.register_pin(&pin.fingerprint, "alice", &["deploy"]);
+    cp.allow("alice", AGENT_NODE, "deploy");
+    cp.set_capabilities(AGENT_NODE, &[Capability::Shell, Capability::Exec]);
+
+    // The customer holds the key: the platform seals to the public half and cannot read
+    // the recording back. We keep the private half only to prove that.
+    let customer = p256::SecretKey::random(&mut OsRng);
+    let customer_pub = customer
+        .public_key()
+        .to_public_key_der()?
+        .as_bytes()
+        .to_vec();
+    cp.set_customer_key(
+        "cust-1",
+        customer_pub,
+        KeySealAlgorithm::EciesP256HkdfSha256Aes256gcm,
+    );
+
+    let (_minio, s3) = docker::start_minio().await?;
+    cp.set_s3_target(s3.clone());
+
+    let gw = start_gateway(&cp, RecorderChoice::Real).await?;
+    let agent_node = start_agent_node(&cp, &host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
+    cp.set_agent_node_connection(
+        AGENT_NODE,
+        AGENT_NODE,
+        cp.pinned_verification(host_key.public_wire.clone()),
+    );
+
+    await_agent(&gw, &agent_node, AGENT_NODE).await;
+    let client = client_container(&pin).await;
+
+    let marker = "RECORDED_OVER_AGENT";
+    let (code, stdout, stderr) = ssh_exec(
+        &client,
+        ssh_cmd(
+            gw.ssh_port,
+            &["-tt"],
+            &format!("deploy%{AGENT_NODE}"),
+            &format!("echo {marker}"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the recorded agent session must run; {stderr}"
+    );
+    assert!(stdout.contains(marker));
+
+    let mut finalized = Vec::new();
+    for _ in 0..120 {
+        finalized = cp.finalized_recordings();
+        if !finalized.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(finalized.len(), 1, "the agent-path session was recorded");
+    let record = &finalized[0];
+    assert_eq!(record.status, RecordingStatus::Finalized as i32);
+    assert!(record.byte_len > 0);
+    assert!(
+        record.hash_chain_head.starts_with("sha256:"),
+        "the hash chain is committed"
+    );
+
+    let object_key = cp
+        .recorded_object_keys()
+        .pop()
+        .expect("an object key was issued");
+    let (status, body) = docker::get_object(&s3, &object_key).await?;
+    assert_eq!(status, 200, "the sealed recording is in the WORM store");
+    assert!(body.starts_with(b"SLREC1"), "the sealed-object envelope");
+    assert!(
+        !String::from_utf8_lossy(&body).contains(marker),
+        "the object is sealed: the session plaintext is NOT readable in it"
+    );
+
+    drop(agent_node);
+    Ok(())
+}
+
+/// The first link of the `health` answer: a live agent control channel must make THIS
+/// Gateway claim presence at the Control Plane, and the claim must be FRESH.
+///
+/// Freshness is the whole of it. The CP derives `healthy` from a claim heartbeated inside
+/// the staleness TTL and `unreachable` from one that is not, so a row that merely exists
+/// is a different answer than the one an operator reads. Every other presence assertion in
+/// this repo goes through `presence_owner`, which cannot tell those two apart.
+#[tokio::test]
+async fn a_live_agent_channel_makes_this_gateway_claim_fresh_presence() -> anyhow::Result<()> {
+    build_images().await?;
+    let cp = MockCp::start().await;
+    let host_key = gen_key(Algorithm::Ed25519);
+
+    let gw = start_gateway(&cp, RecorderChoice::Null).await?;
+    assert_eq!(
+        cp.fresh_presence_owner(AGENT_NODE),
+        None,
+        "no agent has connected yet, so nothing may be claiming this node"
+    );
+
+    let node = start_agent_node(&cp, &host_key, gw.agent_port, AGENT_NODE, AGENT_ID).await?;
+    await_agent(&gw, &node, AGENT_NODE).await;
+
+    let mut claimed = None;
+    for _ in 0..120 {
+        claimed = cp.fresh_presence_owner(AGENT_NODE);
+        if claimed.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        claimed.as_deref(),
+        Some(GW_NAME),
+        "a registered agent control channel must produce a fresh presence claim owned by \
+         THIS gateway, by name - the CP names that owner back to the operator as \
+         owningGateway, so the value is the assertion"
+    );
+
+    node.stop().await?;
+    let mut released = false;
+    for _ in 0..120 {
+        if cp.fresh_presence_owner(AGENT_NODE).is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        released,
+        "the claim outlived the agent's control channel; the node would keep reading as \
+         healthy with nothing serving it (presence_owner still reads {:?})",
+        cp.presence_owner(AGENT_NODE)
+    );
+    Ok(())
+}

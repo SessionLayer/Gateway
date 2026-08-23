@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+import "sessionlayer/controlplane/v1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "IdentityProto";
+
+// Client (Gateway) certificate authentication is REQUIRED for every RPC EXCEPT
+// EnrollGateway: a Gateway that has not yet enrolled has no CP-issued client
+// certificate, so EnrollGateway is authenticated by the single-use enrollment
+// token instead (the documented bootstrap exception). Every other RPC on this
+// plane - RenewGatewayIdentity, Handshake.Negotiate for an enrolled peer, and
+// SessionSigning.SignSessionCertificate - is refused without a valid client
+// certificate chained to the internal CA that resolves to an active, unlocked
+// gateway_identity. All rejection paths fail closed.
+//
+// The Gateway generates its mTLS keypair locally and sends only a PKCS#10 CSR;
+// its mTLS private key never leaves the Gateway.
+service GatewayIdentity {
+  rpc EnrollGateway(EnrollGatewayRequest) returns (EnrollGatewayResponse);
+
+  // RenewGatewayIdentity rotates the caller's mTLS certificate and increments
+  // the generation counter (persist-before-adopt on the Gateway side). REQUIRES
+  // the caller's current mTLS client certificate; a locked/revoked identity or a
+  // generation mismatch is refused and flagged as a security event. The Gateway
+  // renews AHEAD of expiry, never at it.
+  rpc RenewGatewayIdentity(RenewGatewayIdentityRequest) returns (RenewGatewayIdentityResponse);
+
+  // The identity certificate from Enroll/Renew is stamped clientAuth - exactly one
+  // EKU per leaf, by design - so it cannot serve TLS: an Agent validating it as a
+  // server certificate would (correctly) reject it. Agents must verify the Gateway
+  // against an anchor they already hold (the internal mTLS CA) rather than trust it
+  // on first use, so the Gateway needs a genuine serverAuth leaf from that same CA.
+  //
+  // The CP - not the caller - chooses the certificate's SANs, stamping them from the
+  // gateway_identity row it already holds. A Gateway therefore cannot obtain a server
+  // certificate for a name it does not own, even if compromised. The Gateway generates
+  // a SEPARATE keypair for this leaf and sends only a CSR.
+  rpc IssueGatewayServerCertificate(IssueGatewayServerCertificateRequest)
+      returns (IssueGatewayServerCertificateResponse);
+}
+
+message EnrollGatewayRequest {
+  string enrollment_token = 1;
+
+  bytes pkcs10_csr = 2;
+
+  ComponentInfo client = 3;
+
+  // The stable Gateway name the operator provisioned the token for. The CP binds
+  // this into gateway_identity.name and the issued certificate's SAN; a mismatch
+  // between this, the token's scope, and the CSR subject fails closed.
+  string gateway_name = 4;
+}
+
+message EnrollGatewayResponse {
+  bytes certificate = 1;
+
+  // The issuing CA chain (DER; issuing CA first, root last). The Gateway pins
+  // this as the trust anchor for the CP's server certificate and uses the leaf +
+  // its private key to present its own client certificate thereafter.
+  repeated bytes ca_chain = 2;
+
+  string gateway_id = 3;
+
+  uint64 generation = 4;
+
+  // Certificate validity as Unix epoch seconds (UTC). not_before is backdated for
+  // clock skew. The Gateway expires the credential conservatively.
+  int64 not_before_epoch_seconds = 5;
+  int64 not_after_epoch_seconds = 6;
+}
+
+message RenewGatewayIdentityRequest {
+  bytes pkcs10_csr = 1;
+
+  // The generation the Gateway currently holds. The CP issues current_generation
+  // + 1 and enforces monotonicity; a mismatch is a security event (refused and
+  // flagged) rather than a silent pass.
+  uint64 current_generation = 2;
+
+  ComponentInfo client = 3;
+}
+
+message RenewGatewayIdentityResponse {
+  bytes certificate = 1;
+  repeated bytes ca_chain = 2;
+  string gateway_id = 3;
+
+  uint64 generation = 4;
+
+  int64 not_before_epoch_seconds = 5;
+  int64 not_after_epoch_seconds = 6;
+}
+
+message IssueGatewayServerCertificateRequest {
+  bytes pkcs10_csr = 1;
+
+  ComponentInfo client = 2;
+}
+
+// IssueGatewayServerCertificateResponse returns the serverAuth leaf. There is no
+// generation counter: this certificate is not an identity, it is a TLS server
+// credential derived from one. Revocation is by locking the gateway_identity -
+// the CP then refuses to reissue, and the leaf expires.
+message IssueGatewayServerCertificateResponse {
+  // The issued serverAuth X.509 leaf (DER). Its SANs are chosen by the CP from
+  // the gateway_identity row: dNSName = the gateway's enrolled name, plus the
+  // URI SAN sessionlayer://gateway/<gateway_id>. An Agent verifies the presented
+  // certificate against the internal mTLS CA with the gateway name as the
+  // expected server name.
+  bytes certificate = 1;
+
+  repeated bytes ca_chain = 2;
+
+  string gateway_name = 3;
+
+  int64 not_before_epoch_seconds = 4;
+  int64 not_after_epoch_seconds = 5;
+}

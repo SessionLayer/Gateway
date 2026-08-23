@@ -1,0 +1,54 @@
+# Span names are carried verbatim as the `span_name` label value, so a selector that drops
+# the `gateway.` / `cp.` / `agent.` prefix matches nothing.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        # Buckets straddle the 250 ms session-establishment budget so the data-path
+        # legs (host_verify, node.connect, bridge_setup) are queryable against it.
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]
+    dimensions:
+      # Low-cardinality closed enums only (never session_id/correlation_id/node_id -
+      # those stay on the trace, never on a metric dimension).
+      - name: sessionlayer.outcome
+      - name: sessionlayer.access_model
+    exemplars:
+      enabled: true
+    metrics_flush_interval: 15s
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # The trace store. Substitute your own endpoint - Tempo, Jaeger and any other
+  # OTLP-native backend take this unchanged. It exists because `spanmetrics` is a
+  # CONNECTOR, not an exporter: it consumes the span to derive RED metrics and stores
+  # nothing. A traces pipeline exporting only to the connector therefore produces healthy
+  # dashboards and retains no trace, which is precisely the evidence the troubleshooting
+  # guide sends an operator to read by session_id during an incident.
+  otlp/traces:
+    endpoint: tempo.observability.svc:4317
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [spanmetrics, otlp/traces]
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      exporters: [prometheus]
+    # The Gateway's pushed gauges (live_sessions, lock_feed_healthy). Separate from the
+    # span-derived pipeline above because they share no source: these come straight off the
+    # OTLP receiver, and only this pipeline gives them anywhere to go.
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]

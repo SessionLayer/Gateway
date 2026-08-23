@@ -1,0 +1,50 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SessionLayer Gateway daemon: policy-enforced SSH proxy with per-session Control Plane authorization and session recording."
+default-run = "gateway"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+io-uring = ["gateway-core/io-uring"]
+hardening-canary = []
+
+[dependencies]
+gateway-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+# Tier-0 runtime self-hardening. Linux-only and confined to the BINARY: the enforcement
+# never enters `gateway-core`, so the in-process integration tests never sandbox their
+# own runner. Each crate encapsulates its own `unsafe` FFI, so the workspace
+# `forbid(unsafe_code)` lint is upheld in our code.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["user", "process", "resource", "mman"] }
+seccompiler = "0.5"
+landlock = "0.4"
+libc = "0.2"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[[bin]]
+name = "hardening-canary"
+path = "src/bin/hardening-canary.rs"
+required-features = ["hardening-canary"]
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"

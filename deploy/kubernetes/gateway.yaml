@@ -1,0 +1,167 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sessionlayer-gateway-config
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+type: Opaque
+stringData:
+  # `bootstrap` is optional in the config schema and absent means "already enrolled", so a
+  # manifest that omits it deploys a Gateway that can never obtain an identity and never
+  # says why. The three REPLACE_WITH_ values are what an operator substitutes: the token
+  # from `POST /v1/gateway-enrollment-tokens` (single-use, so it belongs in a Secret
+  # projected over this key rather than committed here), the name that token was minted
+  # for, and the path the CP trust anchor is mounted at. `server_name` must match the
+  # certificate the Control Plane presents, not merely the address dialled.
+  gateway.json: |
+    {
+      "cp_mtls_endpoint": "https://controlplane.sessionlayer.svc:9443",
+      "data_dir": "/var/lib/sessionlayer-gateway",
+      "bootstrap": {
+        "enrollment_token": "REPLACE_WITH_ENROLLMENT_TOKEN",
+        "ca_cert_path": "/etc/sessionlayer/ca.pem",
+        "gateway_name": "REPLACE_WITH_GATEWAY_NAME",
+        "server_name": "controlplane.sessionlayer.svc"
+      },
+      "ssh": {
+        "listen_addr": "0.0.0.0:2222",
+        "host_key_path": "/var/lib/sessionlayer-gateway/host_ed25519",
+        "source_ip_allowlist": ["10.0.0.0/8"],
+        "agent": {
+          "listen_addr": "0.0.0.0:9444",
+          "advertise_url": "wss://sessionlayer-gateway.sessionlayer.svc:9444"
+        }
+      },
+      "ha": {
+        "drain": { "readyz_addr": "0.0.0.0:8081" }
+      },
+      "hardening": {
+        "landlock": {
+          "enabled": true,
+          "read_only_paths": [
+            "/etc/sessionlayer",
+            "/etc/ssl/certs",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/usr/local/bin/gateway",
+            "/lib", "/lib64", "/usr/lib",
+            "/dev", "/proc"
+          ],
+          "read_write_paths": ["/var/lib/sessionlayer-gateway"]
+        },
+        "seccomp": { "mode": "enforce" }
+      }
+    }
+---
+# The anchor `bootstrap.ca_cert_path` names. Both this ConfigMap and the config Secret must
+# be projected into /etc/sessionlayer: project only one and the path resolves to nothing,
+# enrollment fails the no-TOFU check, and the failure looks like a Control Plane problem.
+# Fill it with the CA served by `GET /v1/cas/mtls/public-key`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sessionlayer-gateway-trust
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+data:
+  ca.pem: |
+    REPLACE_WITH_CONTROL_PLANE_MTLS_CA_PEM
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sessionlayer-gateway
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+spec:
+  # Two replicas without an `ha.coordination` block leaves the in-process
+  # backend, which cannot signal a peer pod: each Gateway is unaware of the
+  # other, so a session whose Agent channel is owned by the sibling is not
+  # relayed to it. `ha.mode` does not change that - it is only logged. Set
+  # `ha.coordination.backend` in the config above before running more than one.
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: sessionlayer-gateway }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: sessionlayer-gateway }
+    spec:
+      automountServiceAccountToken: false
+      # The drain budget is ha.drain.pre_drain_grace_secs (5) + deadline_secs (30) = 35s,
+      # during which the Gateway stops advertising ready, lets live sessions finish and
+      # finalizes their recordings. Kubernetes' 30s default SIGKILLs five seconds before
+      # that deadline, so the runbook's promise that recordings are finalized on a clean
+      # drain would be broken by the platform rather than by the code. Sized above the real
+      # budget with room for a slow WORM PUT; raise both together if the drain config moves.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: ghcr.io/sessionlayer/gateway:v0.0.2
+          args: ["--config", "/etc/sessionlayer/gateway.json"]
+          ports:
+            - { name: ssh, containerPort: 2222 }
+            - { name: agent, containerPort: 9444 }
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/sessionlayer-gateway }
+            - { name: config, mountPath: /etc/sessionlayer, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 2222 }
+            periodSeconds: 15
+            failureThreshold: 3
+          startupProbe:
+            tcpSocket: { port: 2222 }
+            periodSeconds: 5
+            failureThreshold: 30
+      volumes:
+        # The credential data-dir. An emptyDir re-enrolls on every restart; use a
+        # PVC (or a StatefulSet) to persist the enrolled identity + generation.
+        - name: data
+          emptyDir: {}
+        - name: config
+          projected:
+            sources:
+              - secret: { name: sessionlayer-gateway-config }
+              - configMap: { name: sessionlayer-gateway-trust }
+        - name: tmp
+          emptyDir: { medium: Memory }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sessionlayer-gateway
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: sessionlayer-gateway }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sessionlayer-gateway
+  labels: { app.kubernetes.io/name: sessionlayer-gateway }
+spec:
+  type: LoadBalancer
+  selector: { app.kubernetes.io/name: sessionlayer-gateway }
+  ports:
+    - { name: ssh, port: 22, targetPort: 2222 }
+    - { name: agent, port: 9444, targetPort: 9444 }

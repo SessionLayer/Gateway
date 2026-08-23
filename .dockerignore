@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+deploy/
+tests/
+scripts/
+*.md
+!README.md
+.gitignore
+.dockerignore
+junit.xml

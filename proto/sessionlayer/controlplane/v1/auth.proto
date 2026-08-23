@@ -1,0 +1,239 @@
+syntax = "proto3";
+
+package sessionlayer.controlplane.v1;
+
+option java_multiple_files = true;
+option java_package = "io.sessionlayer.controlplane.grpc.v1";
+option java_outer_classname = "AuthProto";
+
+// OuterLegAuth is the Control Plane's outer-leg AUTHENTICATION service: it
+// resolves an SSH-outer-leg credential the Gateway received (a Vault user cert,
+// a pinned public key, a pre-issued OTP, or an approved OIDC device flow) to a
+// CP-owned {identity, principals}. It is layered over the OTP, pin, device-flow
+// and user-facing-CA services.
+//
+// AUTHENTICATION ONLY, NEVER AUTHORIZATION. These RPCs answer only "who is
+// this?"; they never grant access. On success the Gateway still calls
+// Authorization.Authorize for the target node (a pin/OTP/cert is an authN
+// shortcut; every reconnect re-runs full authorization). The CP maps identity ->
+// principals; the Gateway MUST use only what the CP returns and MUST NOT trust
+// any client-claimed principal.
+//
+// TIER. Every RPC here is on the identity/session (mTLS-required) tier of the
+// control plane: the AuthInterceptor requires the caller's Gateway mTLS client
+// certificate. Only an authenticated Gateway may resolve credentials.
+//
+// NON-DISCLOSURE. Resolution failure is generic: the Resolve* RPCs return
+// `resolved = false` with no identity for ANY reason (unknown / expired /
+// wrong-source / rate-limited / malformed) - the caller is never told which, so
+// the outer-leg auth surface reveals no existence. Reasons go only to the
+// decision log. Source IP is a DENY-ONLY reducer everywhere - it can suppress a
+// resolution, never grant one.
+service OuterLegAuth {
+  // ResolveUserCert validates a presented OpenSSH user certificate against the
+  // user-facing CA (the Vault-user-cert path) and resolves the identity +
+  // cert-scoped principals. A cert that does not chain to a trusted user CA, is
+  // outside its validity window, or is otherwise unusable resolves to
+  // `resolved = false` (generic).
+  rpc ResolveUserCert(ResolveUserCertRequest) returns (ResolveUserCertResponse);
+
+  // ResolvePin resolves a pinned public-key fingerprint to its bound identity.
+  // The pin is source-CIDR bound (deny-only) and must be unexpired and
+  // unrevoked; otherwise `resolved = false`.
+  rpc ResolvePin(ResolvePinRequest) returns (ResolvePinResponse);
+
+  // ResolveOtp validates a pre-issued single-use OTP: constant-time, single-use
+  // (atomic mark-used), source-bound, rate-limited. The identity comes from the
+  // OTP record, never from client input. A replayed, expired, wrong-source, or
+  // throttled code resolves to `resolved = false`.
+  rpc ResolveOtp(ResolveOtpRequest) returns (ResolveOtpResponse);
+
+  // BeginDeviceFlow starts the fallback OIDC device flow. The CP mints the codes
+  // and hosts the verification page as an auth-code + PKCE relying party (the
+  // anti-phishing design). The Gateway shows user_code + verification_uri in the
+  // keyboard-interactive instruction and polls PollDeviceFlow with device_code.
+  // source_ip is bound for the approving-browser correlation (deny-only) and
+  // rate-limiting.
+  rpc BeginDeviceFlow(BeginDeviceFlowRequest) returns (BeginDeviceFlowResponse);
+
+  // PollDeviceFlow reports the flow's status by its device_code; on APPROVED it
+  // carries the resolved identity. Rate-limited: a throttled poll fails with
+  // RESOURCE_EXHAUSTED (the Gateway backs off and keeps its num-prompts=0
+  // heartbeat alive). An unknown device_code reports EXPIRED (generic, no
+  // existence disclosure).
+  rpc PollDeviceFlow(PollDeviceFlowRequest) returns (PollDeviceFlowResponse);
+
+  // ResolveBreakglassKey resolves a registered break-glass FIDO2 `sk-ecdsa` PUBLIC
+  // key to its break-glass identity + scoped principals, INDEPENDENT of the primary
+  // OIDC IdP. The key is public and russh has already verified the FIDO POSSESSION
+  // signature before the Gateway calls this (proving the hardware authenticator, whose
+  // private key never leaves it, is present) - the CP only maps the key to its
+  // registered break-glass credential. NOTE: touch (user-presence) is enforced by the
+  // AUTHENTICATOR for a standard touch-required sk key; it is NOT asserted server-side
+  // (this russh does not expose the sk flags), so break-glass keys MUST be provisioned
+  // touch-required (never `-O no-touch-required`).
+  // On success it mints a single-use `breakglass_token` (in BreakglassResolution)
+  // that authorises exactly one break-glass Authorize. A key that is unknown,
+  // revoked, expired, or out-of-source resolves to `resolved = false` with no token
+  // (generic). This is the primary break-glass auth path.
+  rpc ResolveBreakglassKey(ResolveBreakglassKeyRequest) returns (ResolveBreakglassKeyResponse);
+
+  // ResolveBreakglassCode validates a pre-issued single-use break-glass OFFLINE CODE
+  // - the IdP-independent FALLBACK when no FIDO2 authenticator is available. The code
+  // is looked up by its SHA-256 hash (the raw code is never stored nor compared in the
+  // clear) and consumed by an atomic single-use UPDATE; it is source-bound and the
+  // identity comes from the code record, never client input. A ≥128-bit code makes the
+  // hash-existence timing side-channel useless. The `code` field is a SECRET (entered
+  // over keyboard-interactive with echo off) - NEVER log it. On success it mints a
+  // single-use `breakglass_token`; a replayed, expired, wrong-source, or unknown code
+  // resolves to `resolved = false` with no token (generic).
+  rpc ResolveBreakglassCode(ResolveBreakglassCodeRequest) returns (ResolveBreakglassCodeResponse);
+}
+
+message ResolvedIdentity {
+  bool resolved = 1;
+
+  string identity = 2;
+
+  // The Linux logins this CREDENTIAL is scoped to (cert principals / the OTP or
+  // pin record's allowed principals). A deny-only reducer the Gateway applies on
+  // top of the RBAC-allowed logins: the requested login must be within both.
+  // May be empty (e.g. device flow, where RBAC alone decides the logins).
+  repeated string principals = 3;
+
+  repeated string groups = 4;
+}
+
+message ResolveUserCertRequest {
+  // The OpenSSH user certificate the client presented on the outer leg, as the
+  // raw OpenSSH wire blob (the base64 body of an `...-cert-v01@openssh.com`
+  // authorized-keys entry). Not a secret - a certificate is public - but the CP
+  // validates it fully before trusting anything in it.
+  bytes certificate_blob = 1;
+
+  string source_ip = 2;
+}
+
+// ResolveUserCertResponse wraps the authentication result (unique per RPC to
+// satisfy the request/response-uniqueness contract).
+message ResolveUserCertResponse {
+  ResolvedIdentity identity = 1;
+}
+
+message ResolvePinRequest {
+  // SHA-256 fingerprint of the public key the client offered (OpenSSH
+  // `SHA256:...` form). The pin store is keyed by this; the raw key is not sent.
+  string public_key_fingerprint = 1;
+
+  string source_ip = 2;
+}
+
+message ResolvePinResponse {
+  ResolvedIdentity identity = 1;
+}
+
+message ResolveOtpRequest {
+  // The one-time code the user typed. Secret; validated constant-time and
+  // single-use, then consumed. Must never appear in a log or trace.
+  string otp = 1;
+
+  string source_ip = 2;
+}
+
+message ResolveOtpResponse {
+  ResolvedIdentity identity = 1;
+}
+
+message BeginDeviceFlowRequest {
+  string source_ip = 1;
+}
+
+message BeginDeviceFlowResponse {
+  // The secret code the Gateway polls PollDeviceFlow with. NOT shown to the
+  // user; correlates 1:1 with this SSH connection (anti-phishing binding).
+  string device_code = 1;
+
+  string user_code = 2;
+
+  string verification_uri = 3;
+
+  // Minimum seconds between polls (RFC 8628 interval). The Gateway honours this;
+  // a faster poll is throttled (RESOURCE_EXHAUSTED).
+  int32 interval_seconds = 4;
+
+  int32 expires_in_seconds = 5;
+}
+
+message PollDeviceFlowRequest {
+  string device_code = 1;
+}
+
+message PollDeviceFlowResponse {
+  DeviceFlowStatus status = 1;
+
+  // The resolved identity + principal/group context. Populated (resolved = true)
+  // only when status = APPROVED; otherwise resolved = false.
+  ResolvedIdentity identity = 2;
+}
+
+enum DeviceFlowStatus {
+  DEVICE_FLOW_STATUS_UNSPECIFIED = 0;
+  DEVICE_FLOW_STATUS_PENDING = 1;
+  DEVICE_FLOW_STATUS_APPROVED = 2;
+  DEVICE_FLOW_STATUS_DENIED = 3;
+  DEVICE_FLOW_STATUS_EXPIRED = 4;
+}
+
+// BreakglassResolution is the break-glass authentication result: the resolved
+// break-glass identity + scoped principals, plus a single-use token the Gateway
+// presents to Authorize to open exactly one break-glass session.
+// AUTHENTICATION ONLY - the alert, the breakglass_activation record, and the
+// forced-strict/Lock-checked authorization all happen at Authorize (on actual use),
+// symmetric with how the other Resolve* RPCs authenticate without granting access.
+message BreakglassResolution {
+  ResolvedIdentity identity = 1;
+
+  // A single-use, short-lived break-glass token bound to {gateway (the authenticated
+  // mTLS caller), identity, node, source_ip, exp}. Presented as
+  // AuthorizeRequest.breakglass_token and consumed atomically at Authorize, which then
+  // creates the breakglass_activation, fires the high-priority alert, forces
+  // access_model = BREAKGLASS + strict recording, and evaluates the break-glass allow
+  // SUBJECT TO the top-tier Lock (a Lock still denies - deny wins). Empty when
+  // resolved = false.
+  string breakglass_token = 2;
+}
+
+message ResolveBreakglassKeyRequest {
+  // The OpenSSH `sk-ecdsa-sha2-nistp256@openssh.com` PUBLIC key the client offered,
+  // as the raw OpenSSH wire blob (the base64 body of the authorized-keys entry).
+  // PUBLIC material - the CP matches it to a registered break-glass credential.
+  bytes sk_public_key_blob = 1;
+
+  string source_ip = 2;
+
+  // The fixed target node id (UUID) this break-glass connection is for. Scopes the
+  // credential (a credential may be node-scoped) and binds the minted token. An empty
+  // value is tolerated for a fleet-scoped break-glass credential.
+  string node_id = 3;
+}
+
+message ResolveBreakglassKeyResponse {
+  BreakglassResolution resolution = 1;
+}
+
+message ResolveBreakglassCodeRequest {
+  // The one-time break-glass code the user typed. Secret; matched by SHA-256 hash
+  // (never compared in the clear) and consumed single-use. Must never appear in a
+  // log or trace.
+  string code = 1;
+
+  string source_ip = 2;
+
+  // The fixed target node id (UUID) this break-glass connection is for (scope + token
+  // binding). Empty tolerated for a fleet-scoped code.
+  string node_id = 3;
+}
+
+message ResolveBreakglassCodeResponse {
+  BreakglassResolution resolution = 1;
+}

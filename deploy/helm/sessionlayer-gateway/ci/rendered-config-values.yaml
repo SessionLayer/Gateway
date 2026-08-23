@@ -1,0 +1,70 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/sessionlayer/gateway
+  tag: "v0.0.2"
+
+trustAnchor:
+  existingConfigMap: sessionlayer-bootstrap-ca
+  key: ca.pem
+
+controlPlane:
+  mtlsEndpoint: "https://controlplane.sessionlayer.svc:9443"
+  serverName: "controlplane.sessionlayer.svc"
+
+bootstrap:
+  enabled: true
+  enrollmentToken: "REPLACE-ME-single-use-enrollment-token"
+  gatewayName: "gw-a"
+
+ssh:
+  listenPort: 2222
+  sourceIpAllowlist:
+    - 10.0.0.0/8
+  proxy:
+    lbCidrs:
+      - 10.99.0.0/16
+  agent:
+    listenPort: 9444
+    advertiseUrl: "wss://gw-a.example.com:9444"
+
+ha:
+  mode: ha
+  coordination:
+    backend: nats
+    url: "nats://127.0.0.1:4222"
+    subject_prefix: sl
+  drain:
+    preDrainGraceSecs: 5
+    deadlineSecs: 30
+    readyzPort: 8081
+
+hardening:
+  landlock:
+    enabled: true
+    required: true
+  seccomp:
+    mode: enforce
+
+persistence:
+  enabled: true
+  storageClass: gp3
+  size: 1Gi
+
+podDisruptionBudget:
+  enabled: false
+
+config:
+  overrides:
+    ssh:
+      recorder:
+        require_https: true
+      reeval:
+        mid_session_expiry: grace_then_kill
+
+networkPolicy:
+  enabled: true
+  nodeCidrs:
+    - 10.20.0.0/16
+  wormCidrs:
+    - 10.30.0.0/16

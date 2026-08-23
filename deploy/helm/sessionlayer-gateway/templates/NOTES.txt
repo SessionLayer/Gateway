@@ -1,0 +1,75 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Image:          {{ include "sessionlayer-gateway.image" . }}
+{{- if not .Values.image.digest }}
+                Pinned by tag. Set image.digest to pin the exact bytes.
+{{- end }}
+{{- if .Values.config.existingSecret }}
+Config:         key {{ .Values.config.existingSecretKey }} of Secret {{ .Values.config.existingSecret }}.
+                The chart cannot read it, so ssh.listenPort ({{ .Values.ssh.listenPort }}),
+                ssh.agent.listenPort ({{ .Values.ssh.agent.listenPort }}) and ha.drain.readyzPort
+                ({{ .Values.ha.drain.readyzPort }}) must match what that file says, or the probes
+                and the Service point at ports nothing listens on.
+{{- else }}
+Control Plane:  {{ include "sessionlayer-gateway.cpMtlsEndpoint" . }} (certificate name {{ include "sessionlayer-gateway.cpServerName" . }})
+Agent dial-back: {{ include "sessionlayer-gateway.agentAdvertiseUrl" . }}
+SSH front door: allowed from {{ join ", " .Values.ssh.sourceIpAllowlist }}
+{{- end }}
+
+Watch enrollment finish:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "sessionlayer-gateway.fullname" . }}
+{{ if and .Values.bootstrap.enabled (not .Values.config.existingSecret) }}
+The enrollment token you supplied is now in this release's stored values, and
+comes back out of:
+
+  helm -n {{ .Release.Namespace }} get values {{ .Release.Name }}
+
+along with your shell history if you passed it with --set. The token is
+single-use with a 10-minute default TTL, so one that has already enrolled this
+Gateway is spent. Rotate it if it is still unconsumed and has landed anywhere
+durable, and use config.existingSecret for the next install.
+{{ end }}
+{{- if and .Values.bootstrap.enabled (not .Values.config.existingSecret) (not .Values.persistence.enabled) }}
+persistence is off, so the data dir is an emptyDir and every restart re-enrolls
+against a single-use token that has already been spent. Turn persistence on for
+anything longer-lived than a test.
+{{ end }}
+{{- if and (eq .Values.ha.mode "ha") (eq (dig "backend" "in_process" .Values.ha.coordination) "in_process") }}
+ha.mode is ha but ha.coordination is in_process, which reaches no other process.
+This release is one Gateway, so a second one is a second release, and a session
+landing on a Gateway that does not own the node's agent channel has no way to
+signal the owner. Set ha.coordination to the nats backend for a fleet serving
+agent-based nodes.
+{{- end }}
+{{- if and (eq .Values.service.type "LoadBalancer") (ne .Values.service.externalTrafficPolicy "Local") (or .Values.config.existingSecret (not .Values.ssh.proxy.lbCidrs)) }}
+service.externalTrafficPolicy is {{ .Values.service.externalTrafficPolicy | default "Cluster (the Kubernetes default)" }}, so a load balancer
+that forwards through a second node hands the Gateway that node's address, and
+ssh.sourceIpAllowlist then filters on the wrong thing. Set it to Local, or name
+the load balancer's ranges in ssh.proxy.lbCidrs and have it send PROXY protocol
+v2.
+{{- if .Values.config.existingSecret }}
+Your own Secret may already carry ssh.proxy.lb_cidrs; the chart cannot read it.
+{{- end }}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+{{- if or (not .Values.networkPolicy.nodeCidrs) (not .Values.networkPolicy.wormCidrs) }}
+
+NetworkPolicy is on and denies egress that has not been named:
+{{- if not .Values.networkPolicy.nodeCidrs }}
+  - the SSH nodes (networkPolicy.nodeCidrs is empty), so agentless sessions
+    fail until you add your fleet's subnet.
+{{- end }}
+{{- if not .Values.networkPolicy.wormCidrs }}
+  - the object store (networkPolicy.wormCidrs is empty), so recording uploads
+    fail until you add its range.
+{{- end }}
+A placeholder range would have permitted egress to hosts that are not yours,
+so these start closed.
+{{- end }}
+{{- else }}
+
+NetworkPolicy is disabled, so egress from this pod is unrestricted. The
+binary's seccomp filter cannot scope a destination, so this is the only layer
+that confines where a compromised Gateway can reach.
+{{- end }}

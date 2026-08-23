@@ -1,0 +1,31 @@
+# LogLevel VERBOSE so the cert key-id (session_id+identity) appears in the
+# node-local log.
+Port 22
+AddressFamily any
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+LogLevel VERBOSE
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+
+TrustedUserCAKeys /etc/ssh/trusted_user_ca.pub
+AuthorizedKeysFile .ssh/authorized_keys
+
+Subsystem sftp internal-sftp
+
+# X11 + TCP forwarding are deliberately enabled so the port-forward / X11 E2E
+# can drive real -L/-R/-X through the Gateway; X11 forwarding needs xauth,
+# installed in the image.
+AllowTcpForwarding yes
+X11Forwarding yes
+X11UseLocalhost yes
+
+UsePAM no
+AllowUsers deploy dba
+AcceptEnv LANG LC_*
