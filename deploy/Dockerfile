@@ -7,7 +7,7 @@
 # because rustup honours the toml and fetches the pinned toolchain over the
 # network, so the drift is invisible while defeating the pinned builder.
 
-FROM --platform=$BUILDPLATFORM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
+FROM --platform=$BUILDPLATFORM rust:1.99-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS build
 
 # protoc: build.rs generates the CP<->GW gRPC stubs via tonic-prost-build.
 # The aarch64 cross toolchain is installed unconditionally so both target builds
